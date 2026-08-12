@@ -1,0 +1,24 @@
+# ── Python 字节码 / 缓存 ──
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── 打包产物 (PyInstaller) ──
+dist/
+build/
+*.spec
+
+# ── 运行时生成的诊断报告 (输出目录, 由程序自动创建) ──
+reports/
+
+# ── 本地项目数据 (WorkBuddy, 含记忆/配置, 不入库) ──
+.workbuddy/
+
+# ── 操作系统 / 编辑器 ──
+Thumbs.db
+ehthumbs.db
+.DS_Store
+*.swp
+.idea/
+.vscode/
