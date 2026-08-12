@@ -4179,7 +4179,7 @@ def interactive_menu():
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="netdiag_pro.py",
+        prog="netpulse.py",
         description=f"{APP_NAME} v{APP_VERSION} — Windows 网络诊断工具 (命令行)")
     parser.add_argument("modules", nargs="*",
                         help="要运行的模块 key 或序号 (默认进入交互菜单); 用 --list 查看")

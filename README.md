@@ -2,7 +2,7 @@
 
 > 单文件 Windows 网络诊断命令行工具 · 内置 18 项诊断模块 · v1.0.0
 
-NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `netdiag_pro.py` 文件即可运行**（核心功能仅依赖 Python 标准库），覆盖局域网、网关、DNS、外网、WiFi、测速、TCP、路由等常见排障场景，并可将结果导出为 HTML / PDF / TXT 报告。
+NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `netpulse.py` 文件即可运行**（核心功能仅依赖 Python 标准库），覆盖局域网、网关、DNS、外网、WiFi、测速、TCP、路由等常见排障场景，并可将结果导出为 HTML / PDF / TXT 报告。
 
 ## ✨ 特性
 
@@ -21,36 +21,36 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 pip install scapy speedtest-cli
 
 # 进入交互式菜单 (可直接回车运行全部模块)
-python netdiag_pro.py
+python netpulse.py
 ```
 
 ## 🛠 命令行用法
 
 ```bash
 # 列出全部可用模块
-python netdiag_pro.py --list
+python netpulse.py --list
 
 # 运行全部模块
-python netdiag_pro.py all
+python netpulse.py all
 
 # 指定模块运行 (支持 key 或序号, 空格分隔)
-python netdiag_pro.py gateway dns external
-python netdiag_pro.py 2 10 4
+python netpulse.py gateway dns external
+python netpulse.py 2 10 4
 
 # 以 JSON 输出完整结果 (便于脚本解析)
-python netdiag_pro.py all --json
+python netpulse.py all --json
 
 # 导出报告 (支持 txt / html / pdf, 逗号分隔多种格式)
-python netdiag_pro.py all --export report.pdf,report.html,report.txt
+python netpulse.py all --export report.pdf,report.html,report.txt
 
 # 端口探测: 指定目标与协议
-python netdiag_pro.py port --port-target 223.5.5.5:53,119.29.29.29:53 --port-proto both --port-count 4
+python netpulse.py port --port-target 223.5.5.5:53,119.29.29.29:53 --port-proto both --port-count 4
 
 # 禁用 scapy 二层抓包 (Npcap 不稳定导致崩溃时使用, DHCP 降级)
-python netdiag_pro.py dhcp --no-scapy
+python netpulse.py dhcp --no-scapy
 
 # 自动安装缺失依赖 (scapy / Npcap), 无需交互确认
-python netdiag_pro.py --install
+python netpulse.py --install
 ```
 
 常用参数说明：
@@ -99,7 +99,7 @@ python netdiag_pro.py --install
   - **HTML**：专业工程风，含统计卡、结论高亮、可折叠明细。
   - **PDF**：适合打印 / 归档。
   - **TXT**：纯文本，便于快速查看与粘贴。
-- 示例：`python netdiag_pro.py all --export reports/2026-08-12/diag.pdf,reports/2026-08-12/diag.html`
+- 示例：`python netpulse.py all --export reports/2026-08-12/diag.pdf,reports/2026-08-12/diag.html`
 
 ## 📦 打包为单文件 EXE
 
@@ -128,7 +128,7 @@ build_exe.bat
 ## 📁 目录结构
 
 ```
-netdiag_pro.py      单文件主程序 (~4000 行)
+netpulse.py      单文件主程序 (~4000 行)
 build_exe.bat       PyInstaller 打包脚本
 requirements.txt    依赖说明
 .gitignore          忽略缓存 / 打包产物 / 运行时报告

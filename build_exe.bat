@@ -28,11 +28,11 @@ echo [2/3] 开始构建单文件 EXE...
 pyinstaller --onefile --windowed ^
     --name "NetPulse" ^
     --icon "NONE" ^
-    --add-data "netdiag_pro.py;." ^
+    --add-data "netpulse.py;." ^
     --hidden-import "tkinter" ^
     --hidden-import "scapy.all" ^
     --collect-all "scapy" ^
-    netdiag_pro.py
+    netpulse.py
 
 if errorlevel 1 (
     echo.
