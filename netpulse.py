@@ -82,7 +82,8 @@ SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_NEVER
 LAST_RUN = None
 
 # 端口探测模块的运行参数 (由 CLI --port-* 写入, run_diagnostics 读取)
-PORT_PROBE_CONFIG = {"targets": [], "proto": "tcp", "count": 4, "force": False}
+PORT_PROBE_CONFIG = {"targets": [], "proto": "tcp", "count": 4,
+                     "force": False, "max_total_time": 60.0}
 
 
 def _is_admin():
@@ -3674,9 +3675,12 @@ class PortProbeTester:
 
     # 单次探测目标数硬上限 (避免无意 DoS / 探测风暴)
     DEFAULT_MAX_TARGETS = 1000
+    # 整个端口探测模块总时长上限 (秒), 0 = 不限
+    DEFAULT_MAX_TOTAL_TIME = 60.0
 
     def __init__(self, targets=None, proto="tcp", count=4,
-                 max_targets=DEFAULT_MAX_TARGETS, force=False):
+                 max_targets=DEFAULT_MAX_TARGETS, force=False,
+                 max_total_time=DEFAULT_MAX_TOTAL_TIME):
         self.name = "端口探测"
         self.results = {}
         self.targets = targets or DEFAULT_PORT_TARGETS
@@ -3684,6 +3688,14 @@ class PortProbeTester:
         self.count = max(1, int(count))
         self.max_targets = max(1, int(max_targets))
         self.force = bool(force)
+        self.max_total_time = max(0.0, float(max_total_time))
+        self._start_time = None
+
+    def _time_left(self):
+        """返回剩余可用时间 (秒); 0 或负表示已超时。max_total_time=0 时不限。"""
+        if self.max_total_time <= 0 or self._start_time is None:
+            return float("inf")
+        return self.max_total_time - (time.monotonic() - self._start_time)
 
     def _resolve(self, host):
         """解析主机名 -> (ip, family, 错误); family: socket.AF_INET / AF_INET6。"""
@@ -3852,7 +3864,13 @@ class PortProbeTester:
             return self.results
         # 先把所有 spec 解析成 (host, port) 列表, 不实际探测
         expanded = []  # [(spec, host, port), ...]
+        # 记开始时间, 用于 max_total_time 兜底
+        self._start_time = time.monotonic()
         for spec in self.targets:
+            # 总时长兜底: 解析阶段先检查, 但通常这一步极快, 实际超时发生在 _probe_one
+            if self._time_left() <= 0 and not self.force:
+                skipped.append(spec)
+                continue
             parsed = _parse_target(spec)
             if not parsed:
                 skipped.append(spec)
@@ -3891,8 +3909,24 @@ class PortProbeTester:
 
         # 通过限流, 实际探测
         targets = []
+        timed_out_specs = []  # 因总时长超时被跳过的 spec
+        # 估算单个目标最坏耗时 (count 次采样 × 3s socket timeout + DNS 解析)
+        # 用来判断"剩余时间够不够再探测一个目标", 避免开始一个 12s 的探测
+        # 然后发现超时, 已经浪费了 12s
+        worst_case_per_target = self.count * 3.0 + 1.0
+        last_checked_spec = None
         for spec, h, p in expanded:
+            # 总时长兜底: 每个 spec 第一个目标前检查"够不够一个目标的最坏耗时"
+            if spec != last_checked_spec:
+                last_checked_spec = spec
+                if self._time_left() <= worst_case_per_target and not self.force:
+                    timed_out_specs.append(spec)
+                    continue
             for pr in protos:
+                # 单目标也再检查 (避免最后一个 spec 跨过超时边界)
+                if self._time_left() <= worst_case_per_target and not self.force:
+                    timed_out_specs.append(spec)
+                    break
                 targets.append(self._probe_one(h, p, pr))
 
         issues = []
@@ -3931,6 +3965,23 @@ class PortProbeTester:
         }
         if skipped:
             self.results["skipped"] = skipped
+        # 总时长超时提示: 让用户知道探测被中途截断, 而不是"漏了"
+        if timed_out_specs:
+            self.results["timed_out_specs"] = timed_out_specs
+            self.results["max_total_time"] = self.max_total_time
+            self.results["summary"] += (
+                f" (超时, 跳过 {len(timed_out_specs)} 个 spec, "
+                f"--port-timeout 提高)"
+            )
+            issues.append({
+                "type": "port_total_timeout",
+                "severity": "warning",
+                "message": (f"端口探测总时长超过 {self.max_total_time}s 限制, "
+                            f"跳过 {len(timed_out_specs)} 个 spec"),
+                "detail": (f"已超时 spec: {', '.join(timed_out_specs)}\n"
+                           f"如需探测全部目标, 加 --port-timeout 300 (秒) 重试。")
+            })
+            self.results["issues"] = issues
         if callback:
             callback(self.results["summary"])
         return self.results
@@ -4519,7 +4570,8 @@ def _run_diagnostics_sequential(keys, is_tty):
                 inst = cls(targets=PORT_PROBE_CONFIG["targets"],
                            proto=PORT_PROBE_CONFIG["proto"],
                            count=PORT_PROBE_CONFIG["count"],
-                           force=PORT_PROBE_CONFIG.get("force", False))
+                           force=PORT_PROBE_CONFIG.get("force", False),
+                           max_total_time=PORT_PROBE_CONFIG.get("max_total_time", 60.0))
             else:
                 inst = cls()
             if is_tty:
@@ -4548,30 +4600,32 @@ def _run_diagnostics_sequential(keys, is_tty):
 
 
 def _run_diagnostics_parallel(keys, max_workers, total):
-    """并行模式: 同时跑多个模块, 中间输出抑制, 完成后统一打印。
+    """并行模式: 4 worker 并发跑, 启动和完成行都按 keys 顺序打印。
 
     设计要点:
+      - 启动行: 主线程在 submit 前按 keys 顺序打 (1, 2, 3, ..., 18 整齐一行下来)
+      - 完成行: worker 完成时只存结果, 不立即打印; 主线程等所有完成后按 keys 顺序遍历
+        打 (1, 2, 3, ..., 18 整齐一行下来)
+      - 缺点: 慢模块 (Bufferbloat 30+ 秒) 会让进度"卡"在它那里, 其它 worker 闲着等。
+        优点: 用户能看清 1-18 哪个完成哪个没完成, 视觉上不再"乱"。
       - print() 走 _safe_print (lock) 避免交错
-      - 检测中 callback 静默, 结果统一在主线程按 keys 顺序打印
       - 共享状态 (_CMD_CACHE / _LOCAL_SUBNET_CACHE / _DECODE_CACHE / DNS socket)
         均为只读 / GIL-safe / thread-local, 多个 detector 并发安全
-      - LAST_RUN 在主线程最后写, 无竞争
     """
     results = {}
     full = {}
-    counter = {"done": 0}
-    counter_lock = threading.Lock()
+    completed = {}       # key -> (name, status, res)
+    completed_lock = threading.Lock()
 
     def _run_one(key):
         name, cls = MODULE_MAP[key]
-        idx = keys.index(key) + 1
-        _safe_print(_c(f"  [{idx}/{total}] 正在 {name} …", C_GRAY))
         try:
             if key == "port":
                 inst = cls(targets=PORT_PROBE_CONFIG["targets"],
                            proto=PORT_PROBE_CONFIG["proto"],
                            count=PORT_PROBE_CONFIG["count"],
-                           force=PORT_PROBE_CONFIG.get("force", False))
+                           force=PORT_PROBE_CONFIG.get("force", False),
+                           max_total_time=PORT_PROBE_CONFIG.get("max_total_time", 60.0))
             else:
                 inst = cls()
             inst.detect(callback=lambda msg: None)  # parallel 模式抑制中间输出
@@ -4580,19 +4634,32 @@ def _run_diagnostics_parallel(keys, max_workers, total):
         except Exception as e:
             res = {"error": str(e)}
             status = "错误"
-        # 完成行用 keys 顺序编号 (与启动行一致), 不按完成时间
-        with counter_lock:
-            counter["done"] += 1
-            _safe_print(_c(f"  [{idx}/{total}] ✓ {name}", C_BOLD) + "  "
-                        + _cli_status_badge(status))
-        return key, name, status, res
+        # 存结果, 不立即打 (主线程按 keys 顺序统一打)
+        with completed_lock:
+            completed[key] = (name, status, res)
+        return key
 
+    # 启动行: 主线程按 keys 顺序打 (1-18 整齐一行)
+    for i, key in enumerate(keys, 1):
+        name = MODULE_MAP[key][0]
+        _safe_print(_c(f"  [{i}/{total}] 正在 {name} …", C_GRAY))
+
+    # 等待所有 worker 完成 (中间不打任何东西, 让用户看到 1-18 启动后等一段时间)
     with ThreadPoolExecutor(max_workers=max(1, min(max_workers, total))) as ex:
         futs = [ex.submit(_run_one, k) for k in keys]
         for fut in as_completed(futs):
-            key, _name, status, res = fut.result()
-            results[key] = status
-            full[key] = res
+            fut.result()  # 等待, 不打印
+
+    # 完成行: 主线程按 keys 顺序打 (1-18 整齐一行)
+    for i, key in enumerate(keys, 1):
+        if key not in completed:
+            # 理论上不会到这里 (except 块也存了), 但兜底
+            continue
+        name, status, res = completed[key]
+        _safe_print(_c(f"  [{i}/{total}] ✓ {name}", C_BOLD) + "  "
+                    + _cli_status_badge(status))
+        results[key] = status
+        full[key] = res
     return results, full
 
 
@@ -7342,6 +7409,9 @@ def main():
     parser.add_argument("--port-force", action="store_true",
                         help="强制执行端口探测, 即使目标数超过 1000 上限 "
                              "(默认拦下, 避免无意探测风暴/DoS)")
+    parser.add_argument("--port-timeout", type=float, default=60.0, metavar="SEC",
+                        help="端口探测总时长上限 (秒, 默认 60, 设 0 = 不限)。"
+                             "超过则跳过剩余 spec, 报告里 timed_out_specs 字段列出")
     parser.add_argument("--export", metavar="FILE",
                         help="诊断后将报告导出到文件 (支持 .txt / .html / .pdf); "
                              "多个目标用逗号分隔可一次导出多种格式, 例: report.pdf,report.html,report.txt")
@@ -7371,6 +7441,7 @@ def main():
     PORT_PROBE_CONFIG["proto"] = args.port_proto
     PORT_PROBE_CONFIG["count"] = max(1, int(args.port_count))
     PORT_PROBE_CONFIG["force"] = bool(getattr(args, "port_force", False))
+    PORT_PROBE_CONFIG["max_total_time"] = max(0.0, float(getattr(args, "port_timeout", 60.0)))
 
     if args.list:
         _print_module_list()
