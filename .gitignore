@@ -22,3 +22,9 @@ ehthumbs.db
 *.swp
 .idea/
 .vscode/
+
+# ── 临时文件 ──
+/commit_msg.txt
+/_verify_*.py
+/_smoke_*.py
+/_perf_test*.py
