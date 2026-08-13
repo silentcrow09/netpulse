@@ -67,8 +67,16 @@ except Exception:
 # SECTION 1b: 可选依赖自动安装 (scapy / Npcap)
 # ============================================================
 
-# 本次会话是否已就 scapy 安装提示过用户 (避免重复询问)
-SCAPY_OFFERED = False
+# scapy 安装提示状态机 (避免重复问, 也允许 --install 后重新尝试)
+# - NEVER_OFFERED: 从未问过 (首次 dhcp 缺失时进入提问)
+# - USER_DECLINED: 交互式问过, 用户拒绝 (本次会话不再问, 除非 auto_yes)
+# - USER_ACCEPTED: 用户接受 (已开始装)
+# - INSTALLED: 已装好
+SCAPY_OFFER_STATE_NEVER = "never"
+SCAPY_OFFER_STATE_DECLINED = "declined"
+SCAPY_OFFER_STATE_ACCEPTED = "accepted"
+SCAPY_OFFER_STATE_INSTALLED = "installed"
+SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_NEVER
 
 # 最近一次诊断运行的完整数据 (供报告生成使用)
 LAST_RUN = None
@@ -204,20 +212,25 @@ def ensure_scapy(auto_yes=False, mirror=None):
       - 交互 TTY: 会询问用户是否安装
       - 非 TTY: 仅当 auto_yes=True (--install) 时才安装, 否则仅提示并降级
       - 网络环境: 先检测连通性, 失败则提示并(交互下)提供国内镜像
+
+    状态机 (与旧版的差异):
+      旧版只用单个 ``SCAPY_OFFERED`` 标志, 拒绝后即便 CLI 加上 --install
+      也不会重新提示, 语义错乱。新版区分 NEVER/DECLINED/ACCEPTED/INSTALLED,
+      --install 总是能覆盖拒绝状态。
     """
-    global SCAPY_OFFERED
+    global SCAPY_OFFER_STATE
     if FORCE_NO_SCAPY:
         return False
     if SCAPY_AVAILABLE:
         return True
-    if SCAPY_OFFERED and not auto_yes:
+    if SCAPY_OFFER_STATE == SCAPY_OFFER_STATE_DECLINED and not auto_yes:
         return False
-    SCAPY_OFFERED = True
 
     is_tty = sys.stdout.isatty()
     if not is_tty and not auto_yes:
         print(_c("  ⚠ scapy 未安装，DHCP 完整检测降级为仅检测当前 DHCP 服务器。", C_YELLOW))
         print(_c("    交互运行并选择安装，或加 --install 参数可启用完整检测。", C_GRAY))
+        SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_DECLINED
         return False
 
     print()
@@ -235,7 +248,9 @@ def ensure_scapy(auto_yes=False, mirror=None):
             ans = "n"
     if ans not in ("y", "yes"):
         print(_c("  已跳过安装，DHCP 检测将降级运行。", C_GRAY))
+        SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_DECLINED
         return False
+    SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_ACCEPTED
 
     # 网络连通性预检
     print(_c("  正在检测网络连通性...", C_GRAY))
@@ -251,6 +266,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
             if use_mirror in ("y", "yes"):
                 mirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
             else:
+                SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_DECLINED
                 return False
         print(_c(f"  将使用镜像: {mirror}", C_GRAY))
 
@@ -263,13 +279,16 @@ def ensure_scapy(auto_yes=False, mirror=None):
             if line.strip():
                 print(_c("    " + line.strip(), C_GRAY))
         print(_c("    如需代理/镜像请设置环境变量或加 --install 重试。", C_GRAY))
+        SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_DECLINED
         return False
     print(_c("  ✓ scapy 安装成功", C_GREEN))
 
     # 重新导入
     if not _reload_scapy():
         print(_c("  ✗ scapy 导入失败 (可能仍缺少 Npcap 或依赖)", C_RED))
+        SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_DECLINED
         return False
+    SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_INSTALLED
 
     # Npcap (仅 Windows)
     if os.name == "nt":
@@ -1589,14 +1608,14 @@ class SpeedTester:
         if callback:
             callback("iperf3 下载测速 (reverse)...")
         cmd = f'"{iperf3_path}" -c {server} -p {port} -t {duration} -R -J'
-        code, out, err = run_cmd(cmd, timeout=duration + 15)
+        _, out, _ = run_cmd(cmd, timeout=duration + 15)
         download_result = self._parse_iperf3_json(out)
 
         # 上传测试
         if callback:
             callback("iperf3 上传测速...")
         cmd = f'"{iperf3_path}" -c {server} -p {port} -t {duration} -J'
-        code, out, err = run_cmd(cmd, timeout=duration + 15)
+        _, out, _ = run_cmd(cmd, timeout=duration + 15)
         upload_result = self._parse_iperf3_json(out)
 
         return {
@@ -3266,12 +3285,24 @@ def _print_module_list():
         print(f"  {_c(str(i).rjust(2), C_CYAN)}. {_c(n, C_WHITE)}  {_c('(' + k + ')', C_GRAY)}")
 
 
-def parse_module_names(names):
-    """解析命令行位置参数中的模块名/序号 -> keys 列表; 无效则提示并返回 None"""
+def _parse_keys(tokens, *, strict=True):
+    """解析模块标识符 (key/序号/中文名) -> keys 列表。
+
+    strict=True:  任一 token 非法立即返回 None (用于交互菜单, 整体拒绝);
+    strict=False: 跳过非法 token, 仍接受合法部分 (用于 CLI 批量, 部分合法可接受)。
+
+    与旧版的差异: 旧版 parse_choice / parse_module_names 是两个几乎一样
+    的函数, 重复维护易漂移; 现统一为单函数 + 两种严格度。
+    """
+    if not tokens:
+        return None
     valid = {k for k, _, _ in MODULE_REGISTRY}
     name_to_key = {n.lower(): k for k, n, _ in MODULE_REGISTRY}
     keys = []
-    for m in names:
+    for m in tokens:
+        m = (m or "").strip()
+        if not m:
+            continue
         if m in valid:
             keys.append(m)
         elif m.lower() in name_to_key:
@@ -3279,8 +3310,18 @@ def parse_module_names(names):
         elif m.isdigit() and 1 <= int(m) <= len(MODULE_REGISTRY):
             keys.append(MODULE_REGISTRY[int(m) - 1][0])
         else:
+            if strict:
+                return None
             print(_c(f"未知模块: {m}", C_RED))
     return keys or None
+
+
+def parse_module_names(names):
+    """解析命令行位置参数中的模块名/序号 -> keys 列表。
+
+    非严格模式: 无效 token 打印警告后跳过, 仍接受合法部分。
+    """
+    return _parse_keys(names, strict=False)
 
 
 def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
@@ -4022,7 +4063,11 @@ def render_report_pdf(report, path, auto_install=False):
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
     pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
-    FONT = "STSong-Light"  # 支持中文, 无需外部字体文件
+    # 内置中文字体 (无需外部字体文件), 缺点是只覆盖 GB2312 字符集:
+    # 希腊字母 / 西里尔 / 阿拉伯文 / emoji 等会显示为方块或缺失。
+    # 单文件 EXE 场景下妥协: 用户在 SSID/WiFi 名里塞希腊字母罕见, 报告内
+    # 出现的几乎都是中文+ASCII+少量数字, GB2312 覆盖足够。
+    FONT = "STSong-Light"
 
     # ── 专业工程配色 (与 HTML 报告一致) ──
     C_INK = colors.HexColor("#1b2437")       # 主文字
@@ -4438,30 +4483,15 @@ def prompt_export_report(auto_install=False):
 
 def parse_choice(choice):
     """解析交互菜单输入 -> keys 列表; 无效返回 None。
-    支持: 数字(可多选空格分隔)、0/全部、模块 key、模块中文名"""
-    choice = choice.strip()
+    支持: 数字 (空格分隔多选)、0/全部、模块 key、模块中文名。
+    严格模式: 任一 token 非法即整体拒绝。
+    """
+    choice = (choice or "").strip()
     if choice == "":
         return None
     if choice.lower() in ("0", "all", "a", "*"):
         return [k for k, _, _ in MODULE_REGISTRY]
-    parts = choice.split()
-    valid = {k for k, _, _ in MODULE_REGISTRY}
-    name_to_key = {n.lower(): k for k, n, _ in MODULE_REGISTRY}
-    keys = []
-    for p in parts:
-        if p.isdigit():
-            idx = int(p)
-            if 1 <= idx <= len(MODULE_REGISTRY):
-                keys.append(MODULE_REGISTRY[idx - 1][0])
-            else:
-                return None
-        elif p in valid:
-            keys.append(p)
-        elif p.lower() in name_to_key:
-            keys.append(name_to_key[p.lower()])
-        else:
-            return None
-    return keys or None
+    return _parse_keys(choice.split(), strict=True)
 
 
 def interactive_menu(install=False):
