@@ -340,11 +340,37 @@ TCP_LIMIT_CRITICAL = 10000
 # SECTION 3: UTILITY FUNCTIONS
 # ============================================================
 
+# 工作线程级 socket 缓存: 线程池内每个 worker 复用同一个 UDP socket,
+# 避免每个 DNS 查询都创建/关闭 socket (~2-3ms × 20 次 ≈ 50ms)。
+_DNS_SOCKET_TLS = threading.local()
+
+
+def _get_dns_socket(timeout):
+    """获取当前线程的 UDP socket (懒创建), 失败时新建。"""
+    s = getattr(_DNS_SOCKET_TLS, "sock", None)
+    if s is None:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            _DNS_SOCKET_TLS.sock = s
+        except Exception:
+            return None
+    try:
+        s.settimeout(timeout)
+        return s
+    except Exception:
+        try:
+            s.close()
+        except Exception:
+            pass
+        _DNS_SOCKET_TLS.sock = None
+        return None
+
+
 def _dns_query(server, domain, timeout=2.5):
     """用 UDP 直接向指定 DNS 服务器查询域名 A 记录 (不依赖 nslookup 进程)。
 
     返回 (resolved_ip, elapsed_ms); 失败时 resolved_ip 为 None。
-    并发安全, 可在线程池中使用。
+    并发安全, 可在线程池中使用 (worker 线程内复用 socket)。
     """
     try:
         tid = int.from_bytes(os.urandom(2), "big")
@@ -352,8 +378,9 @@ def _dns_query(server, domain, timeout=2.5):
         qname = (b"".join(bytes([len(p)]) + p.encode("ascii", "ignore")
                           for p in domain.split(".")) + b"\x00")
         question = qname + struct.pack(">HH", 1, 1)  # A 记录, IN
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
+        s = _get_dns_socket(timeout)
+        if s is None:
+            return None, 0
         start = time.time()
         try:
             s.sendto(header + question, (server, 53))
@@ -389,24 +416,37 @@ def _dns_query(server, domain, timeout=2.5):
             return None, round((time.time() - start) * 1000, 1)
         except Exception:
             return None, round((time.time() - start) * 1000, 1)
-        finally:
-            s.close()
     except Exception:
         return None, 0
 
 
-def run_cmd(cmd, timeout=30, shell=True):
-    """执行系统命令，返回 (returncode, stdout, stderr)
-    自动处理 Windows GBK/UTF-8 编码问题。
+# 命令结果 TTL 缓存: 同一次诊断会话内, 多个模块常跑同一条命令 (arp -a / ipconfig /
+# route print / Get-NetAdapter 等), 缓存避免重复进程启动开销 (PowerShell 0.5-1s,
+# 普通命令 50-200ms)。TTL 设短避免跨诊断的状态污染。
+_CMD_CACHE = {}
+_CMD_CACHE_TTL = 5.0  # 秒
 
-    编码选择策略 (与旧版的差异):
-      - 旧版按 ['utf-8', 'gbk', 'gb2312', 'latin-1'] 顺序尝试, 但在中文
-        Windows 上 utf-8 优先会导致「命令输出含中文 → utf-8 失败 → gbk 成功」
-        的路径走得太远, 某些 Win11 22H2+ 输出的混合编码段会被 gbk 静默乱码。
-      - 新版按「系统 ANSI codepage → gbk → utf-8」顺序, 优先匹配 Windows
-        实际使用的代码页 (cp936/CP1252 等); 全部失败时 errors='replace' 保底。
-      - 缓存首次成功的编码, 一次会话内避免重复试错。
+
+def run_cmd(cmd, timeout=30, shell=True, use_cache=True):
+    """执行系统命令, 返回 (returncode, stdout, stderr)。
+
+    性能:
+      - 透明 TTL 缓存: 同一 (cmd, timeout) 在 5 秒内直接返回缓存。
+        跨模块重复调用 (如 arp -a 被 4 个模块各调一次) 实际只跑一次。
+      - 缓存 key 含 timeout: 不同 timeout 的结果不混用, 避免超时被杀
+        的半截输出被后续正常 timeout 调用误用。
+      - use_cache=False 可强制重跑 (例如 _pip_install_scapy 这类带副作用的)。
+
+    编码处理 (与 P1#7 一致):
+      - 按「系统 ANSI codepage → gbk → utf-8」顺序, 首次成功编码缓存。
     """
+    cache_key = (cmd, timeout) if use_cache else None
+    if cache_key is not None:
+        cached = _CMD_CACHE.get(cache_key)
+        if cached is not None:
+            age = time.time() - cached[0]
+            if age < _CMD_CACHE_TTL:
+                return cached[1], cached[2], cached[3]
     try:
         result = subprocess.run(
             cmd, shell=shell, capture_output=True, timeout=timeout
@@ -414,11 +454,14 @@ def run_cmd(cmd, timeout=30, shell=True):
         stdout = result.stdout
         stderr = result.stderr
         stdout_str, stderr_str = _decode_bytes_pair(stdout, stderr)
-        return result.returncode, stdout_str, stderr_str
+        rc, so, se = result.returncode, stdout_str, stderr_str
     except subprocess.TimeoutExpired:
-        return -1, "", "命令执行超时"
+        rc, so, se = -1, "", "命令执行超时"
     except Exception as e:
-        return -1, "", str(e)
+        rc, so, se = -1, "", str(e)
+    if cache_key is not None:
+        _CMD_CACHE[cache_key] = (time.time(), rc, so, se)
+    return rc, so, se
 
 
 # 编码缓存: 一次 run_cmd 成功后把命中顺序记下来, 后续直接用
