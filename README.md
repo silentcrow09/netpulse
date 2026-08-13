@@ -94,12 +94,32 @@ python netpulse.py --install
 
 ## 📄 报告导出
 
-- 不指定路径时报告自动归档到 **`reports/YYYY-MM-DD/`**（按运行日期建文件夹）。
-- 支持三种格式：
-  - **HTML**：专业工程风，含统计卡、结论高亮、可折叠明细。
-  - **PDF**：适合打印 / 归档。
-  - **TXT**：纯文本，便于快速查看与粘贴。
-- 示例：`python netpulse.py all --export reports/2026-08-12/diag.pdf,reports/2026-08-12/diag.html`
+报告是给客户看的，技术细节放 JSON 单独存。**`reports/YYYY-MM-DD/`** 按日期归档。
+
+- **`--export report.html`**：客户版 HTML，含健康分、待办问题清单、关键指标、可折叠技术细节。
+- **`--export report.pdf`**：客户版 PDF，浅色主题、模块卡片化、适合打印/留档。
+- **`--export report.json`**：技术员 / 脚本用。含完整 raw 原始数据（30 个 RTT 序列、ARP 表、路由表等）+ 阈值定义 + 健康分计算依据。
+- 多个格式可同时导：`--export report.html,report.pdf,report.json`。
+- 旧版拍平所有字段的 `.txt` 已废弃，导出 `.txt` 会提示改用 HTML/PDF/JSON。
+
+示例：
+```bash
+# 客户版
+python netpulse.py all --port-target 223.5.5.5:53 --export report.html
+
+# 客户版 + 技术员 JSON
+python netpulse.py all --port-target 223.5.5.5:53 --export report.html,report.json
+
+# 三种都导 (HTML + PDF + JSON)
+python netpulse.py all --port-target 223.5.5.5:53 --export report.html,report.pdf,report.json --install
+```
+
+### 报告设计要点
+
+- **健康分（0-100）**：异常 -20 / 错误 -30 / 警告 -5 / 未检测 -2。等级 A/B/C/D/F。
+- **待办问题清单**：按严重度排序，每条带"影响 + 建议"（如"网关延迟高 → 检查网线/WiFi 信号/路由 CPU"）。
+- **关键指标**：每个模块 3-5 个，颜色按阈值（绿/黄/红）。
+- **技术细节**：HTML 默认折叠；PDF 弱化为浅灰小表；完整数据见 `.json`。
 
 ## 📦 打包为单文件 EXE
 

@@ -28,3 +28,9 @@ ehthumbs.db
 /_verify_*.py
 /_smoke_*.py
 /_perf_test*.py
+
+# ── 报告优化改动留档 (一次性, 升级完就过期) ──
+# 实际改动已合入 netpulse.py, 这些文件不入仓
+/REPORT_REDESIGN_*.md
+/report_redesign_*.html
+/report_full_v2.*

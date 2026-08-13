@@ -1072,11 +1072,23 @@ def _get_local_subnet(local_ip):
 
 
 def get_public_ip():
-    """获取公网 IP (国内 IP 服务, 并发请求, 首个成功即返回)。"""
+    """获取公网 IPv4 (国内 + 国际服务池, 并发请求, 首个成功即返回)。
+
+    服务池从 3 个扩到 6 个, 涵盖:
+      - 国内 (百度/IPIP/Oray): 延迟低, 国内访问稳
+      - 国际 (ip.sb / ifconfig.me / api.ipify.org): 出口链路国际访问异常时
+        国内服务可能拿不到真实公网 IP, 用国际服务对比
+    4s 单服务超时, 整体跑完不会超过 6s (并发)。
+    """
     services = [
+        # 国内
         ("https://qifu-api.baidubce.com/ip/local/geo/v1/district", "json"),
         ("https://myip.ipip.net", "text"),
         ("https://ddns.oray.com/checkip", "text"),
+        # 国际
+        ("https://api.ipify.org", "text"),
+        ("https://ifconfig.me/ip", "text"),
+        ("https://ip.sb", "text"),
     ]
 
     def _probe(url, mode):
@@ -1092,13 +1104,84 @@ def get_public_ip():
         except Exception:
             return ""
 
-    with ThreadPoolExecutor(max_workers=3) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         futs = [ex.submit(_probe, u, m) for u, m in services]
         for f in as_completed(futs):
             ip = f.result()
             if ip:
                 return ip
     return None
+
+
+# IPv6 公网 IP 服务 (国内访问不稳, 失败容错)
+_IPV6_SERVICES = [
+    "https://api64.ipify.org",      # ipify IPv6 版, 国际稳定
+    "https://ipv6.icanhazip.com",   # icanhazip IPv6 版
+    "https://v6.ident.me",          # ident.me IPv6
+]
+
+
+def get_public_ipv6():
+    """获取公网 IPv6 地址, 失败返回 None。
+
+    国内运营商很多没开通 IPv6, 拿到 None 是正常结果 (不代表出错)。
+    """
+    def _probe(url):
+        try:
+            req = Request(url, headers={"User-Agent": "NetPulse/1.0"})
+            # 强制走 IPv6, 避免 happy eyeballs 退回 IPv4
+            resp = urlopen(req, timeout=4)
+            raw = resp.read().decode("utf-8", "ignore").strip()
+            m = re.search(r"\b([0-9a-fA-F:]{3,})\b", raw)
+            if m and ":" in m.group(1):
+                # 简单合法性检查
+                try:
+                    ipaddress.IPv6Address(m.group(1))
+                    return m.group(1)
+                except Exception:
+                    return None
+            return None
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        for ip in ex.map(_probe, _IPV6_SERVICES):
+            if ip:
+                return ip
+    return None
+
+
+# IP 归属地查询 (ASN/地理位置), 拿公网 IP 后调用
+# 用 ip-api.com (免费, 限速 45 req/min, HTTP, 支持 IPv6)
+def get_ip_geo(ip):
+    """查询 IP 的归属地 (国家/省/城市/ASN/运营商)。
+
+    返回 dict 形如:
+      {"country": "中国", "region": "浙江", "city": "杭州",
+       "isp": "中国电信", "asn": "AS4134 Chinanet", "org": "Chinanet"}
+    任何字段缺失时为空字符串。失败返回 None。
+    """
+    if not ip:
+        return None
+    try:
+        # ip-api.com: lang=zh-CN 中文国家/省/市, fields=... 只取要用的
+        url = f"http://ip-api.com/json/{ip}?lang=zh-CN&fields=status,country,regionName,city,isp,org,as"
+        req = Request(url, headers={"User-Agent": "NetPulse/1.0"})
+        resp = urlopen(req, timeout=6)
+        raw = resp.read().decode("utf-8", "ignore")
+        data = json.loads(raw)
+        if data.get("status") != "success":
+            return None
+        return {
+            "country": data.get("country", "") or "",
+            "region":  data.get("regionName", "") or "",
+            "city":    data.get("city", "") or "",
+            "isp":     data.get("isp", "") or "",
+            "org":     data.get("org", "") or "",
+            "asn":     data.get("as", "") or "",
+        }
+    except Exception:
+        return None
 
 
 def parse_ping_output(output):
@@ -4199,11 +4282,47 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
             pub = get_public_ip() or "未知"
         except Exception:
             pub = "未知"
-        sys_info = {"local_ip": lip, "gateway": gw, "dns": dns, "public_ip": pub}
+        # 增强: 拿到公网 IP 后查 ASN/地理位置, 拿 IPv6 公网 IP
+        # 单独 try 包, 这些失败不影响主流程
+        try:
+            geo = get_ip_geo(pub if pub != "未知" else None)
+        except Exception:
+            geo = None
+        try:
+            pub_v6 = get_public_ipv6()
+        except Exception:
+            pub_v6 = None
+        # geo 转成 "国家 / 省 / 市" 简洁串, asn 转成 "ASxxx 运营商"
+        geo_str = ""
+        asn_str = ""
+        if geo:
+            bits = [b for b in (geo.get("country"), geo.get("region"),
+                                geo.get("city")) if b]
+            geo_str = " / ".join(bits)
+            asn_str = geo.get("isp", "")
+            if not asn_str and geo.get("asn"):
+                asn_str = geo.get("asn", "")
+        sys_info = {
+            "local_ip": lip,
+            "gateway": gw,
+            "dns": dns,
+            "public_ip": pub,
+            "asn": asn_str,
+            "geo": geo_str,
+            "ipv6_public_ip": pub_v6 or "",
+        }
+        extra = ""
+        if geo_str:
+            extra += f"    📍 {geo_str}"
+        if asn_str:
+            extra += f"    🏢 {asn_str}"
+        if pub_v6:
+            extra += f"    IPv6: {pub_v6}"
         print(_c(f"  本机IP: {lip}", C_WHITE) +
               _c(f"    网关: {gw}", C_WHITE) +
               _c(f"    DNS: {dns}", C_WHITE) +
-              _c(f"    公网IP: {pub}", C_WHITE))
+              _c(f"    公网IP: {pub}", C_WHITE) +
+              (_c(extra, C_WHITE) if extra else ""))
     except Exception as e:
         print(_c(f"  系统信息获取失败: {e}", C_GRAY))
     print(_c("-" * 60, C_GRAY))
@@ -4360,32 +4479,996 @@ def _run_diagnostics_parallel(keys, max_workers, total):
 # SECTION: 诊断报告生成与导出 (TXT / HTML / PDF)
 # ============================================================
 
+# ============================================================
+# 客户视图 / 技术视图分离
+# ============================================================
+# 老的 render_report_* 直接吃 "扁平 result 字典", 把所有字段拍平成 KV 表,
+# 结果就是客户看到 "ping: sent: 30; rtts: 113, 4, 11, 15, ..." 这种技术细节。
+# 新设计:
+#   - 报告生成面向"客户" (网络维护工程师给客户/老板看)
+#   - 每个模块有专门的 verdict + 关键指标 + 影响/建议, 技术细节折叠
+#   - JSON 报告里同时给 raw 原始数据 + 阈值定义, 给工程师/脚本用
+#
+# 配置式写法: 每个模块的"客户视图"由 MODULE_PRESENTATION 配置,
+# 没配置的模块走 _generic_presentation 用 result.summary + 2-3 个数字字段兜底。
+
+
+# 阈值集中: 健康分 / 颜色判定 / 客户报告"超过阈值"提示都引用这里
+# 注意: 跟模块内部的判定 (gateway.assessment 等) 不一定 1:1 对应,
+#       这里是"客户视角的阈值"——给客户看的警示线, 不一定等于工程判定阈值。
+THRESHOLDS = {
+    "gateway": {
+        "ping.avg_ms":   {"warn": 10,  "err": 30,  "unit": "ms", "label": "平均延迟",
+                          "lower_better": True},
+        "ping.loss_pct": {"warn": 1,   "err": 5,   "unit": "%",  "label": "丢包率",
+                          "lower_better": True},
+        "ping.jitter_ms":{"warn": 5,   "err": 20,  "unit": "ms", "label": "抖动",
+                          "lower_better": True},
+        "ping.max_ms":   {"warn": 100, "err": 300, "unit": "ms", "label": "最大延迟",
+                          "lower_better": True},
+    },
+    "external": {
+        "avg_rtt_ms":     {"warn": 50,  "err": 150, "unit": "ms", "label": "平均延迟",
+                           "lower_better": True},
+        "avg_loss_pct":   {"warn": 1,   "err": 5,   "unit": "%",  "label": "平均丢包",
+                           "lower_better": True},
+        "tcp_ok_count":   {"warn_total": True, "label": "TCP 可达数",
+                           "lower_better": False},
+    },
+    "dns": {
+        "avg_time_ms":    {"warn": 50,  "err": 200, "unit": "ms", "label": "平均响应",
+                           "lower_better": True},
+    },
+    "wifi": {
+        "network_count":  {"warn": 8,   "err": 15,  "label": "WiFi 邻居数",
+                           "lower_better": True},
+    },
+    "speedtest": {
+        "download_mbps":  {"warn": 10,  "err": 1,   "unit": "Mbps", "label": "下载速率",
+                           "lower_better": False},
+    },
+    "bufferbloat": {
+        "bloat_ms":       {"warn": 30,  "err": 100, "unit": "ms", "label": "延迟增加",
+                           "lower_better": True},
+    },
+    "linkspeed": {
+        # 有线: < 100 = 警告; WiFi: < 54 = 警告 (按 is_wifi 分档)
+    },
+    "tcpstats": {
+        "retrans_rate_pct":{"warn": 1,  "err": 5,   "unit": "%", "label": "重传率",
+                            "lower_better": True},
+    },
+}
+
+
+# 每个模块的"客户视图"配置: 一句话结论怎么拼、关键指标取哪几个、
+# 阈值提示怎么写。统一格式:
+#   {
+#     "verdict_fn":   callable(res) -> str  # 一句话结论
+#     "metrics":      [  # 关键指标
+#         (label, value_fn, level_fn)  # level_fn(value) -> "ok"/"warn"/"err"
+#     ]
+#     "issues_fn":    callable(res) -> list[dict]  # [{severity, text, impact, action}]
+#     "tech_keys":    ["rtts", "ping", ...]  # 折叠区域展示哪些原始 key
+#   }
+def _verdict_gateway(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    p = res.get("ping", {})
+    gw = res.get("gateway", "")
+    return (f"网关 {gw}: 平均 {p.get('avg_ms', '?')}ms, "
+            f"丢包 {p.get('loss_pct', '?')}%, 抖动 {p.get('jitter_ms', '?')}ms")
+
+
+def _metrics_gateway(res):
+    if "error" in res:
+        return []
+    p = res.get("ping", {})
+    th = THRESHOLDS["gateway"]
+    out = []
+
+    def _level(key, val):
+        cfg = th.get(key, {})
+        if "warn" in cfg and cfg.get("lower_better", True):
+            if val >= cfg["err"]:
+                return "err"
+            if val >= cfg["warn"]:
+                return "warn"
+        return "ok"
+
+    out.append(("平均延迟", f"{p.get('avg_ms', '?')} ms", _level("ping.avg_ms", p.get("avg_ms", 0))))
+    out.append(("丢包率",   f"{p.get('loss_pct', '?')}%", _level("ping.loss_pct", p.get("loss_pct", 0))))
+    out.append(("抖动",     f"{p.get('jitter_ms', '?')} ms", _level("ping.jitter_ms", p.get("jitter_ms", 0))))
+    out.append(("最大延迟", f"{p.get('max_ms', '?')} ms", _level("ping.max_ms", p.get("max_ms", 0))))
+    return out
+
+
+def _issues_gateway(res):
+    if "error" in res:
+        return [{"severity": "异常", "text": res["error"],
+                 "impact": "无法评估网关质量", "action": "检查网络连接是否正常"}]
+    out = []
+    p = res.get("ping", {})
+    if p.get("avg_ms", 0) >= 30:
+        out.append({
+            "severity": "异常",
+            "text": f"网关平均延迟 {p['avg_ms']}ms 超过阈值 30ms",
+            "impact": "网页加载变慢、视频会议可能卡顿、在线游戏高延迟",
+            "action": ("① 检查网线是否松动 ② 查看 WiFi 信号强度 (&lt;-65dBm 为弱) "
+                       "③ 登录路由器后台查看 CPU 占用率 ④ 如仍未改善请联系运营商")
+        })
+    elif p.get("avg_ms", 0) >= 10:
+        out.append({
+            "severity": "警告",
+            "text": f"网关平均延迟 {p['avg_ms']}ms 略高 (阈值 10ms)",
+            "impact": "对一般上网无明显影响, 实时游戏可能有轻微延迟",
+            "action": "如果频繁出现卡顿, 可检查网线质量或考虑 5GHz WiFi"
+        })
+    if p.get("loss_pct", 0) >= 1:
+        out.append({
+            "severity": "警告" if p["loss_pct"] < 5 else "异常",
+            "text": f"网关丢包 {p['loss_pct']}%",
+            "impact": "丢包会直接导致网页加载失败、视频卡顿",
+            "action": "检查网线/WiFi 信号; 排除路由器/交换机过载"
+        })
+    if p.get("jitter_ms", 0) >= 20:
+        out.append({
+            "severity": "警告" if p["jitter_ms"] < 50 else "异常",
+            "text": f"网关抖动 {p['jitter_ms']}ms 超过阈值 20ms",
+            "impact": "视频会议卡顿、VoIP 通话断续、在线游戏跳ping",
+            "action": "优先排查 WiFi 信号/网线质量; 路由器 QoS 设置可能也有影响"
+        })
+    return out
+
+
+def _verdict_external(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    avg_rtt = res.get("avg_rtt_ms", 0)
+    avg_loss = res.get("avg_loss_pct", 0)
+    tcp_ok = res.get("tcp_ok", 0)
+    tcp_total = res.get("tcp_total", 0)
+    unreachable = res.get("unreachable_count", 0)
+    blocked = res.get("icmp_blocked_count", 0)
+    parts = [f"平均延迟 {avg_rtt}ms, 丢包 {avg_loss}%"]
+    if unreachable:
+        parts.append(f"{unreachable} 个目标不可达")
+    if blocked:
+        parts.append(f"{blocked} 个目标被禁拼 (ICMP 防火墙)")
+    return "外网检测: " + ", ".join(parts) + f" (TCP {tcp_ok}/{tcp_total})"
+
+
+def _metrics_external(res):
+    out = []
+    avg_rtt = res.get("avg_rtt_ms", 0)
+    avg_loss = res.get("avg_loss_pct", 0)
+    tcp_ok = res.get("tcp_ok", 0)
+    tcp_total = res.get("tcp_total", 0)
+
+    def _lvl(val, warn, err, lower=True):
+        if lower:
+            if val >= err: return "err"
+            if val >= warn: return "warn"
+        else:
+            if val <= err: return "err"
+            if val <= warn: return "warn"
+        return "ok"
+
+    out.append(("平均延迟", f"{avg_rtt} ms",
+                _lvl(avg_rtt, 50, 150)))
+    out.append(("平均丢包", f"{avg_loss}%",
+                _lvl(avg_loss, 1, 5)))
+    out.append(("TCP 可达", f"{tcp_ok}/{tcp_total}",
+                "ok" if tcp_ok == tcp_total else
+                "warn" if tcp_ok > 0 else "err"))
+    if res.get("unreachable_count", 0):
+        out.append(("不可达目标", f"{res['unreachable_count']} 个", "err"))
+    elif res.get("icmp_blocked_count", 0):
+        out.append(("禁拼目标", f"{res['icmp_blocked_count']} 个", "warn"))
+    return out
+
+
+def _verdict_dns(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    if res.get("dns_hijack"):
+        return f"DNS 疑似劫持 ({res.get('success_count', 0)}/{res.get('total_count', 0)} 成功)"
+    return (f"DNS 测试: {res.get('success_count', 0)}/{res.get('total_count', 0)} 成功, "
+            f"平均 {res.get('avg_time_ms', 0)}ms")
+
+
+def _metrics_dns(res):
+    out = []
+    succ = res.get("success_count", 0)
+    tot = res.get("total_count", 0)
+    avg = res.get("avg_time_ms", 0)
+
+    out.append(("成功率", f"{succ}/{tot}",
+                "err" if succ < tot * 0.5 else "warn" if succ < tot else "ok"))
+    out.append(("平均响应", f"{avg} ms",
+                "err" if avg >= 200 else "warn" if avg >= 50 else "ok"))
+    # 按服务器选最快的 3 个
+    per = res.get("per_server", [])
+    for s in sorted(per, key=lambda x: x.get("avg_ms", 9999))[:3]:
+        st = s.get("status", "正常")
+        out.append((s.get("dns_name") or s.get("dns_server", "?"),
+                    f"{s.get('avg_ms', '?')} ms ({s.get('ok', 0)}/{s.get('total', 0)})",
+                    "err" if st in ("不可用", "部分失败") else "ok"))
+    return out
+
+
+def _issues_dns(res):
+    out = []
+    if res.get("dns_hijack"):
+        out.append({
+            "severity": "异常",
+            "text": "系统 DNS 对公网域名返回私有/保留 IP, 疑似 DNS 劫持/透明代理",
+            "impact": "可能被劫持到错误的服务器, 隐私泄露, 部分网站访问异常",
+            "action": "检查路由器 DNS 设置, 改用 AliDNS (223.5.5.5) / DNSPod (119.29.29.29)"
+        })
+    succ = res.get("success_count", 0)
+    tot = res.get("total_count", 0)
+    if tot and succ < tot * 0.8:
+        out.append({
+            "severity": "警告" if succ >= tot * 0.5 else "异常",
+            "text": f"DNS 解析失败 {tot - succ}/{tot}",
+            "impact": "网页/APP 加载慢, 部分域名可能无法访问",
+            "action": "尝试更换 DNS 服务器 (阿里/腾讯/114)"
+        })
+    return out
+
+
+def _verdict_wifi(res):
+    n = res.get("network_count", 0)
+    inter = res.get("overall_interference", "正常")
+    best = res.get("best_2g_channel") or {}
+    best_ch = best.get("channel") if isinstance(best, dict) else None
+    s = f"发现 {n} 个 WiFi 网络, 干扰等级: {inter}"
+    if best_ch:
+        s += f", 建议信道: {best_ch}"
+    return s
+
+
+def _metrics_wifi(res):
+    n = res.get("network_count", 0)
+    inter = res.get("overall_interference", "正常")
+    cur = res.get("current_channel")
+    best = res.get("best_2g_channel") or {}
+    best_ch = best.get("channel") if isinstance(best, dict) else None
+    out = [
+        ("当前信道", f"{cur}" if cur else "未连接"),
+        ("邻居数", f"{n} 个",
+         "err" if n >= 15 else "warn" if n >= 8 else "ok"),
+        ("干扰等级", inter,
+         "err" if "严重" in inter else "warn" if "高" in inter or "存在" in inter else "ok"),
+    ]
+    if best_ch:
+        out.append(("推荐信道", f"{best_ch}"))
+    return out
+
+
+def _issues_wifi(res):
+    out = []
+    inter = res.get("overall_interference", "")
+    if "严重" in inter or "高" in inter:
+        out.append({
+            "severity": "警告" if "高" in inter else "异常",
+            "text": f"WiFi 信道干扰{inter}",
+            "impact": "WiFi 速率下降、延迟增加, 设备连接不稳定",
+            "action": ("① 在路由器后台将信道切换到推荐信道 "
+                       "② 优先使用 5GHz 频段 (穿墙弱但干扰少) "
+                       "③ 路由器放在房屋中心位置, 远离微波炉/蓝牙设备")
+        })
+    return out
+
+
+def _verdict_speedtest(res):
+    if "error" in res:
+        # 顶层 error 时, 子模块里也可能有 error
+        for k in ("speedtest", "http", "iperf3"):
+            sub = res.get(k, {})
+            if "error" in sub:
+                return f"测速失败 ({k}): {sub['error']}"
+        return res.get("error", "测速失败")
+    method = res.get("summary", "")
+    return method
+
+
+def _metrics_speedtest(res):
+    out = []
+    for k, label in (("speedtest", "Speedtest"), ("http", "HTTP"), ("iperf3", "iperf3")):
+        sub = res.get(k, {})
+        if not sub or "error" in sub:
+            continue
+        down = sub.get("download_mbps", 0)
+        up = sub.get("upload_mbps", 0)
+        if down or up:
+            out.append((f"{label} 下载", f"{down} Mbps", "ok" if down >= 10 else "warn"))
+            out.append((f"{label} 上传", f"{up} Mbps", "ok" if up >= 5 else "warn"))
+    return out
+
+
+def _verdict_bufferbloat(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    return res.get("summary", "Bufferbloat 检测")
+
+
+def _metrics_bufferbloat(res):
+    if "error" in res:
+        return []
+    idle = res.get("idle_rtt_ms", 0)
+    loaded = res.get("loaded_rtt_ms", 0)
+    bloat = res.get("bloat_ms", 0)
+    grade = res.get("grade", "")
+    out = [
+        ("空闲延迟", f"{idle} ms"),
+        ("负载延迟", f"{loaded} ms",
+         "err" if bloat >= 100 else "warn" if bloat >= 30 else "ok"),
+        ("延迟增加", f"+{bloat} ms" if bloat >= 0 else f"{bloat} ms",
+         "err" if bloat >= 100 else "warn" if bloat >= 30 else "ok"),
+    ]
+    if grade:
+        out.append(("评级", grade.split(" ")[0] if " " in grade else grade,
+                    "err" if "F" in grade or "D" in grade else
+                    "warn" if "C" in grade else "ok"))
+    return out
+
+
+def _issues_bufferbloat(res):
+    if "error" in res:
+        return []
+    bloat = res.get("bloat_ms", 0)
+    if bloat >= 30:
+        return [{
+            "severity": "警告" if bloat < 100 else "异常",
+            "text": f"Bufferbloat: 负载下延迟增加 {bloat}ms",
+            "impact": "带宽跑满时其它设备延迟剧增 (视频会议/游戏会卡)",
+            "action": ("① 路由器开启 QoS / SQM (智能队列管理) "
+                       "② 限制单设备最大带宽 "
+                       "③ 考虑升级到支持 SQM 的路由器固件 (OpenWrt/iKuaiOS)")
+        }]
+    return []
+
+
+def _verdict_linkspeed(res):
+    n = len(res.get("adapters", []))
+    issues = res.get("issues", [])
+    if issues:
+        return f"检测到 {n} 个适配器, {len(issues)} 个问题"
+    return f"检测到 {n} 个网络适配器, 速率正常"
+
+
+def _metrics_linkspeed(res):
+    out = []
+    for a in res.get("adapters", []):
+        if a.get("status") not in ("Up", "已启用"):
+            continue
+        speed = a.get("speed_mbps", 0)
+        kind = "WiFi" if a.get("is_wifi") else "有线"
+        # 阈值
+        if a.get("is_wifi"):
+            level = "ok" if speed >= 150 else "warn" if speed >= 54 else "err"
+        else:
+            level = "ok" if speed >= 1000 else "warn" if speed >= 100 else "err"
+        out.append((f"{kind} · {a.get('name', '?')[:18]}",
+                    f"{speed} Mbps", level))
+    wifi = res.get("wifi_details", {})
+    if wifi.get("signal_pct") is not None:
+        sig = wifi["signal_pct"]
+        out.append(("WiFi 信号", f"{sig}%",
+                    "ok" if sig >= 60 else "warn" if sig >= 30 else "err"))
+    return out
+
+
+def _issues_linkspeed(res):
+    out = []
+    for issue in res.get("issues", []):
+        if isinstance(issue, dict):
+            out.append({
+                "severity": "警告" if issue.get("severity") == "warning" else "信息",
+                "text": issue.get("message", ""),
+                "impact": issue.get("detail", ""),
+                "action": "检查物理连接或网卡驱动"
+            })
+    return out
+
+
+def _verdict_loop(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    n_warn = res.get("warning_count", 0)
+    if res.get("loop_detected"):
+        return "发现疑似网络环路!"
+    return f"未发现环路 ({n_warn} 个警告)" if n_warn else "未发现网络环路"
+
+
+def _metrics_loop(res):
+    out = []
+    n = len(res.get("arp_entries", []))
+    out.append(("ARP 条目", f"{n} 条"))
+    if res.get("loop_detected"):
+        out.append(("环路状态", "发现疑似环路", "err"))
+    return out
+
+
+def _issues_loop(res):
+    out = []
+    for issue in res.get("issues", []):
+        if isinstance(issue, dict):
+            sev = issue.get("severity", "")
+            out.append({
+                "severity": "异常" if sev == "critical" else "警告" if sev == "warning" else "信息",
+                "text": issue.get("message", ""),
+                "impact": issue.get("detail", ""),
+                "action": "联系网络管理员排查物理连接"
+            })
+    return out
+
+
+def _verdict_dhcp(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    n = len(res.get("servers", []))
+    inter = res.get("interference", False)
+    if inter:
+        return f"发现 {n} 个 DHCP 服务器 - 存在多服务器干扰!"
+    method = res.get("method", "")
+    suffix = ""
+    if "ipconfig" in method:
+        suffix = " (scapy 不可用降级, 仅看到当前 DHCP)"
+    return f"发现 {n} 个 DHCP 服务器 - 正常{suffix}"
+
+
+def _metrics_dhcp(res):
+    n = len(res.get("servers", []))
+    out = [("服务器数", f"{n} 个", "err" if n > 1 else "ok")]
+    if res.get("interference"):
+        out.append(("干扰", "存在", "err"))
+    return out
+
+
+def _issues_dhcp(res):
+    out = []
+    if res.get("interference"):
+        out.append({
+            "severity": "异常",
+            "text": "检测到多个 DHCP 服务器响应",
+            "impact": "可能随机获取到错误 IP, 导致网络间歇性中断",
+            "action": "① 关闭未授权的 DHCP 服务器 (非法路由器/AP) "
+                       "② 在路由器开启 DHCP 防护 (DHCP Snooping)"
+        })
+    for e in res.get("errors", []):
+        if isinstance(e, str):
+            out.append({"severity": "信息", "text": e,
+                        "impact": "", "action": "安装 scapy + Npcap 启用完整检测"})
+    return out
+
+
+def _verdict_tcp(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    return res.get("summary", "TCP 连接检测")
+
+
+def _metrics_tcp(res):
+    out = []
+    total = res.get("total", 0)
+    out.append(("当前连接", f"{total} 个",
+                "err" if total > 800 else "warn" if total > 500 else "ok"))
+    by_state = res.get("by_state", {})
+    for st, label in (("ESTABLISHED", "已建立"), ("TIME_WAIT", "等待关闭")):
+        if st in by_state:
+            out.append((label, f"{by_state[st]} 个"))
+    return out
+
+
+def _issues_tcp(res):
+    out = []
+    for w in res.get("warnings", []):
+        if isinstance(w, str):
+            sev = "异常" if "临界" in w else "警告"
+            out.append({"severity": sev, "text": w,
+                        "impact": "可能导致连接建立失败或延迟",
+                        "action": "检查占用大量连接的进程, 必要时重启"})
+    return out
+
+
+def _verdict_port(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    return res.get("summary", "端口探测")
+
+
+def _metrics_port(res):
+    out = []
+    targets = res.get("targets", [])
+    if targets:
+        ok = sum(1 for t in targets if t.get("status") == "开放")
+        out.append(("开放/总数", f"{ok}/{len(targets)}",
+                    "ok" if ok == len(targets) else "warn" if ok > 0 else "err"))
+    out.append(("协议", res.get("proto", "?")))
+    out.append(("采样", f"每目标 {res.get('probe_count', '?')} 次"))
+    return out
+
+
+def _issues_port(res):
+    out = []
+    for issue in res.get("issues", []):
+        if isinstance(issue, dict):
+            sev = issue.get("severity", "")
+            out.append({
+                "severity": "异常" if sev == "critical" else "警告",
+                "text": issue.get("message", ""),
+                "impact": issue.get("detail", ""),
+                "action": "检查目标主机/防火墙配置"
+            })
+    return out
+
+
+def _verdict_egress(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    multi = res.get("multiple_egress", False)
+    issues = res.get("issues", [])
+    if multi:
+        return f"检测到多外网出口 ({len(issues)} 个问题)"
+    return "单一外网出口, 正常" if not issues else "单一外网出口, 有问题"
+
+
+def _metrics_egress(res):
+    out = []
+    real = [r for r in res.get("default_routes", [])
+            if not _is_known_fake_gateway(r.get("gateway", ""))
+            and not _is_vpn_interface(r.get("interface", ""))]
+    fake = [r for r in res.get("default_routes", [])
+            if _is_known_fake_gateway(r.get("gateway", ""))
+            or _is_vpn_interface(r.get("interface", ""))]
+    out.append(("真实默认路由", f"{len(real)} 条",
+                "warn" if len(real) > 1 else "ok"))
+    if fake:
+        out.append(("VPN 占位路由", f"{len(fake)} 条 (已忽略)", "info"))
+    pub_ips = res.get("public_ips", [])
+    if pub_ips:
+        out.append(("公网 IP", ", ".join(pub_ips[:2])))
+    return out
+
+
+def _issues_egress(res):
+    out = []
+    for issue in res.get("issues", []):
+        if isinstance(issue, dict):
+            sev = issue.get("severity", "")
+            out.append({
+                "severity": "异常" if sev == "critical" else "警告" if sev == "warning" else "信息",
+                "text": issue.get("message", ""),
+                "impact": issue.get("detail", ""),
+                "action": "联系网络管理员确认多出口配置"
+            })
+    return out
+
+
+def _verdict_mtu(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    issues = res.get("issues", [])
+    if issues:
+        return f"MTU 检测: {len(issues)} 个问题"
+    return "MTU 路径正常"
+
+
+def _metrics_mtu(res):
+    out = []
+    paths = res.get("path_mtus", [])
+    for p in paths:
+        if p.get("error"):
+            out.append((f"→ {p.get('target', '?')}", "测量失败", "warn"))
+        else:
+            out.append((f"→ {p.get('target', '?')}", f"MTU {p.get('path_mtu', '?')}",
+                        "ok" if not p.get("fragmentation_risk") else "warn"))
+    local = res.get("local_mtus", [])
+    if local:
+        m = local[0]
+        out.append((f"本机 {m.get('interface', '?')[:14]}", f"MTU {m.get('mtu', '?')}",
+                    "ok" if m.get("mtu", 1500) >= 1500 else "warn"))
+    return out
+
+
+def _issues_mtu(res):
+    out = []
+    for issue in res.get("issues", []):
+        if isinstance(issue, str):
+            out.append({
+                "severity": "警告",
+                "text": issue,
+                "impact": "可能导致数据包分片, 降低传输效率",
+                "action": "检查网络设备 MTU 配置 (PPPoE 通常 1492)"
+            })
+    return out
+
+
+def _verdict_arp(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    n_total = res.get("total_entries", 0)
+    n_mac = res.get("unique_macs", 0)
+    n_issue = len(res.get("issues", []))
+    if n_issue:
+        return f"ARP 表 {n_total} 条 / {n_mac} MAC, {n_issue} 个问题"
+    return f"ARP 表 {n_total} 条 / {n_mac} MAC, 正常"
+
+
+def _metrics_arp(res):
+    out = [
+        ("ARP 条目", f"{res.get('total_entries', 0)} 条"),
+        ("MAC 数", f"{res.get('unique_macs', 0)} 个"),
+    ]
+    gw = res.get("gateway_mac")
+    if gw:
+        out.append(("网关 MAC", gw, "ok"))
+    return out
+
+
+def _issues_arp(res):
+    out = []
+    for issue in res.get("issues", []):
+        if isinstance(issue, dict):
+            sev = issue.get("severity", "")
+            out.append({
+                "severity": "异常" if sev == "critical" else "警告" if sev == "warning" else "信息",
+                "text": issue.get("message", ""),
+                "impact": issue.get("detail", ""),
+                "action": "检查是否存在 ARP 欺骗或网关 MAC 变更"
+            })
+    return out
+
+
+def _verdict_ipv6(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    return f"IPv6: {res.get('assessment', '?')}"
+
+
+def _metrics_ipv6(res):
+    out = []
+    out.append(("全局地址", "有" if res.get("has_global_ipv6") else "无",
+                "ok" if res.get("has_global_ipv6") else "warn"))
+    out.append(("连通性", "正常" if res.get("ipv6_connectivity") else "不可达",
+                "ok" if res.get("ipv6_connectivity") else "err"))
+    out.append(("IPv6 DNS", "正常" if res.get("ipv6_dns") else "失败",
+                "ok" if res.get("ipv6_dns") else "warn"))
+    return out
+
+
+def _issues_ipv6(res):
+    out = []
+    for issue in res.get("issues", []):
+        if isinstance(issue, str):
+            out.append({
+                "severity": "信息",
+                "text": issue,
+                "impact": "如果不需要 IPv6 可忽略; 否则影响部分纯 IPv6 网站",
+                "action": "联系运营商开通 IPv6 或检查路由器/防火墙配置"
+            })
+    return out
+
+
+def _verdict_route(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    n = res.get("route_count", 0)
+    issues = res.get("issues", [])
+    if any(i.get("severity") == "critical" for i in issues if isinstance(i, dict)):
+        return f"路由表 {n} 条, 检测到路由环路!"
+    if issues:
+        return f"路由表 {n} 条, {len(issues)} 个问题"
+    return f"路由表 {n} 条, 正常"
+
+
+def _metrics_route(res):
+    out = [("路由总数", f"{res.get('route_count', 0)} 条")]
+    real = [r for r in res.get("default_routes", [])
+            if not _is_known_fake_gateway(r.get("gateway", ""))
+            and not _is_vpn_interface(r.get("interface", ""))]
+    out.append(("默认路由", f"{len(real)} 条",
+                "warn" if len(real) > 1 else "ok"))
+    hr = res.get("host_routes", [])
+    if hr:
+        out.append(("主机路由", f"{len(hr)} 条",
+                    "warn" if len(hr) > 50 else "ok"))
+    return out
+
+
+def _issues_route(res):
+    out = []
+    for issue in res.get("issues", []):
+        if isinstance(issue, dict):
+            sev = issue.get("severity", "")
+            out.append({
+                "severity": "异常" if sev == "critical" else "警告" if sev == "warning" else "信息",
+                "text": issue.get("message", ""),
+                "impact": issue.get("detail", ""),
+                "action": "联系网络管理员检查路由配置"
+            })
+    return out
+
+
+def _verdict_lan(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    return res.get("summary", "LAN 扫描")
+
+
+def _metrics_lan(res):
+    out = [("设备数", f"{res.get('device_count', 0)} 台")]
+    devs = res.get("devices", [])
+    unknown = sum(1 for d in devs if not d.get("vendor") and d.get("mac"))
+    if unknown:
+        out.append(("未知厂商", f"{unknown} 台", "warn"))
+    return out
+
+
+def _verdict_tcpstats(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    return res.get("summary", "TCP 传输质量")
+
+
+def _metrics_tcpstats(res):
+    out = [
+        ("重传率", f"{res.get('retrans_rate_pct', 0)}%",
+         "err" if res.get("retrans_rate_pct", 0) >= 5 else
+         "warn" if res.get("retrans_rate_pct", 0) >= 1 else "ok"),
+        ("当前连接", f"{res.get('current_connections', 0)}"),
+    ]
+    return out
+
+
+def _issues_tcpstats(res):
+    out = []
+    rate = res.get("retrans_rate_pct", 0)
+    if rate >= 1:
+        out.append({
+            "severity": "警告" if rate < 5 else "异常",
+            "text": f"TCP 重传率 {rate}% 偏高",
+            "impact": "网络存在拥塞或链路质量问题, 影响下载/视频流畅度",
+            "action": "检查网络设备负载、网线质量, 排除 WiFi 干扰"
+        })
+    return out
+
+
+# 通用兜底: 没专门配置的模块, 用 summary + 2-3 个简单指标
+def _generic_verdict(res):
+    if "error" in res:
+        return res.get("error", "检测失败")
+    return res.get("summary", "检测完成")
+
+
+def _generic_metrics(res):
+    """从 result 顶层挑 2-3 个数字字段做指标, 没有就空。"""
+    out = []
+    for k, v in res.items():
+        if k in ("summary", "issues", "timestamp", "method", "assessment",
+                 "error", "warnings"):
+            continue
+        if isinstance(v, (int, float)) and v:
+            out.append((HEADER_MAP.get(k, k), str(v)))
+            if len(out) >= 3:
+                break
+    return out
+
+
+def _generic_issues(res):
+    out = []
+    issues = res.get("issues", [])
+    if isinstance(issues, list):
+        for issue in issues:
+            if isinstance(issue, str):
+                out.append({"severity": "警告", "text": issue,
+                            "impact": "", "action": "关注后续诊断结果"})
+            elif isinstance(issue, dict):
+                sev = issue.get("severity", "")
+                out.append({
+                    "severity": "异常" if sev == "critical" else "警告" if sev == "warning" else "信息",
+                    "text": issue.get("message", ""),
+                    "impact": issue.get("detail", ""),
+                    "action": "查看技术细节或联系网络管理员"
+                })
+    for w in res.get("warnings", []):
+        if isinstance(w, str) and not any(i.get("text") == w for i in out):
+            out.append({"severity": "警告", "text": w,
+                        "impact": "", "action": "关注后续诊断结果"})
+    return out
+
+
+# 模块配置映射: 没列的模块走通用规则
+MODULE_PRESENTATION = {
+    "dhcp":       {"verdict_fn": _verdict_dhcp,       "metrics_fn": _metrics_dhcp,
+                   "issues_fn": _issues_dhcp},
+    "gateway":    {"verdict_fn": _verdict_gateway,    "metrics_fn": _metrics_gateway,
+                   "issues_fn": _issues_gateway,
+                   "tech_keys": ["ping"]},
+    "loop":       {"verdict_fn": _verdict_loop,       "metrics_fn": _metrics_loop,
+                   "issues_fn": _issues_loop,
+                   "tech_keys": ["arp_entries"]},
+    "external":   {"verdict_fn": _verdict_external,   "metrics_fn": _metrics_external,
+                   "issues_fn": _generic_issues,
+                   "tech_keys": ["targets", "traceroute"]},
+    "linkspeed":  {"verdict_fn": _verdict_linkspeed,  "metrics_fn": _metrics_linkspeed,
+                   "issues_fn": _issues_linkspeed,
+                   "tech_keys": ["adapters"]},
+    "wifi":       {"verdict_fn": _verdict_wifi,       "metrics_fn": _metrics_wifi,
+                   "issues_fn": _issues_wifi,
+                   "tech_keys": ["networks", "channel_analysis"]},
+    "tcp":        {"verdict_fn": _verdict_tcp,        "metrics_fn": _metrics_tcp,
+                   "issues_fn": _issues_tcp,
+                   "tech_keys": ["top_processes"]},
+    "port":       {"verdict_fn": _verdict_port,       "metrics_fn": _metrics_port,
+                   "issues_fn": _issues_port,
+                   "tech_keys": ["targets"]},
+    "egress":     {"verdict_fn": _verdict_egress,     "metrics_fn": _metrics_egress,
+                   "issues_fn": _issues_egress,
+                   "tech_keys": ["default_routes", "egress_status"]},
+    "dns":        {"verdict_fn": _verdict_dns,        "metrics_fn": _metrics_dns,
+                   "issues_fn": _issues_dns,
+                   "tech_keys": ["detail", "system_dns"]},
+    "mtu":        {"verdict_fn": _verdict_mtu,        "metrics_fn": _metrics_mtu,
+                   "issues_fn": _issues_mtu,
+                   "tech_keys": ["path_mtus", "local_mtus"]},
+    "arp":        {"verdict_fn": _verdict_arp,        "metrics_fn": _metrics_arp,
+                   "issues_fn": _issues_arp,
+                   "tech_keys": ["entries", "multi_ip_macs"]},
+    "bufferbloat":{"verdict_fn": _verdict_bufferbloat,"metrics_fn": _metrics_bufferbloat,
+                   "issues_fn": _issues_bufferbloat},
+    "ipv6":       {"verdict_fn": _verdict_ipv6,       "metrics_fn": _metrics_ipv6,
+                   "issues_fn": _issues_ipv6,
+                   "tech_keys": ["local_ipv6"]},
+    "route":      {"verdict_fn": _verdict_route,      "metrics_fn": _metrics_route,
+                   "issues_fn": _issues_route,
+                   "tech_keys": ["routes"]},
+    "speedtest":  {"verdict_fn": _verdict_speedtest,  "metrics_fn": _metrics_speedtest,
+                   "issues_fn": _generic_issues,
+                   "tech_keys": ["speedtest", "http", "iperf3"]},
+    "lan":        {"verdict_fn": _verdict_lan,        "metrics_fn": _metrics_lan,
+                   "issues_fn": _generic_issues,
+                   "tech_keys": ["devices"]},
+    "tcpstats":   {"verdict_fn": _verdict_tcpstats,   "metrics_fn": _metrics_tcpstats,
+                   "issues_fn": _issues_tcpstats},
+}
+
+
+def _present_module(key, raw_result, status):
+    """把单个模块的 raw result 转成客户视图。"""
+    pres = MODULE_PRESENTATION.get(key, {})
+    verdict_fn = pres.get("verdict_fn", _generic_verdict)
+    metrics_fn = pres.get("metrics_fn", _generic_metrics)
+    issues_fn = pres.get("issues_fn", _generic_issues)
+
+    name = MODULE_MAP.get(key, (key, key))[0]
+    verdict = verdict_fn(raw_result) if raw_result else "未检测"
+
+    # 指标: 兼容老格式 (label, value) 和新格式 (label, value, level)
+    raw_metrics = metrics_fn(raw_result) if raw_result else []
+    metrics = []
+    for m in raw_metrics:
+        if len(m) == 3:
+            metrics.append({"label": m[0], "value": m[1], "level": m[2] or "ok", "hint": ""})
+        else:
+            metrics.append({"label": m[0], "value": m[1], "level": "ok", "hint": ""})
+
+    # 给关键指标补阈值提示
+    for m in metrics:
+        # 已经显式给了 level 的不覆盖 hint
+        if m["level"] != "ok" and not m["hint"]:
+            m["hint"] = "超过阈值" if m["level"] == "err" else "略超阈值"
+
+    issues = issues_fn(raw_result) if raw_result else []
+
+    return {
+        "key": key,
+        "name": name,
+        "status": status,
+        "verdict": verdict,
+        "key_metrics": metrics,
+        "issues": issues,
+        "has_tech_details": bool(pres.get("tech_keys")),
+        "raw": raw_result or {},   # 客户报告不展示, JSON 报告用
+    }
+
+
+# 健康评分: 0-100
+# 异常-20, 错误-30, 警告-5, 未检测-2, 扣到 0 为止
+HEALTH_GRADE_TABLE = [
+    (90, "A", "优秀"),
+    (75, "B", "良好"),
+    (60, "C", "一般"),
+    (40, "D", "欠佳"),
+    (0,  "F", "严重"),
+]
+
+def compute_health_score(counts):
+    """根据状态计数算健康分和等级。counts: {"完成": 14, "警告": 3, "异常": 1, ...}"""
+    score = 100
+    score -= counts.get("异常", 0) * 20
+    score -= counts.get("错误", 0) * 30
+    score -= counts.get("警告", 0) * 5
+    score -= counts.get("未检测", 0) * 2
+    score = max(0, min(100, score))
+    for threshold, grade, label in HEALTH_GRADE_TABLE:
+        if score >= threshold:
+            # 一句话结论
+            if counts.get("异常", 0) == 0 and counts.get("错误", 0) == 0:
+                if counts.get("警告", 0) == 0:
+                    verdict = "网络良好, 无问题"
+                else:
+                    verdict = f"网络可用, {counts.get('警告', 0)} 项可优化"
+            elif counts.get("错误", 0) > 0:
+                verdict = f"存在 {counts.get('错误', 0)} 项严重问题"
+            else:
+                verdict = f"{counts.get('异常', 0)} 项需关注"
+            return {
+                "score": score,
+                "grade": grade,
+                "label": label,
+                "verdict": f"{label} · {verdict}",
+            }
+    return {"score": 0, "grade": "F", "label": "严重", "verdict": "严重"}
+
+
 def build_report():
-    """基于最近一次诊断运行 (LAST_RUN) 构造完整报告数据结构。"""
+    """基于最近一次诊断运行 (LAST_RUN) 构造完整报告数据结构 (双视图)。
+
+    返回结构 (供 render_report_html_customer / render_report_pdf_customer / render_report_json 使用):
+      {
+        "app": ..., "version": ..., "generated_at": ...,
+        "system": {local_ip, gateway, dns, public_ip, asn, geo, ipv6_public_ip},
+        "health": {score, grade, label, verdict, counts},
+        "summary": {key: status},  # 各模块状态 (老格式, 兼容)
+        "counts": {完成: N, 警告: N, ...},  # 状态计数
+        "modules": [  # 客户视图模块列表
+          {key, name, status, verdict, key_metrics, issues, has_tech_details, raw},
+          ...
+        ],
+        "tech": {  # 技术视图, 仅 JSON 报告用
+          "raw_results": {...},   # 原 LAST_RUN["results"] 全量
+          "module_keys": [...],
+          "thresholds": THRESHOLDS,
+        }
+      }
+    """
     if not LAST_RUN:
         return None
     run = LAST_RUN
+
+    # 状态计数
+    counts = {}
+    for st in run["status"].values():
+        counts[st] = counts.get(st, 0) + 1
+    health = compute_health_score(counts)
+
+    # 客户视图模块列表
     modules = []
     for key in run["keys"]:
         name = MODULE_MAP.get(key, (key, key))[0]
         res = run["results"].get(key, {})
         status = run["status"].get(key, "未检测")
-        modules.append({
-            "key": key,
-            "name": name,
-            "status": status,
-            "result": res,
-        })
-    # summary 改由 modules 重建, 避免 run["status"] 多 key 时
-    # health 行 "共 N 项" 与 "X 完成/Y 警告" 计数不一致
-    summary = {m["key"]: m["status"] for m in modules}
+        modules.append(_present_module(key, res, status))
+
     return {
         "app": run["app"],
         "version": run["version"],
         "generated_at": run["generated_at"],
         "system": run["system"],
-        "summary": summary,
+        "health": health,
+        "counts": counts,
+        "summary": {m["key"]: m["status"] for m in modules},
         "modules": modules,
+        "tech": {
+            "raw_results": run["results"],
+            "module_keys": run["keys"],
+            "thresholds": THRESHOLDS,
+            "module_presentation": {k: list(v.keys()) for k, v in MODULE_PRESENTATION.items()},
+        },
     }
 
 
@@ -4969,13 +6052,410 @@ def _record_table(v):
     return headers, rows
 
 
-def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
-    """将报告渲染为 PDF (专业浅色主题 + 模块卡片, 内置中文字体 STSong-Light)。
+# ============================================================
+# 客户版 HTML 渲染器 (新)
+# ============================================================
+# 区别于老的 render_report_html:
+#   - 顶部加健康评分大字
+#   - "待办问题" 单独成块, 客户一眼看到要干啥
+#   - 每模块只显示: 状态 + 一句话结论 + 3-5 个关键指标 + 问题/建议
+#   - 技术细节默认折叠 (工程师点开看)
+#   - 字段名 100% 中文化, 颜色按阈值
+def _html_esc(s):
+    """HTML escape, 中文和空格安全。"""
+    import html as _html
+    if s is None:
+        return ""
+    return _html.escape(str(s), quote=False)
 
-    auto_install: True 时 reportlab 缺失会自动 pip install, 否则只提示。
-    与旧版的差异: 旧版无条件 auto_yes=True, 在 CI/离线环境会无提示尝试
-    pip install 然后卡 5 分钟, 用户体验差。
-    pip_mirror: 显式指定 pip 镜像 URL, 覆盖自动选源。
+
+def _render_html_tech_block(key, raw_result, tech_keys):
+    """把模块的 raw 原始数据按 tech_keys 渲染成可折叠的 <details> 块。
+
+    只在客户报告里"展开技术细节"折叠时显示。
+    """
+    if not raw_result or not tech_keys:
+        return ""
+    out = []
+    out.append("<details class='collapse'>")
+    out.append(f"<summary>技术细节 <span class='cnt'>{len(tech_keys)} 项</span></summary>")
+    out.append("<div class='body'>")
+    for k in tech_keys:
+        v = raw_result.get(k)
+        if v is None:
+            continue
+        if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+            # 同构字典列表 → 真正的多列表格
+            rt = _record_table(v)
+            if rt:
+                headers, rows = rt
+                out.append(f"<div class='subcap'>{_html_esc(HEADER_MAP.get(k, k))} ({len(rows)} 条)</div>")
+                head = "".join(f"<th>{_html_esc(h)}</th>" for h in headers)
+                body = "".join(
+                    "<tr>" + "".join(f"<td>{_html_esc(x or '—')}</td>" for x in r) + "</tr>"
+                    for r in rows[:20]   # 折叠里最多展示 20 条, 防止 HTML 巨大
+                )
+                out.append(f"<table class='tbl'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
+                if len(rows) > 20:
+                    out.append(f"<p class='muted'>… 还有 {len(rows) - 20} 条 (JSON 报告里有完整 {len(rows)} 条)</p>")
+        elif isinstance(v, dict):
+            # 嵌套字典 → KV 表格
+            rows = []
+            for kk, vv in v.items():
+                if vv is None or vv == "" or vv == []:
+                    continue
+                if isinstance(vv, (dict, list)):
+                    rows.append((_html_esc(HEADER_MAP.get(kk, kk)),
+                                 _html_esc(json.dumps(vv, ensure_ascii=False)[:200])))
+                else:
+                    rows.append((_html_esc(HEADER_MAP.get(kk, kk)), _html_esc(str(vv))))
+            if rows:
+                out.append(f"<div class='subcap'>{_html_esc(HEADER_MAP.get(k, k))}</div>")
+                body = "".join(
+                    f"<tr><td class='k'>{k_}</td><td class='v'>{v_}</td></tr>"
+                    for k_, v_ in rows)
+                out.append(f"<table class='tbl kv'><thead><tr><th>指标</th><th>值</th></tr></thead>"
+                           f"<tbody>{body}</tbody></table>")
+        else:
+            out.append(f"<div class='subcap'>{_html_esc(HEADER_MAP.get(k, k))}</div>")
+            out.append(f"<p class='mono'>{_html_esc(str(v))}</p>")
+    out.append("</div></details>")
+    return "".join(out)
+
+
+def render_report_html_customer(report):
+    """渲染客户版 HTML 报告。
+
+    输入: build_report() 的输出 (双视图)
+    输出: 完整可独立打开的 HTML 字符串
+    """
+    if not report:
+        return "<p>尚无诊断数据，请先运行诊断</p>"
+
+    import html as _html
+    g = report["generated_at"].strftime("%Y-%m-%d %H:%M:%S")
+    sys_i = report["system"]
+    health = report["health"]
+    counts = report["counts"]
+    modules = report["modules"]
+
+    # 状态色
+    SKEY = {"完成": "ok", "警告": "warn", "异常": "err", "错误": "fatal", "未检测": "idle"}
+    SC = {"ok": "#16a34a", "warn": "#ea580c", "err": "#dc2626", "fatal": "#7f1d1d", "idle": "#94a3b8"}
+
+    # ── 顶部 hero ──
+    geo_line = ""
+    if sys_i.get("asn") or sys_i.get("geo"):
+        geo_bits = []
+        if sys_i.get("geo"):
+            geo_bits.append(sys_i["geo"])
+        if sys_i.get("asn"):
+            geo_bits.append(sys_i["asn"])
+        geo_line = f"<div class='geo'>📍 {' / '.join(geo_bits)}</div>"
+    ipv6_line = ""
+    if sys_i.get("ipv6_public_ip"):
+        ipv6_line = f"<div class='geo'>IPv6: {_html_esc(sys_i['ipv6_public_ip'])}</div>"
+
+    host_line = f"本机 {_html_esc(sys_i.get('local_ip', '?'))} · 公网 {_html_esc(sys_i.get('public_ip', '?'))}"
+    if sys_i.get("dns"):
+        host_line += f" · DNS {_html_esc(sys_i['dns'])}"
+
+    hero = f"""
+<header class="hero">
+  <div>
+    <h1>📡 {_html_esc(report['app'])} 诊断报告</h1>
+    <div class="sub">网络健康度检测 · {_html_esc(g)}</div>
+    <div class="host">{host_line}</div>
+    {geo_line}
+    {ipv6_line}
+  </div>
+  <div class="score">
+    <div class="score-num">{health['score']}</div>
+    <div class="score-grade">{_html_esc(health['grade'])}</div>
+    <div class="score-text">{_html_esc(health['verdict'])}</div>
+  </div>
+</header>"""
+
+    # ── 待办问题 ──
+    todo_issues = []
+    for m in modules:
+        for issue in m.get("issues", []):
+            todo_issues.append({**issue, "_module": m["name"], "_status": m["status"]})
+    # 按严重度排序
+    sev_order = {"异常": 0, "错误": 0, "警告": 1, "信息": 2}
+    todo_issues.sort(key=lambda i: sev_order.get(i.get("severity", "信息"), 3))
+
+    if todo_issues:
+        todo_blocks = []
+        for issue in todo_issues[:10]:   # 最多展示 10 条
+            sev = issue.get("severity", "信息")
+            sev_class = "err" if sev in ("异常", "错误") else "warn" if sev == "警告" else "info"
+            impact = issue.get("impact", "")
+            action = issue.get("action", "")
+            text = issue.get("text", "")
+            module = issue.get("_module", "")
+            todo_blocks.append(f"""
+<div class="issue {sev_class}">
+  <h3><span class="sev">{_html_esc(sev)}</span>{_html_esc(text)}</h3>
+  <div class="meta">📍 来源: {_html_esc(module)}</div>
+  {f"<div class='impact'>📌 影响: {_html_esc(impact)}</div>" if impact else ""}
+  {f"<div class='action'>💡 建议: {_html_esc(action)}</div>" if action else ""}
+</div>""")
+        todo_section = f"""
+<div class="sec"><h2><span class="icon">⚠</span>{len(todo_issues)} 个问题需要您关注</h2></div>
+<div class="todo">{"".join(todo_blocks)}</div>"""
+    else:
+        todo_section = """
+<div class="sec"><h2><span class="icon">✓</span>所有检测通过</h2></div>
+<div class="todo ok">
+  <div class="todo-head">✓ 网络状态良好</div>
+  <div class="impact">所有 18 项检测均正常, 无需特别处理。</div>
+</div>"""
+
+    # ── 检测结果一览 ──
+    overview_items = []
+    for m in modules:
+        st = m["status"]
+        sk = SKEY.get(st, "idle")
+        # 概览行只显示"结论"前 60 字, 避免太长
+        verdict_short = m["verdict"][:60] + ("…" if len(m["verdict"]) > 60 else "")
+        overview_items.append(
+            f"<li>"
+            f"<span class='dot {sk}'></span>"
+            f"<span class='name'>{_html_esc(m['name'])}</span>"
+            f"<span class='verdict'>{_html_esc(verdict_short)}</span>"
+            f"<span class='badge {sk}'>{_html_esc(st)}</span>"
+            f"</li>"
+        )
+    overview_section = f"""
+<div class="sec"><h2><span class="icon">📋</span>检测结果一览</h2></div>
+<div class="overview"><ul>{"".join(overview_items)}</ul></div>"""
+
+    # ── 详细模块 ──
+    mod_blocks = []
+    for m in modules:
+        st = m["status"]
+        sk = SKEY.get(st, "idle")
+        # 关键指标
+        metrics = m.get("key_metrics", [])
+        if metrics:
+            metric_html = []
+            for me in metrics:
+                level = me.get("level", "ok")
+                hint = me.get("hint", "")
+                hint_html = f"<span class='hint'>{_html_esc(hint)}</span>" if hint else ""
+                metric_html.append(
+                    f"<div class='metric'>"
+                    f"<span class='lab'>{_html_esc(me['label'])}</span>"
+                    f"<span><span class='v {level}'>{_html_esc(me['value'])}</span>{hint_html}</span>"
+                    f"</div>"
+                )
+            metrics_html = f"<div class='metrics'>{''.join(metric_html)}</div>"
+        else:
+            metrics_html = ""
+
+        # 问题
+        issues = m.get("issues", [])
+        if issues:
+            issue_html = []
+            for issue in issues:
+                sev = issue.get("severity", "信息")
+                sev_class = "err" if sev in ("异常", "错误") else "warn" if sev == "警告" else ""
+                text = issue.get("text", "")
+                impact = issue.get("impact", "")
+                action = issue.get("action", "")
+                if sev_class:
+                    issue_html.append(
+                        f"<div class='impact-line {sev_class}'>"
+                        f"<b>[{_html_esc(sev)}]</b> {_html_esc(text)}"
+                        f"</div>"
+                    )
+                if action:
+                    issue_html.append(
+                        f"<div class='action-line'>💡 {_html_esc(action)}</div>"
+                    )
+            issues_html = "".join(issue_html)
+        else:
+            issues_html = ""
+
+        # 技术细节折叠
+        tech_html = ""
+        if m.get("has_tech_details"):
+            pres = MODULE_PRESENTATION.get(m["key"], {})
+            tech_keys = pres.get("tech_keys", [])
+            tech_html = _render_html_tech_block(m["key"], m.get("raw", {}), tech_keys)
+
+        # 整个模块卡
+        verdict = m.get("verdict", "")
+        mod_blocks.append(f"""
+<div class="mod {sk}">
+  <div class="mod-head">
+    <span class="dot {sk}"></span>
+    <span class="name">{_html_esc(m['name'])}</span>
+    <span class="badge {sk}">{_html_esc(st)}</span>
+  </div>
+  <div class="mod-body">
+    <div class="verdict"><span class="tag">结论</span>{_html_esc(verdict)}</div>
+    {metrics_html}
+    {issues_html}
+    {tech_html}
+  </div>
+</div>""")
+
+    modules_section = f"""
+<div class="sec"><h2><span class="icon">🔍</span>详细结果</h2></div>
+{"".join(mod_blocks)}"""
+
+    # ── 主机信息 ──
+    sys_pairs = [
+        ("本机 IP", sys_i.get("local_ip")),
+        ("默认网关", sys_i.get("gateway")),
+        ("DNS", sys_i.get("dns")),
+        ("公网 IP", sys_i.get("public_ip")),
+    ]
+    if sys_i.get("asn") or sys_i.get("geo"):
+        loc = []
+        if sys_i.get("geo"):
+            loc.append(sys_i["geo"])
+        if sys_i.get("asn"):
+            loc.append(sys_i["asn"])
+        sys_pairs.append(("出口位置", " / ".join(loc)))
+    if sys_i.get("ipv6_public_ip"):
+        sys_pairs.append(("IPv6 公网", sys_i["ipv6_public_ip"]))
+
+    host_cards = "".join(
+        f"<div class='host-card'><div class='lab'>{_html_esc(lab)}</div>"
+        f"<div class='val'>{_html_esc(val) if val else '—'}</div></div>"
+        for lab, val in sys_pairs
+    )
+    host_section = f"""
+<div class="sec"><h2><span class="icon">🖥</span>主机信息</h2></div>
+<div class="host-grid">{host_cards}</div>"""
+
+    # ── CSS ──
+    CSS = """
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#f6f8fa;color:#1e293b;font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding:32px 16px 80px}
+.wrap{max-width:920px;margin:0 auto}
+.hero{background:linear-gradient(135deg,#1e3a8a 0%,#2563eb 100%);color:#fff;padding:28px 32px;border-radius:16px;display:grid;grid-template-columns:1fr auto;gap:24px;align-items:center;box-shadow:0 4px 12px rgba(37,99,235,.2);margin-bottom:8px}
+.hero h1{font-size:24px;font-weight:800;margin-bottom:6px}
+.hero .sub{font-size:13px;opacity:.9}
+.hero .host{margin-top:10px;font-size:12px;opacity:.85;font-family:Cascadia Mono,Consolas,monospace}
+.hero .geo{margin-top:4px;font-size:12px;opacity:.85}
+.score{background:rgba(255,255,255,.15);border-radius:14px;padding:16px 26px;text-align:center;min-width:150px;backdrop-filter:blur(8px)}
+.score-num{font-size:48px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
+.score-grade{font-size:20px;font-weight:700;margin-top:4px;letter-spacing:2px}
+.score-text{font-size:11.5px;opacity:.9;margin-top:6px;line-height:1.4}
+.sec{margin:32px 0 12px}
+.sec h2{font-size:17px;font-weight:700;display:flex;align-items:center;gap:10px;color:#0f172a}
+.sec h2 .icon{width:26px;height:26px;border-radius:7px;background:#e0e7ff;color:#4338ca;display:inline-flex;align-items:center;justify-content:center;font-size:14px}
+.todo{background:linear-gradient(180deg,#fef2f2 0%,#fff5f5 100%);border:1px solid #fecaca;border-radius:14px;padding:18px 22px;margin-bottom:8px}
+.todo.ok{background:linear-gradient(180deg,#f0fdf4 0%,#f7fee7 100%);border-color:#bbf7d0}
+.todo-head{font-size:15px;font-weight:700;color:#991b1b;margin-bottom:12px}
+.todo.ok .todo-head{color:#166534}
+.issue{padding:12px 0;border-top:1px dashed #fecaca}
+.issue:first-of-type{border-top:none;padding-top:0}
+.issue.ok{border-top-color:#bbf7d0}
+.issue h3{font-size:14.5px;font-weight:700;color:#7f1d1d;margin-bottom:4px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.issue.ok h3{color:#166534}
+.issue .sev{display:inline-block;padding:2px 10px;border-radius:999px;font-size:11px;font-weight:700;background:#dc2626;color:#fff}
+.issue.warn .sev{background:#ea580c}
+.issue.info .sev{background:#64748b}
+.issue .meta{font-size:11.5px;color:#94a3b8;margin-bottom:6px}
+.issue .impact{font-size:12.5px;color:#991b1b;margin:4px 0 6px;padding:6px 10px;background:rgba(255,255,255,.6);border-radius:6px}
+.issue.ok .impact{color:#166534}
+.issue .action{font-size:12.5px;color:#1e293b;padding:8px 12px;background:#fffbeb;border-left:3px solid #f59e0b;border-radius:0 6px 6px 0;line-height:1.7}
+.overview{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:6px 0;margin-bottom:8px;box-shadow:0 1px 3px rgba(15,23,42,.05)}
+.overview ul{list-style:none}
+.overview li{padding:10px 22px;border-bottom:1px solid #f1f5f9;display:flex;align-items:center;gap:12px;font-size:13.5px;transition:background .1s}
+.overview li:hover{background:#f8fafc}
+.overview li:last-child{border-bottom:none}
+.overview .name{font-weight:600;min-width:130px;color:#0f172a}
+.overview .verdict{color:#475569;flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.overview .badge{padding:2px 11px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.5px;flex:none}
+.badge.ok{background:#dcfce7;color:#15803d}
+.badge.warn{background:#fed7aa;color:#9a3412}
+.badge.err{background:#fecaca;color:#991b1b}
+.badge.fatal{background:#7f1d1d;color:#fff}
+.badge.idle{background:#e2e8f0;color:#475569}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+.dot.ok{background:#16a34a}.dot.warn{background:#ea580c}.dot.err{background:#dc2626}.dot.fatal{background:#7f1d1d}.dot.idle{background:#94a3b8}
+.mod{background:#fff;border:1px solid #e2e8f0;border-radius:14px;margin-bottom:12px;box-shadow:0 1px 3px rgba(15,23,42,.05);overflow:hidden}
+.mod.ok{border-left:4px solid #16a34a}
+.mod.warn{border-left:4px solid #ea580c}
+.mod.err{border-left:4px solid #dc2626}
+.mod.fatal{border-left:4px solid #7f1d1d}
+.mod.idle{border-left:4px solid #94a3b8}
+.mod-head{padding:14px 20px;display:flex;align-items:center;gap:10px;border-bottom:1px solid #f1f5f9}
+.mod-head .name{font-size:15px;font-weight:700;color:#0f172a}
+.mod-head .badge{margin-left:auto;padding:3px 12px;border-radius:999px;font-size:11.5px;font-weight:700;letter-spacing:.5px}
+.mod-body{padding:16px 20px}
+.verdict{font-size:14px;line-height:1.7;color:#1e293b;margin-bottom:12px}
+.verdict .tag{display:inline-block;padding:2px 9px;border-radius:5px;font-size:11px;font-weight:700;background:#e0e7ff;color:#4338ca;margin-right:8px;vertical-align:1px}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-bottom:8px}
+.metric{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:9px 13px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.metric .lab{font-size:12px;color:#64748b}
+.metric .v{font-size:14px;font-weight:700;font-family:Cascadia Mono,Consolas,monospace;text-align:right}
+.metric .v.ok{color:#15803d}.metric .v.warn{color:#c2410c}.metric .v.err{color:#b91c1c}.metric .v.idle{color:#94a3b8}
+.metric .hint{font-size:11px;color:#94a3b8;margin-left:4px;font-weight:400}
+.impact-line{background:#fef2f2;border-left:3px solid #dc2626;padding:6px 12px;border-radius:0 6px 6px 0;font-size:12.5px;color:#7f1d1d;margin:8px 0}
+.impact-line.warn{background:#fffbeb;border-left-color:#f59e0b;color:#78350f}
+.action-line{background:#f0f9ff;border-left:3px solid #0284c7;padding:6px 12px;border-radius:0 6px 6px 0;font-size:12.5px;color:#0c4a6e;margin:4px 0 8px;line-height:1.6}
+details.collapse{margin-top:10px;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:8px}
+details.collapse summary{padding:9px 14px;font-size:12.5px;color:#475569;cursor:pointer;font-weight:600;user-select:none;list-style:none;display:flex;align-items:center;gap:6px}
+details.collapse summary::-webkit-details-marker{display:none}
+details.collapse summary::before{content:"▸";color:#64748b;transition:transform .15s;display:inline-block}
+details.collapse[open] summary::before{transform:rotate(90deg)}
+details.collapse .cnt{background:#e2e8f0;color:#475569;border-radius:999px;font-size:10.5px;padding:1px 8px;margin-left:6px;font-weight:600}
+details.collapse .body{padding:4px 14px 12px;font-size:12px;color:#475569;line-height:1.7}
+details.collapse .subcap{font-size:12px;font-weight:700;color:#475569;margin:10px 0 4px}
+details.collapse table{width:100%;border-collapse:collapse;margin-top:4px}
+details.collapse th{background:#e2e8f0;color:#334155;text-align:left;padding:5px 8px;font-weight:600;font-size:11.5px}
+details.collapse td{padding:4px 8px;border-top:1px solid #e2e8f0;font-family:Cascadia Mono,Consolas,monospace;font-size:11.5px}
+details.collapse td.k{width:35%;color:#64748b;background:#f8fafc}
+details.collapse p.mono{font-family:Cascadia Mono,Consolas,monospace;background:#f1f5f9;padding:6px 10px;border-radius:4px;word-break:break-all}
+details.collapse p.muted{color:#94a3b8;font-size:11.5px;margin-top:6px}
+.host-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+.host-card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:11px 14px;box-shadow:0 1px 2px rgba(15,23,42,.04)}
+.host-card .lab{font-size:11px;color:#94a3b8;margin-bottom:3px;font-weight:500}
+.host-card .val{font-size:13px;font-weight:600;font-family:Cascadia Mono,Consolas,monospace;color:#0f172a}
+@media(max-width:600px){.hero{grid-template-columns:1fr;text-align:center}.score{justify-self:center}}
+@media print{body{background:#fff;padding:0;font-size:12px}.hero{background:#1e3a8a !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.mod,.host-card,.todo{box-shadow:none;break-inside:avoid}.mod-head{break-after:avoid}details.collapse[open] .body{display:block}}
+footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-top:20px;border-top:1px solid #e2e8f0}
+"""
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_html_esc(report['app'])} 诊断报告</title>
+<style>{CSS}</style>
+</head>
+<body>
+<div class="wrap">
+{hero}
+{todo_section}
+{overview_section}
+{modules_section}
+{host_section}
+<footer>由 {_html_esc(report['app'])} v{_html_esc(report['version'])} 自动生成 · {_html_esc(g)}</footer>
+</div>
+</body>
+</html>"""
+
+
+def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
+    """客户版 PDF 报告 (浅色主题 + 模块卡片, 内置中文字体 STSong-Light)。
+
+    与老版的差异:
+      - 用 build_report 的双视图 (customer_view + tech_view), 不再吃 raw result
+      - 每模块: 状态徽章 + 结论 + 3-5 个关键指标 + 问题/建议
+      - PDF 不能折叠, 技术细节弱化为浅灰小表 (工程师看 JSON 拿完整数据)
+      - 顶部加健康分大字, 待办问题单独成块
+
+    auto_install: True 时 reportlab 缺失会自动 pip install
+    pip_mirror: 显式指定 pip 镜像 URL
     """
     if not ensure_reportlab(auto_yes=auto_install, mirror=pip_mirror):
         return False
@@ -4990,45 +6470,48 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
     pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
-    # 内置中文字体 (无需外部字体文件), 缺点是只覆盖 GB2312 字符集:
-    # 希腊字母 / 西里尔 / 阿拉伯文 / emoji 等会显示为方块或缺失。
-    # 单文件 EXE 场景下妥协: 用户在 SSID/WiFi 名里塞希腊字母罕见, 报告内
-    # 出现的几乎都是中文+ASCII+少量数字, GB2312 覆盖足够。
     FONT = "STSong-Light"
 
-    # ── 专业工程配色 (与 HTML 报告一致) ──
-    C_INK = colors.HexColor("#1b2437")       # 主文字
-    C_SUB = colors.HexColor("#5a6472")       # 次文字
-    C_FAINT = colors.HexColor("#8a94a6")     # 弱文字
-    C_LINE = colors.HexColor("#e3e8f0")      # 边框/分隔线
-    C_CARD = colors.HexColor("#f4f6f9")      # 卡片底
-    C_BAND = colors.HexColor("#0f1c33")      # 页眉深带
-    C_PRI = colors.HexColor("#1a56db")       # 主色
-    C_PRI_DEEP = colors.HexColor("#1648a8")  # 主色(深, 表头文字)
-    C_PRI_SOFT = colors.HexColor("#e8effc")  # 主色浅底
-    C_OK = colors.HexColor("#0e8a4f")
-    C_WARN = colors.HexColor("#b26a00")
-    C_ERR = colors.HexColor("#d92d20")
-    C_FATAL = colors.HexColor("#b42318")
-    C_IDLE = colors.HexColor("#8a94a6")
+    # ── 配色 (与 HTML 客户版一致) ──
+    C_INK = colors.HexColor("#1e293b")
+    C_SUB = colors.HexColor("#64748b")
+    C_FAINT = colors.HexColor("#94a3b8")
+    C_LINE = colors.HexColor("#e2e8f0")
+    C_CARD = colors.HexColor("#f6f8fa")
+    C_BAND = colors.HexColor("#1e3a8a")
+    C_PRI = colors.HexColor("#2563eb")
+    C_PRI_DEEP = colors.HexColor("#1e40af")
+    C_PRI_SOFT = colors.HexColor("#dbeafe")
+    C_OK = colors.HexColor("#16a34a")
+    C_WARN = colors.HexColor("#ea580c")
+    C_ERR = colors.HexColor("#dc2626")
+    C_FATAL = colors.HexColor("#7f1d1d")
+    C_IDLE = colors.HexColor("#94a3b8")
     SC = {"完成": C_OK, "警告": C_WARN, "异常": C_ERR, "错误": C_FATAL,
           "未检测": C_IDLE}
-    SC_HEX = {"完成": "#0e8a4f", "警告": "#b26a00", "异常": "#d92d20",
-              "错误": "#b42318", "未检测": "#8a94a6"}
-    SC_SOFT = {"完成": "#e7f6ee", "警告": "#fdf3e3", "异常": "#fdecec",
-               "错误": "#fbebea", "未检测": "#f1f3f7"}
+    SC_HEX = {"完成": "#16a34a", "警告": "#ea580c", "异常": "#dc2626",
+              "错误": "#7f1d1d", "未检测": "#94a3b8"}
+    SC_SOFT = {"完成": "#dcfce7", "警告": "#fed7aa", "异常": "#fecaca",
+               "错误": "#fecaca", "未检测": "#e2e8f0"}
 
     # ── 样式 ──
-    h_title = ParagraphStyle("h_title", fontName=FONT, fontSize=16,
-                             textColor=colors.white, leading=19, spaceAfter=0)
+    h_title = ParagraphStyle("h_title", fontName=FONT, fontSize=18,
+                             textColor=colors.white, leading=22, spaceAfter=0)
     h_sub = ParagraphStyle("h_sub", fontName=FONT, fontSize=8.5,
                            textColor=colors.HexColor("#9db8e8"), leading=12)
+    h_score = ParagraphStyle("h_score", fontName=FONT, fontSize=26,
+                             textColor=colors.white, leading=30, alignment=1)
+    h_score_lbl = ParagraphStyle("h_score_lbl", fontName=FONT, fontSize=9,
+                                 textColor=colors.HexColor("#c6d6f0"), leading=12,
+                                 alignment=1)
     sec = ParagraphStyle("sec", fontName=FONT, fontSize=13,
-                         textColor=C_INK, leading=17, spaceBefore=14, spaceAfter=6)
+                         textColor=C_INK, leading=17, spaceBefore=12, spaceAfter=6)
     lbl = ParagraphStyle("lbl", fontName=FONT, fontSize=9,
-                         textColor=C_PRI, leading=13)
+                         textColor=C_SUB, leading=13)
     val = ParagraphStyle("val", fontName=FONT, fontSize=9.5, textColor=C_INK, leading=13)
-    mod_title = ParagraphStyle("mt", fontName=FONT, fontSize=11,
+    val_bold = ParagraphStyle("val_bold", fontName=FONT, fontSize=10,
+                              textColor=C_INK, leading=13, fontWeight="bold")
+    mod_title = ParagraphStyle("mt", fontName=FONT, fontSize=11.5,
                                textColor=C_INK, leading=15)
     mod_sub = ParagraphStyle("ms", fontName=FONT, fontSize=9,
                             textColor=C_SUB, leading=13, spaceBefore=2)
@@ -5036,22 +6519,33 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
                         textColor=C_PRI_DEEP, leading=12)
     cell = ParagraphStyle("cell", fontName=FONT, fontSize=8.5,
                           textColor=C_INK, leading=12)
-    concl = ParagraphStyle("concl", fontName=FONT, fontSize=9,
-                           textColor=C_INK, leading=13)
+    concl = ParagraphStyle("concl", fontName=FONT, fontSize=9.5,
+                           textColor=C_INK, leading=14)
     err_style = ParagraphStyle("err", fontName=FONT, fontSize=9,
                                textColor=C_ERR, leading=13, spaceBefore=1)
     warn_style = ParagraphStyle("warn", fontName=FONT, fontSize=9,
                                 textColor=C_WARN, leading=13, spaceBefore=1)
+    action_style = ParagraphStyle("act", fontName=FONT, fontSize=8.5,
+                                  textColor=colors.HexColor("#0c4a6e"),
+                                  leading=12, spaceBefore=1)
     badge_style = ParagraphStyle("badge", fontName=FONT, fontSize=8.5,
                                  textColor=colors.white, leading=11, alignment=1)
-    foot_style = ParagraphStyle("foot", fontName=FONT, fontSize=7.5,
-                                textColor=C_FAINT, leading=10)
-    detail_cap = ParagraphStyle("detail_cap", fontName=FONT, fontSize=9,
-                                textColor=C_FAINT, leading=12, spaceBefore=4)
-    kv_cap = ParagraphStyle("kv_cap", fontName=FONT, fontSize=9.5,
-                            textColor=C_SUB, leading=13, spaceBefore=4)
+    detail_cap = ParagraphStyle("detail_cap", fontName=FONT, fontSize=8,
+                                textColor=C_FAINT, leading=11, spaceBefore=2)
+    metric_lbl = ParagraphStyle("mlbl", fontName=FONT, fontSize=8.5,
+                                textColor=C_SUB, leading=12)
+    metric_val_ok = ParagraphStyle("mv_ok", fontName=FONT, fontSize=10,
+                                  textColor=C_OK, leading=13, alignment=2)
+    metric_val_warn = ParagraphStyle("mv_warn", fontName=FONT, fontSize=10,
+                                    textColor=C_WARN, leading=13, alignment=2)
+    metric_val_err = ParagraphStyle("mv_err", fontName=FONT, fontSize=10,
+                                   textColor=C_ERR, leading=13, alignment=2)
+    metric_val_idle = ParagraphStyle("mv_idle", fontName=FONT, fontSize=10,
+                                     textColor=C_IDLE, leading=13, alignment=2)
+    metric_val_map = {"ok": metric_val_ok, "warn": metric_val_warn,
+                      "err": metric_val_err, "idle": metric_val_idle}
 
-    def _badge(status, width=22 * mm):
+    def _badge(status, width=24 * mm):
         c = SC_HEX.get(status, "#57606a")
         t = Table([[Paragraph(f"<b>{status}</b>", badge_style)]], colWidths=[width])
         t.setStyle(TableStyle([
@@ -5063,7 +6557,6 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
         return t
 
     def _stat_cards(cnt):
-        """四宫格大数字统计卡 (与 HTML 概览一致)。"""
         order = ["完成", "警告", "异常", "错误", "未检测"]
         items = [(k, cnt.get(k, 0)) for k in order if cnt.get(k, 0)]
         if not items:
@@ -5097,64 +6590,14 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
             ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
         return t
 
-    def _kv_table_pdf(rows):
-        """由 (指标, 值) 列表构建常规两列表格。"""
-        if not rows:
-            return None
-        tdata = [[Paragraph("<b>指标</b>", th), Paragraph("<b>值</b>", th)]]
-        for k, v in rows:
-            label = HEADER_MAP.get(k, k)
-            tdata.append([Paragraph(label, cell), Paragraph(v or "—", cell)])
-        dt = Table(tdata, colWidths=[58 * mm, content_w - 58 * mm], repeatRows=1)
-        dt.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), C_PRI_SOFT),
-            ("BOX", (0, 0), (-1, -1), 0.5, C_LINE),
-            ("LINEBELOW", (0, 0), (-1, -1), 0.3, C_LINE),
-            ("LINEBELOW", (0, 0), (-1, 0), 0.8, C_LINE),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 6)]))
-        return dt
-
-    def _record_block_pdf(key, rt, is_detail=False):
-        """由记录表 (headers, rows) 构建: 小标题 + 多列数据表。
-        is_detail=True 时弱化为「详细测试记录」风格。"""
-        headers, rows = rt
-        cap = ("详细测试记录（原始测量数据）"
-               if is_detail else HEADER_MAP.get(key, key))
-        elems = [Paragraph(cap, detail_cap if is_detail else kv_cap)]
-        ncol = len(headers)
-        cw = [content_w / ncol] * ncol
-        tdata = [[Paragraph(f"<b>{h}</b>", th) for h in headers]]
-        for r in rows:
-            tdata.append([Paragraph(x or "—", cell) for x in r])
-        rt_tbl = Table(tdata, colWidths=cw, repeatRows=1)
-        rt_tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0),
-             C_PRI_SOFT if not is_detail
-             else colors.HexColor("#f1f3f7")),
-            ("BOX", (0, 0), (-1, -1), 0.5, C_LINE),
-            ("LINEBELOW", (0, 0), (-1, -1), 0.3, C_LINE),
-            ("LINEBELOW", (0, 0), (-1, 0), 0.8, C_LINE),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-            ("LEFTPADDING", (0, 0), (-1, -1), 5),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 5)]))
-        elems.append(rt_tbl)
-        return elems
-
     g = report["generated_at"].strftime("%Y-%m-%d %H:%M:%S")
     PW, PH = A4
-    LM = RM = 16 * mm
-    TM = 18 * mm
-    BM = 16 * mm
+    LM = RM = 14 * mm
+    TM = 16 * mm
+    BM = 14 * mm
 
     def _on_page(canvas, doc_):
         canvas.saveState()
-        # 页脚分隔线 + 文案
         canvas.setStrokeColor(C_LINE)
         canvas.setLineWidth(0.5)
         canvas.line(LM, BM - 4 * mm, PW - RM, BM - 4 * mm)
@@ -5174,33 +6617,127 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
     flow = []
     content_w = PW - LM - RM
 
-    # ── 页眉深带 ──
+    sys_i = report["system"]
+    health = report["health"]
+    counts = report["counts"]
+    modules = report["modules"]
+
+    # ── 页眉深带 (含健康分) ──
+    score_box = Table(
+        [[Paragraph(f"<b>{health['score']}</b>", h_score)],
+         [Paragraph(f"{health['grade']} · {health['label']}", h_score_lbl)]],
+        colWidths=[36 * mm], rowHeights=[28 * mm, 8 * mm])
+    score_box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#2563eb")),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (0, 0), "MIDDLE"),
+        ("VALIGN", (0, 1), (0, 1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, 0), 6),
+        ("BOTTOMPADDING", (0, 1), (-1, 1), 8)]))
+
     header = Table(
-        [[Paragraph(f"{report['app']} v{report['version']}  ·  网络诊断报告",
+        [[Paragraph(f"{report['app']} v{report['version']}",
                     h_title),
-          Paragraph(f"生成时间: {g}", h_sub)]],
-        colWidths=[content_w - 46 * mm, 46 * mm])
+          Paragraph(f"<b>网络诊断报告</b><br/>"
+                    f"生成时间: {g}<br/>"
+                    f"健康分: {health['score']} / 100 ({health['grade']})",
+                    h_sub),
+          score_box]],
+        colWidths=[content_w - 60 * mm, 24 * mm, 36 * mm])
     header.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), C_BAND),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
         ("LEFTPADDING", (0, 0), (-1, -1), 10),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
         ("TOPPADDING", (0, 0), (-1, -1), 9),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 9)]))
     flow.append(header)
     flow.append(Spacer(1, 10))
 
-    # ── 主机信息 ──
-    sys_i = report["system"]
+    # ── 待办问题 (按严重度) ──
+    todo_issues = []
+    for m in modules:
+        for issue in m.get("issues", []):
+            todo_issues.append({**issue, "_module": m["name"]})
+    sev_order = {"异常": 0, "错误": 0, "警告": 1, "信息": 2}
+    todo_issues.sort(key=lambda i: sev_order.get(i.get("severity", "信息"), 3))
+
+    if todo_issues:
+        flow.append(Paragraph(
+            f"<b>需要您关注 ({len(todo_issues)} 项)</b>", sec))
+        todo_rows = []
+        todo_rows.append([
+            Paragraph("<b>严重度</b>", th),
+            Paragraph("<b>问题</b>", th),
+            Paragraph("<b>建议</b>", th),
+        ])
+        for issue in todo_issues[:10]:
+            sev = issue.get("severity", "信息")
+            sev_color = {"异常": "#dc2626", "错误": "#7f1d1d",
+                         "警告": "#ea580c", "信息": "#64748b"}.get(sev, "#64748b")
+            todo_rows.append([
+                Paragraph(f"<b><font color='{sev_color}'>{sev}</font></b>", cell),
+                Paragraph(f"<b>{issue.get('text', '')}</b>", cell),
+                Paragraph(issue.get("action", "—") or "—", cell),
+            ])
+        todo_t = Table(todo_rows,
+                       colWidths=[16 * mm, (content_w - 16 * mm) * 0.45,
+                                  (content_w - 16 * mm) * 0.55],
+                       repeatRows=1)
+        todo_t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), C_PRI_SOFT),
+            ("BOX", (0, 0), (-1, -1), 0.5, C_LINE),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.3, C_LINE),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        flow.append(todo_t)
+        flow.append(Spacer(1, 6))
+    else:
+        flow.append(Paragraph("<b>所有检测通过</b>", sec))
+        flow.append(Paragraph(
+            "<font color='#16a34a'>✓ 网络状态良好, 所有 18 项检测均正常, 无需特别处理。</font>",
+            mod_sub))
+        flow.append(Spacer(1, 6))
+
+    # ── 主机信息 + 状态统计卡 ──
     flow.append(Paragraph("<b>主机信息</b>", sec))
-    sdata = [
-        [Paragraph("本机 IP", lbl), Paragraph(sys_i.get("local_ip", "未知"), val),
-         Paragraph("默认网关", lbl), Paragraph(sys_i.get("gateway", "未知"), val)],
-        [Paragraph("DNS 服务器", lbl), Paragraph(sys_i.get("dns", "未知"), val),
-         Paragraph("公网 IP", lbl), Paragraph(sys_i.get("public_ip", "未知"), val)],
+    sys_pairs = [
+        ("本机 IP", sys_i.get("local_ip", "未知")),
+        ("默认网关", sys_i.get("gateway", "未知")),
+        ("DNS", sys_i.get("dns", "未知")),
+        ("公网 IP", sys_i.get("public_ip", "未知")),
     ]
-    st = Table(sdata, colWidths=[22 * mm, (content_w - 44 * mm) / 2,
+    if sys_i.get("asn") or sys_i.get("geo"):
+        loc = []
+        if sys_i.get("geo"):
+            loc.append(sys_i["geo"])
+        if sys_i.get("asn"):
+            loc.append(sys_i["asn"])
+        sys_pairs.append(("出口位置", " / ".join(loc)))
+    if sys_i.get("ipv6_public_ip"):
+        sys_pairs.append(("IPv6 公网", sys_i["ipv6_public_ip"]))
+
+    # 2 列布局, 每行 2 项
+    rows = []
+    for i in range(0, len(sys_pairs), 2):
+        row = [Paragraph("<b>" + sys_pairs[i][0] + "</b>", lbl),
+               Paragraph(sys_pairs[i][1], val)]
+        if i + 1 < len(sys_pairs):
+            row += [Paragraph("<b>" + sys_pairs[i + 1][0] + "</b>", lbl),
+                    Paragraph(sys_pairs[i + 1][1], val)]
+        else:
+            row += [Paragraph("", lbl), Paragraph("", val)]
+        rows.append(row)
+    if not rows:
+        rows = [[Paragraph("(无)", val), Paragraph("", val),
+                 Paragraph("", lbl), Paragraph("", val)]]
+    st = Table(rows, colWidths=[22 * mm, (content_w - 44 * mm) / 2,
                                  22 * mm, (content_w - 44 * mm) / 2])
     st.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, -1), FONT),
@@ -5212,32 +6749,32 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ("LEFTPADDING", (0, 0), (-1, -1), 6)]))
     flow.append(st)
-
-    # ── 诊断汇总 ──
-    cnt = {}
-    for stt in report["summary"].values():
-        cnt[stt] = cnt.get(stt, 0) + 1
-    flow.append(Paragraph("<b>诊断汇总</b>", sec))
-    flow.append(_stat_cards(cnt))
     flow.append(Spacer(1, 6))
-    total = len(report["modules"])
-    ok_n = cnt.get("完成", 0)
+
+    flow.append(Paragraph("<b>检测汇总</b>", sec))
+    flow.append(_stat_cards(counts))
+    flow.append(Spacer(1, 6))
+    total = len(modules)
+    ok_n = counts.get("完成", 0)
     flow.append(Paragraph(
-        f"共 {total} 项检测，其中 <b>{ok_n}</b> 项正常、"
-        f"<b>{cnt.get('警告',0)}</b> 项警告、<b>{cnt.get('异常',0)+cnt.get('错误',0)}</b> 项异常。",
+        f"共 {total} 项检测, 其中 <b>{ok_n}</b> 项正常、"
+        f"<b>{counts.get('警告',0)}</b> 项警告、"
+        f"<b>{counts.get('异常',0)+counts.get('错误',0)}</b> 项异常。"
+        f" {health['verdict']}。",
         mod_sub))
 
-    # ── 详细结果（每模块一张卡片）──
+    # ── 详细结果 (每模块一张卡片) ──
     flow.append(Paragraph("<b>详细结果</b>", sec))
     flow.append(HRFlowable(width="100%", thickness=0.5, color=C_LINE,
-                           spaceBefore=0, spaceAfter=8))
+                           spaceBefore=0, spaceAfter=6))
 
-    for m in report["modules"]:
-        c = SC.get(m["status"], C_IDLE)
-        res = m["result"] or {}
+    for m in modules:
+        status = m["status"]
+        c = SC.get(status, C_IDLE)
+        verdict = m.get("verdict", "")
 
-        # ── 标题卡片: 状态圆点 + 名称 + 徽章 + 结论/问题 (始终可放下, 整体 KeepTogether) ──
-        head = []
+        # ── 标题 + 状态徽章 ──
+        head_elems = []
         dot = Table([[""]], colWidths=[3 * mm], rowHeights=[3 * mm])
         dot.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, -1), c),
@@ -5247,7 +6784,7 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
             ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
         title_row = Table(
             [[dot, Paragraph(f"<b>{m['name']}</b>", mod_title),
-              _badge(m["status"])]],
+              _badge(status)]],
             colWidths=[5 * mm, content_w - 29 * mm, 24 * mm])
         title_row.setStyle(TableStyle([
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -5255,30 +6792,127 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
             ("RIGHTPADDING", (0, 0), (-1, -1), 0),
             ("TOPPADDING", (0, 0), (-1, -1), 2),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
-        head.append(title_row)
+        head_elems.append(title_row)
 
-        if "error" in res:
-            head.append(Paragraph(f"诊断异常: {res['error']}", err_style))
-        else:
-            if res.get("summary"):
-                concl_tbl = Table(
-                    [[Paragraph(
-                        f"<font color='#1a56db'><b>结论</b></font>　"
-                        f"{res['summary']}", concl)]],
-                    colWidths=[content_w])
-                concl_tbl.setStyle(TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, -1), C_PRI_SOFT),
-                    ("LINEBEFORE", (0, 0), (0, 0), 2.5, c),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 10),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-                    ("TOPPADDING", (0, 0), (-1, -1), 5),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
-                head.append(Spacer(1, 3))
-                head.append(concl_tbl)
-            for e in (res.get("errors") or []):
-                head.append(Paragraph(f"⚠ {e}", warn_style))
+        # 结论
+        if verdict:
+            concl_tbl = Table(
+                [[Paragraph(
+                    f"<font color='#1e40af'><b>结论</b></font>　{verdict}",
+                    concl)]],
+                colWidths=[content_w])
+            concl_tbl.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), C_PRI_SOFT),
+                ("LINEBEFORE", (0, 0), (0, 0), 2.5, c),
+                ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+            head_elems.append(Spacer(1, 3))
+            head_elems.append(concl_tbl)
 
-        head_tbl = Table([[head]], colWidths=[content_w])
+        # 关键指标
+        metrics = m.get("key_metrics", [])
+        if metrics:
+            # 3 列网格, 每项 = (label, value, level, hint)
+            met_rows = []
+            row = []
+            for me in metrics:
+                level = me.get("level", "ok")
+                val_style = metric_val_map.get(level, metric_val_ok)
+                # 指标卡: 标签 + 值 (颜色按阈值)
+                cell_t = Table(
+                    [[Paragraph(me.get("label", ""), metric_lbl)],
+                     [Paragraph(me.get("value", ""), val_style)]],
+                    colWidths=[(content_w - 4) / 3])
+                cell_t.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, -1), C_CARD),
+                    ("BOX", (0, 0), (-1, -1), 0.4, C_LINE),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ]))
+                row.append(cell_t)
+                if len(row) == 3:
+                    met_rows.append(row)
+                    row = []
+            if row:
+                while len(row) < 3:
+                    row.append(Paragraph("", cell))
+                met_rows.append(row)
+            met_tbl = Table(met_rows, colWidths=[content_w / 3] * 3)
+            met_tbl.setStyle(TableStyle([
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]))
+            head_elems.append(Spacer(1, 4))
+            head_elems.append(met_tbl)
+
+        # 问题/建议
+        issues = m.get("issues", [])
+        for issue in issues:
+            sev = issue.get("severity", "信息")
+            text = issue.get("text", "")
+            impact = issue.get("impact", "")
+            action = issue.get("action", "")
+            sev_color = {"异常": "#dc2626", "错误": "#7f1d1d",
+                         "警告": "#ea580c", "信息": "#64748b"}.get(sev, "#64748b")
+            head_elems.append(Spacer(1, 2))
+            head_elems.append(Paragraph(
+                f"<b><font color='{sev_color}'>● [{sev}]</font></b> {text}",
+                warn_style if sev == "警告" else err_style))
+            if impact:
+                head_elems.append(Paragraph(
+                    f"<b>影响:</b> {impact}", cell))
+            if action:
+                head_elems.append(Paragraph(
+                    f"<b><font color='#b45309'>建议:</font></b> {action}",
+                    action_style))
+
+        # 技术细节 (弱化为简表, PDF 不能折叠)
+        if m.get("has_tech_details"):
+            pres = MODULE_PRESENTATION.get(m["key"], {})
+            tech_keys = pres.get("tech_keys", [])
+            raw = m.get("raw", {})
+            tech_parts = []
+            for k in tech_keys:
+                v = raw.get(k)
+                if v is None:
+                    continue
+                tech_parts.append(f"<b>{HEADER_MAP.get(k, k)}</b>")
+                if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                    rt = _record_table(v)
+                    if rt:
+                        h, rs = rt
+                        tech_parts.append("  " + " / ".join(h))
+                        for r in rs[:3]:  # 最多 3 行, 防止 PDF 巨大
+                            tech_parts.append("  " + "  ".join(str(x) for x in r))
+                        if len(rs) > 3:
+                            tech_parts.append(f"  … (还有 {len(rs) - 3} 行, 详见 JSON 报告)")
+                elif isinstance(v, dict):
+                    for kk, vv in list(v.items())[:5]:
+                        if vv is None or vv == "":
+                            continue
+                        s = str(vv)[:100]
+                        tech_parts.append(f"  {HEADER_MAP.get(kk, kk)}: {s}")
+                else:
+                    tech_parts.append(f"  {str(v)[:200]}")
+            if tech_parts:
+                head_elems.append(Spacer(1, 2))
+                head_elems.append(Paragraph(
+                    f"<font color='#94a3b8'><b>技术细节</b> "
+                    f"(完整数据见 .json 报告)</font>", detail_cap))
+                head_elems.append(Paragraph(
+                    "<font color='#64748b'>" +
+                    "<br/>".join(tech_parts).replace("<", "&lt;").replace(">", "&gt;") +
+                    "</font>", cell))
+
+        # 整块卡片 (KeepTogether 让标题/结论/指标不被截断)
+        head_tbl = Table([[head_elems]], colWidths=[content_w])
         head_tbl.setStyle(TableStyle([
             ("LINEBEFORE", (0, 0), (0, 0), 3, c),
             ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fbfcfd")),
@@ -5288,30 +6922,56 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
             ("TOPPADDING", (0, 0), (-1, -1), 7),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
         flow.append(KeepTogether(head_tbl))
-        flow.append(Spacer(1, 4))
-
-        # ── 结构化数据表 (可自然跨页) ──
-        if "error" not in res:
-            skip = {"summary", "errors", "timestamp", "method"}
-            extra = {k: v for k, v in res.items() if k not in skip}
-            kv_rows = []  # 累积常规 指标/值 两列
-            for k, v in extra.items():
-                rt = _record_table(v)
-                if rt is not None:
-                    # 遇到记录表: 先 flush 累积的两列, 再独立成多列表格
-                    if kv_rows:
-                        flow.append(_kv_table_pdf(kv_rows))
-                        kv_rows = []
-                    flow.extend(_record_block_pdf(
-                        k, rt, is_detail=(k in DETAIL_KEYS)))
-                else:
-                    kv_rows.extend(_flatten_kv({k: v}))
-            if kv_rows:
-                flow.append(_kv_table_pdf(kv_rows))
-        flow.append(Spacer(1, 9))
+        flow.append(Spacer(1, 7))
 
     doc.build(flow)
     return True
+
+
+# ============================================================
+# JSON 报告 (技术员/脚本用, 包含 raw 原始数据 + 阈值定义)
+# ============================================================
+def _json_default(o):
+    """JSON 序列化时处理 datetime 等不可序列化对象。"""
+    if isinstance(o, datetime):
+        return o.isoformat()
+    if isinstance(o, set):
+        return sorted(o)
+    raise TypeError(f"Type {type(o).__name__} not JSON serializable")
+
+
+def render_report_json(report, indent=2):
+    """渲染 JSON 报告 (技术员/脚本用)。
+
+    结构 (build_report 双视图):
+      - meta: 应用信息 + 生成时间 + 主机信息 + 模块运行列表
+      - health: 健康评分 (score, grade, label, verdict) + counts
+      - modules: 客户视图 (verdict + key_metrics + issues)
+      - tech.raw_results: 每个模块的原始 result 字典 (含 30 个 RTT 全序列等)
+      - tech.thresholds: 阈值定义 (为啥这个值是"异常"的依据)
+      - tech.module_presentation: 每个模块的客户视图配置 key
+    """
+    if not report:
+        return "{}"
+    out = {
+        "meta": {
+            "app": report["app"],
+            "version": report["version"],
+            "generated_at": report["generated_at"],
+            "host": report["system"],
+        },
+        "health": report["health"],
+        "counts": report["counts"],
+        "summary": report["summary"],
+        "modules": report["modules"],
+        "tech": report["tech"],
+    }
+    return json.dumps(out, ensure_ascii=False, indent=indent, default=_json_default)
+
+
+# 老的 render_report_text 保留, 但 export_report 默认不再导出
+# (客户报告走 HTML/PDF/JSON, TXT 是 legacy 模式; 仍可手工调用)
+# 已存在的 render_report_text / render_report_html 保留代码, 不再被 export_report 调用
 
 
 def _report_dir():
@@ -5346,11 +7006,18 @@ def _normalize_report_path(path):
 
 
 def export_report(path, auto_install=False, pip_mirror=None):
-    """按扩展名导出报告: .pdf / .html / .txt。返回错误信息或 None。
+    """按扩展名导出客户版报告: .html / .pdf / .json。
+
+    客户版设计:
+      - .html → 客户版 HTML (健康分 + 问题清单 + 关键指标 + 折叠技术细节)
+      - .pdf  → 客户版 PDF (浅色主题, 适合打印/归档)
+      - .json → 技术员/脚本用 (含 raw 原始数据 + 阈值定义)
+
+    老的 .txt 报告 (拍平所有数据) 已废弃, 导出 .txt 现在会返回错误提示。
+    如需旧格式, 请手动调用 render_report_text()。
 
     auto_install: True 时允许 PDF 导出时自动 pip install reportlab
-    (对应 CLI 的 --install)。默认 False, 缺包时只提示不安装。
-    pip_mirror: 显式指定 pip 镜像 (CLI --pip-mirror)。
+    pip_mirror: 显式指定 pip 镜像 (CLI --pip-mirror)
     """
     path = _normalize_report_path(path)
     report = build_report()
@@ -5364,12 +7031,17 @@ def export_report(path, auto_install=False, pip_mirror=None):
             return None if ok else "PDF 导出失败（reportlab 未就绪）"
         elif ext in (".html", ".htm"):
             with open(path, "w", encoding="utf-8") as f:
-                f.write(render_report_html(report))
+                f.write(render_report_html_customer(report))
             return None
-        else:  # 默认按 txt
+        elif ext == ".json":
             with open(path, "w", encoding="utf-8") as f:
-                f.write(render_report_text(report))
+                f.write(render_report_json(report))
             return None
+        elif ext == ".txt":
+            return ("TXT 客户版未提供, 改用 --export report.html / .pdf / .json。"
+                    "如需旧拍平格式, 可手动调用 render_report_text()。")
+        else:
+            return f"不支持的扩展名: {ext} (支持: .html / .pdf / .json)"
     except Exception as e:
         return f"导出失败: {e}"
 
