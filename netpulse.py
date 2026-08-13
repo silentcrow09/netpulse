@@ -610,51 +610,13 @@ def run_ps(script, timeout=30):
     return run_cmd(cmd, timeout=timeout)
 
 
-def get_default_gateway():
-    """获取默认网关 IP"""
-    code, out, _ = run_cmd("route print 0.0.0.0")
-    for line in out.split("\n"):
-        parts = line.split()
-        if len(parts) >= 3 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":
-            gw = parts[2]
-            try:
-                ipaddress.IPv4Address(gw)
-                return gw
-            except Exception:
-                continue
-    # Fallback: WMI
-    code, out, _ = run_ps(
-        "(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True').DefaultIPGateway"
-    )
-    gw = out.strip().strip('"').strip("{").strip("}")
-    if gw and gw != "":
-        return gw.split(",")[0].strip().strip('"')
-    return None
+def _get_local_ip_independent():
+    """不依赖 get_default_gateway 的本机 IP 获取 (用于打破循环依赖)。
 
-
-def get_local_ip():
-    """获取本机 IP 地址 (优先返回与网关同子网的物理网卡 IP)"""
-    gateway = get_default_gateway()
-    # 方法1: 通过 ipconfig 查找与网关同子网的 IP
-    if gateway:
-        try:
-            gw_parts = list(map(int, gateway.split(".")))
-            code, out, _ = run_cmd("ipconfig")
-            for line in out.split("\n"):
-                line = line.strip()
-                # 匹配 IPv4 地址行
-                m = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
-                if m and ("IPv4" in line or "IP Address" in line or "IP 地址" in line):
-                    ip = m.group(1)
-                    if ip.startswith("127."):
-                        continue
-                    ip_parts = list(map(int, ip.split(".")))
-                    # 检查是否与网关在同一 /24 子网
-                    if ip_parts[:3] == gw_parts[:3]:
-                        return ip
-        except Exception:
-            pass
-    # 方法2: UDP socket (可能返回虚拟网卡 IP)
+    UDP socket connect() 不真正发包, 只在路由表里查"到 223.5.5.5 走哪张网卡",
+    返回该网卡的源 IP。这是当前会话内最稳定的本机 IP 来源, 不受 VPN /
+    虚拟网卡默认路由顺序影响 (split-tunnel VPN 不会接管本机 IP)。
+    """
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("223.5.5.5", 80))
@@ -664,9 +626,136 @@ def get_local_ip():
             return ip
     except Exception:
         pass
+    return None
+
+
+def _pick_best_gateway(candidates, local_ip=None):
+    """从多个默认网关候选中选最合适的。
+
+    优先级:
+      1. 与 local_ip 在同一子网 (用 _get_local_subnet 拿真实 prefix length,
+         避免 /24 硬编码在大子网环境误判 — 这跟 P0#3 是同一类问题)
+      2. 第一个候选 (保留旧行为兜底)
+
+    candidates: 网关 IP 列表 (IPv4 字符串)
+    local_ip: 本机 IP; None 时自动用 _get_local_ip_independent 拿
+    返回: 选中的网关 IP, 或 None
+    """
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    if local_ip is None:
+        local_ip = _get_local_ip_independent()
+    if not local_ip:
+        return candidates[0]
+    local_net = _get_local_subnet(local_ip)
+    if local_net is not None:
+        for gw in candidates:
+            try:
+                if ipaddress.IPv4Address(gw) in local_net:
+                    return gw
+            except Exception:
+                continue
+    return candidates[0]
+
+
+def get_default_gateway():
+    """获取默认网关 IP。
+
+    优先级:
+      1. 从 ``route print 0.0.0.0`` 收集所有 0.0.0.0 默认路由, 用
+         _pick_best_gateway 选与本机 IP 同子网的 (避免 VPN/虚拟适配器干扰)
+      2. Fallback: WMI Win32_NetworkAdapterConfiguration.DefaultIPGateway,
+         同样多候选时按子网优先选
+    """
+    # 1) route print
+    code, out, _ = run_cmd("route print 0.0.0.0")
+    candidates = []
+    for line in out.split("\n"):
+        parts = line.split()
+        # 完整字段: dest, mask, gateway, interface, metric
+        if len(parts) >= 5 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":
+            try:
+                ipaddress.IPv4Address(parts[2])
+                candidates.append(parts[2])
+            except Exception:
+                continue
+    picked = _pick_best_gateway(candidates)
+    if picked:
+        return picked
+
+    # 2) WMI fallback
+    code, out, _ = run_ps(
+        "(Get-WmiObject Win32_NetworkAdapterConfiguration "
+        "-Filter 'IPEnabled=True').DefaultIPGateway"
+    )
+    # WMI 输出可能是:
+    #   {100.70.0.1}          (单适配器)
+    #   {100.70.0.1}
+    #   {25.255.255.254}      (多适配器, 每行一对花括号)
+    wmi_candidates = []
+    for line in (out or "").strip().split("\n"):
+        gw = line.strip().strip('"').strip("{").strip("}").strip()
+        if not gw:
+            continue
+        try:
+            ipaddress.IPv4Address(gw)
+            wmi_candidates.append(gw)
+        except Exception:
+            continue
+    return _pick_best_gateway(wmi_candidates)
+
+
+def get_local_ip():
+    """获取本机 IP 地址 (优先返回与网关同子网的物理网卡 IP)。
+
+    实现策略:
+      - 优先用 UDP socket 拿到「主用」本机 IP (不依赖 gateway, 避免循环)
+      - 再用 _get_local_subnet (真实 prefix length) 验证与网关是否同子网
+      - 若主用 IP 与网关不同子网, 扫描 ipconfig 找与网关同子网的 IP
+        (可能存在于多网卡, 但被低 metric 路由藏起来)
+    """
+    # 方法1: UDP socket (主用本机 IP, 不依赖 get_default_gateway)
+    primary_ip = _get_local_ip_independent()
+
+    # 方法2: 通过 ipconfig 找与网关同子网的 IP (用真实 prefix length, 不用 /24)
+    gateway = get_default_gateway()
+    if gateway:
+        try:
+            gw_addr = ipaddress.IPv4Address(gateway)
+            code, out, _ = run_cmd("ipconfig")
+            for line in out.split("\n"):
+                line = line.strip()
+                m = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
+                if not m:
+                    continue
+                if not ("IPv4" in line or "IP Address" in line or "IP 地址" in line):
+                    continue
+                ip = m.group(1)
+                if ip.startswith("127."):
+                    continue
+                try:
+                    ip_addr = ipaddress.IPv4Address(ip)
+                except Exception:
+                    continue
+                # 优先: 与本机主用 IP 同一 /32 (就是它本身)
+                if primary_ip and ip == primary_ip:
+                    return ip
+                # 次选: 与网关同一子网 (用 _get_local_subnet 拿真实 mask)
+                ip_net = _get_local_subnet(ip)
+                if ip_net is not None and gw_addr in ip_net:
+                    return ip
+        except Exception:
+            pass
+
+    if primary_ip:
+        return primary_ip
+
     # 方法3: PowerShell
     code, out, _ = run_ps(
-        "(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True').IPAddress"
+        "(Get-WmiObject Win32_NetworkAdapterConfiguration "
+        "-Filter 'IPEnabled=True').IPAddress"
     )
     if out:
         for line in out.strip().split("\n"):
@@ -3592,7 +3681,7 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
 
 
 def _run_diagnostics_sequential(keys, is_tty):
-    """顺序模式: 与旧版行为完全一致。"""
+    """顺序模式: 保留 TTY 实时进度行 (\\r\\033[K 刷新), 详细 result 留给主循环统一打。"""
     results = {}
     full = {}
     for key in keys:
@@ -3621,8 +3710,6 @@ def _run_diagnostics_sequential(keys, is_tty):
                 sys.stdout.flush()
             res = inst.results
             status = determine_status(res)
-            print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge(status))
-            _cli_print_result(res)  # 详细 result 在主循环外统一打
             results[key] = status
             full[key] = res
         except Exception as e:
