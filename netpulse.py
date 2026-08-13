@@ -82,8 +82,9 @@ SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_NEVER
 LAST_RUN = None
 
 # 端口探测模块的运行参数 (由 CLI --port-* 写入, run_diagnostics 读取)
-PORT_PROBE_CONFIG = {"targets": [], "proto": "tcp", "count": 4,
-                     "force": False, "max_total_time": 60.0}
+PORT_PROBE_CONFIG = {"targets": [], "proto": "tcp", "count": 2,
+                     "force": False, "max_total_time": 60.0,
+                     "max_concurrency": 8}
 
 
 def _is_admin():
@@ -3677,10 +3678,13 @@ class PortProbeTester:
     DEFAULT_MAX_TARGETS = 1000
     # 整个端口探测模块总时长上限 (秒), 0 = 不限
     DEFAULT_MAX_TOTAL_TIME = 60.0
+    # 默认并发度: 同时探测多少个 (host, port) 目标
+    DEFAULT_MAX_CONCURRENCY = 8
 
     def __init__(self, targets=None, proto="tcp", count=4,
                  max_targets=DEFAULT_MAX_TARGETS, force=False,
-                 max_total_time=DEFAULT_MAX_TOTAL_TIME):
+                 max_total_time=DEFAULT_MAX_TOTAL_TIME,
+                 max_concurrency=DEFAULT_MAX_CONCURRENCY):
         self.name = "端口探测"
         self.results = {}
         self.targets = targets or DEFAULT_PORT_TARGETS
@@ -3689,6 +3693,8 @@ class PortProbeTester:
         self.max_targets = max(1, int(max_targets))
         self.force = bool(force)
         self.max_total_time = max(0.0, float(max_total_time))
+        # 并发度: 1 = 串行; 8 = 默认; 上限 64 (防 OS socket FD 爆掉)
+        self.max_concurrency = max(1, min(64, int(max_concurrency)))
         self._start_time = None
 
     def _time_left(self):
@@ -3907,27 +3913,50 @@ class PortProbeTester:
                 callback(self.results["summary"])
             return self.results
 
-        # 通过限流, 实际探测
+        # 通过限流, 实际探测 (内部并发, max_concurrency worker)
         targets = []
         timed_out_specs = []  # 因总时长超时被跳过的 spec
         # 估算单个目标最坏耗时 (count 次采样 × 3s socket timeout + DNS 解析)
-        # 用来判断"剩余时间够不够再探测一个目标", 避免开始一个 12s 的探测
-        # 然后发现超时, 已经浪费了 12s
         worst_case_per_target = self.count * 3.0 + 1.0
-        last_checked_spec = None
+
+        # 把 expanded 展平成 (spec, h, p, pr) flat list, 保留原始顺序索引
+        # 用于探测完成后按原顺序排回 (并发完成顺序会乱)
+        probes = []  # [(spec, h, p, pr, flat_idx), ...]
+        flat_idx = 0
         for spec, h, p in expanded:
-            # 总时长兜底: 每个 spec 第一个目标前检查"够不够一个目标的最坏耗时"
-            if spec != last_checked_spec:
-                last_checked_spec = spec
-                if self._time_left() <= worst_case_per_target and not self.force:
-                    timed_out_specs.append(spec)
-                    continue
+            if self._time_left() <= worst_case_per_target and not self.force:
+                timed_out_specs.append(spec)
+                continue
             for pr in protos:
-                # 单目标也再检查 (避免最后一个 spec 跨过超时边界)
                 if self._time_left() <= worst_case_per_target and not self.force:
                     timed_out_specs.append(spec)
                     break
-                targets.append(self._probe_one(h, p, pr))
+                probes.append((spec, h, p, pr, flat_idx))
+                flat_idx += 1
+
+        # 并发探测: ThreadPoolExecutor 跑 probes, 结果存到 results_by_idx
+        results_by_idx = [None] * len(probes)
+        with ThreadPoolExecutor(max_workers=self.max_concurrency) as ex:
+            future_to_idx = {}
+            for spec, h, p, pr, idx in probes:
+                fut = ex.submit(self._probe_one, h, p, pr)
+                future_to_idx[fut] = idx
+            for fut in as_completed(future_to_idx):
+                idx = future_to_idx[fut]
+                try:
+                    results_by_idx[idx] = fut.result()
+                except Exception as e:
+                    # 探测异常 (不应该发生, _probe_one 内部都 try 了) 兜底
+                    spec, h, p, pr, _ = probes[idx]
+                    results_by_idx[idx] = {
+                        "proto": pr.upper(), "host": h, "port": p,
+                        "resolved_ip": "—", "status": "错误",
+                        "rtt_ms": "—", "loss": f"{self.count}/{self.count}",
+                        "error": str(e),
+                    }
+
+        # 按原始 flat_idx 顺序还原, 这样报告里 targets 列表按 (spec, host, port) 顺序展示
+        targets = [r for r in results_by_idx if r is not None]
 
         issues = []
         for t in targets:
@@ -4571,7 +4600,8 @@ def _run_diagnostics_sequential(keys, is_tty):
                            proto=PORT_PROBE_CONFIG["proto"],
                            count=PORT_PROBE_CONFIG["count"],
                            force=PORT_PROBE_CONFIG.get("force", False),
-                           max_total_time=PORT_PROBE_CONFIG.get("max_total_time", 60.0))
+                           max_total_time=PORT_PROBE_CONFIG.get("max_total_time", 60.0),
+                           max_concurrency=PORT_PROBE_CONFIG.get("max_concurrency", 8))
             else:
                 inst = cls()
             if is_tty:
@@ -4625,7 +4655,8 @@ def _run_diagnostics_parallel(keys, max_workers, total):
                            proto=PORT_PROBE_CONFIG["proto"],
                            count=PORT_PROBE_CONFIG["count"],
                            force=PORT_PROBE_CONFIG.get("force", False),
-                           max_total_time=PORT_PROBE_CONFIG.get("max_total_time", 60.0))
+                           max_total_time=PORT_PROBE_CONFIG.get("max_total_time", 60.0),
+                           max_concurrency=PORT_PROBE_CONFIG.get("max_concurrency", 8))
             else:
                 inst = cls()
             inst.detect(callback=lambda msg: None)  # parallel 模式抑制中间输出
@@ -7404,14 +7435,17 @@ def main():
                              "可多次指定或用逗号分隔, 例: --port-target 223.5.5.5:53,10.0.0.1:1-1024")
     parser.add_argument("--port-proto", choices=["tcp", "udp", "both"], default="tcp",
                         help="端口探测协议 (默认 tcp); both = TCP 与 UDP 均测")
-    parser.add_argument("--port-count", type=int, default=4, metavar="N",
-                        help="每个目标采样次数 (默认 4)")
+    parser.add_argument("--port-count", type=int, default=2, metavar="N",
+                        help="每个目标采样次数 (默认 2; 越大越可靠但越慢, 1=快速, 10=高可靠)")
     parser.add_argument("--port-force", action="store_true",
                         help="强制执行端口探测, 即使目标数超过 1000 上限 "
                              "(默认拦下, 避免无意探测风暴/DoS)")
     parser.add_argument("--port-timeout", type=float, default=60.0, metavar="SEC",
                         help="端口探测总时长上限 (秒, 默认 60, 设 0 = 不限)。"
                              "超过则跳过剩余 spec, 报告里 timed_out_specs 字段列出")
+    parser.add_argument("--port-concurrency", type=int, default=8, metavar="N",
+                        help="端口探测内部并发度 (默认 8, 1=串行, 上限 64)。"
+                             "并发下 60s 内能扫 20-50 个端口, 串行只扫 4-5 个")
     parser.add_argument("--export", metavar="FILE",
                         help="诊断后将报告导出到文件 (支持 .txt / .html / .pdf); "
                              "多个目标用逗号分隔可一次导出多种格式, 例: report.pdf,report.html,report.txt")
@@ -7442,6 +7476,7 @@ def main():
     PORT_PROBE_CONFIG["count"] = max(1, int(args.port_count))
     PORT_PROBE_CONFIG["force"] = bool(getattr(args, "port_force", False))
     PORT_PROBE_CONFIG["max_total_time"] = max(0.0, float(getattr(args, "port_timeout", 60.0)))
+    PORT_PROBE_CONFIG["max_concurrency"] = max(1, min(64, int(getattr(args, "port_concurrency", 8))))
 
     if args.list:
         _print_module_list()
