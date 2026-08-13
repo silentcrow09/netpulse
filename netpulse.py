@@ -2333,6 +2333,8 @@ class SpeedTester:
 
     def _parse_iperf3_json(self, output):
         """解析 iperf3 JSON 输出"""
+        if not output or not output.strip():
+            return {"error": "iperf3 无输出", "method": "iperf3"}
         try:
             data = json.loads(output)
             end = data.get("end", {})
@@ -2346,6 +2348,9 @@ class SpeedTester:
             sum_data = end.get("sum_sent", end.get("sum", {}))
             if sum_data:
                 result["retransmits"] = sum_data.get("retransmits", 0)
+            if not result:
+                # JSON 解析成功但没有速率数据 (例如 iperf3 跑一半超时)
+                return {"error": "iperf3 输出无速率数据", "method": "iperf3"}
             return result
         except Exception:
             # 尝试解析文本输出
@@ -2358,7 +2363,7 @@ class SpeedTester:
                 elif "Kbits" in unit:
                     val /= 1000
                 return {"bitrate_mbps": round(val, 2)}
-            return {}
+            return {"error": "iperf3 输出无法解析", "method": "iperf3"}
 
     def detect(self, iperf3_server=None, iperf3_port=5201, callback=None):
         """执行完整测速"""
@@ -2398,6 +2403,7 @@ class SpeedTester:
         results["timestamp"] = datetime.now().isoformat()
         if callback:
             callback(results["summary"])
+        self.results = results    # 关键: 同步到 self.results (其它模块都用这个)
         return results
 
 
