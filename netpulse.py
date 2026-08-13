@@ -4917,6 +4917,12 @@ def interactive_menu(install=False, pip_mirror=None):
     install: 是否允许在交互过程中自动安装缺失依赖
              (与 CLI --install 联动, 让 PDF 导出等行为可预测)。
     pip_mirror: 透传给 ensure_scapy / ensure_reportlab。
+
+    并发策略:
+      - 选 0 / 选多个模块 -> 默认并发 (跟 CLI `all --parallel` 对齐,
+        选全部时绝大多数用户想要快而不是看实时进度)
+      - 选单模块 -> 走顺序, 让 TTY 实时进度行 (\\r\\033[K 刷新) 正常显示
+      - run_diagnostics 内部 `parallel and len(keys) > 1` 会自动归一化
     """
     while True:
         # 清屏: 用 ANSI 转义 (VT 已在 _cli_enable_vt 启用) 替代 os.system('cls'),
@@ -4939,7 +4945,7 @@ def interactive_menu(install=False, pip_mirror=None):
         print(_c("  请选择要执行的诊断 (输入数字, 空格分隔可多选):", C_WHITE))
         for i, (k, n, _) in enumerate(MODULE_REGISTRY, 1):
             print(f"    {_c(str(i).rjust(2), C_CYAN)}. {n}  {_c('(' + k + ')', C_GRAY)}")
-        print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断")
+        print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发)', C_GRAY)}")
         print(f"    {_c(' q', C_CYAN)}. 退出")
         print(_c("-" * 60, C_GRAY))
         try:
@@ -4957,7 +4963,10 @@ def interactive_menu(install=False, pip_mirror=None):
             except (EOFError, KeyboardInterrupt):
                 break
             continue
-        run_diagnostics(keys, banner=False)
+        # 菜单模式: 多模块默认并发 (与 CLI `all --parallel` 对齐)。
+        # run_diagnostics 内部 `parallel and len(keys) > 1` 会自动避免
+        # 单模块走并发 (无意义且会浪费线程开销)。
+        run_diagnostics(keys, banner=False, parallel=True, max_workers=4)
         if sys.stdout.isatty():
             prompt_export_report(auto_install=install, pip_mirror=pip_mirror)
         try:
