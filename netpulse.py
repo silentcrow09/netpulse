@@ -455,11 +455,15 @@ APP_VERSION = "1.0.0"
 
 
 # 常用外网测试目标 (国内网络环境)
+# 格式: (host, name, tcp_port)
+#   tcp_port 用于 TCP 可达性预检 (应对 ICMP 被防火墙过滤的场景:
+#   很多企业网禁 ping 到 8.8.8.8 / 114.114.114.114 等公共 DNS 或国际
+#   站点, 但这些目标的 TCP 服务端口通常是开的, 不应该判为不可达)
 EXTERNAL_TARGETS = [
-    ("223.5.5.5", "AliDNS"),
-    ("114.114.114.114", "114DNS"),
-    ("119.29.29.29", "DNSPod"),
-    ("www.baidu.com", "Baidu"),
+    ("223.5.5.5", "AliDNS", 53),
+    ("114.114.114.114", "114DNS", 53),
+    ("119.29.29.29", "DNSPod", 53),
+    ("www.baidu.com", "Baidu", 80),
 ]
 
 # 常用 DNS 服务器 (国内网络环境)
@@ -631,6 +635,47 @@ def _download_speed_test(url, target_bytes=5 * 1024 * 1024, chunk_size=64 * 1024
         if callback:
             callback(f"  测速失败 ({url[:40]}...): {e}")
         return None
+
+
+def _tcp_probe(host, port=80, timeout=2.0):
+    """TCP 可达性预检: 给定 host:port 测能否完成 TCP 三次握手。
+
+    返回 (reachable: bool, rtt_ms: float | None):
+      - reachable: 是否能 connect 成功
+      - rtt_ms: 三次握手耗时 (毫秒), 失败时 None
+
+    与 ping 的关系:
+      - ping 通 + TCP 通 = 目标完全可达
+      - ping 100% 丢 + TCP 通 = ICMP 被防火墙过滤 ("禁拼"), 目标实际可达
+      - ping 100% 丢 + TCP 不通 = 目标不可达 (网络问题或主机宕机)
+
+    实现用 socket.create_connection (内部一步完成 getaddrinfo + create +
+    connect), 计时只覆盖真正的 TCP 握手时间, 不含 DNS 解析。
+    """
+    try:
+        t0 = time.perf_counter()
+        s = socket.create_connection((host, port), timeout=timeout)
+        rtt = round((time.perf_counter() - t0) * 1000, 1)
+        s.close()
+        return True, rtt
+    except Exception:
+        return False, None
+
+
+def _tcp_probe_multi(host, ports=(80, 443, 53), timeout=2.0):
+    """对 host 试多个端口, 任一通就算 TCP 可达。
+
+    为什么需要这个: 不同服务的常用端口不一定都开:
+      - DNS 119.29.29.29 只开 UDP 53, TCP 53 经常被禁
+      - Web 服务大多数开 80/443
+      - Cloudflare 1.1.1.1 只在特定端口开 DNS-over-TLS (853) / HTTPS (443)
+    所以单一端口探测会误判, 试多个端口任一通就算可达。
+    """
+    for port in ports:
+        ok, rtt = _tcp_probe(host, port=port, timeout=timeout)
+        if ok:
+            return True, rtt, port
+    return False, None, None
 
 
 def run_cmd(cmd, timeout=30, shell=True, use_cache=True):
@@ -1549,7 +1594,13 @@ class LoopDetector:
 
 
 class ExternalNetworkTester:
-    """外网延迟 / 路径 / 丢包检测"""
+    """外网延迟 / 路径 / 丢包检测。
+
+    关键设计: 区分"目标禁拼"和"目标不可达"。
+      - ping 100% 丢包 + TCP 通 = "禁拼" (ICMP 被防火墙过滤, 实际可达)
+      - ping 100% 丢包 + TCP 不通 = "不可达" (网络问题/主机宕机)
+    旧版只信 ping, 把所有 100% 丢包都报"不可达", 用户体验差。
+    """
 
     def __init__(self):
         self.name = "外网网络检测"
@@ -1563,14 +1614,50 @@ class ExternalNetworkTester:
 
         results = []
 
-        def _test_target(tip, tname):
-            # Ping 测试
+        def _test_target(item):
+            # 兼容 (host, name) 和 (host, name, port) 两种格式
+            if len(item) == 3:
+                tip, tname, tcp_port = item
+            else:
+                tip, tname = item
+                tcp_port = 80  # 默认 HTTP 端口
+
+            # 1. TCP 可达性预检 (多端口试, 任一通就算可达)
+            # 单一端口探测不可靠: DNS 类目标 119.29.29.29 只开 UDP 53,
+            # TCP 53 经常被禁; Web 类 80/443 多数情况开。
+            # 用多端口 fallback 提高准确度。
+            tcp_ok, tcp_rtt, tcp_used = _tcp_probe_multi(
+                tip, ports=(tcp_port, 80, 443, 53), timeout=2.0)
+
+            # 2. Ping 测试
             ping_result = ping_host(tip, count=10, timeout=15)
-            # Traceroute (15 跳足够覆盖国内主流路径)
-            code, tracert_out, _ = run_cmd(
-                f"tracert -d -h 15 -w 1000 {tip}", timeout=40)
-            hops = parse_tracert_output(tracert_out)
-            # DNS 解析 (如果目标是域名)
+            # 判定 ping 是否"100% 丢包且无回包"
+            ping_total_loss = (
+                ping_result["loss_pct"] >= 100 and not ping_result["rtts"])
+
+            # 3. 三态判定: ok / icmp_blocked / unreachable
+            if not tcp_ok and ping_total_loss:
+                # TCP 不通 + ping 也丢 -> 真实不可达
+                reachability = "unreachable"
+            elif tcp_ok and ping_total_loss:
+                # TCP 通 + ping 丢 -> 目标活着, ICMP 被防火墙过滤
+                reachability = "icmp_blocked"
+            elif tcp_ok and not ping_total_loss:
+                # 都通 -> 正常
+                reachability = "ok"
+            else:
+                # TCP 不通 + ping 有回包 -> 矛盾状态 (端口被禁, 但 host 通)
+                # 例如企业内网允许 ping 但禁外网 TCP 80
+                reachability = "tcp_blocked"
+
+            # 4. Traceroute: 不可达/禁拼时跳过 (省 40s × 目标数)
+            hops = []
+            if reachability in ("ok", "tcp_blocked"):
+                code, tracert_out, _ = run_cmd(
+                    f"tracert -d -h 15 -w 1000 {tip}", timeout=40)
+                hops = parse_tracert_output(tracert_out)
+
+            # 5. DNS 解析 (如果目标是域名) - 跟 ping/TCP 独立, 总是测
             dns_time = None
             if not re.match(r"^\d+\.\d+\.\d+\.\d+$", tip):
                 try:
@@ -1579,24 +1666,46 @@ class ExternalNetworkTester:
                     dns_time = round((time.time() - start) * 1000, 1)
                 except Exception:
                     dns_time = None
-            return {"target": tip, "name": tname,
-                    "loss_pct": ping_result["loss_pct"],
-                    "avg_ms": ping_result["avg_ms"],
-                    "hop_count": len(hops),
-                    "dns_time_ms": dns_time,
-                    "_hops": hops}
+
+            return {
+                "target": tip,
+                "name": tname,
+                "tcp_port": tcp_port,
+                "tcp_used_port": tcp_used,
+                "tcp_reachable": tcp_ok,
+                "tcp_rtt_ms": tcp_rtt,
+                "ping_loss_pct": ping_result["loss_pct"],
+                "ping_avg_ms": ping_result["avg_ms"],
+                "reachability": reachability,
+                "hop_count": len(hops),
+                "dns_time_ms": dns_time,
+                "_hops": hops,
+            }
 
         if callback:
             callback(f"外网检测 {len(targets)} 个目标 (并发)...")
         with ThreadPoolExecutor(max_workers=min(4, len(targets))) as ex:
-            for r in ex.map(lambda t: _test_target(*t), targets):
+            for r in ex.map(_test_target, targets):
                 results.append(r)
 
-        # 综合评估
-        all_loss = [r["loss_pct"] for r in results]
-        all_rtt = [r["avg_ms"] for r in results if r["avg_ms"] > 0]
-        avg_loss = sum(all_loss) / len(all_loss) if all_loss else 100
-        avg_rtt = sum(all_rtt) / len(all_rtt) if all_rtt else 0
+        # 综合评估: 基于 TCP 可达性 (而不是仅 ping)
+        # 老逻辑用 ping loss 平均, 一个被禁拼的目标会拖累整个评估。
+        # 新逻辑: TCP 可达比例 + ping 真实延迟 (在可达目标上)
+        tcp_ok_count = sum(1 for r in results if r["tcp_reachable"])
+        unreachable_count = sum(1 for r in results
+                               if r["reachability"] == "unreachable")
+        blocked_count = sum(1 for r in results
+                           if r["reachability"] == "icmp_blocked")
+
+        # 平均延迟只在 ping 通的目标上算 (禁拼目标不参与)
+        ping_rtts = [r["ping_avg_ms"] for r in results
+                    if r["ping_avg_ms"] > 0]
+        avg_rtt = sum(ping_rtts) / len(ping_rtts) if ping_rtts else 0
+
+        # 平均丢包只在 ping 通的目标上算 (禁拼目标不参与, 避免 100% 拖累)
+        ping_losses = [r["ping_loss_pct"] for r in results
+                      if r["reachability"] in ("ok", "tcp_blocked")]
+        avg_loss = sum(ping_losses) / len(ping_losses) if ping_losses else 100
 
         # 路径追踪记录表 (每跳一行, 供报告渲染成多列表 + 状态着色)
         traceroute = []
@@ -1609,23 +1718,43 @@ class ExternalNetworkTester:
                     "target": r["name"], "hop": h["hop"],
                     "node": h["ip"], "avg_ms": avg, "status": status})
 
-        if avg_loss == 0 and avg_rtt < 50:
+        # 评估: TCP 可达性优先
+        if tcp_ok_count == len(results) and avg_loss == 0 and avg_rtt < 50:
             assessment = "外网连通正常"
-        elif avg_loss < 5 and avg_rtt < 100:
+        elif tcp_ok_count == len(results) and avg_loss < 5:
             assessment = "外网连通性良好"
-        elif avg_loss < 20:
+        elif tcp_ok_count == len(results):
             assessment = "外网存在一定丢包"
+        elif unreachable_count == 0:
+            # 全部 TCP 通, 但部分被禁拼 -> 实际网络正常, ICMP 被防火墙挡
+            assessment = f"外网 TCP 可达 ({tcp_ok_count}/{len(results)}), " \
+                         f"{blocked_count} 个目标禁拼"
+        elif unreachable_count >= len(results) / 2:
+            assessment = "外网严重不可达"
         else:
-            assessment = "外网连通性差"
+            assessment = f"外网部分不可达 ({unreachable_count}/{len(results)}), " \
+                         f"{tcp_ok_count} 个 TCP 可达"
+
+        # 拼接 summary 包含禁拼提示
+        summary_parts = [f"外网检测: 平均延迟 {avg_rtt:.0f}ms, 平均丢包 {avg_loss:.1f}%"]
+        if unreachable_count > 0:
+            summary_parts.append(f"{unreachable_count} 个不可达")
+        if blocked_count > 0:
+            summary_parts.append(f"{blocked_count} 个禁拼")
+        summary = ", ".join(summary_parts)
 
         self.results = {
             "targets": results,
             "traceroute": traceroute,
+            "tcp_ok": tcp_ok_count,
+            "tcp_total": len(results),
+            "unreachable_count": unreachable_count,
+            "icmp_blocked_count": blocked_count,
             "avg_loss_pct": round(avg_loss, 1),
             "avg_rtt_ms": round(avg_rtt, 1),
             "assessment": assessment,
             "timestamp": datetime.now().isoformat(),
-            "summary": f"外网检测: 平均延迟 {avg_rtt:.0f}ms, 平均丢包 {avg_loss:.1f}%",
+            "summary": summary,
         }
         if callback:
             callback(self.results["summary"])
@@ -4514,6 +4643,12 @@ HEADER_MAP = {
     "target": "目标", "loss_pct": "丢包(%)", "hop_count": "跳数",
     "dns_time_ms": "DNS(ms)", "avg_rtt_ms": "平均延迟(ms)",
     "avg_loss_pct": "平均丢包(%)",
+    # 外网模块字段 (区分 ping 和 TCP)
+    "ping_loss_pct": "Ping 丢包(%)", "ping_avg_ms": "Ping 平均(ms)",
+    "tcp_reachable": "TCP 可达", "tcp_rtt_ms": "TCP RTT(ms)",
+    "tcp_port": "TCP 端口", "reachability": "可达性",
+    "tcp_ok": "TCP 通", "tcp_total": "目标数",
+    "unreachable_count": "不可达数", "icmp_blocked_count": "禁拼数",
 }
 
 
