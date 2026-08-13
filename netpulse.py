@@ -124,6 +124,59 @@ def _is_broadcast_or_reserved_ip(ip):
     return False
 
 
+# 已知的"假网关"地址 (VPN 客户端为绕过 Windows 网络分类限制而插入的占位默认路由)
+# 特点: 地址本身不可达, metric 极高 (10000+), 仅作 Windows 网络栈分类触发用。
+#  - 25.255.255.254: ZeroTier 在 Windows 上为触发"网络连接类型识别"而加的占位默认路由
+#    (25.0.0.0/8 是英国国防部历史保留段, 现在未分配, 不会与真实公网冲突)
+#  - 类似的 240.0.0.0/4 (IETF 协议保留) 也常被 VPN 用作占位
+# 遇到这些地址时, 不应报警告/异常, 也不应去 ping。
+_KNOWN_FAKE_GATEWAY_IPS = frozenset({"25.255.255.254"})
+
+
+def _is_known_fake_gateway(gateway, metric=None):
+    """判断一个默认路由的 gateway 是否是"假网关"占位 (VPN 客户端为触发 Windows
+    网络栈分类而插入的不可达地址)。
+
+    判定: gateway 在 _KNOWN_FAKE_GATEWAY_IPS 集合内, 或 gateway 处于
+    240.0.0.0/4 (IETF 协议保留段), 且 metric 通常 >= 1000 (极低优先级, 不可能
+    真的承担流量转发)。
+    """
+    if not gateway:
+        return False
+    if gateway in _KNOWN_FAKE_GATEWAY_IPS:
+        return True
+    try:
+        addr = ipaddress.IPv4Address(gateway)
+    except Exception:
+        return False
+    # 240.0.0.0/4 — IETF 协议保留 (RFC 1112), 永远不可达
+    if ipaddress.IPv4Address("240.0.0.0") <= addr <= ipaddress.IPv4Address("255.255.255.254"):
+        return True
+    # 其它未分配段如有需要可在这里加
+    return False
+
+
+# VPN 客户端常见虚拟接口名关键字 (Tailscale / ZeroTier / Wireguard 等)
+# 匹配到的话, 对应接口的默认路由通常是"假网关"或 VPN 内部地址,
+# 不能直接 ping (要么不可达, 要么走 VPN 隧道, 都会误报)
+_VPN_INTERFACE_KEYWORDS = (
+    "zerotier", "tailscale", "wireguard", "wg", "tap", "tun",
+    "nordvpn", "expressvpn", "surfshark", "protonvpn", "windscribe",
+    "hamachi", "lan-turtle", "openconnect", "anyconnect",
+    "default",  # Windows route print 对某些 VPN 虚拟接口显示为 "Default" 而不是接口名
+)
+
+
+def _is_vpn_interface(interface_name):
+    """判断 default_routes 里的 interface 字段是否指向 VPN 虚拟接口。"""
+    if not interface_name:
+        return False
+    name = interface_name.lower()
+    if name == "default":  # VPN 虚拟接口常见空字符串/默认值
+        return True
+    return any(kw in name for kw in _VPN_INTERFACE_KEYWORDS)
+
+
 def _is_valid_unicast_mac(mac):
     """判断 MAC 地址是否是"有效单播" (排除广播/组播)。
 
@@ -2388,12 +2441,44 @@ class MultiEgressDetector:
                     "metric": metric,
                 })
 
-        if len(default_routes) > 1:
+        # 排除假网关 / VPN 虚拟接口占位 (ZeroTier 25.255.255.254 / Tailscale
+        # 默认接口的 gateway 等)。这些地址要么不可达, 要么走 VPN 隧道, 都不算
+        # 真正的"多出口"
+        real_default = [
+            r for r in default_routes
+            if not _is_known_fake_gateway(r.get("gateway", ""))
+            and not _is_vpn_interface(r.get("interface", ""))
+        ]
+        fake_default = [
+            r for r in default_routes
+            if _is_known_fake_gateway(r.get("gateway", ""))
+            or _is_vpn_interface(r.get("interface", ""))
+        ]
+
+        if len(real_default) > 1:
+            msg = f"检测到 {len(real_default)} 条真实默认路由"
+            if fake_default:
+                msg += f" (另有 {len(fake_default)} 条 VPN 占位假网关已忽略)"
             issues.append({
                 "type": "multiple_default_routes",
                 "severity": "warning",
-                "message": f"检测到 {len(default_routes)} 条默认路由",
+                "message": msg,
                 "detail": "多默认路由可能导致流量分担到不同出口，某条链路故障时可能影响部分流量"
+            })
+        elif fake_default:
+            # 唯一真默认路由 + 假网关 -> 不报警, 改报 info
+            fake_str = ", ".join(
+                f"{r['gateway']}(metric={r.get('metric','?')})"
+                for r in fake_default)
+            issues.append({
+                "type": "fake_gateway_present",
+                "severity": "info",
+                "message": f"检测到 {len(fake_default)} 条 VPN 占位/虚拟接口默认路由",
+                "detail": f"{fake_str}。可能是 VPN 客户端 (ZeroTier/Tailscale/WireGuard 等) "
+                          f"为触发 Windows 网络分类或自身转发而插入的占位默认路由, "
+                          f"不可达或走 VPN 隧道, 不影响真实流量。"
+                          f"如需关闭可在对应 VPN 客户端关闭 'Allow Default Route' / "
+                          f"'Allow Global IPs' 等选项。"
             })
 
         # 2. 检测 VPN/虚拟适配器
@@ -2501,6 +2586,24 @@ class MultiEgressDetector:
 
         def _check_egress(route):
             gw = route["gateway"]
+            iface = route.get("interface", "")
+            # 跳过"假网关"占位 (ZeroTier 等 VPN 的不可达地址, ping 必 100% 丢,
+            # 报故障会误导用户)。改成 info 标注
+            if _is_known_fake_gateway(gw) or _is_vpn_interface(iface):
+                # 区分两种情况给不同状态文案
+                if _is_known_fake_gateway(gw):
+                    reason = "VPN 占位 (假网关, 已跳过)"
+                else:
+                    reason = f"VPN 虚拟接口 ({iface}, 已跳过)"
+                return {
+                    "gateway": gw,
+                    "interface": iface,
+                    "metric": route["metric"],
+                    "ping_loss_pct": None,
+                    "ping_avg_ms": None,
+                    "status": reason,
+                    "_critical": False,
+                }
             ping_result = ping_host(gw, count=10, timeout=15)
             status = ("正常" if ping_result["loss_pct"] == 0 else
                       f"丢包 {ping_result['loss_pct']}%"
@@ -2529,7 +2632,7 @@ class MultiEgressDetector:
                         "detail": "该出口链路可能存在问题，建议检查物理连接或网络设备"
                     })
 
-        multiple_egress = len(default_routes) > 1 or len(vpn_adapters) > 0 or len(first_hops) > 1
+        multiple_egress = len(real_default) > 1 or len(vpn_adapters) > 0 or len(first_hops) > 1
 
         self.results = {
             "default_routes": default_routes,
@@ -3190,12 +3293,47 @@ class RouteTableAnalyzer:
 
         # 检查异常
         default_routes = [r for r in routes if r["destination"] == "0.0.0.0"]
-        if len(default_routes) > 1:
+        # 排除"假网关" / VPN 虚拟接口占位 (ZeroTier 25.255.255.254 / Tailscale
+        # 默认接口的 gateway 等, 不可达或走 VPN 隧道, 不算真"多默认路由")
+        real_default_routes = [
+            r for r in default_routes
+            if not _is_known_fake_gateway(r.get("gateway", ""))
+            and not _is_vpn_interface(r.get("interface", ""))
+        ]
+        fake_default_routes = [
+            r for r in default_routes
+            if _is_known_fake_gateway(r.get("gateway", ""))
+            or _is_vpn_interface(r.get("interface", ""))
+        ]
+        if len(real_default_routes) > 1:
+            msg = f"多条默认路由 ({len(real_default_routes)} 条)"
+            detail = "可能导致流量路径不确定"
+            if fake_default_routes:
+                # 提示用户: 这些不是真问题, 是 VPN 客户端的占位
+                fake_str = ", ".join(
+                    f"{r['gateway']}(metric={r.get('metric','?')})"
+                    for r in fake_default_routes)
+                detail += f"。另有 {len(fake_default_routes)} 条 VPN 占位/虚拟接口已忽略: {fake_str}"
             issues.append({
                 "type": "multiple_default",
                 "severity": "warning",
-                "message": f"多条默认路由 ({len(default_routes)} 条)",
-                "detail": "可能导致流量路径不确定"
+                "message": msg,
+                "detail": detail,
+            })
+        elif len(default_routes) > 1 and fake_default_routes:
+            # 唯一真默认路由 + 一条或多条假网关 -> 不报警, 改报 info 提示
+            fake_str = ", ".join(
+                f"{r['gateway']}(metric={r.get('metric','?')})"
+                for r in fake_default_routes)
+            issues.append({
+                "type": "fake_gateway_present",
+                "severity": "info",
+                "message": f"检测到 {len(fake_default_routes)} 条 VPN 占位/虚拟接口默认路由",
+                "detail": f"{fake_str}。可能是 VPN 客户端 (ZeroTier/Tailscale/WireGuard 等) "
+                          f"为触发 Windows 网络分类或自身转发而插入的占位默认路由, "
+                          f"不可达或走 VPN 隧道, 不影响真实流量。"
+                          f"如需关闭可在对应 VPN 客户端关闭 'Allow Default Route' / "
+                          f"'Allow Global IPs' 等选项。"
             })
 
         # 检查异常路由 (目标为具体 IP 但掩码为 255.255.255.255 的大量主机路由)
