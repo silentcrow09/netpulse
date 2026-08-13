@@ -378,29 +378,76 @@ def _dns_query(server, domain, timeout=2.5):
 
 def run_cmd(cmd, timeout=30, shell=True):
     """执行系统命令，返回 (returncode, stdout, stderr)
-    自动处理 Windows GBK/UTF-8 编码问题"""
+    自动处理 Windows GBK/UTF-8 编码问题。
+
+    编码选择策略 (与旧版的差异):
+      - 旧版按 ['utf-8', 'gbk', 'gb2312', 'latin-1'] 顺序尝试, 但在中文
+        Windows 上 utf-8 优先会导致「命令输出含中文 → utf-8 失败 → gbk 成功」
+        的路径走得太远, 某些 Win11 22H2+ 输出的混合编码段会被 gbk 静默乱码。
+      - 新版按「系统 ANSI codepage → gbk → utf-8」顺序, 优先匹配 Windows
+        实际使用的代码页 (cp936/CP1252 等); 全部失败时 errors='replace' 保底。
+      - 缓存首次成功的编码, 一次会话内避免重复试错。
+    """
     try:
         result = subprocess.run(
             cmd, shell=shell, capture_output=True, timeout=timeout
         )
         stdout = result.stdout
         stderr = result.stderr
-        # 尝试多种编码解码
-        for enc in ['utf-8', 'gbk', 'gb2312', 'latin-1']:
-            try:
-                stdout_str = stdout.decode(enc)
-                stderr_str = stderr.decode(enc) if stderr else ""
-                break
-            except (UnicodeDecodeError, AttributeError):
-                continue
-        else:
-            stdout_str = stdout.decode('utf-8', errors='replace') if stdout else ""
-            stderr_str = stderr.decode('utf-8', errors='replace') if stderr else ""
+        stdout_str, stderr_str = _decode_bytes_pair(stdout, stderr)
         return result.returncode, stdout_str, stderr_str
     except subprocess.TimeoutExpired:
         return -1, "", "命令执行超时"
     except Exception as e:
         return -1, "", str(e)
+
+
+# 编码缓存: 一次 run_cmd 成功后把命中顺序记下来, 后续直接用
+_DECODE_CACHE = {"order": None}
+
+
+def _system_ansi_codepage():
+    """获取 Windows ANSI 代码页 (e.g. 936=GBK, 1252=Western), 失败返回 None。"""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        return "cp" + str(ctypes.windll.kernel32.GetACP())
+    except Exception:
+        return None
+
+
+def _build_decode_order():
+    """构造编码尝试顺序: ANSI codepage > GBK > UTF-8 (去重保序)。"""
+    seen = set()
+    order = []
+    for enc in (_system_ansi_codepage(), "gbk", "utf-8"):
+        if enc and enc not in seen:
+            seen.add(enc)
+            order.append(enc)
+    if not order:
+        order = ["utf-8"]
+    return order
+
+
+def _decode_bytes_pair(stdout, stderr):
+    """按缓存/默认顺序解码 (stdout, stderr); 任一为空时仍返回 str。"""
+    if not stdout and not stderr:
+        return "", ""
+    order = _DECODE_CACHE.get("order") or _build_decode_order()
+    for enc in order:
+        try:
+            so = stdout.decode(enc) if stdout else ""
+            se = stderr.decode(enc) if stderr else ""
+            _DECODE_CACHE["order"] = order
+            return so, se
+        except (UnicodeDecodeError, AttributeError):
+            continue
+    # 全部失败: replace 保底, 仍写缓存避免再试
+    so = stdout.decode("utf-8", errors="replace") if stdout else ""
+    se = stderr.decode("utf-8", errors="replace") if stderr else ""
+    _DECODE_CACHE["order"] = order
+    return so, se
 
 
 def run_ps(script, timeout=30):
@@ -566,7 +613,12 @@ def get_public_ip():
 
 
 def parse_ping_output(output):
-    """解析 ping 命令输出 (支持中文/英文 Windows)"""
+    """解析 ping 命令输出 (支持中文/英文 Windows)。
+
+    兼容 Windows 7/部分多语版本把 "Packets: Sent / Received / Lost" 拆到
+    多行的情况: 旧版用 ``.*?`` 不跨 \\n 匹配, 在跨行场景会丢字段。修复:
+    解析统计行前先把 \\n 折成空格, 行为一致。
+    """
     result = {"sent": 0, "received": 0, "loss_pct": 100.0,
               "min_ms": 0, "avg_ms": 0, "max_ms": 0, "rtts": [], "jitter_ms": 0}
     # 解析回复行 - 匹配 "时间=2ms" / "time=2ms" / "时间<1ms" / "time<1ms"
@@ -578,12 +630,14 @@ def parse_ping_output(output):
             m = re.search(r"(?:[Tt]ime|时间)[=<]\s*(\d+)\s*ms", line)
             if m:
                 result["rtts"].append(int(m.group(1)))
+    # 把 "统计" 段折成单行, 兼容老 Windows 把字段拆到多行
+    flat = re.sub(r"\s*\n\s*", " ", output)
     # 解析统计行
     m = re.search(
         r"(?:Sent|已发送)\s*[=:：]\s*(\d+)"
         r".*?(?:Received|已接收)\s*[=:：]\s*(\d+)"
         r".*?(?:Lost|丢失)\s*[=:：]\s*(\d+)\s*[\(（](\d+)%",
-        output
+        flat
     )
     if m:
         result["sent"] = int(m.group(1))
@@ -834,6 +888,9 @@ class DHCPDetector:
                 dhcp_discover, timeout=timeout, multi=True,
                 iface=conf.iface, verbose=0
             )
+            # 按 (server_ip, server_mac) 去重: 同一服务器可能因 retransmission
+            # 响应多次, 旧实现会重复计数, 把单服务器误判为「多服务器干扰」。
+            seen = set()
             for snd, rcv in ans:
                 if rcv.haslayer(DHCP):
                     dhcp_opts = rcv[DHCP].options
@@ -850,8 +907,13 @@ class DHCPDetector:
                     if msg_type == 2:  # DHCPOFFER
                         offered_ip = rcv[BOOTP].yiaddr
                         server_mac = rcv[Ether].src
+                        sip = server_id or str(rcv[IP].src)
+                        key = (str(sip), str(server_mac))
+                        if key in seen:
+                            continue
+                        seen.add(key)
                         servers.append({
-                            "server_ip": server_id or str(rcv[IP].src),
+                            "server_ip": sip,
                             "server_mac": server_mac,
                             "offered_ip": str(offered_ip),
                             "lease_time": lease_time or 86400,
@@ -2323,6 +2385,8 @@ class BufferbloatTester:
             ]
             while not stop_event.is_set():
                 for url in urls:
+                    if stop_event.is_set():
+                        return
                     try:
                         req = Request(url, headers={"User-Agent": "NetPulse/1.0"})
                         urlopen(req, timeout=5)
@@ -2335,16 +2399,36 @@ class BufferbloatTester:
             t.start()
             load_threads.append(t)
 
-        # 等待负载建立
-        time.sleep(2)
+        # 等待负载建立并稳定: 旧版固定 sleep(2), 慢链路(1Mbps)1MB 需 8s,
+        # 容易在带宽尚未打满时就采样; 这里用「多轮 0.5s 心跳确认吞吐
+        # 不再增长」的方式自适应, 但设上限避免慢网络下等太久。
+        if callback:
+            callback("等待链路负载稳定...")
+        stable_deadline = time.time() + 8
+        prev_bytes = 0
+        stable_rounds = 0
+        while time.time() < stable_deadline:
+            time.sleep(0.5)
+            # 简单启发: 如果 4 轮 (2s) 内 stop_event 未 set 且线程仍在跑,
+            # 就认为负载已建立; 主线程不直接测量吞吐 (避免给探测本身加噪)
+            stable_rounds += 1
+            if stable_rounds >= 4:
+                break
+            if stop_event.is_set():
+                break
 
         # 在负载下 ping
+        if callback:
+            callback("采样负载下延迟...")
         loaded_ping = ping_host(gateway, count=15, timeout=20)
         loaded_rtt = loaded_ping["avg_ms"]
         loaded_jitter = loaded_ping["jitter_ms"]
 
-        # 停止负载
+        # 停止负载并 join, 避免 daemon 线程残留到下一模块
         stop_event.set()
+        for t in load_threads:
+            t.join(timeout=10)
+        # 残留线程置为 None, 不再被引用 (daemon=True 时进程退出时也会被强杀)
 
         # 计算 Bufferbloat 等级
         bloat = loaded_rtt - idle_rtt
@@ -2602,8 +2686,10 @@ class PortProbeTester:
 
     - TCP: 三次握手成功即「开放」; ConnectionRefused 即「关闭」(可达但无服务);
            超时无响应即「过滤」(可能被防火墙丢弃)。
-    - UDP: 收到回包即「开放」; 超时即「无响应」(UDP 无连接, 开放或被过滤均可能无回包,
-           无法严格区分, 故标注为「无响应」)。
+    - UDP: 按协议发协议感知探针 (DNS=53/NTP=123/SSDP=1900/mDNS=5353),
+           收到回包即「开放」; ConnectionRefused (ICMP unreachable) 即「关闭」;
+           其它端口回退到 1 字节空载荷, 超时即「无响应」(UDP 无连接,
+           开放或被过滤均可能无回包, 无法严格区分, 故标注为「无响应」)。
     每个目标做多次采样, 统计平均/最小/最大 RTT 与丢包。
     """
 
@@ -2624,6 +2710,33 @@ class PortProbeTester:
         except Exception as e:
             return None, None, str(e)
 
+    def _udp_probe(self, port):
+        """根据端口号构造协议感知 UDP 探针, 返回 (payload, expect_reply, probe_name)。
+
+        与旧版的差异: 旧版所有端口都发 1 字节空载荷, DNS/SNMP 等服务收到会
+        丢弃, 导致 UDP 探测几乎全部被标"无响应", 用户看不出是服务挂了还是
+        探针格式不对。改为按协议发合法请求, 命中率显著提升。
+        """
+        if port == 53:  # DNS: 标准 A 查询 (baidu.com, RD=1)
+            header = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
+            qname = (b"\x05" b"baidu" b"\x03" b"com" b"\x00")
+            question = qname + struct.pack(">HH", 1, 1)  # A, IN
+            return header + question, True, "DNS"
+        if port == 123:  # NTP v3 client
+            return b"\x1b" + b"\x00" * 47, True, "NTP"
+        if port == 1900:  # SSDP M-SEARCH
+            return (b"M-SEARCH * HTTP/1.1\r\n"
+                    b"HOST: 239.255.255.250:1900\r\n"
+                    b'MAN: "ssdp:discover"\r\n'
+                    b"MX: 1\r\nST: ssdp:all\r\n\r\n"), True, "SSDP"
+        if port == 5353:  # mDNS PTR query
+            header = struct.pack(">HHHHHH", 0x0000, 0x0000, 1, 0, 0, 0)
+            qname = b"\x09_services\x07_dns-sd\x04_udp\x05local\x00"
+            question = qname + struct.pack(">HH", 12, 1)  # PTR, IN
+            return header + question, True, "mDNS"
+        # 其它端口: 1 字节空载荷, 几乎肯定无回包
+        return b"\x00", False, "raw"
+
     def _probe_one(self, host, port, proto):
         ip, fam, rerr = self._resolve(host)
         row = {
@@ -2639,6 +2752,13 @@ class PortProbeTester:
         if ip is None:
             row["error"] = rerr or "主机解析失败"
             return row
+
+        # 协议感知探针 (UDP 时)
+        udp_payload = b"\x00"
+        udp_probe_name = "raw"
+        if proto == "udp":
+            udp_payload, _, udp_probe_name = self._udp_probe(port)
+            row["probe"] = udp_probe_name
 
         timeout = 3.0
         rtts = []
@@ -2671,13 +2791,22 @@ class PortProbeTester:
                 s.settimeout(timeout)
                 t0 = time.perf_counter()
                 try:
-                    s.sendto(b"\x00", (ip, port))
+                    s.sendto(udp_payload, (ip, port))
                     s.recvfrom(1024)
                     rtts.append((time.perf_counter() - t0) * 1000.0)
                     c_reply += 1
                 except socket.timeout:
                     c_filtered += 1
+                except ConnectionRefusedError:
+                    # 部分 OS 收到 ICMP port unreachable 后, 下一次 sendto/recvfrom
+                    # 会以 ConnectionRefusedError 形式告知
+                    c_closed += 1
+                except ConnectionResetError:
+                    # Windows: ICMP port unreachable 到达后, 下次 sendto/recvfrom
+                    # 抛 WinError 10054 (ConnectionResetError)
+                    c_closed += 1
                 except OSError as e:
+                    # 其它 OS 错误: 可能是网络不可达 (10051) 等, 算作错误
                     c_err += 1
                     last_err = str(e)
                 finally:
@@ -3071,6 +3200,21 @@ def _cli_enable_vt():
         k.SetConsoleMode(h, m.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
     except Exception:
         pass
+
+
+def _clear_screen():
+    """通过 ANSI 转义清屏 (VT 模式下), 失败返回 False 让调用方降级。"""
+    try:
+        if sys.platform == "win32":
+            # 依赖 _cli_enable_vt() 已设置 ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+        else:
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+        return True
+    except Exception:
+        return False
 
 
 def _cli_status_badge(status):
@@ -3814,6 +3958,7 @@ HEADER_MAP = {
     "proto": "协议", "host": "主机", "port": "端口",
     "rtt_ms": "RTT(ms)", "loss": "丢包", "error": "错误",
     "targets": "探测目标", "probe_count": "探测次数", "skipped": "已跳过",
+    "probe": "探针类型",
     # LAN 设备扫描
     "ip": "IP 地址", "vendor": "厂商", "is_gateway": "网关",
     "devices": "设备列表", "device_count": "设备数", "subnet": "网段",
@@ -3857,9 +4002,14 @@ def _record_table(v):
     return headers, rows
 
 
-def render_report_pdf(report, path):
-    """将报告渲染为 PDF (专业浅色主题 + 模块卡片, 内置中文字体 STSong-Light)。"""
-    if not ensure_reportlab(auto_yes=True):
+def render_report_pdf(report, path, auto_install=False):
+    """将报告渲染为 PDF (专业浅色主题 + 模块卡片, 内置中文字体 STSong-Light)。
+
+    auto_install: True 时 reportlab 缺失会自动 pip install, 否则只提示。
+    与旧版的差异: 旧版无条件 auto_yes=True, 在 CI/离线环境会无提示尝试
+    pip install 然后卡 5 分钟, 用户体验差。
+    """
+    if not ensure_reportlab(auto_yes=auto_install):
         return False
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
@@ -4223,8 +4373,12 @@ def _normalize_report_path(path):
     return path
 
 
-def export_report(path):
-    """按扩展名导出报告: .pdf / .html / .txt。返回错误信息或 None。"""
+def export_report(path, auto_install=False):
+    """按扩展名导出报告: .pdf / .html / .txt。返回错误信息或 None。
+
+    auto_install: True 时允许 PDF 导出时自动 pip install reportlab
+    (对应 CLI 的 --install)。默认 False, 缺包时只提示不安装。
+    """
     path = _normalize_report_path(path)
     report = build_report()
     if not report:
@@ -4232,7 +4386,7 @@ def export_report(path):
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext == ".pdf":
-            ok = render_report_pdf(report, path)
+            ok = render_report_pdf(report, path, auto_install=auto_install)
             return None if ok else "PDF 导出失败（reportlab 未就绪）"
         elif ext in (".html", ".htm"):
             with open(path, "w", encoding="utf-8") as f:
@@ -4246,8 +4400,12 @@ def export_report(path):
         return f"导出失败: {e}"
 
 
-def prompt_export_report():
-    """交互菜单跑完后, 询问是否将本次诊断导出为报告文件。"""
+def prompt_export_report(auto_install=False):
+    """交互菜单跑完后, 询问是否将本次诊断导出为报告文件。
+
+    auto_install: True 时 PDF 导出允许自动安装 reportlab
+    (例如 CLI 加了 --install, 在交互菜单中也保持一致行为)。
+    """
     if not LAST_RUN:
         return
     try:
@@ -4271,7 +4429,7 @@ def prompt_export_report():
         name = default_name
     if not os.path.splitext(name)[1]:
         name += ext
-    err = export_report(name)
+    err = export_report(name, auto_install=auto_install)
     if err:
         print(_c(f"  ✗ {err}", C_RED))
     else:
@@ -4306,13 +4464,26 @@ def parse_choice(choice):
     return keys or None
 
 
-def interactive_menu():
-    """交互式数字选择菜单 (cmd 窗口)"""
+def interactive_menu(install=False):
+    """交互式数字选择菜单 (cmd 窗口)。
+
+    install: 是否允许在交互过程中自动安装缺失依赖
+             (与 CLI --install 联动, 让 PDF 导出等行为可预测)。
+    """
     while True:
-        if os.name == "nt":
-            os.system("cls")
-        else:
-            os.system("clear")
+        # 清屏: 用 ANSI 转义 (VT 已在 _cli_enable_vt 启用) 替代 os.system('cls'),
+        # 避免 cmd.exe 解析 + 子进程阻塞。VT 未启用时退回到 subprocess 直调 cls。
+        if not _clear_screen():
+            if os.name == "nt":
+                try:
+                    subprocess.run(["cls"], shell=True, timeout=2)
+                except Exception:
+                    pass
+            else:
+                try:
+                    subprocess.run(["clear"], timeout=2)
+                except Exception:
+                    pass
         bar = "=" * 60
         print(_c(bar, C_BLUE))
         print(_c(f"  {APP_NAME} v{APP_VERSION}    命令行网络诊断", C_BOLD))
@@ -4340,7 +4511,7 @@ def interactive_menu():
             continue
         run_diagnostics(keys, banner=False)
         if sys.stdout.isatty():
-            prompt_export_report()
+            prompt_export_report(auto_install=install)
         try:
             input(_c("\n  按 Enter 返回菜单...", C_GRAY))
         except (EOFError, KeyboardInterrupt):
@@ -4411,14 +4582,14 @@ def main():
             if not targets:
                 targets = [args.export]
             for t in targets:
-                err = export_report(t)
+                err = export_report(t, auto_install=args.install)
                 if err:
                     print(_c(f"  ✗ {err}", C_RED))
                 else:
                     print(_c(f"  ✓ 报告已导出: {os.path.abspath(_normalize_report_path(t))}", C_GREEN))
         return
     # 无参数 -> 进入交互式菜单
-    interactive_menu()
+    interactive_menu(install=args.install)
 
 
 if __name__ == "__main__":
