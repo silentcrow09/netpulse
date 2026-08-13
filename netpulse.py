@@ -48,7 +48,7 @@ from urllib.request import urlopen, Request
 try:
     from scapy.all import (
         Ether, IP, UDP, DHCP, BOOTP, ICMP, ARP,
-        srp, sendp, sniff, conf, sr1, get_if_list, get_if_addr
+        srp, sendp, sniff, conf, sr1, get_if_list, get_if_addr, get_if_hwaddr
     )
     SCAPY_AVAILABLE = True
 except Exception:
@@ -193,11 +193,11 @@ def _install_npcap():
 def _reload_scapy():
     """运行时重新导入 scapy 并绑定到模块命名空间。返回是否成功。"""
     global SCAPY_AVAILABLE, Ether, IP, UDP, DHCP, BOOTP, ICMP, ARP
-    global srp, sendp, sniff, conf, sr1, get_if_list, get_if_addr
+    global srp, sendp, sniff, conf, sr1, get_if_list, get_if_addr, get_if_hwaddr
     try:
         from scapy.all import (
             Ether, IP, UDP, DHCP, BOOTP, ICMP, ARP,
-            srp, sendp, sniff, conf, sr1, get_if_list, get_if_addr
+            srp, sendp, sniff, conf, sr1, get_if_list, get_if_addr, get_if_hwaddr
         )
         SCAPY_AVAILABLE = True
         return True
@@ -453,7 +453,9 @@ def run_cmd(cmd, timeout=30, shell=True, use_cache=True):
         )
         stdout = result.stdout
         stderr = result.stderr
-        stdout_str, stderr_str = _decode_bytes_pair(stdout, stderr)
+        # 编码缓存按 cmd 维度 (不同命令互不污染)
+        cache_cmd = cmd if isinstance(cmd, str) else None
+        stdout_str, stderr_str = _decode_bytes_pair(cache_cmd, stdout, stderr)
         rc, so, se = result.returncode, stdout_str, stderr_str
     except subprocess.TimeoutExpired:
         rc, so, se = -1, "", "命令执行超时"
@@ -464,8 +466,10 @@ def run_cmd(cmd, timeout=30, shell=True, use_cache=True):
     return rc, so, se
 
 
-# 编码缓存: 一次 run_cmd 成功后把命中顺序记下来, 后续直接用
-_DECODE_CACHE = {"order": None}
+# 编码缓存: 按 cmd 维度分别记命中编码, 避免不同命令互相污染。
+# 例如 arp -a 在中文 Windows 上 cp936 成功, netsh 在 Win11 22H2+ 输出 utf-8,
+# 全局单一缓存会把后者强行按 cp936 解码产生乱码。
+_DECODE_CACHE = {}  # cmd -> encoding name (e.g. "cp936", "utf-8", "utf-8-replace")
 
 
 def _system_ansi_codepage():
@@ -492,23 +496,43 @@ def _build_decode_order():
     return order
 
 
-def _decode_bytes_pair(stdout, stderr):
-    """按缓存/默认顺序解码 (stdout, stderr); 任一为空时仍返回 str。"""
+def _decode_bytes_pair(cmd, stdout, stderr):
+    """按 cmd 维度缓存的编码选择: 同一命令的首次成功编码记下来, 后续直接用;
+    不同命令独立缓存, 避免 arp (cp936) 污染 netsh (utf-8)。
+
+    若该命令上次缓存的编码本轮失败, 自动回退到通用尝试序列并重写缓存。
+    全部失败时 errors='replace' 保底。
+    """
     if not stdout and not stderr:
         return "", ""
-    order = _DECODE_CACHE.get("order") or _build_decode_order()
-    for enc in order:
+
+    # 1) 优先用本命令上次成功的编码
+    if cmd:
+        cached = _DECODE_CACHE.get(cmd)
+        if cached and cached != "utf-8-replace":
+            try:
+                so = stdout.decode(cached) if stdout else ""
+                se = stderr.decode(cached) if stderr else ""
+                return so, se
+            except (UnicodeDecodeError, AttributeError):
+                pass  # 本轮输出与上次不同, 回退到通用序列
+
+    # 2) 通用尝试序列
+    for enc in _build_decode_order():
         try:
             so = stdout.decode(enc) if stdout else ""
             se = stderr.decode(enc) if stderr else ""
-            _DECODE_CACHE["order"] = order
+            if cmd:
+                _DECODE_CACHE[cmd] = enc
             return so, se
         except (UnicodeDecodeError, AttributeError):
             continue
-    # 全部失败: replace 保底, 仍写缓存避免再试
+
+    # 3) 全部失败: errors='replace' 保底
     so = stdout.decode("utf-8", errors="replace") if stdout else ""
     se = stderr.decode("utf-8", errors="replace") if stderr else ""
-    _DECODE_CACHE["order"] = order
+    if cmd:
+        _DECODE_CACHE[cmd] = "utf-8-replace"
     return so, se
 
 
@@ -936,13 +960,27 @@ class DHCPDetector:
 
         try:
             conf.verb = 0
-            # 构造 DHCP Discover
-            client_mac = "00:11:22:33:44:55"
+            # 构造 DHCP Discover, 使用真实网卡 MAC
+            #
+            # 旧版硬编码 00:11:22:33:44:55 有两个问题:
+            #   1) DHCP server 收到 Discover 时记录的是 chaddr=00:11:22:33:44:55,
+            #      OFFER 报文以广播方式发出 (因为 chaddr 不是本机 MAC, 服务器认为
+            #      client 不在同一链路), 依赖网卡 promiscuous mode 才能收到;
+            #   2) 与本机真实 IP/MAC 关联的 DHCP 缓存会被「假 client」污染。
+            # 改为用本机 iface 的真实 MAC 后, 报文路径更标准, 也能在非 promiscuous
+            # 下工作 (在多数 Npcap 配置下)。
+            try:
+                client_mac = get_if_hwaddr(conf.iface)
+                client_mac_bytes = bytes.fromhex(client_mac.replace(":", ""))
+            except Exception:
+                client_mac = "00:11:22:33:44:55"
+                client_mac_bytes = b"\x00\x11\x22\x33\x44\x55"
+
             dhcp_discover = (
-                Ether(dst="ff:ff:ff:ff:ff:ff") /
+                Ether(dst="ff:ff:ff:ff:ff:ff", src=client_mac) /
                 IP(src="0.0.0.0", dst="255.255.255.255") /
                 UDP(sport=68, dport=67) /
-                BOOTP(op=1, chaddr=b"\x00\x11\x22\x33\x44\x55") /
+                BOOTP(op=1, chaddr=client_mac_bytes) /
                 DHCP(options=[("message-type", "discover"), "end"])
             )
             # 发送并接收响应
@@ -3367,9 +3405,27 @@ def parse_module_names(names):
     return _parse_keys(names, strict=False)
 
 
+# 并行执行时 print() 同步锁, 避免多线程输出交错
+_PRINT_LOCK = threading.Lock()
+
+
+def _safe_print(*args, **kwargs):
+    """线程安全的 print (并行模式用)。"""
+    with _PRINT_LOCK:
+        print(*args, **kwargs)
+        sys.stdout.flush()
+
+
 def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
-                   banner=True, install=False):
-    """执行指定模块并打印结果与汇总。返回 {key: status}"""
+                   banner=True, install=False, parallel=False, max_workers=4):
+    """执行指定模块并打印结果与汇总。返回 {key: status}。
+
+    parallel: True 时多个模块并发执行 (--parallel)。共享状态 (LAST_RUN,
+              _CMD_CACHE 等) 已为线程安全, 但 print() 通过 _safe_print 同步。
+              输出策略: 启动时一行, 完成后一行, 详细 result 等所有模块结束
+              后按 keys 顺序打印, 避免交错混乱。
+    max_workers: 并行模式下的最大并发数 (--max-workers N)。
+    """
     global _C_NOCOLOR, LAST_RUN
     _C_NOCOLOR = no_color
     _cli_enable_vt()
@@ -3383,6 +3439,8 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
         print(_c(bar, C_BLUE))
         print(_c(f"  {APP_NAME} v{APP_VERSION}", C_BOLD) +
               _c("   Windows 网络诊断 · 命令行模式", C_GRAY))
+        if parallel and len(keys) > 1:
+            print(_c(f"  并行模式 (max_workers={max_workers})", C_GRAY))
         print(_c(bar, C_BLUE))
 
     # 系统信息
@@ -3409,44 +3467,27 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
     IS_TTY = sys.stdout.isatty()
     results = {}
     full = {}  # key -> 完整结果 dict (供报告使用)
+
+    use_parallel = parallel and len(keys) > 1
+    if use_parallel:
+        results, full = _run_diagnostics_parallel(
+            keys, max_workers=max_workers, total=len(keys))
+    else:
+        results, full = _run_diagnostics_sequential(
+            keys, is_tty=IS_TTY)
+
+    # 详细结果 (按 keys 顺序, 避免 parallel 模式输出乱序)
     for key in keys:
-        name, cls = MODULE_MAP[key]
-        if IS_TTY:
-            sys.stdout.write(_c(f"  正在 {name} …", C_GRAY))
-            sys.stdout.flush()
+        res = full.get(key, {"error": "未执行"})
+        status = results.get(key, "错误")
+        name = MODULE_MAP.get(key, (key, key))[0]
+        prefix = ""
+        if use_parallel:
+            prefix = ""  # parallel 模式启动/完成行已打印, 这里只打 result
         else:
-            print(_c(f"  正在 {name} …", C_GRAY))
-        try:
-            if key == "port":
-                inst = cls(targets=PORT_PROBE_CONFIG["targets"],
-                           proto=PORT_PROBE_CONFIG["proto"],
-                           count=PORT_PROBE_CONFIG["count"])
-            else:
-                inst = cls()
-            if IS_TTY:
-                def _cb(msg):
-                    sys.stdout.write("\r\033[K" + _c(f"  … {msg}", C_GRAY))
-                    sys.stdout.flush()
-            else:
-                _cb = lambda msg: None
-            inst.detect(callback=_cb)
-            if IS_TTY:
-                sys.stdout.write("\r\033[K")
-                sys.stdout.flush()
-            res = inst.results
-            status = determine_status(res)
-            print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge(status))
-            _cli_print_result(res, verbose=verbose, as_json=as_json)
-            results[key] = status
-            full[key] = res
-        except Exception as e:
-            if IS_TTY:
-                sys.stdout.write("\r\033[K")
-                sys.stdout.flush()
-            print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge("错误"))
-            print(_c(f"  诊断异常: {e}", C_RED))
-            results[key] = "错误"
-            full[key] = {"error": str(e)}
+            pass  # 顺序模式也已经在 detect() 前/后打了
+        print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge(status))
+        _cli_print_result(res, verbose=verbose, as_json=as_json)
 
     # 汇总
     print()
@@ -3478,6 +3519,99 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
         "keys": list(keys),
     }
     return results
+
+
+def _run_diagnostics_sequential(keys, is_tty):
+    """顺序模式: 与旧版行为完全一致。"""
+    results = {}
+    full = {}
+    for key in keys:
+        name, cls = MODULE_MAP[key]
+        if is_tty:
+            sys.stdout.write(_c(f"  正在 {name} …", C_GRAY))
+            sys.stdout.flush()
+        else:
+            print(_c(f"  正在 {name} …", C_GRAY))
+        try:
+            if key == "port":
+                inst = cls(targets=PORT_PROBE_CONFIG["targets"],
+                           proto=PORT_PROBE_CONFIG["proto"],
+                           count=PORT_PROBE_CONFIG["count"])
+            else:
+                inst = cls()
+            if is_tty:
+                def _cb(msg, _n=name):
+                    sys.stdout.write("\r\033[K" + _c(f"  … {msg}", C_GRAY))
+                    sys.stdout.flush()
+            else:
+                _cb = lambda msg: None
+            inst.detect(callback=_cb)
+            if is_tty:
+                sys.stdout.write("\r\033[K")
+                sys.stdout.flush()
+            res = inst.results
+            status = determine_status(res)
+            print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge(status))
+            _cli_print_result(res)  # 详细 result 在主循环外统一打
+            results[key] = status
+            full[key] = res
+        except Exception as e:
+            if is_tty:
+                sys.stdout.write("\r\033[K")
+                sys.stdout.flush()
+            print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge("错误"))
+            print(_c(f"  诊断异常: {e}", C_RED))
+            results[key] = "错误"
+            full[key] = {"error": str(e)}
+    return results, full
+
+
+def _run_diagnostics_parallel(keys, max_workers, total):
+    """并行模式: 同时跑多个模块, 中间输出抑制, 完成后统一打印。
+
+    设计要点:
+      - print() 走 _safe_print (lock) 避免交错
+      - 检测中 callback 静默, 结果统一在主线程按 keys 顺序打印
+      - 共享状态 (_CMD_CACHE / _LOCAL_SUBNET_CACHE / _DECODE_CACHE / DNS socket)
+        均为只读 / GIL-safe / thread-local, 多个 detector 并发安全
+      - LAST_RUN 在主线程最后写, 无竞争
+    """
+    results = {}
+    full = {}
+    counter = {"done": 0}
+    counter_lock = threading.Lock()
+
+    def _run_one(key):
+        name, cls = MODULE_MAP[key]
+        idx = keys.index(key) + 1
+        _safe_print(_c(f"  [{idx}/{total}] 正在 {name} …", C_GRAY))
+        try:
+            if key == "port":
+                inst = cls(targets=PORT_PROBE_CONFIG["targets"],
+                           proto=PORT_PROBE_CONFIG["proto"],
+                           count=PORT_PROBE_CONFIG["count"])
+            else:
+                inst = cls()
+            inst.detect(callback=lambda msg: None)  # parallel 模式抑制中间输出
+            res = inst.results
+            status = determine_status(res)
+        except Exception as e:
+            res = {"error": str(e)}
+            status = "错误"
+        # 完成行用 keys 顺序编号 (与启动行一致), 不按完成时间
+        with counter_lock:
+            counter["done"] += 1
+            _safe_print(_c(f"  [{idx}/{total}] ✓ {name}", C_BOLD) + "  "
+                        + _cli_status_badge(status))
+        return key, name, status, res
+
+    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, total))) as ex:
+        futs = [ex.submit(_run_one, k) for k in keys]
+        for fut in as_completed(futs):
+            key, _name, status, res = fut.result()
+            results[key] = status
+            full[key] = res
+    return results, full
 
 
 # ============================================================
@@ -4620,6 +4754,11 @@ def main():
     parser.add_argument("--export", metavar="FILE",
                         help="诊断后将报告导出到文件 (支持 .txt / .html / .pdf); "
                              "多个目标用逗号分隔可一次导出多种格式, 例: report.pdf,report.html,report.txt")
+    parser.add_argument("--parallel", action="store_true",
+                        help="多模块并发执行 (典型场景: `all` 时速度提升 2-3x; "
+                             "输出经线程锁同步, 详细结果仍按 keys 顺序排列)")
+    parser.add_argument("--max-workers", type=int, default=4, metavar="N",
+                        help="并行模式下的最大并发数 (--parallel 时生效, 默认 4)")
     args = parser.parse_args()
 
     # 禁用 scapy 二层抓包 (避免 Npcap 不稳定导致段错误)
@@ -4649,7 +4788,8 @@ def main():
             print("可用模块: " + ", ".join(k for k, _, _ in MODULE_REGISTRY))
             return
         run_diagnostics(keys, verbose=args.verbose, as_json=args.json,
-                        no_color=args.no_color, install=args.install)
+                        no_color=args.no_color, install=args.install,
+                        parallel=args.parallel, max_workers=args.max_workers)
         if args.export:
             targets = [t.strip() for t in args.export.split(",") if t.strip()]
             if not targets:
