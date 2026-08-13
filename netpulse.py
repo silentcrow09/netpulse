@@ -493,6 +493,48 @@ def get_dns_servers():
     return dns_servers
 
 
+# 本机 IP -> 真实子网的缓存 (PowerShell Get-NetIPAddress 查询较慢, 一次会话内复用)
+_LOCAL_SUBNET_CACHE = {}
+
+
+def _get_local_subnet(local_ip):
+    """根据本机 IP 解析其所属的 IPv4 子网, 含真实 prefix length。
+
+    返回 ``ipaddress.IPv4Network``, 失败时回退 ``/24`` (兼容老行为)。
+    缓存结果避免重复查询 (一次诊断会话内本机 IP 不变)。
+    """
+    if local_ip in _LOCAL_SUBNET_CACHE:
+        return _LOCAL_SUBNET_CACHE[local_ip]
+    if not local_ip or local_ip == "127.0.0.1":
+        return None
+    try:
+        ipaddress.IPv4Address(local_ip)  # 必须是合法 IPv4
+    except Exception:
+        return None
+    # 用 PowerShell 取真实 prefix length (比解析 ipconfig 文本更稳)
+    try:
+        code, out, _ = run_ps(
+            f"(Get-NetIPAddress -IPAddress '{local_ip}' -AddressFamily IPv4 "
+            "-ErrorAction SilentlyContinue | "
+            "Select-Object -First 1 -ExpandProperty PrefixLength)")
+        m = re.search(r"\b(\d+)\b", out or "")
+        if m:
+            prefix = int(m.group(1))
+            if 0 <= prefix <= 32:
+                net = ipaddress.IPv4Network(f"{local_ip}/{prefix}", strict=False)
+                _LOCAL_SUBNET_CACHE[local_ip] = net
+                return net
+    except Exception:
+        pass
+    # 回退: /24 (写缓存避免重复 powershell 调用, 本机 IP 在一次会话内不变)
+    try:
+        net = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
+        _LOCAL_SUBNET_CACHE[local_ip] = net
+        return net
+    except Exception:
+        return None
+
+
 def get_public_ip():
     """获取公网 IP (国内 IP 服务, 并发请求, 首个成功即返回)。"""
     services = [
@@ -1220,7 +1262,7 @@ class LinkSpeedDetector:
                     elif detail["speed_mbps"] >= 54:
                         detail["assessment"] = "WiFi 速率较低 (802.11g)"
                     else:
-                        detail["assessment"] = "WiFi 速率低"
+                        detail["assessment"] = "WiFi 速率过低"
                 else:
                     if detail["speed_mbps"] >= 1000:
                         detail["assessment"] = "千兆以太网"
@@ -1235,9 +1277,33 @@ class LinkSpeedDetector:
 
             adapter_details.append(detail)
 
+        # 收集需要被 status 检测器识别的告警 (determine_status 只看 result.issues 和
+        # result.assessment, 不会下钻到 adapters[].assessment, 因此极低速/异常需要
+        # 显式提升到顶层 issues 才能触发"警告/异常"状态)
+        issues = []
+        for d in adapter_details:
+            if d["status"] not in ("Up", "已启用"):
+                continue
+            if d.get("is_wifi") and d.get("speed_mbps", 0) < 54:
+                issues.append({
+                    "type": "wifi_rate_low",
+                    "severity": "warning",
+                    "message": f"WiFi 适配器 {d['name']} 协商速率仅 {d.get('speed_mbps', 0):.1f} Mbps",
+                    "detail": "极低速 WiFi 通常由信号弱/距离远/障碍物/驱动异常导致, 建议靠近路由器或检查天线",
+                })
+            elif (not d.get("is_wifi")) and d.get("speed_mbps", 0) > 0 \
+                    and d.get("speed_mbps", 0) < 100:
+                issues.append({
+                    "type": "ethernet_rate_low",
+                    "severity": "warning",
+                    "message": f"有线适配器 {d['name']} 协商速率仅 {d.get('speed_mbps', 0):.1f} Mbps",
+                    "detail": "有线协商到非千兆可能是网线/端口/驱动降速, 建议检查网线类别 (千兆需 Cat5e+) 与端口",
+                })
+
         self.results = {
             "adapters": adapter_details,
             "wifi_details": wifi_details,
+            "issues": issues,
             "timestamp": datetime.now().isoformat(),
             "summary": f"检测到 {len(adapter_details)} 个网络适配器" +
                        (f", WiFi 信号: {wifi_details.get('signal_pct', 'N/A')}" if wifi_details else ""),
@@ -1761,6 +1827,7 @@ class MultiEgressDetector:
         if callback:
             callback("比较到不同目标的路径...")
         first_hops = set()
+        timed_out_targets = []
         tracert_targets = [("223.5.5.5", "AliDNS"),
                            ("114.114.114.114", "114DNS")]
 
@@ -1768,14 +1835,35 @@ class MultiEgressDetector:
             code, tracert_out, _ = run_cmd(
                 f"tracert -d -h 3 -w 1000 {target_ip}", timeout=15)
             hops = parse_tracert_output(tracert_out)
-            return hops[0]["ip"] if hops else None
+            if not hops:
+                return (target_ip, None)
+            ip = hops[0]["ip"]
+            return (target_ip, ip if ip != "*" else None)
 
         with ThreadPoolExecutor(max_workers=2) as ex:
             futs = [ex.submit(_first_hop, t, n) for t, n in tracert_targets]
             for f in as_completed(futs):
-                hop = f.result()
+                target, hop = f.result()
                 if hop:
                     first_hops.add(hop)
+                else:
+                    timed_out_targets.append(target)
+
+        # 全超时也要单独报警, 避免被当 "单一出口"
+        if timed_out_targets and not first_hops:
+            issues.append({
+                "type": "all_first_hops_timed_out",
+                "severity": "warning",
+                "message": f"到 {', '.join(timed_out_targets)} 的第一跳均无响应 (tracert 全部超时)",
+                "detail": "可能是 ICMP 被本地/上游防火墙过滤, 或本地到第一跳的链路异常",
+            })
+        elif timed_out_targets:
+            issues.append({
+                "type": "some_first_hops_timed_out",
+                "severity": "info",
+                "message": f"到 {', '.join(timed_out_targets)} 的第一跳无响应",
+                "detail": "ICMP 探测被部分目标过滤, 仅供参考",
+            })
 
         if len(first_hops) > 1:
             issues.append({
@@ -1975,27 +2063,89 @@ class MTUDetector:
         targets.append("223.5.5.5")
 
         def _measure_mtu(target):
-            # 二分查找 MTU (ICMP payload: MTU - 28)
+            """二分查找 MTU (ICMP payload: MTU - 28)。
+
+            与原实现的区别:
+            - 区分「无信号」(超时/丢包) 与「太大」(DF 拒绝) 两种情形;
+              原实现把超时一律当「太大」, 在 ICMP 被防火墙过滤的环境下
+              会返回错误的 path_mtu (实际上是探测失败, 但被报告为正常)。
+            - 多次无信号直接放弃, 返回 error 而非假数据。
+            - 加入总探测次数上限, 防止边界死循环。
+            """
             low, high = 576, 1472
-            best_mtu = low
-            while low <= high:
+            best_mtu = None
+            ever_fits = False
+            last_fits = False
+            indeterminate_count = 0
+            total_count = 0
+            MAX_INDETERMINATE = 4
+            MAX_TOTAL = 15
+
+            while low <= high and total_count < MAX_TOTAL:
                 mid = (low + high) // 2
+                total_count += 1
                 code, out, _ = run_cmd(
                     f"ping -f -l {mid} -n 1 -w 2000 {target}", timeout=5)
-                if "需要拆分数据包但是设置 DF" in out or \
-                   "Packet needs to be fragmented but DF set" in out or \
-                   " Frag" in out:
+
+                too_big = ("需要拆分数据包但是设置 DF" in out or
+                           "Packet needs to be fragmented but DF set" in out or
+                           " Frag" in out)
+                fits = ("TTL=" in out or "回复" in out or "Reply" in out)
+                no_signal = (
+                    "传输中过期" in out or "timed out" in out or
+                    "100% 丢失" in out or "100% loss" in out or
+                    "请求超时" in out or "Request timed out" in out or
+                    not out.strip() or code != 0
+                )
+
+                if too_big:
                     high = mid - 1
-                elif "TTL" in out or "回复" in out or "Reply" in out:
+                    last_fits = False
+                elif fits:
                     best_mtu = mid
+                    ever_fits = True
+                    last_fits = True
                     low = mid + 1
+                elif no_signal:
+                    indeterminate_count += 1
+                    if indeterminate_count >= MAX_INDETERMINATE:
+                        break
+                    # 范围略缩, 避免边界死循环; 保守假设: 之前若 fits 倾向 +
+                    if last_fits:
+                        low = mid + 1
+                    else:
+                        high = mid - 1
                 else:
-                    high = mid - 1
+                    # 未知输出: 也算无信号
+                    indeterminate_count += 1
+                    if indeterminate_count >= MAX_INDETERMINATE:
+                        break
+                    if last_fits:
+                        low = mid + 1
+                    else:
+                        high = mid - 1
+
+            if not ever_fits:
+                return {
+                    "target": target,
+                    "error": (f"未收到任何 ICMP Echo Reply ({total_count} 次探测均无响应), "
+                              f"无法测量 MTU (可能是 ICMP 被防火墙/网关过滤)"),
+                    "path_mtu": None,
+                    "max_payload": None,
+                    "fragmentation_risk": None,
+                    "indeterminate": True,
+                    "probes": total_count,
+                }
+
             return {
                 "target": target,
                 "max_payload": best_mtu,
                 "path_mtu": best_mtu + 28,
                 "fragmentation_risk": best_mtu < 1472,
+                "indeterminate_pct": round(
+                    indeterminate_count / total_count * 100, 1)
+                    if total_count else 0,
+                "probes": total_count,
             }
 
         if callback:
@@ -2028,6 +2178,9 @@ class MTUDetector:
         # 评估
         issues = []
         for r in results:
+            if r.get("error"):
+                issues.append(f"到 {r['target']} 的 MTU 测量失败: {r['error']}")
+                continue
             if r["path_mtu"] < 1500:
                 issues.append(f"到 {r['target']} 的路径 MTU ({r['path_mtu']}) 小于标准 1500，可能导致分片")
         for lm in local_mtus:
@@ -2384,12 +2537,13 @@ class RouteTableAnalyzer:
         # 检查无效路由 (网关不可达)
         gateway = get_default_gateway()
         if gateway:
-            # 检查默认路由的网关是否在相同子网
+            # 检查默认路由的网关是否在相同子网 (用真实 prefix length, 避免 /24 误判)
             local_ip = get_local_ip()
             if gateway and local_ip:
                 try:
-                    local_net = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
-                    if ipaddress.IPv4Address(gateway) not in local_net:
+                    local_net = _get_local_subnet(local_ip)
+                    if local_net is not None and \
+                            ipaddress.IPv4Address(gateway) not in local_net:
                         issues.append({
                             "type": "gateway_not_in_subnet",
                             "severity": "warning",
@@ -4039,11 +4193,27 @@ def render_report_pdf(report, path):
 
 
 def _report_dir():
-    """报告默认保存目录: <脚本目录>/reports/YYYY-MM-DD/ (自动创建)。"""
-    base = os.path.dirname(os.path.abspath(__file__))
+    """报告默认保存目录: <程序所在目录>/reports/YYYY-MM-DD/ (自动创建)。
+
+    PyInstaller 打包后 ``__file__`` 指向临时解压目录, 故使用 ``sys.executable`` 解析。
+    若首选目录不可写 (例如 EXE 装在 ``C:\\Program Files\\`` 只读位置),
+    自动回退到 ``%USERPROFILE%\\NetPulse\\reports\\``。
+    """
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
     d = os.path.join(base, "reports", datetime.now().strftime("%Y-%m-%d"))
-    os.makedirs(d, exist_ok=True)
-    return d
+    try:
+        os.makedirs(d, exist_ok=True)
+        return d
+    except OSError:
+        # 回退: 用户主目录下的 NetPulse 目录
+        fallback = os.path.join(
+            os.path.expanduser("~"), "NetPulse", "reports",
+            datetime.now().strftime("%Y-%m-%d"))
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
 
 
 def _normalize_report_path(path):
