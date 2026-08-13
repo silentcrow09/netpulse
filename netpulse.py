@@ -82,7 +82,7 @@ SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_NEVER
 LAST_RUN = None
 
 # 端口探测模块的运行参数 (由 CLI --port-* 写入, run_diagnostics 读取)
-PORT_PROBE_CONFIG = {"targets": None, "proto": "tcp", "count": 4}
+PORT_PROBE_CONFIG = {"targets": [], "proto": "tcp", "count": 4}
 
 
 def _is_admin():
@@ -3258,10 +3258,11 @@ class RouteTableAnalyzer:
 # 端口连通性探测 (tcping / udpping)
 # ============================================================
 
-# 默认探测目标 (国内网络环境): 运行 `all` 或 `port` 不带 --port-target 时使用
-DEFAULT_PORT_TARGETS = [
-    "223.5.5.5:53", "114.114.114.114:53", "119.29.29.29:53", "180.76.76.76:53",
-]
+# 默认探测目标: 留空。端口探测必须由用户显式指定 (host:port), 不再有内置默认值。
+# 原因: 内置 DNS 53 端口探测跟"外网检测"功能重叠, 且绝大多数用户实际想测的
+#       是内网服务/特定业务端口, 默认值会误导。运行 `all` 时端口探测会从模块
+#       列表里被排除; 运行 `port` 时 (菜单/CLI) 强制要求用户输入目标。
+DEFAULT_PORT_TARGETS = []
 
 
 def _parse_target(spec):
@@ -3281,6 +3282,54 @@ def _parse_target(spec):
         except ValueError:
             return None
     return None
+
+
+def _prompt_for_port_targets():
+    """交互式询问端口探测目标。返回 (targets_list, proto, count) 或 None (用户取消)。
+
+    用法: 交互菜单选 port, 或 CLI `port` 不带 --port-target 时调用。
+    非 TTY 场景不应调用本函数 (调用方需先 sys.stdout.isatty() 判断)。
+    """
+    print(_c("  端口探测必须指定目标 (host:port), 不再内置默认值。", C_YELLOW))
+    print(_c("  格式: HOST:PORT (例: 192.168.1.1:443)。多个用逗号分隔。", C_GRAY))
+    print(_c("  协议: tcp / udp / both (默认 tcp)。采样次数默认 4。", C_GRAY))
+    try:
+        spec = input(_c("  目标 > ", C_GREEN)).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not spec:
+        return None
+    # 解析目标列表 (逗号分隔, 空白容错)
+    parts = [p.strip() for p in spec.replace("，", ",").split(",") if p.strip()]
+    valid = []
+    for p in parts:
+        if _parse_target(p):
+            valid.append(p)
+        else:
+            print(_c(f"  ! 忽略非法目标: {p} (应为 HOST:PORT)", C_YELLOW))
+    if not valid:
+        print(_c("  没有合法目标, 已取消端口探测。", C_YELLOW))
+        return None
+    # 协议
+    try:
+        proto = input(_c("  协议 [tcp/udp/both] (默认 tcp) > ", C_GREEN)).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        proto = "tcp"
+    if proto not in ("tcp", "udp", "both"):
+        proto = "tcp"
+    # 采样次数
+    try:
+        cnt_raw = input(_c("  采样次数 (默认 4) > ", C_GREEN)).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        cnt_raw = ""
+    try:
+        cnt = max(1, int(cnt_raw)) if cnt_raw else 4
+    except ValueError:
+        cnt = 4
+    return valid, proto, cnt
 
 
 class PortProbeTester:
@@ -3447,6 +3496,26 @@ class PortProbeTester:
         protos = ["tcp", "udp"] if self.proto == "both" else [self.proto]
         targets = []
         skipped = []
+        if not self.targets:
+            # 端口探测必须由用户显式提供目标, 不再有内置默认
+            self.results = {
+                "proto": self.proto.upper(),
+                "probe_count": self.count,
+                "targets": [],
+                "issues": [{
+                    "type": "port_no_targets",
+                    "severity": "warning",
+                    "message": "未提供端口探测目标",
+                    "detail": "请用 --port-target host:port 指定 (可多次或逗号分隔); "
+                              "菜单/CLI 选 port 时也会交互式询问"
+                }],
+                "assessment": "未提供目标",
+                "timestamp": datetime.now().isoformat(),
+                "summary": "端口探测: 未提供目标 (需用 --port-target 指定)"
+            }
+            if callback:
+                callback(self.results["summary"])
+            return self.results
         for spec in self.targets:
             parsed = _parse_target(spec)
             if not parsed:
@@ -5239,6 +5308,25 @@ def interactive_menu(install=False, pip_mirror=None):
             except (EOFError, KeyboardInterrupt):
                 break
             continue
+        # 端口探测: 不管是单选 port 还是 0/all, 跑之前都要求用户输入目标
+        # (用户偏好: 端口探测必须有显式目标, 不再有隐式默认)
+        if "port" in keys and not PORT_PROBE_CONFIG.get("targets"):
+            prompted = _prompt_for_port_targets()
+            if prompted is None:
+                # 用户取消: 跳过 port, 跑其余模块
+                print(_c("  已取消端口探测, 其余模块继续。", C_YELLOW))
+                keys = [k for k in keys if k != "port"]
+                if not keys:
+                    try:
+                        input(_c("  按 Enter 返回菜单...", C_GRAY))
+                    except (EOFError, KeyboardInterrupt):
+                        break
+                    continue
+            else:
+                tgt, proto, cnt = prompted
+                PORT_PROBE_CONFIG["targets"] = tgt
+                PORT_PROBE_CONFIG["proto"] = proto
+                PORT_PROBE_CONFIG["count"] = cnt
         # 菜单模式: 多模块默认并发 (与 CLI `all --parallel` 对齐)。
         # run_diagnostics 内部 `parallel and len(keys) > 1` 会自动避免
         # 单模块走并发 (无意义且会浪费线程开销)。
@@ -5301,7 +5389,7 @@ def main():
         targets = []
         for part in args.port_target:
             targets.extend(p.strip() for p in part.split(",") if p.strip())
-        PORT_PROBE_CONFIG["targets"] = targets or None
+        PORT_PROBE_CONFIG["targets"] = targets or []
     PORT_PROBE_CONFIG["proto"] = args.port_proto
     PORT_PROBE_CONFIG["count"] = max(1, int(args.port_count))
 
@@ -5309,13 +5397,32 @@ def main():
         _print_module_list()
         return
     if args.modules:
-        if args.modules == ["all"]:
+        is_all_only = (args.modules == ["all"])
+        if is_all_only:
             keys = [k for k, _, _ in MODULE_REGISTRY]
         else:
             keys = parse_module_names(args.modules)
         if not keys:
             print("可用模块: " + ", ".join(k for k, _, _ in MODULE_REGISTRY))
             return
+        # 端口探测: 不管是 all 还是单选 port, 跑之前都要求用户输入目标
+        # (用户偏好: 端口探测必须有显式目标, 不再有隐式默认)
+        if "port" in keys and not PORT_PROBE_CONFIG.get("targets"):
+            if sys.stdout.isatty():
+                prompted = _prompt_for_port_targets()
+                if prompted is None:
+                    print(_c("  已取消端口探测。", C_YELLOW))
+                    return
+                tgt, proto, cnt = prompted
+                PORT_PROBE_CONFIG["targets"] = tgt
+                PORT_PROBE_CONFIG["proto"] = proto
+                PORT_PROBE_CONFIG["count"] = cnt
+            else:
+                print(_c("  错误: 端口探测必须指定目标。", C_RED))
+                print(_c("  用法: netpulse.py port --port-target HOST:PORT [...]", C_GRAY))
+                print(_c("  例:   netpulse.py port --port-target 192.168.1.1:443,8.8.8.8:53", C_GRAY))
+                print(_c("       或: netpulse.py all --port-target 8.8.8.8:53", C_GRAY))
+                sys.exit(2)
         run_diagnostics(keys, verbose=args.verbose, as_json=args.json,
                         no_color=args.no_color, install=args.install,
                         parallel=args.parallel, max_workers=args.max_workers,
