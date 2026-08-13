@@ -1388,7 +1388,7 @@ class DHCPDetector:
                             "server_ip": ip,
                             "server_mac": mac,
                             "offered_ip": get_local_ip(),
-                            "lease_time": 0,
+                            "lease_time": None,  # ipconfig 不提供租约时间, 0 会误读为"0秒租约"
                             "source": "ipconfig"
                         })
                     except Exception:
@@ -1452,18 +1452,27 @@ class GatewayTester:
 
         ping_result = ping_host(gateway, count=count, timeout=count + 10)
 
-        # 评估
-        assessment = "正常"
-        if ping_result["loss_pct"] > 0:
-            assessment = "存在丢包"
-        if ping_result["loss_pct"] > 5:
-            assessment = "丢包严重"
-        if ping_result["avg_ms"] > 10:
-            assessment = "延迟偏高"
-        if ping_result["avg_ms"] > 50:
-            assessment = "延迟严重"
-        if ping_result["loss_pct"] > 5 and ping_result["avg_ms"] > 10:
+        # 评估: 分级阈值, 避免 53ms 0% 丢包被误报"延迟严重"
+        # 阈值依据: 国内普通宽带/企业网到局域网网关一般 < 10ms;
+        #           50ms 以内算"略高" (常见于 2.4G WiFi);
+        #           100ms 以上才算"严重" (需要排查)
+        avg = ping_result["avg_ms"]
+        loss = ping_result["loss_pct"]
+        jitter = ping_result.get("jitter_ms", 0)
+        if loss > 5 and avg > 10:
             assessment = "网络质量差"
+        elif loss > 5:
+            assessment = "丢包严重"
+        elif loss > 0:
+            assessment = "存在丢包"
+        elif avg > 100:
+            assessment = "延迟严重"
+        elif avg > 50:
+            assessment = "延迟偏高"
+        elif avg > 10:
+            assessment = "延迟略高"
+        else:
+            assessment = "正常"
 
         self.results = {
             "gateway": gateway,
@@ -1499,12 +1508,19 @@ class LoopDetector:
         arp_entries = []
         mac_to_ips = defaultdict(list)
         ip_to_mac = {}
+        # Windows `arp -a` 会按接口分组重复输出同一 (IP,MAC,type), 去重避免误报
+        seen_entries = set()
         for line in arp_out.split("\n"):
             m = re.match(r"\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F-]{17})\s+(\S+)", line)
             if m:
                 ip = m.group(1)
                 mac = m.group(2).lower()
-                arp_entries.append({"ip": ip, "mac": mac, "type": m.group(3)})
+                etype = m.group(3)
+                key = (ip, mac, etype)
+                if key in seen_entries:
+                    continue
+                seen_entries.add(key)
+                arp_entries.append({"ip": ip, "mac": mac, "type": etype})
                 mac_to_ips[mac].append(ip)
                 ip_to_mac[ip] = mac
 
@@ -2864,20 +2880,34 @@ class ARPAnalyzer:
                 # (需要多次采样)
 
             # 检测 ARP 冲突 (同一 IP 多个 MAC — 从 ARP 表可能看不到)
-            # 检查静态 ARP 条目
+            # 检查静态 ARP 条目: 排除广播/组播/协议保留 MAC
+            # (Windows arp -a 会把 ff-ff-ff-ff-ff-ff 标记为 static, 是协议保留,
+            #  不是用户配置的静态 ARP, 误报)
             static_entries = [e for e in entries if e["type"] == "static"]
-            if static_entries:
+            static_valid = [e for e in static_entries
+                            if _is_valid_unicast_mac(e["mac"])]
+            static_reserved = len(static_entries) - len(static_valid)
+            if static_valid:
+                detail = f"其中 {static_reserved} 条为广播/组播/协议保留 (已忽略)。" \
+                         f"静态 ARP 可以防止 ARP 欺骗，但也可能导致 IP 变更后无法通信"
                 issues.append({
                     "type": "static_arp",
                     "severity": "info",
-                    "message": f"发现 {len(static_entries)} 条静态 ARP 记录",
-                    "detail": "静态 ARP 可以防止 ARP 欺骗，但也可能导致 IP 变更后无法通信"
+                    "message": f"发现 {len(static_valid)} 条静态 ARP 记录",
+                    "detail": detail
                 })
 
         # 统计
         total_entries = len(entries)
-        unique_macs = len(mac_to_ips)
-        multi_ip_macs = {mac: ips for mac, ips in mac_to_ips.items() if len(ips) > 1}
+        # unique_macs: 排除广播/组播/协议保留 MAC
+        valid_macs = {m for m in mac_to_ips.keys() if _is_valid_unicast_mac(m)}
+        unique_macs = len(valid_macs)
+        # multi_ip_macs: 只统计有效 unicast MAC, 否则广播/组播 MAC
+        # 关联到多个子网广播 IP 是正常现象, 误报"多 IP 同 MAC"
+        multi_ip_macs = {
+            mac: ips for mac, ips in mac_to_ips.items()
+            if _is_valid_unicast_mac(mac) and len(ips) > 1
+        }
 
         self.results = {
             "gateway": gateway,
@@ -2986,9 +3016,10 @@ class BufferbloatTester:
         # 残留线程置为 None, 不再被引用 (daemon=True 时进程退出时也会被强杀)
 
         # 计算 Bufferbloat 等级
+        # bloat 为负 (负载下延迟反而更低) 不应判为优秀, 而是"未恶化/无 Bufferbloat"
         bloat = loaded_rtt - idle_rtt
-        if bloat < 10:
-            grade = "A (优秀)"
+        if bloat < 5:
+            grade = "A (优秀, 无 Bufferbloat)"
         elif bloat < 30:
             grade = "B (良好)"
         elif bloat < 60:
@@ -3004,6 +3035,14 @@ class BufferbloatTester:
         elif bloat > 30:
             issues.append(f"存在 Bufferbloat: 负载下延迟增加 {bloat:.0f}ms")
 
+        # summary 措辞: bloat<0 (噪声) 时不要显示"增加 -Xms"
+        if bloat >= 5:
+            bloat_desc = f"增加 {bloat:.0f}ms"
+        elif bloat <= -5:
+            bloat_desc = f"降低 {-bloat:.0f}ms (网络在负载下未恶化)"
+        else:
+            bloat_desc = "基本无变化"
+
         self.results = {
             "gateway": gateway,
             "idle_rtt_ms": idle_rtt,
@@ -3014,7 +3053,7 @@ class BufferbloatTester:
             "grade": grade,
             "issues": issues,
             "timestamp": datetime.now().isoformat(),
-            "summary": f"Bufferbloat: 空闲 {idle_rtt:.0f}ms → 负载 {loaded_rtt:.0f}ms (增加 {bloat:.0f}ms, {grade})",
+            "summary": f"Bufferbloat: 空闲 {idle_rtt:.0f}ms → 负载 {loaded_rtt:.0f}ms ({bloat_desc}, {grade})",
         }
         if callback:
             callback(self.results["summary"])
@@ -3078,7 +3117,15 @@ class IPv6Tester:
         if not has_global_ipv6:
             issues.append("未检测到全局 IPv6 地址")
         if has_global_ipv6 and not ipv6_connectivity:
-            issues.append("有 IPv6 地址但无法建立 IPv6 连接，可能 IPv6 路由配置有问题")
+            # Windows `route print ::/0` 不显示 ISATAP/6to4 隧道的默认路由, 所以
+            # has_ipv6_route=False 不一定是配置问题。实际能 ping 通 2400:: 等
+            # 目的地址才算真正的 IPv6 可用, 这里用更准确的措辞
+            if has_ipv6_route:
+                issues.append("有 IPv6 路由但无法建立 IPv6 连接，可能是防火墙/MTU 问题")
+            else:
+                issues.append("未检测到默认 IPv6 路由（可能是 ISATAP/6to4 隧道，"
+                              "Windows `route print` 不显示），如需 IPv6 外网请检查 "
+                              "隧道适配器或路由器 IPv6 转发")
         if has_global_ipv6 and not ipv6_dns:
             issues.append("IPv6 DNS 解析失败")
 
@@ -4092,12 +4139,15 @@ def build_report():
             "status": status,
             "result": res,
         })
+    # summary 改由 modules 重建, 避免 run["status"] 多 key 时
+    # health 行 "共 N 项" 与 "X 完成/Y 警告" 计数不一致
+    summary = {m["key"]: m["status"] for m in modules}
     return {
         "app": run["app"],
         "version": run["version"],
         "generated_at": run["generated_at"],
         "system": run["system"],
-        "summary": run["status"],
+        "summary": summary,
         "modules": modules,
     }
 
@@ -4673,7 +4723,12 @@ def _record_table(v):
     if full < max(1, len(v) // 2):
         return None
     headers = [HEADER_MAP.get(k, k) for k in keys]
-    rows = [[("" if x.get(k) is None else str(x.get(k))) for k in keys] for x in v]
+    def _cell(v):
+        if v is None:
+            return "N/A"  # None 明确显示 N/A, 而不是空字符串让用户误以为缺数据
+        s = str(v)
+        return s if s else "N/A"
+    rows = [[_cell(x.get(k)) for k in keys] for x in v]
     return headers, rows
 
 
