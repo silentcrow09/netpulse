@@ -82,7 +82,7 @@ SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_NEVER
 LAST_RUN = None
 
 # 端口探测模块的运行参数 (由 CLI --port-* 写入, run_diagnostics 读取)
-PORT_PROBE_CONFIG = {"targets": [], "proto": "tcp", "count": 4}
+PORT_PROBE_CONFIG = {"targets": [], "proto": "tcp", "count": 4, "force": False}
 
 
 def _is_admin():
@@ -3516,23 +3516,87 @@ class RouteTableAnalyzer:
 DEFAULT_PORT_TARGETS = []
 
 
+# 端口范围探测时, 单次 spec 能展开多少个 (host, port) 元组的硬上限。
+# 这个数独立于"总目标数 1000", 是防止 "host:1-65535" 这种单 spec 一次展开
+# 65k 目标把内存/线程池打爆。65535 = 单 IP 全端口, 足够任何单 spec 场景。
+_MAX_PORTS_PER_SPEC = 65535
+
+
 def _parse_target(spec):
-    """解析 'host:port' 或 '[v6]:port' -> (host, port); 非法返回 None。"""
+    """解析端口目标规格 -> 展开后的 (host, port) 列表; 非法返回 None。
+
+    支持格式:
+      - host:port           单端口 (例: 192.168.1.1:443)
+      - host:port1,port2    多离散端口 (例: 223.5.5.5:80,443)
+      - host:port1-port2    端口范围 (例: 10.0.0.1:1-1024)
+      - host:p1,p2,p3-p4    混合 (例: a.com:22,80,8000-8100)
+      - [ipv6]:port         IPv6 单端口 (例: [::1]:443)
+      - [ipv6]:port1-port2  IPv6 范围 (例: [2400::1]:80-443)
+
+    不支持 CIDR (按 Simon 拍板, 留作未来扩展)。
+
+    返回:
+      - [(host, port), ...]  成功 (可能为空, 实际不会空, 空说明 spec 解析失败)
+      - None                  非法 spec (空字符串 / 解析失败 / 端口越界 / 范围倒序)
+    """
     spec = (spec or "").strip()
     if not spec:
         return None
-    if spec.startswith("["):  # IPv6 方括号形式 [::1]:443
-        m = re.match(r"^\[(.+)\]:(\d+)$", spec)
-        if m:
-            return m.group(1), int(m.group(2))
+
+    # 拆 host 和 ports 部分: 最后一个 ':' 之前是 host, 之后是 ports
+    # IPv6 用 [..] 包裹, 找 ']:' 分割
+    if spec.startswith("["):
+        m = re.match(r"^\[(.+)\]:(.+)$", spec)
+        if not m:
+            return None
+        host, ports_str = m.group(1), m.group(2)
+    else:
+        # 单 host 形式, 最后一个 ':' 分割
+        if ":" not in spec:
+            return None
+        # 避免主机名含 ':' (罕见, 一般 host 只有数字 IP 或域名)
+        idx = spec.rfind(":")
+        host, ports_str = spec[:idx], spec[idx + 1:]
+
+    if not host or not ports_str:
         return None
-    if spec.count(":") == 1:
-        h, p = spec.split(":")
+
+    # 解析 ports 部分: 逗号分隔, 每项是 port 或 port-port
+    port_items = [p.strip() for p in ports_str.split(",") if p.strip()]
+    if not port_items:
+        return None
+
+    ports = []
+    for item in port_items:
+        # 单端口
+        if "-" not in item:
+            try:
+                p = int(item)
+            except ValueError:
+                return None
+            if not (1 <= p <= 65535):
+                return None
+            ports.append(p)
+            continue
+        # 范围 port1-port2
+        rng = item.split("-", 1)
+        if len(rng) != 2:
+            return None
         try:
-            return h, int(p)
+            lo, hi = int(rng[0]), int(rng[1])
         except ValueError:
             return None
-    return None
+        if not (1 <= lo <= 65535) or not (1 <= hi <= 65535):
+            return None
+        if lo > hi:
+            return None   # 倒序不合法, 让用户写对
+        ports.extend(range(lo, hi + 1))
+
+    # 单 spec 展开上限保护 (防御 "host:1-65535" 一次展 65k)
+    if len(ports) > _MAX_PORTS_PER_SPEC:
+        return None
+
+    return [(host, p) for p in ports]
 
 
 def _prompt_for_port_targets():
@@ -3542,8 +3606,10 @@ def _prompt_for_port_targets():
     非 TTY 场景不应调用本函数 (调用方需先 sys.stdout.isatty() 判断)。
     """
     print(_c("  端口探测必须指定目标 (host:port), 不再内置默认值。", C_YELLOW))
-    print(_c("  格式: HOST:PORT (例: 192.168.1.1:443)。多个用逗号分隔。", C_GRAY))
+    print(_c("  格式: HOST:PORT (例: 192.168.1.1:443)", C_GRAY))
+    print(_c("  范围: HOST:port1-port2 (例: 10.0.0.1:1-1024) 或混合 HOST:80,443,8000-8100", C_GRAY))
     print(_c("  协议: tcp / udp / both (默认 tcp)。采样次数默认 4。", C_GRAY))
+    print(_c("  上限: 单次探测目标数不超过 1000 (防探测风暴), 强制请用 --port-force", C_GRAY))
     try:
         spec = input(_c("  目标 > ", C_GREEN)).strip()
     except (EOFError, KeyboardInterrupt):
@@ -3554,14 +3620,19 @@ def _prompt_for_port_targets():
     # 解析目标列表 (逗号分隔, 空白容错)
     parts = [p.strip() for p in spec.replace("，", ",").split(",") if p.strip()]
     valid = []
+    expanded_count = 0
     for p in parts:
-        if _parse_target(p):
+        parsed = _parse_target(p)
+        if parsed:
             valid.append(p)
+            expanded_count += len(parsed)
         else:
-            print(_c(f"  ! 忽略非法目标: {p} (应为 HOST:PORT)", C_YELLOW))
+            print(_c(f"  ! 忽略非法目标: {p}", C_YELLOW))
     if not valid:
         print(_c("  没有合法目标, 已取消端口探测。", C_YELLOW))
         return None
+    if expanded_count > 1:
+        print(_c(f"  → 共展开 {expanded_count} 个探测目标 (含端口范围)", C_GRAY))
     # 协议
     try:
         proto = input(_c("  协议 [tcp/udp/both] (默认 tcp) > ", C_GREEN)).strip().lower()
@@ -3595,12 +3666,18 @@ class PortProbeTester:
     每个目标做多次采样, 统计平均/最小/最大 RTT 与丢包。
     """
 
-    def __init__(self, targets=None, proto="tcp", count=4):
+    # 单次探测目标数硬上限 (避免无意 DoS / 探测风暴)
+    DEFAULT_MAX_TARGETS = 1000
+
+    def __init__(self, targets=None, proto="tcp", count=4,
+                 max_targets=DEFAULT_MAX_TARGETS, force=False):
         self.name = "端口探测"
         self.results = {}
         self.targets = targets or DEFAULT_PORT_TARGETS
         self.proto = (proto or "tcp").lower()
         self.count = max(1, int(count))
+        self.max_targets = max(1, int(max_targets))
+        self.force = bool(force)
 
     def _resolve(self, host):
         """解析主机名 -> (ip, family, 错误); family: socket.AF_INET / AF_INET6。"""
@@ -3767,12 +3844,48 @@ class PortProbeTester:
             if callback:
                 callback(self.results["summary"])
             return self.results
+        # 先把所有 spec 解析成 (host, port) 列表, 不实际探测
+        expanded = []  # [(spec, host, port), ...]
         for spec in self.targets:
             parsed = _parse_target(spec)
             if not parsed:
                 skipped.append(spec)
                 continue
-            h, p = parsed
+            for h, p in parsed:
+                expanded.append((spec, h, p))
+
+        # 目标数限流: 范围展开后总数 > max_targets 时阻止 (除非 force=True)
+        # 注意: 限流检查在 _probe_one 之前, 否则探测大量端口会先执行造成卡顿
+        n_total = len(expanded) * len(protos)
+        if n_total > self.max_targets and not self.force:
+            self.results = {
+                "proto": self.proto.upper(),
+                "probe_count": self.count,
+                "targets": [],
+                "specs": list(self.targets),
+                "expanded_count": n_total,
+                "max_targets": self.max_targets,
+                "issues": [{
+                    "type": "too_many_targets",
+                    "severity": "warning",
+                    "message": (f"展开后目标数 {n_total} 超过上限 {self.max_targets} "
+                                f"(已取消探测, 防止无意探测风暴/DoS)"),
+                    "detail": (f"原始 spec: {', '.join(self.targets)}\n"
+                               f"展开后共 {n_total} 个 host:port 目标"
+                               f"{(' × 2 协议' if len(protos) > 1 else '')}。"
+                               f"如确认要探测这么多端口, 加 --port-force 重试。")
+                }],
+                "assessment": f"目标数 {n_total} 超限, 已取消",
+                "timestamp": datetime.now().isoformat(),
+                "summary": f"端口探测: 目标数 {n_total} 超过 {self.max_targets}, 已取消 (--port-force 强制执行)",
+            }
+            if callback:
+                callback(self.results["summary"])
+            return self.results
+
+        # 通过限流, 实际探测
+        targets = []
+        for spec, h, p in expanded:
             for pr in protos:
                 targets.append(self._probe_one(h, p, pr))
 
@@ -4399,7 +4512,8 @@ def _run_diagnostics_sequential(keys, is_tty):
             if key == "port":
                 inst = cls(targets=PORT_PROBE_CONFIG["targets"],
                            proto=PORT_PROBE_CONFIG["proto"],
-                           count=PORT_PROBE_CONFIG["count"])
+                           count=PORT_PROBE_CONFIG["count"],
+                           force=PORT_PROBE_CONFIG.get("force", False))
             else:
                 inst = cls()
             if is_tty:
@@ -4450,7 +4564,8 @@ def _run_diagnostics_parallel(keys, max_workers, total):
             if key == "port":
                 inst = cls(targets=PORT_PROBE_CONFIG["targets"],
                            proto=PORT_PROBE_CONFIG["proto"],
-                           count=PORT_PROBE_CONFIG["count"])
+                           count=PORT_PROBE_CONFIG["count"],
+                           force=PORT_PROBE_CONFIG.get("force", False))
             else:
                 inst = cls()
             inst.detect(callback=lambda msg: None)  # parallel 模式抑制中间输出
@@ -4985,10 +5100,21 @@ def _metrics_port(res):
     targets = res.get("targets", [])
     if targets:
         ok = sum(1 for t in targets if t.get("status") == "开放")
-        out.append(("开放/总数", f"{ok}/{len(targets)}",
-                    "ok" if ok == len(targets) else "warn" if ok > 0 else "err"))
-    out.append(("协议", res.get("proto", "?")))
-    out.append(("采样", f"每目标 {res.get('probe_count', '?')} 次"))
+        closed = sum(1 for t in targets if t.get("status") == "关闭")
+        filtered = sum(1 for t in targets if t.get("status") in ("过滤", "无响应"))
+        # 开放端口颜色: 0-5 = 安全(ok), 6-15 = 偏多(warn), >15 = 偏多(err)
+        # (粗略启发: 大多数服务 < 10 个开放端口, 多了通常意味着有非预期服务暴露)
+        ok_level = "ok" if ok <= 5 else "warn" if ok <= 15 else "err"
+        out.append(("开放端口", f"{ok} 个", ok_level))
+        out.append(("关闭/过滤", f"{closed + filtered} 个", "ok"))
+        out.append(("探测总数", f"{len(targets)} 个"))
+        out.append(("协议", res.get("proto", "?")))
+        out.append(("每目标采样", f"{res.get('probe_count', '?')} 次"))
+    else:
+        # 探测未执行 (例如限流拦住, 提示用户原因)
+        if res.get("expanded_count"):
+            out.append(("原始目标数", f"{res['expanded_count']} (被限流拦住)"))
+        out.append(("协议", res.get("proto", "?")))
     return out
 
 
@@ -7199,12 +7325,17 @@ def main():
                         help="禁用 scapy 二层抓包 (部分机器 Npcap 不稳定会崩溃), "
                              "DHCP 检测降级为仅读取当前 DHCP 服务器")
     parser.add_argument("--port-target", action="append", metavar="HOST:PORT",
-                        help="端口探测目标, 格式 host:port (如 223.5.5.5:53); "
-                             "可多次指定或用逗号分隔, 例: --port-target 223.5.5.5:53,119.29.29.29:53")
+                        help="端口探测目标, 格式 host:port (如 223.5.5.5:53) 或 "
+                             "host:port1-port2 范围 (如 10.0.0.1:1-1024) 或 "
+                             "host:port,port (如 8.8.8.8:80,443,8000-8100); "
+                             "可多次指定或用逗号分隔, 例: --port-target 223.5.5.5:53,10.0.0.1:1-1024")
     parser.add_argument("--port-proto", choices=["tcp", "udp", "both"], default="tcp",
                         help="端口探测协议 (默认 tcp); both = TCP 与 UDP 均测")
     parser.add_argument("--port-count", type=int, default=4, metavar="N",
                         help="每个目标采样次数 (默认 4)")
+    parser.add_argument("--port-force", action="store_true",
+                        help="强制执行端口探测, 即使目标数超过 1000 上限 "
+                             "(默认拦下, 避免无意探测风暴/DoS)")
     parser.add_argument("--export", metavar="FILE",
                         help="诊断后将报告导出到文件 (支持 .txt / .html / .pdf); "
                              "多个目标用逗号分隔可一次导出多种格式, 例: report.pdf,report.html,report.txt")
@@ -7225,13 +7356,15 @@ def main():
         SCAPY_AVAILABLE = False
 
     # 端口探测参数 -> 全局配置 (run_diagnostics 读取)
+    # 注意: args.port_target 已经是 argparse action="append" 后的 list,
+    # 每个元素是一个完整 spec (允许内部用逗号分隔多端口 / 用 - 范围)。
+    # 多 host 必须用多个 --port-target, 例: --port-target a:80 --port-target b:80
     if args.port_target:
-        targets = []
-        for part in args.port_target:
-            targets.extend(p.strip() for p in part.split(",") if p.strip())
+        targets = [p.strip() for p in args.port_target if p and p.strip()]
         PORT_PROBE_CONFIG["targets"] = targets or []
     PORT_PROBE_CONFIG["proto"] = args.port_proto
     PORT_PROBE_CONFIG["count"] = max(1, int(args.port_count))
+    PORT_PROBE_CONFIG["force"] = bool(getattr(args, "port_force", False))
 
     if args.list:
         _print_module_list()

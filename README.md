@@ -46,6 +46,18 @@ python netpulse.py all --export report.pdf,report.html,report.txt
 # 端口探测: 指定目标与协议
 python netpulse.py port --port-target 223.5.5.5:53,119.29.29.29:53 --port-proto both --port-count 4
 
+# 端口探测: 范围扫描 (host:port1-port2)
+python netpulse.py port --port-target 10.0.0.1:1-1024
+
+# 端口探测: 混合 (离散 + 范围)
+python netpulse.py port --port-target "8.8.8.8:80,443,8000-8100"
+
+# 端口探测: 多个目标主机
+python netpulse.py port --port-target a.com:80 --port-target b.com:443
+
+# 端口探测: 超过 1000 目标数, 加 --port-force
+python netpulse.py port --port-target "10.0.0.0/24:80" --port-force
+
 # 禁用 scapy 二层抓包 (Npcap 不稳定导致崩溃时使用, DHCP 降级)
 python netpulse.py dhcp --no-scapy
 
@@ -64,9 +76,10 @@ python netpulse.py --install
 | `--no-color` | 禁用彩色输出（兼容老旧终端） |
 | `--install` | 自动安装缺失依赖 |
 | `--no-scapy` | 禁用 scapy 二层抓包，DHCP 检测降级 |
-| `--port-target` | 端口探测目标 `HOST:PORT`，可多次或逗号分隔 |
+| `--port-target` | 端口探测目标，支持单端口/范围/混合，详见下方 |
 | `--port-proto` | 端口探测协议：`tcp`（默认）/ `udp` / `both` |
 | `--port-count` | 每个目标采样次数（默认 4） |
+| `--port-force` | 强制执行端口探测（即使展开后目标数超过 1000 上限） |
 | `--export` | 诊断后导出报告，逗号分隔多格式（`report.pdf,report.html`） |
 
 ## 📋 诊断模块（18 项）
@@ -91,6 +104,38 @@ python netpulse.py --install
 | 16 | `speedtest` | 测速 | Speedtest.net + HTTP 降级测速 |
 | 17 | `lan` | LAN 设备扫描 | `arp -a` 发现局域网设备，结合 MAC OUI 识别厂商 |
 | 18 | `tcpstats` | TCP 传输质量 | 解析 `netstat -s` 重传率、错误段、连接失败数 |
+
+## 🔌 端口探测 `--port-target` 语法
+
+支持单端口、范围、混合，以及多目标主机：
+
+```bash
+# 单端口
+--port-target 223.5.5.5:53
+
+# 单主机多端口 (逗号分隔)
+--port-target "223.5.5.5:80,443,8080"
+
+# 端口范围 (短横线)
+--port-target 10.0.0.1:1-1024
+--port-target 8.8.8.8:8000-8100
+
+# 混合 (离散 + 范围)
+--port-target "8.8.8.8:22,80,443,8000-8100"
+
+# 多个目标主机 (多次 --port-target)
+--port-target a.com:80 --port-target b.com:443
+
+# IPv6 主机
+--port-target "[2400:3200::1]:443"
+--port-target "[::1]:80-82"
+```
+
+**安全限流**：单次探测目标数（`host:port` 展开后）默认上限 **1000**。超过会拒绝并提示加 `--port-force`。例：
+```bash
+--port-target 10.0.0.1:1-1500      # 1500 目标, 被拦下
+--port-target 10.0.0.1:1-1500 --port-force   # 强制执行
+```
 
 ## 📄 报告导出
 
