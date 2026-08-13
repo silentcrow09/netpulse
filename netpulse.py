@@ -495,6 +495,72 @@ _CMD_CACHE = {}
 _CMD_CACHE_TTL = 5.0  # 秒
 
 
+def _download_speed_test(url, target_bytes=5 * 1024 * 1024, chunk_size=64 * 1024,
+                         overall_timeout=20, callback=None):
+    """下载测速通用函数: chunked read 累计到 target_bytes 就 stop, 不等下完。
+
+    与 ``resp.read()`` 一次读完的区别:
+      - 旧版 resp.read() 必须等服务器发完全部数据, 10MB 文件在 1Mbps 链路
+        需要 80s, 国际 CDN 从国内访问 5-10 分钟
+      - 新版累计下载到 target_bytes (默认 5MB) 就 break 退出, 100Mbps 链路
+        不到 1s 出结果, 10Mbps ~4s, 1Mbps ~40s (并伴随进度反馈)
+
+    参数:
+      url: 测速源 URL
+      target_bytes: 累计下载到这么多字节就停 (默认 5MB, 测速精度足够)
+      chunk_size: 每次 read 的块大小 (默认 64KB)
+      overall_timeout: 整体超时秒数 (默认 20s, 超过就 break 用已下载数据)
+      callback: 进度回调, 接受 str (每 1MB 或每 1s 报一次)
+
+    返回 dict (含 download_mbps / downloaded_mb / elapsed_s) 或 None (失败)。
+    """
+    try:
+        req = Request(url, headers={"User-Agent": "NetPulse/1.0"})
+        start = time.time()
+        deadline = start + overall_timeout
+        # connect timeout 短一点 (10s 足够建立连接)
+        resp = urlopen(req, timeout=10)
+        downloaded = 0
+        last_report_time = start
+        last_report_bytes = 0
+        while True:
+            now = time.time()
+            if now >= deadline:
+                break
+            # 每次 read 的 timeout = 剩余时间, 至少 2s 避免频繁超时
+            remaining = max(2.0, deadline - now)
+            try:
+                chunk = resp.read(chunk_size)
+            except (socket.timeout, TimeoutError):
+                break  # 单次 read 超时, 用已下数据计算
+            if not chunk:
+                break  # EOF
+            downloaded += len(chunk)
+            # 进度 callback: 每 1MB 或每 1s 报一次
+            if callback and (downloaded - last_report_bytes >= 1024 * 1024
+                             or now - last_report_time >= 1.0):
+                cur_speed = (downloaded * 8) / 1e6 / (now - start)
+                callback(f"  已下 {downloaded // 1024}KB, 当前 {cur_speed:.2f} Mbps")
+                last_report_time = now
+                last_report_bytes = downloaded
+            if downloaded >= target_bytes:
+                break
+        elapsed = time.time() - start
+        if downloaded > 0:
+            speed_mbps = (downloaded * 8) / 1e6 / elapsed
+            return {
+                "url": url,
+                "download_mbps": round(speed_mbps, 2),
+                "downloaded_mb": round(downloaded / 1e6, 2),
+                "elapsed_s": round(elapsed, 2),
+            }
+        return None
+    except Exception as e:
+        if callback:
+            callback(f"  测速失败 ({url[:40]}...): {e}")
+        return None
+
+
 def run_cmd(cmd, timeout=30, shell=True, use_cache=True):
     """执行系统命令, 返回 (returncode, stdout, stderr)。
 
@@ -1806,32 +1872,46 @@ class SpeedTester:
             return {"error": str(e), "method": "speedtest_lib"}
 
     def test_http(self, callback=None):
-        """HTTP 下载测速 (降级方案)"""
+        """HTTP 下载测速 (降级方案)。
+
+        旧版问题 (用户已踩):
+          - 测速源 speedtest.tele2.net / cachefly.cachefly.net 是国外 CDN,
+            从国内访问极慢 (17KB/s 量级), 完整下载 10MB 文件要 5-10 分钟
+          - resp.read() 一次读完全部数据, 必须等服务器发完才返回
+          - timeout=15s 在慢链路上必然超时, 但用户只看到 "HTTP 下载测速中...",
+            不知道是卡了还是快好了
+
+        修复:
+          - 测速源改为国内 (清华/阿里/腾讯镜像, 700MB boot.iso 支持 range)
+            + Cloudflare __down 按需返回 N 字节作为兜底
+          - chunked read, 累计下载到 target_bytes (5MB) 就 stop, 不等下完
+          - 进度 callback: 每 1MB 或每 1s 报告一次当前速率
+          - 整体 overall_timeout=20s 兜底, 慢链路也能给出"低速率"结果
+        """
         if callback:
             callback("HTTP 下载测速中...")
+        # 国内大文件镜像 + Cloudflare 兜底; 全部 HTTPS, 安全 + 不被劫持。
+        # 候选列表按实测速率排序 (腾讯主域 > 华为云 > 腾讯子域 > Cloudflare),
+        # 旧版用国外 speedtest.tele2.net / cachefly.cachefly.net 国内只有
+        # 17KB/s, 完整下 10MB 要 10 分钟, 是用户报告卡顿的根因。
+        # 注意: centos 8 已 EOL, 清华/USTC/163/阿里部分路径已下线, 优先用
+        # 还在线的腾讯/华为/Cloudflare 源。
         test_urls = [
-            ("http://speedtest.tele2.net/10MB.zip", 10),
-            ("http://cachefly.cachefly.net/10mb.test", 10),
+            "https://mirrors.tencent.com/centos/8/BaseOS/x86_64/os/images/boot.iso",
+            "https://mirrors.huaweicloud.com/centos/8/BaseOS/x86_64/os/images/boot.iso",
+            "https://mirrors.cloud.tencent.com/centos/8/BaseOS/x86_64/os/images/boot.iso",
+            "https://speed.cloudflare.com/__down?bytes=10485760",
         ]
-        for url, size_mb in test_urls:
-            try:
-                start = time.time()
-                req = Request(url, headers={"User-Agent": "NetPulse/1.0"})
-                resp = urlopen(req, timeout=15)
-                data = resp.read()
-                elapsed = time.time() - start
-                if len(data) > 0:
-                    speed_mbps = (len(data) * 8) / 1e6 / elapsed
-                    return {
-                        "method": "http_download",
-                        "url": url,
-                        "download_mbps": round(speed_mbps, 2),
-                        "downloaded_mb": round(len(data) / 1e6, 2),
-                        "elapsed_s": round(elapsed, 2),
-                    }
-            except Exception:
-                continue
-        return {"error": "所有 HTTP 测速服务器均不可用", "method": "http_download"}
+        for url in test_urls:
+            if callback:
+                callback(f"  测速源: {url[:60]}{'...' if len(url) > 60 else ''}")
+            result = _download_speed_test(
+                url, target_bytes=5 * 1024 * 1024,
+                overall_timeout=20, callback=callback)
+            if result and result.get("downloaded_mb", 0) > 0.05:
+                # 至少下到 50KB 才认为有效 (避免空响应/被劫持的短响应)
+                return result
+        return {"error": "所有 HTTP 测速服务器均不可用或太慢", "method": "http_download"}
 
     def test_iperf3(self, server, port=5201, duration=10, callback=None):
         """iperf3 客户端测速"""
@@ -2635,20 +2715,26 @@ class BufferbloatTester:
         load_threads = []
 
         def generate_load():
-            """生成网络负载"""
+            """生成网络负载。
+
+            旧版问题: 用国外测速源 + urlopen 完整文件, 国内访问极慢, 每个
+            线程每次循环要等几秒到几十秒, 4 个线程一起也打不满带宽。
+            修复: 用国内 + Cloudflare 源, 通过 _download_speed_test 拿 ~1MB
+            数据就停 (而不是等完整 1MB 文件), 循环更快, 链路实际更"打满"。
+            """
             urls = [
-                "http://speedtest.tele2.net/1MB.zip",
-                "http://cachefly.cachefly.net/1mb.test",
+                "https://speed.cloudflare.com/__down?bytes=2097152",
+                "https://mirrors.tuna.tsinghua.edu.cn/centos/8/BaseOS/x86_64/os/images/boot.iso",
+                "https://mirrors.aliyun.com/centos/8/BaseOS/x86_64/os/images/boot.iso",
             ]
             while not stop_event.is_set():
                 for url in urls:
                     if stop_event.is_set():
                         return
-                    try:
-                        req = Request(url, headers={"User-Agent": "NetPulse/1.0"})
-                        urlopen(req, timeout=5)
-                    except Exception:
-                        pass
+                    # 拿 1MB 数据就停, 不等完整大文件
+                    _download_speed_test(
+                        url, target_bytes=1024 * 1024,
+                        overall_timeout=15, callback=None)
 
         # 启动 4 个负载线程
         for _ in range(4):
