@@ -93,6 +93,78 @@ def _is_admin():
         return False
 
 
+def _is_broadcast_or_reserved_ip(ip):
+    """判断 IP 是否是广播/组播/保留 (用于 ARP 表多 IP 同 MAC 场景)。
+
+    与 _is_valid_unicast_mac 互补: 那个判断 MAC 端, 这个判断 IP 端。
+    ARP 表里 "ff-ff-ff-ff-ff-ff -> 192.168.56.255 / 100.70.255.255 /
+    255.255.255.255" 都是这种类型, 在判断"网关 MAC 是不是被多个真实设备
+    共用"之前必须先排除。
+
+    规则:
+      - 255.255.255.255 — 本地有限广播
+      - x.x.x.255 / x.x.x.0 / 子网定向广播 — 子网广播 (子网号 + 全 1 主机号)
+        简化判断: 末位 255 且不是 1.2.3.255 这种合法主机 (更严的判断需知
+        prefix length, 但实际 ARP 表里出现 .255 的基本都是子网广播)
+      - 224.0.0.0/4 — IPv4 组播
+      - 127.0.0.0/8 — loopback
+      - 0.0.0.0 — 未指定地址
+    """
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.IPv4Address(ip)
+    except Exception:
+        return True  # 解析不了当作异常值排除
+    if addr.is_loopback or addr.is_multicast or addr.is_unspecified:
+        return True
+    # 末位 255 — 子网定向广播
+    if (int(addr) & 0xFF) == 0xFF:
+        return True
+    return False
+
+
+def _is_valid_unicast_mac(mac):
+    """判断 MAC 地址是否是"有效单播" (排除广播/组播)。
+
+    规则依据 IEEE 802 + IANA:
+      - 00:00:00:00:00:00 — 无效 (ARP 残留/未初始化)
+      - ff:ff:ff:ff:ff:ff — 广播 (L2)
+      - 最低字节位 (I/G bit) = 1 — 多播
+        包括 01:00:5e:xx:xx:xx (IPv4 组播, OUI 00:00:5e)
+        包括 33:33:xx:xx:xx:xx (IPv6 组播, OUI 33:33)
+        包括 01:80:c2:xx:xx:xx (LLDP/MSTP/802.1X/CDP/PVST 等协议保留,
+          IANA 分配的 OUI 本身多播位=1, 协议用多播地址实现,
+          不会出现在 IP ARP 表里)
+        包括 ff:xx:xx:xx:xx:xx 等所有多播
+      - 其它 (X0/X2/X4/X6/X8/XA/XC/XE 前缀的单播 OUI) — 视为正常设备
+
+    这是 ARP 表分析 (LoopDetector / ARPAnalyzer / LANDeviceScanner) 的
+    关键过滤: 不做这一步会把"一个广播 MAC 对应多个子网广播 IP"或
+    "一个组播 MAC 对应多个组播组 IP"误判为"交换机/环路"。
+    """
+    if not mac or not isinstance(mac, str):
+        return False
+    # 规范化: 接受 "aa-bb-cc..." 或 "aa:bb:cc..." 两种格式
+    parts = mac.lower().replace("-", ":").split(":")
+    if len(parts) != 6:
+        return False
+    try:
+        b = [int(x, 16) for x in parts]
+    except ValueError:
+        return False
+    # 全 0 / 全 1
+    if all(x == 0 for x in b):
+        return False
+    if all(x == 0xFF for x in b):
+        return False
+    # 多播位 (I/G bit = 最低字节最低位) — 一次性覆盖广播/组播/IPv4组播/
+    # IPv6组播/协议保留 (LLDP/MSTP 等), 不需要再写 01:80:c2 那种 dead code
+    if b[0] & 0x01:
+        return False
+    return True
+
+
 def _net_ok(host="pypi.org", port=443, timeout=6):
     """检测网络连通性 — 注意企业/受限网络环境可能不通"""
     try:
@@ -1391,14 +1463,19 @@ class LoopDetector:
                 mac_to_ips[mac].append(ip)
                 ip_to_mac[ip] = mac
 
-        # 检查同一 MAC 对应多个 IP (可能是交换机，也可能是环路)
+        # 检查同一 (有效单播) MAC 对应多个 IP, 可能是代理 ARP / 网关多接口
+        # 关键: 必须先排除广播 (ff-ff-ff-...) / IPv4组播 (01-00-5e-...) /
+        # IPv6组播 (33-33-...) / 链路层协议保留 (01-80-c2-00-00-0x) 这些 MAC,
+        # 否则 "ff-ff-ff-ff-ff-ff 对应 5 个子网广播 IP" 这种正常配置会被误报。
         for mac, ips in mac_to_ips.items():
+            if not _is_valid_unicast_mac(mac):
+                continue  # 跳过协议保留/广播/组播
             if len(ips) > 3:
                 issues.append({
                     "type": "arp_duplicate_mac",
                     "severity": "warning",
                     "message": f"MAC {mac} 对应 {len(ips)} 个 IP: {', '.join(ips[:5])}",
-                    "detail": "同一 MAC 地址对应多个 IP，可能是交换机/路由器，也可能是网络环路"
+                    "detail": "同一单播 MAC 对应多个 IP, 可能是网关多接口/代理 ARP, 也可能是环路/ARP 欺骗"
                 })
 
         # 2. TTL 分析 — 检测异常 TTL
@@ -2638,8 +2715,14 @@ class ARPAnalyzer:
                     "detail": "可能尚未与网关通信，或 ARP 缓存已过期"
                 })
             else:
-                # 检查是否有其他 IP 也使用网关的 MAC
-                same_mac_ips = [ip for ip in mac_to_ips.get(gw_mac, []) if ip != gateway]
+                # 检查是否有其他 IP 也使用网关的 MAC。
+                # 关键: 排除广播/组播/协议保留 MAC 对应的 IP, 否则像
+                # "ff-ff-ff-ff-ff-ff 对应 5 个子网广播 IP" 这种正常条目会误报。
+                same_mac_ips = [
+                    ip for ip in mac_to_ips.get(gw_mac, [])
+                    if ip != gateway
+                    and not _is_broadcast_or_reserved_ip(ip)
+                ]
                 if len(same_mac_ips) > 2:
                     issues.append({
                         "type": "gateway_mac_shared",
@@ -3302,9 +3385,12 @@ class LANDeviceScanner:
         for ip, mac in sorted(arp_map.items()):
             if base and not ip.startswith(base + "."):
                 continue
-            mac_low = mac.lower()
-            # 过滤广播 / 组播 MAC
-            if mac_low.startswith("ff-ff-ff") or mac_low.startswith("01-00-5e"):
+            # 过滤广播/组播/协议保留 MAC (用统一 helper, 比手写前缀更稳):
+            #   - ff-ff-ff-ff-ff-ff  L2 广播
+            #   - 01-00-5e-xx-xx-xx   IPv4 组播 (224/4)
+            #   - 33-33-xx-xx-xx-xx   IPv6 组播 (ff02::/16)
+            #   - 01-80-c2-00-00-0x   LLDP/MSTP/CDP 等链路层协议保留
+            if not _is_valid_unicast_mac(mac):
                 continue
             devices.append({
                 "ip": ip, "mac": mac, "vendor": _oui_vendor(mac),
