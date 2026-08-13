@@ -126,9 +126,19 @@ def _is_broadcast_or_reserved_ip(ip):
 
 # 已知的"假网关"地址 (VPN 客户端为绕过 Windows 网络分类限制而插入的占位默认路由)
 # 特点: 地址本身不可达, metric 极高 (10000+), 仅作 Windows 网络栈分类触发用。
-#  - 25.255.255.254: ZeroTier 在 Windows 上为触发"网络连接类型识别"而加的占位默认路由
-#    (25.0.0.0/8 是英国国防部历史保留段, 现在未分配, 不会与真实公网冲突)
-#  - 类似的 240.0.0.0/4 (IETF 协议保留) 也常被 VPN 用作占位
+#
+#  - 25.255.255.254: ZeroTier 在 Windows 上加的占位默认路由
+#    * 用途: Windows 网络栈需要默认网关才能正确给网卡分类 (公共网络/专用网络),
+#      分类结果决定 Windows 防火墙应用哪套规则。ZeroTier 虚拟网卡没真实网关,
+#      所以人为插入一个不可达地址让 Windows 完成分类, 避免防火墙规则失效。
+#    * 选段: 25.0.0.0/8 是英国国防部历史保留段 (MOD), 当前未分配给任何国家/组织,
+#      公网上不可能真实存在, 不会与真实环境冲突。
+#    * 副作用: metric 极高 (通常 10000+), 只有物理链路全失效时才会被选中,
+#      此时自然不可达, 不影响正常使用。
+#
+#  - 240.0.0.0/4 (RFC 1112 IETF 协议保留) 也常被 VPN 用作占位
+#    (Tailscale/WireGuard 等类似机制, 段内任何地址都不可达)
+#
 # 遇到这些地址时, 不应报警告/异常, 也不应去 ping。
 _KNOWN_FAKE_GATEWAY_IPS = frozenset({"25.255.255.254"})
 
@@ -2470,15 +2480,25 @@ class MultiEgressDetector:
             fake_str = ", ".join(
                 f"{r['gateway']}(metric={r.get('metric','?')})"
                 for r in fake_default)
+            # 识别常见 ZeroTier 25.255.255.254 情况, 提示更准确
+            is_zerotier_fake = any(
+                r["gateway"] == "25.255.255.254" for r in fake_default)
+            if is_zerotier_fake:
+                msg = f"检测到 ZeroTier 假网关 {fake_str} (设计行为, 无害)"
+                detail = (f"ZeroTier 在 Windows 上为触发网络分类机制 (决定 Windows 防火墙规则) "
+                          f"而插入的占位默认路由, 25.0.0.0/8 是英国国防部历史保留段, "
+                          f"公网上不可能真实存在, 不影响真实流量。")
+            else:
+                msg = f"检测到 {len(fake_default)} 条 VPN 占位/虚拟接口默认路由"
+                detail = (f"{fake_str}。可能是 VPN 客户端 (Tailscale/WireGuard 等) "
+                          f"为触发 Windows 网络分类或自身转发而插入的占位默认路由, "
+                          f"不可达或走 VPN 隧道, 不影响真实流量。")
+            detail += " 如需关闭可在对应 VPN 客户端关闭 'Allow Default Route' / 'Allow Global IPs' 等选项。"
             issues.append({
                 "type": "fake_gateway_present",
                 "severity": "info",
-                "message": f"检测到 {len(fake_default)} 条 VPN 占位/虚拟接口默认路由",
-                "detail": f"{fake_str}。可能是 VPN 客户端 (ZeroTier/Tailscale/WireGuard 等) "
-                          f"为触发 Windows 网络分类或自身转发而插入的占位默认路由, "
-                          f"不可达或走 VPN 隧道, 不影响真实流量。"
-                          f"如需关闭可在对应 VPN 客户端关闭 'Allow Default Route' / "
-                          f"'Allow Global IPs' 等选项。"
+                "message": msg,
+                "detail": detail,
             })
 
         # 2. 检测 VPN/虚拟适配器
@@ -3325,15 +3345,25 @@ class RouteTableAnalyzer:
             fake_str = ", ".join(
                 f"{r['gateway']}(metric={r.get('metric','?')})"
                 for r in fake_default_routes)
+            # 识别常见 ZeroTier 25.255.255.254 情况, 提示更准确
+            is_zerotier_fake = any(
+                r["gateway"] == "25.255.255.254" for r in fake_default_routes)
+            if is_zerotier_fake:
+                msg = f"检测到 ZeroTier 假网关 {fake_str} (设计行为, 无害)"
+                detail = (f"ZeroTier 在 Windows 上为触发网络分类机制 (决定 Windows 防火墙规则) "
+                          f"而插入的占位默认路由, 25.0.0.0/8 是英国国防部历史保留段, "
+                          f"公网上不可能真实存在, 不影响真实流量。")
+            else:
+                msg = f"检测到 {len(fake_default_routes)} 条 VPN 占位/虚拟接口默认路由"
+                detail = (f"{fake_str}。可能是 VPN 客户端 (Tailscale/WireGuard 等) "
+                          f"为触发 Windows 网络分类或自身转发而插入的占位默认路由, "
+                          f"不可达或走 VPN 隧道, 不影响真实流量。")
+            detail += " 如需关闭可在对应 VPN 客户端关闭 'Allow Default Route' / 'Allow Global IPs' 等选项。"
             issues.append({
                 "type": "fake_gateway_present",
                 "severity": "info",
-                "message": f"检测到 {len(fake_default_routes)} 条 VPN 占位/虚拟接口默认路由",
-                "detail": f"{fake_str}。可能是 VPN 客户端 (ZeroTier/Tailscale/WireGuard 等) "
-                          f"为触发 Windows 网络分类或自身转发而插入的占位默认路由, "
-                          f"不可达或走 VPN 隧道, 不影响真实流量。"
-                          f"如需关闭可在对应 VPN 客户端关闭 'Allow Default Route' / "
-                          f"'Allow Global IPs' 等选项。"
+                "message": msg,
+                "detail": detail,
             })
 
         # 检查异常路由 (目标为具体 IP 但掩码为 255.255.255.255 的大量主机路由)
