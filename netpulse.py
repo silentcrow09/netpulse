@@ -136,7 +136,14 @@ def _urlopen_with_proxy(url, timeout=120):
 
 
 def _pip_install_scapy(mirror=None):
-    """用当前解释器安装 scapy。返回 (ok, msg)。"""
+    """用当前解释器安装 scapy。返回 (ok, msg)。
+
+    mirror: 显式指定的 pip 镜像 URL; None 时由 _resolve_pip_mirror 自动选源。
+    """
+    if mirror is None:
+        mirror, source = _resolve_pip_mirror()
+        if mirror:
+            print(_c(f"  自动选源: {mirror} ({source})", C_GRAY))
     cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "scapy"]
     if mirror:
         cmd += ["-i", mirror]
@@ -153,6 +160,85 @@ def _pip_install_scapy(mirror=None):
     if proc.returncode != 0:
         return False, out or "pip 返回非零退出码"
     return True, out
+
+
+# ============================================================
+# PIP 镜像自动选源
+# ============================================================
+#
+# 国内网络环境下, pypi.org 经常卡到超时 (TCP RST / 极慢 / 间歇性失败),
+# 装 scapy / reportlab 等依赖会卡 5-10 分钟。自动探测并切到国内镜像:
+#   1. --pip-mirror CLI 显式指定 (优先级最高)
+#   2. PIP_INDEX_URL 环境变量
+#   3. 探测国内镜像候选, 选第一个可达的
+#   4. PyPI 官方 (None, 让 pip 走默认)
+#
+# 探测策略: HEAD 请求 2s 超时, 只在首次调用时探测, 缓存结果。
+# 避免每次 pip install 都重新探测 (安装期间会调多次)。
+
+_PIP_MIRROR_CANDIDATES = [
+    "https://pypi.tuna.tsinghua.edu.cn/simple",       # 清华
+    "https://mirrors.aliyun.com/pypi/simple",         # 阿里云
+    "https://pypi.mirrors.ustc.edu.cn/simple",        # 中科大
+    "https://mirrors.cloud.tencent.com/pypi/simple",  # 腾讯云
+]
+_PIP_MIRROR_REACHABLE_CACHE = {}  # url -> bool (可达性探测结果缓存)
+_PIP_MIRROR_RESOLVED = None      # (url_or_None, source_desc) 全局一次解析
+
+
+def _probe_pip_mirror(url, timeout=2.0):
+    """探测单个 pip 镜像是否可达, HEAD 请求, 超时即不可达。"""
+    if url in _PIP_MIRROR_REACHABLE_CACHE:
+        return _PIP_MIRROR_REACHABLE_CACHE[url]
+    try:
+        req = Request(url.rstrip("/") + "/", method="HEAD",
+                      headers={"User-Agent": "NetPulse/1.0"})
+        with urlopen(req, timeout=timeout) as resp:
+            ok = 200 <= resp.status < 500  # 4xx 算可达 (只是路径不对)
+    except Exception:
+        ok = False
+    _PIP_MIRROR_REACHABLE_CACHE[url] = ok
+    return ok
+
+
+def _resolve_pip_mirror(explicit=None):
+    """选一个能用的 pip 镜像。
+
+    返回 (url_or_None, source_desc):
+      - url_or_None: 选中的镜像, None 表示用 pip 默认
+      - source_desc: 选源原因 (用于日志展示)
+
+    注意: 结果在一次会话内只解析一次, 后续直接返回缓存。pip install
+    期间会被调多次 (splash 一次, 实际装又调), 重探测会拖慢。
+    """
+    global _PIP_MIRROR_RESOLVED
+    if _PIP_MIRROR_RESOLVED is not None:
+        return _PIP_MIRROR_RESOLVED
+
+    if explicit:
+        _PIP_MIRROR_RESOLVED = (explicit, "CLI 显式指定")
+        return _PIP_MIRROR_RESOLVED
+    env_url = (os.environ.get("PIP_INDEX_URL") or "").strip()
+    if env_url:
+        _PIP_MIRROR_RESOLVED = (env_url, "环境变量 PIP_INDEX_URL")
+        return _PIP_MIRROR_RESOLVED
+
+    # 探测国内镜像候选
+    for url in _PIP_MIRROR_CANDIDATES:
+        if _probe_pip_mirror(url):
+            _PIP_MIRROR_RESOLVED = (url, "国内镜像自动探测")
+            return _PIP_MIRROR_RESOLVED
+
+    # 全部不可达: 用 PyPI 默认
+    _PIP_MIRROR_RESOLVED = (None, "PyPI 默认 (国内镜像均不可达)")
+    return _PIP_MIRROR_RESOLVED
+
+
+def reset_pip_mirror_cache():
+    """测试用: 重置选源缓存以重新探测。"""
+    global _PIP_MIRROR_RESOLVED
+    _PIP_MIRROR_RESOLVED = None
+    _PIP_MIRROR_REACHABLE_CACHE.clear()
 
 
 def _download_file(url, dest, timeout=180):
@@ -211,7 +297,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
     返回 True 表示可用, False 表示仍不可用。
       - 交互 TTY: 会询问用户是否安装
       - 非 TTY: 仅当 auto_yes=True (--install) 时才安装, 否则仅提示并降级
-      - 网络环境: 先检测连通性, 失败则提示并(交互下)提供国内镜像
+      - 网络环境: pip 镜像由 _resolve_pip_mirror() 自动选 (CLI/环境变量/国内探测/PyPI 默认)
 
     状态机 (与旧版的差异):
       旧版只用单个 ``SCAPY_OFFERED`` 标志, 拒绝后即便 CLI 加上 --install
@@ -252,25 +338,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
         return False
     SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_ACCEPTED
 
-    # 网络连通性预检
-    print(_c("  正在检测网络连通性...", C_GRAY))
-    if not _net_ok():
-        print(_c("  ✗ 无法连接 PyPI，请检查网络/代理设置。", C_RED))
-        if auto_yes:
-            mirror = mirror or "https://pypi.tuna.tsinghua.edu.cn/simple"
-        else:
-            try:
-                use_mirror = input(_c("  是否改用国内镜像(清华)安装? [y/N] ", C_GREEN)).strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                use_mirror = "n"
-            if use_mirror in ("y", "yes"):
-                mirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
-            else:
-                SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_DECLINED
-                return False
-        print(_c(f"  将使用镜像: {mirror}", C_GRAY))
-
-    # 安装 scapy
+    # 安装 scapy: 镜像由 _pip_install_scapy 内部自动选源
     print(_c("  正在安装 scapy (pip install scapy)...", C_GRAY))
     ok, msg = _pip_install_scapy(mirror=mirror)
     if not ok:
@@ -278,7 +346,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
         for line in msg.replace("\r", "").split("\n")[-12:]:
             if line.strip():
                 print(_c("    " + line.strip(), C_GRAY))
-        print(_c("    如需代理/镜像请设置环境变量或加 --install 重试。", C_GRAY))
+        print(_c("    如需代理/镜像请设置 PIP_INDEX_URL 或加 --pip-mirror 重试。", C_GRAY))
         SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_DECLINED
         return False
     print(_c("  ✓ scapy 安装成功", C_GREEN))
@@ -3417,7 +3485,8 @@ def _safe_print(*args, **kwargs):
 
 
 def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
-                   banner=True, install=False, parallel=False, max_workers=4):
+                   banner=True, install=False, parallel=False, max_workers=4,
+                   pip_mirror=None):
     """执行指定模块并打印结果与汇总。返回 {key: status}。
 
     parallel: True 时多个模块并发执行 (--parallel)。共享状态 (LAST_RUN,
@@ -3425,6 +3494,7 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
               输出策略: 启动时一行, 完成后一行, 详细 result 等所有模块结束
               后按 keys 顺序打印, 避免交错混乱。
     max_workers: 并行模式下的最大并发数 (--max-workers N)。
+    pip_mirror: 显式指定 pip 镜像 (--pip-mirror)。
     """
     global _C_NOCOLOR, LAST_RUN
     _C_NOCOLOR = no_color
@@ -3432,7 +3502,7 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
 
     # 依赖预检: DHCP 完整检测需要 scapy (+Npcap)
     if "dhcp" in keys and not SCAPY_AVAILABLE and not FORCE_NO_SCAPY:
-        ensure_scapy(auto_yes=install)
+        ensure_scapy(auto_yes=install, mirror=pip_mirror)
 
     if banner:
         bar = "=" * 60
@@ -4042,7 +4112,10 @@ footer{margin-top:32px;text-align:center;color:var(--faint);font-size:12px;
 
 
 def ensure_reportlab(auto_yes=False, mirror=None):
-    """确保 reportlab 可用 (PDF 导出依赖)。缺失时提示/自动安装。"""
+    """确保 reportlab 可用 (PDF 导出依赖)。缺失时提示/自动安装。
+
+    镜像选择: 走 _resolve_pip_mirror() 自动选源, 显式参数 mirror 仍可用作覆盖。
+    """
     try:
         import reportlab  # noqa
         return True
@@ -4054,20 +4127,10 @@ def ensure_reportlab(auto_yes=False, mirror=None):
                  "或改用 --export report.html / report.txt。", C_YELLOW))
         return False
     print(_c("  正在准备 PDF 导出依赖 reportlab ...", C_GRAY))
-    if not _net_ok():
-        print(_c("  ✗ 无法连接 PyPI，请检查网络/代理设置。", C_RED))
-        if auto_yes:
-            mirror = mirror or "https://pypi.tuna.tsinghua.edu.cn/simple"
-        else:
-            try:
-                use_mirror = input(_c("  是否改用国内镜像(清华)安装? [y/N] ", C_GREEN)).strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                use_mirror = "n"
-            if use_mirror in ("y", "yes"):
-                mirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
-            else:
-                return False
-        print(_c(f"  将使用镜像: {mirror}", C_GRAY))
+    if mirror is None:
+        mirror, source = _resolve_pip_mirror()
+        if mirror:
+            print(_c(f"  自动选源: {mirror} ({source})", C_GRAY))
     cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "reportlab"]
     if mirror:
         cmd += ["-i", mirror]
@@ -4220,14 +4283,15 @@ def _record_table(v):
     return headers, rows
 
 
-def render_report_pdf(report, path, auto_install=False):
+def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
     """将报告渲染为 PDF (专业浅色主题 + 模块卡片, 内置中文字体 STSong-Light)。
 
     auto_install: True 时 reportlab 缺失会自动 pip install, 否则只提示。
     与旧版的差异: 旧版无条件 auto_yes=True, 在 CI/离线环境会无提示尝试
     pip install 然后卡 5 分钟, 用户体验差。
+    pip_mirror: 显式指定 pip 镜像 URL, 覆盖自动选源。
     """
-    if not ensure_reportlab(auto_yes=auto_install):
+    if not ensure_reportlab(auto_yes=auto_install, mirror=pip_mirror):
         return False
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
@@ -4595,11 +4659,12 @@ def _normalize_report_path(path):
     return path
 
 
-def export_report(path, auto_install=False):
+def export_report(path, auto_install=False, pip_mirror=None):
     """按扩展名导出报告: .pdf / .html / .txt。返回错误信息或 None。
 
     auto_install: True 时允许 PDF 导出时自动 pip install reportlab
     (对应 CLI 的 --install)。默认 False, 缺包时只提示不安装。
+    pip_mirror: 显式指定 pip 镜像 (CLI --pip-mirror)。
     """
     path = _normalize_report_path(path)
     report = build_report()
@@ -4608,7 +4673,8 @@ def export_report(path, auto_install=False):
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext == ".pdf":
-            ok = render_report_pdf(report, path, auto_install=auto_install)
+            ok = render_report_pdf(report, path, auto_install=auto_install,
+                                   pip_mirror=pip_mirror)
             return None if ok else "PDF 导出失败（reportlab 未就绪）"
         elif ext in (".html", ".htm"):
             with open(path, "w", encoding="utf-8") as f:
@@ -4622,11 +4688,12 @@ def export_report(path, auto_install=False):
         return f"导出失败: {e}"
 
 
-def prompt_export_report(auto_install=False):
+def prompt_export_report(auto_install=False, pip_mirror=None):
     """交互菜单跑完后, 询问是否将本次诊断导出为报告文件。
 
     auto_install: True 时 PDF 导出允许自动安装 reportlab
     (例如 CLI 加了 --install, 在交互菜单中也保持一致行为)。
+    pip_mirror: 透传给 export_report。
     """
     if not LAST_RUN:
         return
@@ -4651,7 +4718,7 @@ def prompt_export_report(auto_install=False):
         name = default_name
     if not os.path.splitext(name)[1]:
         name += ext
-    err = export_report(name, auto_install=auto_install)
+    err = export_report(name, auto_install=auto_install, pip_mirror=pip_mirror)
     if err:
         print(_c(f"  ✗ {err}", C_RED))
     else:
@@ -4671,11 +4738,12 @@ def parse_choice(choice):
     return _parse_keys(choice.split(), strict=True)
 
 
-def interactive_menu(install=False):
+def interactive_menu(install=False, pip_mirror=None):
     """交互式数字选择菜单 (cmd 窗口)。
 
     install: 是否允许在交互过程中自动安装缺失依赖
              (与 CLI --install 联动, 让 PDF 导出等行为可预测)。
+    pip_mirror: 透传给 ensure_scapy / ensure_reportlab。
     """
     while True:
         # 清屏: 用 ANSI 转义 (VT 已在 _cli_enable_vt 启用) 替代 os.system('cls'),
@@ -4718,7 +4786,7 @@ def interactive_menu(install=False):
             continue
         run_diagnostics(keys, banner=False)
         if sys.stdout.isatty():
-            prompt_export_report(auto_install=install)
+            prompt_export_report(auto_install=install, pip_mirror=pip_mirror)
         try:
             input(_c("\n  按 Enter 返回菜单...", C_GRAY))
         except (EOFError, KeyboardInterrupt):
@@ -4759,6 +4827,9 @@ def main():
                              "输出经线程锁同步, 详细结果仍按 keys 顺序排列)")
     parser.add_argument("--max-workers", type=int, default=4, metavar="N",
                         help="并行模式下的最大并发数 (--parallel 时生效, 默认 4)")
+    parser.add_argument("--pip-mirror", metavar="URL",
+                        help="pip 镜像 URL, 显式覆盖自动选源。"
+                             "例: --pip-mirror https://pypi.tuna.tsinghua.edu.cn/simple")
     args = parser.parse_args()
 
     # 禁用 scapy 二层抓包 (避免 Npcap 不稳定导致段错误)
@@ -4789,20 +4860,22 @@ def main():
             return
         run_diagnostics(keys, verbose=args.verbose, as_json=args.json,
                         no_color=args.no_color, install=args.install,
-                        parallel=args.parallel, max_workers=args.max_workers)
+                        parallel=args.parallel, max_workers=args.max_workers,
+                        pip_mirror=args.pip_mirror)
         if args.export:
             targets = [t.strip() for t in args.export.split(",") if t.strip()]
             if not targets:
                 targets = [args.export]
             for t in targets:
-                err = export_report(t, auto_install=args.install)
+                err = export_report(t, auto_install=args.install,
+                                    pip_mirror=args.pip_mirror)
                 if err:
                     print(_c(f"  ✗ {err}", C_RED))
                 else:
                     print(_c(f"  ✓ 报告已导出: {os.path.abspath(_normalize_report_path(t))}", C_GREEN))
         return
     # 无参数 -> 进入交互式菜单
-    interactive_menu(install=args.install)
+    interactive_menu(install=args.install, pip_mirror=args.pip_mirror)
 
 
 if __name__ == "__main__":
