@@ -5634,7 +5634,7 @@ def _print_module_list():
         letter = MODULE_NAME_LETTER.get(cat_name, "")
         tag = _c(f"[{letter}]", C_CYAN) if letter else ""
         print()
-        print(_c(f"  {tag} {cat_name}", C_BOLD) + _c(f"  ({desc})", C_GRAY))
+        print(_c(f"  {tag} {cat_name}", C_BOLD) + _c(f"  {desc}", C_GRAY))
         for k in keys:
             idx += 1
             n = MODULE_MAP[k][0]
@@ -8704,16 +8704,20 @@ def interactive_menu(install=False, pip_mirror=None):
         print(_c(bar, C_BLUE))
         print(_c(f"  {APP_NAME} v{APP_VERSION}    命令行网络诊断", C_BOLD))
         print(_c(bar, C_BLUE))
-        print(_c("  请选择要执行的诊断 (输入数字 / 分类字母 a,b,c / 模块 key):", C_WHITE))
+        print(_c("  请选择要执行的诊断 (输入数字 / 分类 a,b,c / 模块 key):", C_WHITE))
         idx = 0
-        for cat_name, keys, desc in MODULE_CATEGORIES:
+        for ci, (cat_name, keys, desc) in enumerate(MODULE_CATEGORIES):
+            if ci > 0:
+                print()
             letter = MODULE_NAME_LETTER.get(cat_name, "")
             tag = _c(f"[{letter}]", C_CYAN) if letter else ""
-            print(_c(f"  ── {tag} {cat_name} {_c(desc, C_GRAY)}", C_BOLD))
+            print(_c(f"  {tag} {cat_name}", C_BOLD) +
+                  _c(f"  {desc}", C_GRAY))
             for k in keys:
                 idx += 1
                 n = MODULE_MAP[k][0]
                 print(f"    {_c(str(idx).rjust(2), C_CYAN)}. {n}  {_c('(' + k + ')', C_GRAY)}")
+        print()
         print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发)', C_GRAY)}")
         print(f"    {_c(' e', C_CYAN)}. 导出上次诊断报告")
         print(f"    {_c(' q', C_CYAN)}. 退出")
