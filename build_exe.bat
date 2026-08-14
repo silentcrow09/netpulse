@@ -25,9 +25,8 @@ echo.
 
 REM 构建
 echo [2/3] 开始构建单文件 EXE...
-pyinstaller --onefile --windowed ^
+pyinstaller --onefile --console ^
     --name "NetPulse" ^
-    --icon "NONE" ^
     --add-data "netpulse.py;." ^
     --hidden-import "tkinter" ^
     --hidden-import "scapy.all" ^
