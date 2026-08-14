@@ -3395,28 +3395,31 @@ class BufferbloatTester:
         # 启动负载线程
         stop_event = threading.Event()
         load_threads = []
+        load_progress = {"bytes": 0, "lock": threading.Lock()}
 
         def generate_load():
             """生成网络负载。
 
             旧版问题: 用国外测速源 + urlopen 完整文件, 国内访问极慢, 每个
             线程每次循环要等几秒到几十秒, 4 个线程一起也打不满带宽。
-            修复: 用国内 + Cloudflare 源, 通过 _download_speed_test 拿 ~1MB
-            数据就停 (而不是等完整 1MB 文件), 循环更快, 链路实际更"打满"。
+            更早版本用的清华/阿里镜像路径已下线 (实测 404 / 拒连), Cloudflare
+            从国内只有 ~1Mbps, 都打不满链路; 现用实测在线的腾讯/华为镜像。
+            每次循环多下一点 (4MB) 摊薄 TLS 握手开销, 让链路真正"打满"。
             """
             urls = [
-                "https://speed.cloudflare.com/__down?bytes=2097152",
-                "https://mirrors.tuna.tsinghua.edu.cn/centos/8/BaseOS/x86_64/os/images/boot.iso",
-                "https://mirrors.aliyun.com/centos/8/BaseOS/x86_64/os/images/boot.iso",
+                "https://mirrors.tencent.com/centos/8/BaseOS/x86_64/os/images/boot.iso",
+                "https://mirrors.huaweicloud.com/centos/8/BaseOS/x86_64/os/images/boot.iso",
             ]
             while not stop_event.is_set():
                 for url in urls:
                     if stop_event.is_set():
                         return
-                    # 拿 1MB 数据就停, 不等完整大文件
-                    _download_speed_test(
-                        url, target_bytes=1024 * 1024,
-                        overall_timeout=15, callback=None)
+                    r = _download_speed_test(
+                        url, target_bytes=4 * 1024 * 1024,
+                        overall_timeout=12, callback=None)
+                    if r and r.get("downloaded_bytes"):
+                        with load_progress["lock"]:
+                            load_progress["bytes"] += r["downloaded_bytes"]
 
         # 启动 4 个负载线程
         for _ in range(4):
@@ -3424,23 +3427,21 @@ class BufferbloatTester:
             t.start()
             load_threads.append(t)
 
-        # 等待负载建立并稳定: 旧版固定 sleep(2), 慢链路(1Mbps)1MB 需 8s,
-        # 容易在带宽尚未打满时就采样; 这里用「多轮 0.5s 心跳确认吞吐
-        # 不再增长」的方式自适应, 但设上限避免慢网络下等太久。
+        # 等待负载建立: 累计下载 ≥16MB 即认为链路已打满 (100M 链路约 1.5s,
+        # 1Mbps 慢链路要 2 分钟, 由 10s 上限兜底)。主线程不直接测量吞吐,
+        # 避免给探测本身加噪。
         if callback:
             callback("等待链路负载稳定...")
-        stable_deadline = time.time() + 8
-        prev_bytes = 0
-        stable_rounds = 0
-        while time.time() < stable_deadline:
+        load_stable_deadline = time.time() + 10
+        while time.time() < load_stable_deadline:
             time.sleep(0.5)
-            # 简单启发: 如果 4 轮 (2s) 内 stop_event 未 set 且线程仍在跑,
-            # 就认为负载已建立; 主线程不直接测量吞吐 (避免给探测本身加噪)
-            stable_rounds += 1
-            if stable_rounds >= 4:
-                break
-            if stop_event.is_set():
-                break
+            with load_progress["lock"]:
+                if load_progress["bytes"] >= 16 * 1024 * 1024:
+                    break
+        with load_progress["lock"]:
+            load_bytes = load_progress["bytes"]
+        # 累计不足 4MB = 负载基本没建立 (测速源不可用), 结果不可信
+        load_warning = load_bytes < 4 * 1024 * 1024
 
         # 在负载下 ping
         if callback:
@@ -3458,7 +3459,9 @@ class BufferbloatTester:
         # 计算 Bufferbloat 等级
         # bloat 为负 (负载下延迟反而更低) 不应判为优秀, 而是"未恶化/无 Bufferbloat"
         bloat = loaded_rtt - idle_rtt
-        if bloat < 5:
+        if load_warning:
+            grade = "无法判定 (负载未建立, 测速源不可用)"
+        elif bloat < 5:
             grade = "A (优秀, 无 Bufferbloat)"
         elif bloat < 30:
             grade = "B (良好)"
@@ -3470,7 +3473,9 @@ class BufferbloatTester:
             grade = "F (很差)"
 
         issues = []
-        if bloat > 100:
+        if load_warning:
+            issues.append("测速源不可用, 未产生有效负载, 结果不可信")
+        elif bloat > 100:
             issues.append(f"严重 Bufferbloat: 负载下延迟增加 {bloat:.0f}ms")
         elif bloat > 30:
             issues.append(f"存在 Bufferbloat: 负载下延迟增加 {bloat:.0f}ms")
@@ -3483,6 +3488,13 @@ class BufferbloatTester:
         else:
             bloat_desc = "基本无变化"
 
+        if load_warning:
+            summary = (f"Bufferbloat: 测速源不可用，负载未建立 "
+                       f"(累计仅 {load_bytes // 1024}KB)，结果不可信")
+        else:
+            summary = (f"Bufferbloat: 空闲 {idle_rtt:.0f}ms → 负载 {loaded_rtt:.0f}ms "
+                       f"({bloat_desc}, {grade})")
+
         self.results = {
             "gateway": gateway,
             "idle_rtt_ms": idle_rtt,
@@ -3491,9 +3503,11 @@ class BufferbloatTester:
             "loaded_jitter_ms": loaded_jitter,
             "bloat_ms": round(bloat, 1),
             "grade": grade,
+            "load_bytes": load_bytes,
+            "load_warning": load_warning,
             "issues": issues,
             "timestamp": datetime.now().isoformat(),
-            "summary": f"Bufferbloat: 空闲 {idle_rtt:.0f}ms → 负载 {loaded_rtt:.0f}ms ({bloat_desc}, {grade})",
+            "summary": summary,
         }
         if callback:
             callback(self.results["summary"])
@@ -5255,23 +5269,37 @@ def _metrics_bufferbloat(res):
     loaded = res.get("loaded_rtt_ms", 0)
     bloat = res.get("bloat_ms", 0)
     grade = res.get("grade", "")
+    load_warning = res.get("load_warning", False)
     out = [
         ("空闲延迟", f"{idle} ms"),
         ("负载延迟", f"{loaded} ms",
+         "err" if load_warning else
          "err" if bloat >= 100 else "warn" if bloat >= 30 else "ok"),
         ("延迟增加", f"+{bloat} ms" if bloat >= 0 else f"{bloat} ms",
+         "err" if load_warning else
          "err" if bloat >= 100 else "warn" if bloat >= 30 else "ok"),
     ]
     if grade:
         out.append(("评级", grade.split(" ")[0] if " " in grade else grade,
+                    "err" if load_warning else
                     "err" if "F" in grade or "D" in grade else
                     "warn" if "C" in grade else "ok"))
+    if load_warning:
+        out.append(("备注", "负载未建立，结果不可信", "err"))
     return out
 
 
 def _issues_bufferbloat(res):
     if "error" in res:
         return []
+    if res.get("load_warning"):
+        return [{
+            "severity": "警告",
+            "text": "Bufferbloat 检测未能建立有效负载（测速源不可用）",
+            "impact": "负载下延迟未实际测量，检测结果不可信",
+            "action": ("检查外网连通性后重试；或手动打满带宽（如用 speedtest）"
+                       "后观察网关延迟")
+        }]
     bloat = res.get("bloat_ms", 0)
     if bloat >= 30:
         return [{
