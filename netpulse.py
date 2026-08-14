@@ -4505,7 +4505,7 @@ C_BLUE   = "94"
 STATUS_STYLE = {
     "完成": C_GREEN, "正常": C_GREEN,
     "警告": C_YELLOW,
-    "异常": C_RED, "错误": C_RED,
+    "异常": C_RED, "错误": C_RED, "超时": C_RED,
     "未检测": C_GRAY,
 }
 
@@ -4807,6 +4807,7 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
     if cnt.get("警告"): summ.append(_c(f"警告 {cnt['警告']}", C_YELLOW))
     if cnt.get("异常"): summ.append(_c(f"异常 {cnt['异常']}", C_RED))
     if cnt.get("错误"): summ.append(_c(f"错误 {cnt['错误']}", C_RED))
+    if cnt.get("超时"): summ.append(_c(f"超时 {cnt['超时']}", C_RED))
     print("  " + "   ".join(summ) if summ else "  无结果")
     print(_c("=" * 60, C_BLUE))
 
@@ -4823,8 +4824,79 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
     return results
 
 
+# ── 模块级超时 ──
+# 旧版并行/顺序执行对单个模块没有超时: Speedtest 选服可拖数分钟、某些模块
+# 卡死时会拖住整个诊断。现在每个模块在 daemon 线程里跑, 到点未完成即标记
+# "超时"并继续, 不再互相拖累; daemon 线程也不会阻塞进程退出。
+DEFAULT_MODULE_TIMEOUT = 120.0  # 秒
+MODULE_TIMEOUTS = {
+    "speedtest":   180.0,  # 国内HTTP(多源×多连接) + 可选 speedtest-cli + iperf3
+    "bufferbloat": 120.0,
+    "port":        180.0,  # 端口探测自带总时长上限, 这里只兜底
+    "dhcp":        150.0,  # 可能等待 Npcap/scapy 抓包
+    "lan":         150.0,
+}
+
+
+def _module_detect_kwargs(key):
+    """模块 detect() 的额外参数 (由 CLI/全局配置注入)。"""
+    if key == "speedtest":
+        return dict(
+            iperf3_server=SPEEDTEST_CONFIG.get("iperf3_server"),
+            iperf3_port=SPEEDTEST_CONFIG.get("iperf3_port", 5201),
+            use_speedtest_net=SPEEDTEST_CONFIG.get("use_speedtest_net", False),
+        )
+    return {}
+
+
+def _module_timeout(key):
+    return MODULE_TIMEOUTS.get(key, DEFAULT_MODULE_TIMEOUT)
+
+
+def _run_module_with_timeout(key, callback):
+    """在 daemon 线程中执行模块 detect(), 超时返回 ("超时", {error})。
+
+    返回 (status, res_dict):
+      - 正常完成: (determine_status(res), res)
+      - 模块抛异常: ("错误", {"error": ...})
+      - 超过 _module_timeout(key): ("超时", {"error": ...})
+    超时后模块线程继续在后台运行 (daemon, 进程退出时被强杀), 结果被丢弃,
+    不影响其它模块。
+    """
+    name, cls = MODULE_MAP[key]
+    timeout = _module_timeout(key)
+    if key == "port":
+        inst = cls(targets=PORT_PROBE_CONFIG["targets"],
+                   proto=PORT_PROBE_CONFIG["proto"],
+                   count=PORT_PROBE_CONFIG["count"],
+                   force=PORT_PROBE_CONFIG.get("force", False),
+                   max_total_time=PORT_PROBE_CONFIG.get("max_total_time", 60.0),
+                   max_concurrency=PORT_PROBE_CONFIG.get("max_concurrency", 8))
+    else:
+        inst = cls()
+    detect_kwargs = _module_detect_kwargs(key)
+    box = {}
+
+    def _work():
+        try:
+            inst.detect(callback=callback, **detect_kwargs)
+            box["res"] = inst.results
+        except Exception as e:
+            box["err"] = e
+
+    t = threading.Thread(target=_work, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return "超时", {"error": f"模块执行超时（超过 {timeout:.0f} 秒）"}
+    if "err" in box:
+        return "错误", {"error": str(box["err"])}
+    return determine_status(box["res"]), box["res"]
+
+
 def _run_diagnostics_sequential(keys, is_tty):
-    """顺序模式: 保留 TTY 实时进度行 (\\r\\033[K 刷新), 详细 result 留给主循环统一打。"""
+    """顺序模式: 保留 TTY 实时进度行 (\\r\\033[K 刷新), 详细 result 留给主循环统一打。
+    每个模块有独立超时 (_run_module_with_timeout), 单个模块卡死不会拖住整个流程。"""
     results = {}
     full = {}
     for key in keys:
@@ -4834,38 +4906,24 @@ def _run_diagnostics_sequential(keys, is_tty):
             sys.stdout.flush()
         else:
             print(_c(f"  正在 {name} …", C_GRAY))
+        if is_tty:
+            def _cb(msg, _n=name):
+                sys.stdout.write("\r\033[K" + _c(f"  … {msg}", C_GRAY))
+                sys.stdout.flush()
+        else:
+            _cb = lambda msg: None
         try:
-            if key == "port":
-                inst = cls(targets=PORT_PROBE_CONFIG["targets"],
-                           proto=PORT_PROBE_CONFIG["proto"],
-                           count=PORT_PROBE_CONFIG["count"],
-                           force=PORT_PROBE_CONFIG.get("force", False),
-                           max_total_time=PORT_PROBE_CONFIG.get("max_total_time", 60.0),
-                           max_concurrency=PORT_PROBE_CONFIG.get("max_concurrency", 8))
-            else:
-                inst = cls()
-            if is_tty:
-                def _cb(msg, _n=name):
-                    sys.stdout.write("\r\033[K" + _c(f"  … {msg}", C_GRAY))
-                    sys.stdout.flush()
-            else:
-                _cb = lambda msg: None
-            inst.detect(callback=_cb)
-            if is_tty:
-                sys.stdout.write("\r\033[K")
-                sys.stdout.flush()
-            res = inst.results
-            status = determine_status(res)
-            results[key] = status
-            full[key] = res
+            status, res = _run_module_with_timeout(key, _cb)
         except Exception as e:
-            if is_tty:
-                sys.stdout.write("\r\033[K")
-                sys.stdout.flush()
-            print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge("错误"))
-            print(_c(f"  诊断异常: {e}", C_RED))
-            results[key] = "错误"
-            full[key] = {"error": str(e)}
+            status, res = "错误", {"error": str(e)}
+        if is_tty:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+        if status in ("错误", "超时"):
+            print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge(status))
+            print(_c(f"  {res.get('error', status)}", C_RED))
+        results[key] = status
+        full[key] = res
     return results, full
 
 
@@ -4876,8 +4934,8 @@ def _run_diagnostics_parallel(keys, max_workers, total):
       - 启动行: 主线程在 submit 前按 keys 顺序打 (1, 2, 3, ..., 18 整齐一行下来)
       - 完成行: worker 完成时只存结果, 不立即打印; 主线程等所有完成后按 keys 顺序遍历
         打 (1, 2, 3, ..., 18 整齐一行下来)
-      - 缺点: 慢模块 (Bufferbloat 30+ 秒) 会让进度"卡"在它那里, 其它 worker 闲着等。
-        优点: 用户能看清 1-18 哪个完成哪个没完成, 视觉上不再"乱"。
+      - 每个模块有独立超时 (_run_module_with_timeout), 慢模块卡死只影响自己,
+        不再拖累其它 worker
       - print() 走 _safe_print (lock) 避免交错
       - 共享状态 (_CMD_CACHE / _LOCAL_SUBNET_CACHE / _DECODE_CACHE / DNS socket)
         均为只读 / GIL-safe / thread-local, 多个 detector 并发安全
@@ -4889,22 +4947,7 @@ def _run_diagnostics_parallel(keys, max_workers, total):
 
     def _run_one(key):
         name, cls = MODULE_MAP[key]
-        try:
-            if key == "port":
-                inst = cls(targets=PORT_PROBE_CONFIG["targets"],
-                           proto=PORT_PROBE_CONFIG["proto"],
-                           count=PORT_PROBE_CONFIG["count"],
-                           force=PORT_PROBE_CONFIG.get("force", False),
-                           max_total_time=PORT_PROBE_CONFIG.get("max_total_time", 60.0),
-                           max_concurrency=PORT_PROBE_CONFIG.get("max_concurrency", 8))
-            else:
-                inst = cls()
-            inst.detect(callback=lambda msg: None)  # parallel 模式抑制中间输出
-            res = inst.results
-            status = determine_status(res)
-        except Exception as e:
-            res = {"error": str(e)}
-            status = "错误"
+        status, res = _run_module_with_timeout(key, lambda msg: None)
         # 存结果, 不立即打 (主线程按 keys 顺序统一打)
         with completed_lock:
             completed[key] = (name, status, res)
@@ -4915,7 +4958,7 @@ def _run_diagnostics_parallel(keys, max_workers, total):
         name = MODULE_MAP[key][0]
         _safe_print(_c(f"  [{i}/{total}] 正在 {name} …", C_GRAY))
 
-    # 等待所有 worker 完成 (中间不打任何东西, 让用户看到 1-18 启动后等一段时间)
+    # 等待所有 worker 完成 (每个 worker 内部自带超时, 不会无限等)
     with ThreadPoolExecutor(max_workers=max(1, min(max_workers, total))) as ex:
         futs = [ex.submit(_run_one, k) for k in keys]
         for fut in as_completed(futs):
@@ -7720,6 +7763,13 @@ def main():
     parser.add_argument("--pip-mirror", metavar="URL",
                         help="pip 镜像 URL, 显式覆盖自动选源。"
                              "例: --pip-mirror https://pypi.tuna.tsinghua.edu.cn/simple")
+    parser.add_argument("--iperf3-server", metavar="HOST[:PORT]",
+                        help="iperf3 服务器地址 (可选): 提供后测速模块会用 iperf3 "
+                             "测量上下行 (iperf3.exe 缺失时会交互式询问自动下载)。"
+                             "例: 192.168.1.10 或 192.168.1.10:5201")
+    parser.add_argument("--speedtest-net", action="store_true",
+                        help="启用 Speedtest.net 测速 (默认关闭: 国内网络下常选中"
+                             "海外服务器, 结果严重偏低, 仅作参考)")
     args = parser.parse_args()
 
     # 禁用 scapy 二层抓包 (避免 Npcap 不稳定导致段错误)
@@ -7740,6 +7790,20 @@ def main():
     PORT_PROBE_CONFIG["force"] = bool(getattr(args, "port_force", False))
     PORT_PROBE_CONFIG["max_total_time"] = max(0.0, float(getattr(args, "port_timeout", 60.0)))
     PORT_PROBE_CONFIG["max_concurrency"] = max(1, min(64, int(getattr(args, "port_concurrency", 8))))
+
+    # 测速参数 -> 全局配置 (runner -> SpeedTester.detect 读取)
+    if args.iperf3_server:
+        spec = args.iperf3_server.strip()
+        if ":" in spec:
+            host, _, port = spec.rpartition(":")
+            if host and port.isdigit():
+                SPEEDTEST_CONFIG["iperf3_server"] = host
+                SPEEDTEST_CONFIG["iperf3_port"] = int(port)
+            else:
+                SPEEDTEST_CONFIG["iperf3_server"] = spec
+        else:
+            SPEEDTEST_CONFIG["iperf3_server"] = spec
+    SPEEDTEST_CONFIG["use_speedtest_net"] = bool(args.speedtest_net)
 
     if args.list:
         _print_module_list()

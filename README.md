@@ -174,7 +174,10 @@ build_exe.bat
 ```
 
 > 若需 DHCP 完整检测，目标机需安装 [Npcap](https://npcap.com/)（勾选 WinPcap API 兼容模式）；
-> 若需 iperf3 测速，将 `iperf3.exe` 放在 EXE 同目录。
+> 若需 iperf3 测速（可测上下行），用 `--iperf3-server HOST[:PORT]` 指定服务器，
+> 缺少 `iperf3.exe` 时程序会询问是否自动下载（或手动放到 EXE 同目录）。
+> 默认测速为国内镜像多连接下载（仅下行）；`--speedtest-net` 可开启 Speedtest.net
+> 作参考（国内网络下常选中海外服务器，结果会严重偏低并给出提示）。
 
 ## 🚀 一键分发部署
 
