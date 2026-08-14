@@ -3314,6 +3314,10 @@ def _render_speedtest_html(res):
     # 大数字指标 (主流测速报告风格: 下行/上行/延迟)
     up_big = f"{upload:.1f}" if upload is not None else "未测"
     ping_big = f"{idle_rtt:.0f}" if idle_rtt is not None else "—"
+    # 测速节点延迟 (TCP 握手, 与报告"延迟 Ping"的 ICMP 网关延迟区分)
+    up_res = res.get("up_result") or {}
+    server_lat = up_res.get("server_latency_ms")
+    server_lat_str = (f"{server_lat:.0f} ms (TCP 握手)" if server_lat is not None else "—")
 
     # 速率曲线: 下行段 (蓝) + 上行段 (橙, 时间轴偏移到下行之后)
     down_data = [[round(t, 2), v] for t, v in down_series]
@@ -3387,7 +3391,7 @@ def _render_speedtest_html(res):
     <div class="metric ping">
       <div class="label">延迟 Ping</div>
       <div class="big">{ping_big}<span class="unit"> ms</span></div>
-      <div class="note">空闲基线延迟</div>
+      <div class="note">对网关 {gateway} 的 ICMP 延迟 (空闲基线)</div>
     </div>
   </div>
 
@@ -3423,7 +3427,8 @@ def _render_speedtest_html(res):
     <table>
       <tr><td>下行测速方式</td><td>国内镜像多连接 HTTP 下载 ({down_threads} 连接 × {src_domain})</td></tr>
       <tr><td>上行测速方式</td><td>{upload_method} ({upload_server}) · {up_threads} 连接</td></tr>
-      <tr><td>延迟采样目标</td><td>{res.get("latency_target", "—")}</td></tr>
+      <tr><td>延迟采样目标</td><td>{res.get("latency_target", "—")} (空闲/负载延迟均对它测)</td></tr>
+      <tr><td>测速节点延迟</td><td>{server_lat_str}</td></tr>
       <tr><td>空闲延迟 / 负载延迟</td><td>{idle_str} / {loaded_str} ({res.get("loaded_phase") or "—"} 阶段)</td></tr>
       <tr><td>延迟采样阶段</td><td>空闲基线 → 下行 → 上行 (全程并行采样)</td></tr>
       <tr><td>缓冲膨胀增量</td><td>{bloat_str}</td></tr>
@@ -5403,27 +5408,46 @@ class TCPStatsTester:
 # ============================================================
 
 # 模块注册表 (key, 显示名, 检测器类)
+# 顺序 = 装维工作流分类顺序 (先看 → 再测 → 后查), 序号 1-18 全局连续,
+# CLI/菜单的序号解析与此保持一致。
 MODULE_REGISTRY = [
-    ("dhcp",       "DHCP 检测",     DHCPDetector),
-    ("gateway",    "网关检测",      GatewayTester),
-    ("loop",       "环路检测",      LoopDetector),
-    ("external",   "外网检测",      ExternalNetworkTester),
+    # ── 基础信息: 环境快照 ──
     ("linkspeed",  "链路速率",      LinkSpeedDetector),
+    ("dhcp",       "DHCP 检测",     DHCPDetector),
+    ("lan",        "LAN 设备扫描",  LANDeviceScanner),
     ("wifi",       "WiFi 分析",     WiFiAnalyzer),
+    ("ipv6",       "IPv6 检测",     IPv6Tester),
+    ("egress",     "多出口",        MultiEgressDetector),
+    # ── 宽带测速: 带宽达标验证 (装维核心高频) ──
+    ("speedtest",  "测速",          SpeedTester),
+    ("bufferbloat","Bufferbloat",   BufferbloatTester),
+    # ── 故障诊断: 定位故障根源 ──
+    ("gateway",    "网关检测",      GatewayTester),
+    ("external",   "外网检测",      ExternalNetworkTester),
+    ("dns",        "DNS 诊断",      DNSTester),
+    ("arp",        "ARP 分析",      ARPAnalyzer),
+    ("loop",       "环路检测",      LoopDetector),
     ("tcp",        "TCP 连接",      TCPConnectionAnalyzer),
     ("port",       "端口探测",      PortProbeTester),
-    ("egress",     "多出口",        MultiEgressDetector),
-    ("dns",        "DNS 诊断",      DNSTester),
-    ("mtu",        "MTU 检测",      MTUDetector),
-    ("arp",        "ARP 分析",      ARPAnalyzer),
-    ("bufferbloat","Bufferbloat",   BufferbloatTester),
-    ("ipv6",       "IPv6 检测",     IPv6Tester),
     ("route",      "路由表",        RouteTableAnalyzer),
-    ("speedtest",  "测速",          SpeedTester),
-    ("lan",        "LAN 设备扫描",  LANDeviceScanner),
     ("tcpstats",   "TCP 传输质量",  TCPStatsTester),
+    ("mtu",        "MTU 检测",      MTUDetector),
 ]
 MODULE_MAP = {k: (n, c) for k, n, c in MODULE_REGISTRY}
+
+# 模块三大分类 (装维工作流: 先看 → 再测 → 后查)
+# 每项: (分类名, keys, 一句话定位); 顺序即展示顺序
+MODULE_CATEGORIES = [
+    ("基础信息", ["linkspeed", "dhcp", "lan", "wifi", "ipv6", "egress"],
+     "环境快照 · 看清网络状态"),
+    ("宽带测速", ["speedtest", "bufferbloat"],
+     "带宽达标验证 · 装维核心高频"),
+    ("故障诊断", ["gateway", "external", "dns", "arp", "loop", "tcp",
+                  "port", "route", "tcpstats", "mtu"],
+     "定位故障根源"),
+]
+# 分类速查: key -> 分类名
+MODULE_CATEGORY_OF = {k: name for name, keys, _ in MODULE_CATEGORIES for k in keys}
 
 # ── ANSI 颜色 ──
 _C_NOCOLOR = False
@@ -5561,10 +5585,17 @@ def _cli_print_result(res, verbose=False, as_json=False):
 
 
 def _print_module_list():
-    """打印所有可用诊断模块"""
+    """打印所有可用诊断模块 (按三大类分组展示, 序号全局连续 1-18)"""
     print(_c(f"{APP_NAME} v{APP_VERSION} — 可用诊断模块:", C_BOLD))
-    for i, (k, n, _) in enumerate(MODULE_REGISTRY, 1):
-        print(f"  {_c(str(i).rjust(2), C_CYAN)}. {_c(n, C_WHITE)}  {_c('(' + k + ')', C_GRAY)}")
+    idx = 0
+    for cat_name, keys, desc in MODULE_CATEGORIES:
+        print()
+        print(_c(f"  {cat_name}", C_BOLD) + _c(f"  ({desc})", C_GRAY))
+        for k in keys:
+            idx += 1
+            n = MODULE_MAP[k][0]
+            print(f"    {_c(str(idx).rjust(2), C_CYAN)}. {_c(n, C_WHITE)}  {_c('(' + k + ')', C_GRAY)}")
+    print()
 
 
 def _parse_keys(tokens, *, strict=True):
@@ -8606,8 +8637,13 @@ def interactive_menu(install=False, pip_mirror=None):
         print(_c(f"  {APP_NAME} v{APP_VERSION}    命令行网络诊断", C_BOLD))
         print(_c(bar, C_BLUE))
         print(_c("  请选择要执行的诊断 (输入数字, 空格分隔可多选):", C_WHITE))
-        for i, (k, n, _) in enumerate(MODULE_REGISTRY, 1):
-            print(f"    {_c(str(i).rjust(2), C_CYAN)}. {n}  {_c('(' + k + ')', C_GRAY)}")
+        idx = 0
+        for cat_name, keys, desc in MODULE_CATEGORIES:
+            print(_c(f"  ── {cat_name} {_c(desc, C_GRAY)}", C_BOLD))
+            for k in keys:
+                idx += 1
+                n = MODULE_MAP[k][0]
+                print(f"    {_c(str(idx).rjust(2), C_CYAN)}. {n}  {_c('(' + k + ')', C_GRAY)}")
         print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发)', C_GRAY)}")
         print(f"    {_c(' q', C_CYAN)}. 退出")
         print(_c("-" * 60, C_GRAY))
@@ -8650,7 +8686,13 @@ def interactive_menu(install=False, pip_mirror=None):
         # 单模块走并发 (无意义且会浪费线程开销)。
         run_diagnostics(keys, banner=False, parallel=True, max_workers=4)
         if sys.stdout.isatty():
-            prompt_export_report(auto_install=install, pip_mirror=pip_mirror)
+            # 单独跑测速时跳过"生成综合诊断报告"询问: 测速已自动保存独立的
+            # 专业测速报告 (HTML+JSON), 再问会产生冗余的 netdiag_report_*
+            if keys == ["speedtest"]:
+                print(_c("  测速报告已自动保存至 reports/ 目录 (speedtest_时间戳.html/.json)。",
+                         C_GRAY))
+            else:
+                prompt_export_report(auto_install=install, pip_mirror=pip_mirror)
         try:
             input(_c("\n  按 Enter 返回菜单...", C_GRAY))
         except (EOFError, KeyboardInterrupt):
