@@ -8031,7 +8031,7 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame,
                                     Paragraph, Spacer, Table, TableStyle,
-                                    KeepTogether, HRFlowable)
+                                    KeepTogether, HRFlowable, CondPageBreak)
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
@@ -8106,13 +8106,13 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
     metric_lbl = ParagraphStyle("mlbl", fontName=FONT, fontSize=8.5,
                                 textColor=C_SUB, leading=12)
     metric_val_ok = ParagraphStyle("mv_ok", fontName=FONT, fontSize=10,
-                                  textColor=C_OK, leading=13, alignment=2)
+                                  textColor=C_OK, leading=13, alignment=0)
     metric_val_warn = ParagraphStyle("mv_warn", fontName=FONT, fontSize=10,
-                                    textColor=C_WARN, leading=13, alignment=2)
+                                    textColor=C_WARN, leading=13, alignment=0)
     metric_val_err = ParagraphStyle("mv_err", fontName=FONT, fontSize=10,
-                                   textColor=C_ERR, leading=13, alignment=2)
+                                   textColor=C_ERR, leading=13, alignment=0)
     metric_val_idle = ParagraphStyle("mv_idle", fontName=FONT, fontSize=10,
-                                     textColor=C_IDLE, leading=13, alignment=2)
+                                     textColor=C_IDLE, leading=13, alignment=0)
     metric_val_map = {"ok": metric_val_ok, "warn": metric_val_warn,
                       "err": metric_val_err, "idle": metric_val_idle}
 
@@ -8185,7 +8185,7 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
         canvas.setFont(FONT, 7.5)
         canvas.setFillColor(C_FAINT)
         canvas.drawString(LM, BM - 8 * mm,
-                          f"{report['app']} v{report['version']} · 自动生成诊断报告")
+                          f"{report['app']} / {report['version']} · 自动生成诊断报告")
         canvas.drawRightString(PW - RM, BM - 8 * mm, f"第 {doc_.page} 页")
         canvas.restoreState()
 
@@ -8197,8 +8197,6 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
 
     flow = []
     content_w = PW - LM - RM
-    # 模块卡片内可用宽度 (减去 head_tbl 的 LEFTPADDING 10pt + RIGHTPADDING 8pt)
-    card_inner_w = content_w - 18
 
     sys_i = report["system"]
     health = report["health"]
@@ -8358,8 +8356,7 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
         c = SC.get(status, C_IDLE)
         verdict = m.get("verdict", "")
 
-        # ── 标题 + 状态徽章 ──
-        head_elems = []
+        # ── 标题条 (仅 1 行的小块, KeepTogether 不会造成大段空白) ──
         dot = Table([[""]], colWidths=[3 * mm], rowHeights=[3 * mm])
         dot.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, -1), c),
@@ -8367,77 +8364,56 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
             ("RIGHTPADDING", (0, 0), (-1, -1), 0),
             ("TOPPADDING", (0, 0), (-1, -1), 0),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
-        title_row = Table(
+        heading = Table(
             [[dot, Paragraph(f"<b>{m['name']}</b>", mod_title),
               _badge(status)]],
-            colWidths=[5 * mm, card_inner_w - 29 * mm, 24 * mm])
-        title_row.setStyle(TableStyle([
+            colWidths=[5 * mm, content_w - 29 * mm, 24 * mm])
+        heading.setStyle(TableStyle([
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("LEFTPADDING", (0, 0), (-1, -1), 0),
             ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-            ("TOPPADDING", (0, 0), (-1, -1), 2),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
-        head_elems.append(title_row)
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LINEBEFORE", (0, 0), (0, -1), 3, c)]))
+        # 接近页底时先分页, 避免标题孤行; 不会因整块 KeepTogether 留大空白
+        flow.append(CondPageBreak(22 * mm))
+        flow.append(KeepTogether(heading))
+        flow.append(Spacer(1, 3))
 
-        # 结论
+        # 结论 (流式段落, 可跨页)
         if verdict:
-            concl_tbl = Table(
-                [[Paragraph(
-                    f"<font color='#1e40af'><b>结论</b></font>　{verdict}",
-                    concl)]],
-                colWidths=[card_inner_w])
-            concl_tbl.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), C_PRI_SOFT),
-                ("LINEBEFORE", (0, 0), (0, 0), 2.5, c),
-                ("LEFTPADDING", (0, 0), (-1, -1), 10),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-                ("TOPPADDING", (0, 0), (-1, -1), 5),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
-            head_elems.append(Spacer(1, 3))
-            head_elems.append(concl_tbl)
+            flow.append(Paragraph(
+                f"<font color='{SC_HEX.get(status, '#1e40af')}'>"
+                f"<b>结论</b></font>　{_html_esc(verdict)}", concl))
+            flow.append(Spacer(1, 3))
 
-        # 关键指标
+        # 关键指标 (流式 2 列键值表, 行可拆分, 不整体 KeepTogether)
         metrics = m.get("key_metrics", [])
         if metrics:
-            # 3 列网格, 每项 = (label, value, level, hint)
-            met_rows = []
-            row = []
+            mrows = []
             for me in metrics:
-                level = me.get("level", "ok")
-                val_style = metric_val_map.get(level, metric_val_ok)
-                # 指标卡: 标签 + 值 (颜色按阈值)
-                cell_t = Table(
-                    [[Paragraph(me.get("label", ""), metric_lbl)],
-                     [Paragraph(me.get("value", ""), val_style)]],
-                    colWidths=[(card_inner_w - 4) / 3])
-                cell_t.setStyle(TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, -1), C_CARD),
-                    ("BOX", (0, 0), (-1, -1), 0.4, C_LINE),
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("TOPPADDING", (0, 0), (-1, -1), 4),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ]))
-                row.append(cell_t)
-                if len(row) == 3:
-                    met_rows.append(row)
-                    row = []
-            if row:
-                while len(row) < 3:
-                    row.append(Paragraph("", cell))
-                met_rows.append(row)
-            met_tbl = Table(met_rows, colWidths=[card_inner_w / 3] * 3)
-            met_tbl.setStyle(TableStyle([
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                ("TOPPADDING", (0, 0), (-1, -1), 2),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-            ]))
-            head_elems.append(Spacer(1, 4))
-            head_elems.append(met_tbl)
+                lvl = me.get("level", "ok")
+                vstyle = metric_val_map.get(lvl, metric_val_ok)
+                hint = me.get("hint", "")
+                vtext = me.get("value", "")
+                if hint:
+                    vtext += (f"  <font size=7 color='#94a3b8'>"
+                              f"{_html_esc(hint)}</font>")
+                mrows.append([
+                    Paragraph(_html_esc(me.get("label", "")), metric_lbl),
+                    Paragraph(vtext, vstyle)])
+            mt = Table(mrows, colWidths=[52 * mm, content_w - 52 * mm])
+            mt.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LINEBELOW", (0, 0), (-1, -1), 0.3, C_LINE),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4)]))
+            flow.append(mt)
+            flow.append(Spacer(1, 4))
 
-        # 问题/建议
+        # 问题/建议 (流式段落)
         issues = m.get("issues", [])
         for issue in issues:
             sev = issue.get("severity", "信息")
@@ -8446,38 +8422,29 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
             action = issue.get("action", "")
             sev_color = {"异常": "#dc2626", "错误": "#7f1d1d",
                          "警告": "#ea580c", "信息": "#64748b"}.get(sev, "#64748b")
-            sev_c = colors.HexColor(sev_color)
-            issue_dot = Table([[""]], colWidths=[2.5 * mm],
-                              rowHeights=[2.5 * mm])
-            issue_dot.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), sev_c),
+            bullet = Table([[""]], colWidths=[2.5 * mm], rowHeights=[2.5 * mm])
+            bullet.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(sev_color)),
                 ("LEFTPADDING", (0, 0), (-1, -1), 0),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 0),
                 ("TOPPADDING", (0, 0), (-1, -1), 0),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
-            issue_line = Table(
-                [[issue_dot,
-                  Paragraph(
-                      f"<b><font color='{sev_color}'>[{sev}]</font></b> {text}",
-                      warn_style if sev == "警告" else err_style)]],
-                colWidths=[5 * mm, card_inner_w - 5 * mm])
-            issue_line.setStyle(TableStyle([
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                ("TOPPADDING", (0, 0), (-1, -1), 1),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 1)]))
-            head_elems.append(Spacer(1, 2))
-            head_elems.append(issue_line)
+            flow.append(Table(
+                [[bullet, Paragraph(
+                    f"<b><font color='{sev_color}'>[{sev}]</font></b> "
+                    f"{_html_esc(text)}",
+                    warn_style if sev == "警告" else err_style)]],
+                colWidths=[5 * mm, content_w - 5 * mm]))
             if impact:
-                head_elems.append(Paragraph(
-                    f"<b>影响:</b> {impact}", cell))
+                flow.append(Paragraph(
+                    f"<b>影响:</b> {_html_esc(impact)}", cell))
             if action:
-                head_elems.append(Paragraph(
-                    f"<b><font color='#b45309'>建议:</font></b> {action}",
-                    action_style))
+                flow.append(Paragraph(
+                    f"<b><font color='#b45309'>建议:</font></b> "
+                    f"{_html_esc(action)}", action_style))
+            flow.append(Spacer(1, 2))
 
-        # 技术细节 (客户版 PDF 只放简化摘要, 完整数据见 JSON)
+        # 技术细节 (简化摘要, 表格可拆分跨页; 完整数据见 JSON)
         if m.get("has_tech_details"):
             pres = MODULE_PRESENTATION.get(m["key"], {})
             tech_keys = pres.get("tech_keys", [])
@@ -8486,6 +8453,8 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
             for k in tech_keys:
                 v = raw.get(k)
                 if v is None:
+                    continue
+                if isinstance(v, (list, dict, tuple)) and not v:
                     continue
                 label = HEADER_MAP.get(k, k)
                 tech_elems.append(Paragraph(
@@ -8498,7 +8467,7 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
                         rt = None
                     if rt:
                         headers, rows = rt
-                        show = rows[:3]
+                        show = rows[:5]
                         cell_data = [[Paragraph(_html_esc(h), th)
                                       for h in headers]]
                         for r in show:
@@ -8506,7 +8475,7 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
                                 Paragraph(_html_esc(str(c)[:60]), tech_cell)
                                 for c in r])
                         n_cols = len(headers)
-                        cw = card_inner_w / max(n_cols, 1)
+                        cw = (content_w - 12) / max(n_cols, 1)
                         rtbl = Table(cell_data,
                                      colWidths=[cw] * n_cols,
                                      repeatRows=1)
@@ -8523,16 +8492,14 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
                         ]))
                         tech_elems.append(Spacer(1, 2))
                         tech_elems.append(rtbl)
-                        if len(rows) > 3:
+                        if len(rows) > 5:
                             tech_elems.append(Paragraph(
                                 f"<font color='#94a3b8'>"
-                                f"⋯ 还有 {len(rows) - 3} 行, 详见 JSON 报告</font>",
+                                f"⋯ 还有 {len(rows) - 5} 行, 详见 JSON 报告</font>",
                                 detail_cap))
                         continue
-                    # 标量列表: 逗号分隔, 避免 Python repr
                     s = ", ".join(str(x) for x in v)
-                    tech_elems.append(Paragraph(
-                        _html_esc(s[:150]), tech_cell))
+                    tech_elems.append(Paragraph(_html_esc(s[:150]), tech_cell))
                     continue
 
                 if isinstance(v, dict):
@@ -8548,16 +8515,14 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
                             p_rows.append([
                                 Paragraph(f"<b>{_html_esc(lbl)}</b>",
                                           metric_lbl),
-                                Paragraph(_html_esc(val), tech_cell),
-                            ])
+                                Paragraph(_html_esc(val), tech_cell)])
                         ptbl = Table(p_rows,
-                                     colWidths=[26 * mm,
-                                                card_inner_w - 26 * mm])
+                                     colWidths=[40 * mm,
+                                                content_w - 40 * mm])
                         ptbl.setStyle(TableStyle([
                             ("VALIGN", (0, 0), (-1, -1), "TOP"),
                             ("TOPPADDING", (0, 0), (-1, -1), 1),
-                            ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
-                        ]))
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 1)]))
                         tech_elems.append(Spacer(1, 2))
                         tech_elems.append(ptbl)
                 else:
@@ -8565,26 +8530,16 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
                         _html_esc(str(v)[:150]), tech_cell))
 
             if tech_elems:
-                head_elems.append(Spacer(1, 4))
-                head_elems.append(Paragraph(
+                flow.append(Spacer(1, 3))
+                flow.append(Paragraph(
                     "<font color='#94a3b8'>"
-                    "技术细节（完整数据见 .json 报告）</font>",
-                    detail_cap))
+                    "技术细节（完整数据见 .json 报告）</font>", detail_cap))
                 for elem in tech_elems:
-                    head_elems.append(elem)
+                    flow.append(elem)
 
-        # 整块卡片 (KeepTogether 让标题/结论/指标不被截断)
-        head_tbl = Table([[head_elems]], colWidths=[content_w])
-        head_tbl.setStyle(TableStyle([
-            ("LINEBEFORE", (0, 0), (0, 0), 3, c),
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fbfcfd")),
-            ("BOX", (0, 0), (-1, -1), 0.5, C_LINE),
-            ("LEFTPADDING", (0, 0), (-1, -1), 10),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-            ("TOPPADDING", (0, 0), (-1, -1), 7),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
-        flow.append(KeepTogether(head_tbl))
-        flow.append(Spacer(1, 7))
+        flow.append(Spacer(1, 8))
+        flow.append(HRFlowable(width="100%", thickness=0.4, color=C_LINE,
+                               spaceBefore=1, spaceAfter=6))
 
     doc.build(flow)
     return True
