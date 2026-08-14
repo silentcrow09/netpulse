@@ -39,6 +39,8 @@ import sys
 import argparse
 import tempfile
 import ipaddress
+import shutil
+import zipfile
 from datetime import datetime
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -277,6 +279,15 @@ def _pip_install_scapy(mirror=None):
 
     mirror: 显式指定的 pip 镜像 URL; None 时由 _resolve_pip_mirror 自动选源。
     """
+    # PyInstaller 打包的 exe 没有 pip; scapy 已通过 --collect-all 打进 exe,
+    # 此处直接成功返回, 避免误报 "pip 安装失败"。
+    if getattr(sys, "frozen", False):
+        try:
+            import scapy.all  # noqa: F401
+            return True, "scapy 已随 exe 打包 (--collect-all scapy)"
+        except Exception as e:
+            return False, (f"scapy 导入失败 (PyInstaller 打包不完整?): {e}\n"
+                           f"请重新运行 build_exe.bat 重新打包。")
     if mirror is None:
         mirror, source = _resolve_pip_mirror()
         if mirror:
@@ -411,6 +422,73 @@ def _install_npcap():
         return True, "Npcap 安装完成 (可能需要重启后生效)"
     except Exception as e:
         return False, f"Npcap 安装异常: {e}"
+
+
+def _download_iperf3(target_dir=None):
+    """下载 iperf3 Windows 二进制并解压到 target_dir。返回 (ok, path_or_msg)。
+
+    target_dir: None 时优先选程序目录, 不可写则回退到 %LOCALAPPDATA%\\NetPulse\\。
+    """
+    # 选目标目录
+    if target_dir is None:
+        app_dir = os.path.dirname(os.path.abspath(
+            sys.argv[0] if getattr(sys, "frozen", False) else __file__))
+        try:
+            test_file = os.path.join(app_dir, ".np_write_test")
+            with open(test_file, "w") as f:
+                f.write("ok")
+            os.remove(test_file)
+            target_dir = app_dir
+        except Exception:
+            target_dir = os.path.join(
+                os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "NetPulse")
+    os.makedirs(target_dir, exist_ok=True)
+    dst = os.path.join(target_dir, "iperf3.exe")
+
+    if os.path.exists(dst) and os.path.getsize(dst) > 1000:
+        return True, dst
+
+    # 候选下载源: GitHub 官方 + 国内镜像 (ghproxy)
+    version = "3.17.1"
+    zip_name = f"iperf-{version}-win64.zip"
+    candidates = [
+        f"https://github.com/esnet/iperf/releases/download/{version}/{zip_name}",
+        f"https://mirror.ghproxy.com/https://github.com/esnet/iperf/releases/download/{version}/{zip_name}",
+    ]
+    tmp_zip = os.path.join(tempfile.gettempdir(), zip_name)
+    downloaded_from = None
+    for url in candidates:
+        print(_c(f"  尝试: {url[:80]}{'...' if len(url) > 80 else ''}", C_GRAY))
+        ok, msg = _download_file(url, tmp_zip, timeout=120)
+        if ok and os.path.exists(tmp_zip) and os.path.getsize(tmp_zip) > 10000:
+            downloaded_from = url
+            break
+        print(_c(f"  ✗ {msg}", C_YELLOW))
+    if not downloaded_from:
+        return False, "所有 iperf3 下载源均失败"
+
+    # 解压找 iperf3.exe (zip 内通常在子目录里)
+    try:
+        with zipfile.ZipFile(tmp_zip, "r") as zf:
+            target_member = None
+            for name in zf.namelist():
+                if name.lower().replace("\\", "/").endswith("iperf3.exe"):
+                    target_member = name
+                    break
+            if not target_member:
+                return False, f"zip 内未找到 iperf3.exe (含 {len(zf.namelist())} 个文件)"
+            with zf.open(target_member) as src, open(dst, "wb") as f:
+                shutil.copyfileobj(src, f)
+        try:
+            os.remove(tmp_zip)
+        except OSError:
+            pass
+    except Exception as e:
+        return False, f"解压失败: {e}"
+
+    if not os.path.exists(dst) or os.path.getsize(dst) < 1000:
+        return False, f"解压后 iperf3.exe 不存在或过小: {dst}"
+    return True, dst
 
 
 def _reload_scapy():
@@ -2316,8 +2394,8 @@ class SpeedTester:
             "upload_retransmits": upload_result.get("retransmits", 0),
         }
 
-    def _find_iperf3(self):
-        """查找 iperf3.exe"""
+    def _find_iperf3(self, auto_download=True):
+        """查找 iperf3.exe (auto_download=True 时找不到则交互式询问下载)"""
         # 当前目录
         exe_name = "iperf3.exe"
         if os.path.exists(exe_name):
@@ -2331,6 +2409,25 @@ class SpeedTester:
         code, out, _ = run_cmd("where iperf3", timeout=5)
         if code == 0 and out.strip():
             return out.strip().split("\n")[0].strip()
+
+        # 都找不到 — 尝试自动下载
+        if not auto_download:
+            return None
+        try:
+            ans = input(_c("  未找到 iperf3.exe, 是否自动下载到程序目录? [Y/n] ",
+                           C_GREEN)).strip().lower()
+        except (EOFError, RuntimeError):
+            return None
+        if ans and ans not in ("y", "yes", ""):
+            return None
+        print(_c("  正在下载 iperf3 (~2MB)...", C_GRAY))
+        ok, result = _download_iperf3()
+        if ok:
+            print(_c(f"  ✓ iperf3 已就绪: {result}", C_GREEN))
+            return result
+        print(_c(f"  ✗ 自动下载失败: {result}", C_RED))
+        print(_c("    可手动下载: https://iperf.fr/iperf-download.php "
+                 "(解压后将 iperf3.exe 放到本程序同目录)", C_GRAY))
         return None
 
     def _parse_iperf3_json(self, output):
