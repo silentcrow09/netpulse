@@ -25,6 +25,8 @@ pip install scapy speedtest-cli
 
 # 进入交互式菜单 (可直接回车运行全部模块)
 python netpulse.py
+# 交互菜单内: 数字=单模块, 分类字母 a/b/c=按分类运行, 0/all=全部,
+#             e=导出上次诊断报告 (回车返回菜单后无需重新测试即可导出)
 ```
 
 ## 🛠 命令行用法
@@ -39,6 +41,10 @@ python netpulse.py all
 # 指定模块运行 (支持 key 或序号, 空格分隔)
 python netpulse.py gateway dns external
 python netpulse.py 2 10 4
+
+# 按分类运行 (a=基础信息  b=宽带测速  c=故障诊断, 可组合)
+python netpulse.py a
+python netpulse.py a c --export report.pdf
 
 # 以 JSON 输出完整结果 (便于脚本解析)
 python netpulse.py all --json
@@ -80,7 +86,7 @@ python netpulse.py --install
 
 | 参数 | 说明 |
 |------|------|
-| `modules` | 要运行的模块 key 或序号；`all` 表示全部；省略则进入交互菜单 |
+| `modules` | 要运行的模块 key、序号或分类字母 `a/b/c`；`all` 表示全部；省略则进入交互菜单 |
 | `--list` | 列出所有可用模块后退出 |
 | `--json` | 以 JSON 格式输出每个模块的完整结果 |
 | `--verbose` | 显示完整原始字段（默认仅显示结论 + 关键指标 + 问题清单，细节保存在 HTML/JSON 报告中） |
@@ -97,6 +103,8 @@ python netpulse.py --install
 | `--export` | 诊断后导出报告，逗号分隔多格式（`report.pdf,report.html`） |
 
 ## 📋 诊断模块（18 项）
+
+> 按装维工作流分三大类，菜单 / CLI 均可用分类字母快捷运行：**a=基础信息、b=宽带测速、c=故障诊断**。
 
 | # | key | 模块 | 说明 |
 |---|-----|------|------|
@@ -156,7 +164,7 @@ python netpulse.py --install
 报告是给客户看的，技术细节放 JSON 单独存。**`reports/YYYY-MM-DD/`** 按日期归档。
 
 - **`--export report.html`**：客户版 HTML，含健康分、待办问题清单、关键指标、可折叠技术细节。
-- **`--export report.pdf`**：客户版 PDF，浅色主题、模块卡片化、适合打印/留档。
+- **`--export report.pdf`**：客户版 PDF，浅色主题、模块卡片化、适合打印/留档。依赖 `reportlab`；缺失或 EXE 未内置时**自动降级导出同名 HTML** 并提示原因。
 - **`--export report.json`**：技术员 / 脚本用。含完整 raw 原始数据（30 个 RTT 序列、ARP 表、路由表等）+ 阈值定义 + 健康分计算依据。
 - 多个格式可同时导：`--export report.html,report.pdf,report.json`。
 - 旧版拍平所有字段的 `.txt` 已废弃，导出 `.txt` 会提示改用 HTML/PDF/JSON。
@@ -299,6 +307,7 @@ irm https://<bucket>.oss-cn-hangzhou.aliyuncs.com/netpulse/v1-beta/install.ps1 |
 |------|------|--------|
 | `scapy` | DHCP 完整检测（发送 Discover） | DHCP 降级为仅读取当前 DHCP 服务器 |
 | `speedtest-cli` | Speedtest.net 参考测速（可选，`--speedtest-net`） | 不启用；上行仍用内置国内节点，不受影响 |
+| `reportlab` | PDF 报告导出 | 导出 PDF 自动降级为同名 HTML（打包 EXE 内置，无需单独安装） |
 | `pyinstaller` | 打包为单文件 EXE | 不影响直接运行 |
 
 ## 💻 系统要求

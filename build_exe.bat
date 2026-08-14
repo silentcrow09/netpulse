@@ -17,7 +17,7 @@ if errorlevel 1 (
 
 REM 安装依赖
 echo [1/3] 安装依赖...
-pip install scapy speedtest-cli pyinstaller -q
+pip install scapy speedtest-cli reportlab pyinstaller -q
 if errorlevel 1 (
     echo [警告] 部分依赖安装失败，继续构建...
 )
@@ -31,6 +31,8 @@ pyinstaller --onefile --console ^
     --hidden-import "tkinter" ^
     --hidden-import "scapy.all" ^
     --collect-all "scapy" ^
+    --hidden-import "reportlab" ^
+    --collect-all "reportlab" ^
     netpulse.py
 
 if errorlevel 1 (

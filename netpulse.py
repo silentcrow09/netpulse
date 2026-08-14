@@ -5449,6 +5449,19 @@ MODULE_CATEGORIES = [
 # 分类速查: key -> 分类名
 MODULE_CATEGORY_OF = {k: name for name, keys, _ in MODULE_CATEGORIES for k in keys}
 
+# 分类字母标识 (菜单 / CLI 快捷输入): a/b/c 按分类运行
+# 字母顺序 = MODULE_CATEGORIES 定义顺序; 与分类名一一对应
+MODULE_CATEGORY_LETTERS = ["a", "b", "c"]
+MODULE_LETTER_KEYS = {}     # 字母 -> 该分类全部模块 key (按定义顺序)
+MODULE_LETTER_NAME = {}     # 字母 -> 分类名
+MODULE_NAME_LETTER = {}     # 分类名 -> 字母 (反向)
+for _li, (_cat, _keys, _) in enumerate(MODULE_CATEGORIES):
+    if _li < len(MODULE_CATEGORY_LETTERS):
+        _letter = MODULE_CATEGORY_LETTERS[_li]
+        MODULE_LETTER_KEYS[_letter] = list(_keys)
+        MODULE_LETTER_NAME[_letter] = _cat
+        MODULE_NAME_LETTER[_cat] = _letter
+
 # ── ANSI 颜色 ──
 _C_NOCOLOR = False
 def _c(text, code):
@@ -5618,13 +5631,16 @@ def _print_module_list():
     print(_c(f"{APP_NAME} v{APP_VERSION} — 可用诊断模块:", C_BOLD))
     idx = 0
     for cat_name, keys, desc in MODULE_CATEGORIES:
+        letter = MODULE_NAME_LETTER.get(cat_name, "")
+        tag = _c(f"[{letter}]", C_CYAN) if letter else ""
         print()
-        print(_c(f"  {cat_name}", C_BOLD) + _c(f"  ({desc})", C_GRAY))
+        print(_c(f"  {tag} {cat_name}", C_BOLD) + _c(f"  ({desc})", C_GRAY))
         for k in keys:
             idx += 1
             n = MODULE_MAP[k][0]
             print(f"    {_c(str(idx).rjust(2), C_CYAN)}. {_c(n, C_WHITE)}  {_c('(' + k + ')', C_GRAY)}")
     print()
+    print(_c("  分类快捷: 输入 a/b/c 按分类运行; all / 0 / * 运行全部。", C_GRAY))
 
 
 def _parse_keys(tokens, *, strict=True):
@@ -5649,6 +5665,9 @@ def _parse_keys(tokens, *, strict=True):
             keys.append(m)
         elif m.lower() in name_to_key:
             keys.append(name_to_key[m.lower()])
+        elif m.lower() in MODULE_LETTER_KEYS:
+            # 分类字母 (a/b/c): 展开为该分类下全部模块
+            keys.extend(MODULE_LETTER_KEYS[m.lower()])
         elif m.isdigit() and 1 <= int(m) <= len(MODULE_REGISTRY):
             keys.append(MODULE_REGISTRY[int(m) - 1][0])
         else:
@@ -7412,12 +7431,20 @@ def ensure_reportlab(auto_yes=False, mirror=None):
     """确保 reportlab 可用 (PDF 导出依赖)。缺失时提示/自动安装。
 
     镜像选择: 走 _resolve_pip_mirror() 自动选源, 显式参数 mirror 仍可用作覆盖。
+
+    frozen (PyInstaller EXE) 场景: 无法用 sys.executable -m pip 安装
+    (sys.executable 是 EXE 本身, -m pip 无效且装到系统 Python 对 EXE 也不生效),
+    直接返回 False 并给出明确提示, 由调用方降级 (如自动导出 HTML)。
     """
     try:
         import reportlab  # noqa
         return True
     except Exception:
         pass
+    if getattr(sys, "frozen", False):
+        print(_c("  ⚠ 当前 EXE 版未内置 PDF 导出依赖 (reportlab)，无法导出 PDF。", C_YELLOW))
+        print(_c("    将自动降级导出 HTML 报告；如需 PDF 请用内置 reportlab 的打包版。", C_YELLOW))
+        return False
     is_tty = sys.stdout.isatty()
     if not is_tty and not auto_yes:
         print(_c("  ⚠ 未安装 reportlab，无法导出 PDF。可先运行一次交互模式安装，"
@@ -8567,7 +8594,17 @@ def export_report(path, auto_install=False, pip_mirror=None):
         if ext == ".pdf":
             ok = render_report_pdf(report, path, auto_install=auto_install,
                                    pip_mirror=pip_mirror)
-            return None if ok else "PDF 导出失败（reportlab 未就绪）"
+            if ok:
+                return None
+            # 降级: 自动导出同名 HTML, 保证用户总能拿到可读报告
+            html_path = os.path.splitext(path)[0] + ".html"
+            try:
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(render_report_html_customer(report))
+                return ("PDF 导出失败（reportlab 未就绪），已自动降级导出 HTML: "
+                        + os.path.abspath(html_path))
+            except Exception as e2:
+                return f"PDF 导出失败: {e2}"
         elif ext in (".html", ".htm"):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(render_report_html_customer(report))
@@ -8624,13 +8661,14 @@ def prompt_export_report(auto_install=False, pip_mirror=None):
 
 def parse_choice(choice):
     """解析交互菜单输入 -> keys 列表; 无效返回 None。
-    支持: 数字 (空格分隔多选)、0/全部、模块 key、模块中文名。
+    支持: 数字 (空格分隔多选)、0/all/* (全部)、分类字母 a/b/c、
+    模块 key、模块中文名。
     严格模式: 任一 token 非法即整体拒绝。
     """
     choice = (choice or "").strip()
     if choice == "":
         return None
-    if choice.lower() in ("0", "all", "a", "*"):
+    if choice.lower() in ("0", "all", "*"):
         return [k for k, _, _ in MODULE_REGISTRY]
     return _parse_keys(choice.split(), strict=True)
 
@@ -8666,16 +8704,20 @@ def interactive_menu(install=False, pip_mirror=None):
         print(_c(bar, C_BLUE))
         print(_c(f"  {APP_NAME} v{APP_VERSION}    命令行网络诊断", C_BOLD))
         print(_c(bar, C_BLUE))
-        print(_c("  请选择要执行的诊断 (输入数字, 空格分隔可多选):", C_WHITE))
+        print(_c("  请选择要执行的诊断 (输入数字 / 分类字母 a,b,c / 模块 key):", C_WHITE))
         idx = 0
         for cat_name, keys, desc in MODULE_CATEGORIES:
-            print(_c(f"  ── {cat_name} {_c(desc, C_GRAY)}", C_BOLD))
+            letter = MODULE_NAME_LETTER.get(cat_name, "")
+            tag = _c(f"[{letter}]", C_CYAN) if letter else ""
+            print(_c(f"  ── {tag} {cat_name} {_c(desc, C_GRAY)}", C_BOLD))
             for k in keys:
                 idx += 1
                 n = MODULE_MAP[k][0]
                 print(f"    {_c(str(idx).rjust(2), C_CYAN)}. {n}  {_c('(' + k + ')', C_GRAY)}")
         print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发)', C_GRAY)}")
+        print(f"    {_c(' e', C_CYAN)}. 导出上次诊断报告")
         print(f"    {_c(' q', C_CYAN)}. 退出")
+        print(_c("  快捷: a/b/c=按分类运行; all/0/*=全部; e=导出报告。", C_GRAY))
         print(_c("-" * 60, C_GRAY))
         try:
             choice = input(_c("  输入 > ", C_GREEN)).strip()
@@ -8684,6 +8726,17 @@ def interactive_menu(install=False, pip_mirror=None):
             break
         if choice.lower() in ("q", "quit", "exit"):
             break
+        # e / export: 不跑诊断, 直接导出上次报告 (回车返回菜单后无需重新测试)
+        if choice.lower() in ("e", "export", "导出"):
+            if not LAST_RUN:
+                print(_c("  尚无诊断数据，请先运行一次诊断。", C_YELLOW))
+            else:
+                prompt_export_report(auto_install=install, pip_mirror=pip_mirror)
+            try:
+                input(_c("  按 Enter 返回菜单...", C_GRAY))
+            except (EOFError, KeyboardInterrupt):
+                break
+            continue
         keys = parse_choice(choice)
         if keys is None:
             print(_c("  无效选择, 请重新输入。", C_YELLOW))
