@@ -8098,6 +8098,11 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
                                  textColor=colors.white, leading=11, alignment=1)
     detail_cap = ParagraphStyle("detail_cap", fontName=FONT, fontSize=8,
                                 textColor=C_FAINT, leading=11, spaceBefore=2)
+    detail_sec = ParagraphStyle("detail_sec", fontName=FONT, fontSize=8,
+                                textColor=C_SUB, leading=11, spaceBefore=3,
+                                spaceAfter=1)
+    tech_cell = ParagraphStyle("tech_cell", fontName=FONT, fontSize=7.5,
+                               textColor=C_INK, leading=10)
     metric_lbl = ParagraphStyle("mlbl", fontName=FONT, fontSize=8.5,
                                 textColor=C_SUB, leading=12)
     metric_val_ok = ParagraphStyle("mv_ok", fontName=FONT, fontSize=10,
@@ -8156,6 +8161,16 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
             ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
         return t
 
+    def _fmt_val(vv, max_len=80):
+        """把原始值格式化为适合 PDF 的简短字符串, 避免 Python repr。"""
+        if isinstance(vv, (list, tuple)):
+            s = ", ".join(str(x) for x in vv)
+        elif isinstance(vv, dict):
+            s = "; ".join(f"{k}={v}" for k, v in vv.items())
+        else:
+            s = str(vv)
+        return s[:max_len]
+
     g = report["generated_at"].strftime("%Y-%m-%d %H:%M:%S")
     PW, PH = A4
     LM = RM = 14 * mm
@@ -8182,6 +8197,8 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
 
     flow = []
     content_w = PW - LM - RM
+    # 模块卡片内可用宽度 (减去 head_tbl 的 LEFTPADDING 10pt + RIGHTPADDING 8pt)
+    card_inner_w = content_w - 18
 
     sys_i = report["system"]
     health = report["health"]
@@ -8204,16 +8221,18 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
         ("BOTTOMPADDING", (0, 1), (-1, 1), 8)]))
 
     header = Table(
-        [[Paragraph(f"{report['app']} v{report['version']}",
+        [[Paragraph(f"<b>{report['app']}</b><br/>{report['version']}",
                     h_title),
-          Paragraph(f"<b>网络诊断报告</b><br/>"
+          score_box],
+         [Paragraph(f"<b>网络诊断报告</b><br/>"
                     f"生成时间: {g}<br/>"
                     f"健康分: {health['score']} / 100 ({health['grade']})",
                     h_sub),
-          score_box]],
-        colWidths=[content_w - 60 * mm, 24 * mm, 36 * mm])
+          Paragraph("", h_sub)]],
+        colWidths=[content_w - 36 * mm, 36 * mm])
     header.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), C_BAND),
+        ("SPAN", (0, 1), (-1, 1)),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("LEFTPADDING", (0, 0), (-1, -1), 10),
         ("RIGHTPADDING", (0, 0), (-1, -1), 8),
@@ -8267,7 +8286,7 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
     else:
         flow.append(Paragraph("<b>所有检测通过</b>", sec))
         flow.append(Paragraph(
-            "<font color='#16a34a'>✓ 网络状态良好, 所有 18 项检测均正常, 无需特别处理。</font>",
+            "<font color='#16a34a'>网络状态良好，所有 18 项检测均正常，无需特别处理。</font>",
             mod_sub))
         flow.append(Spacer(1, 6))
 
@@ -8351,7 +8370,7 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
         title_row = Table(
             [[dot, Paragraph(f"<b>{m['name']}</b>", mod_title),
               _badge(status)]],
-            colWidths=[5 * mm, content_w - 29 * mm, 24 * mm])
+            colWidths=[5 * mm, card_inner_w - 29 * mm, 24 * mm])
         title_row.setStyle(TableStyle([
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("LEFTPADDING", (0, 0), (-1, -1), 0),
@@ -8366,7 +8385,7 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
                 [[Paragraph(
                     f"<font color='#1e40af'><b>结论</b></font>　{verdict}",
                     concl)]],
-                colWidths=[content_w])
+                colWidths=[card_inner_w])
             concl_tbl.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, -1), C_PRI_SOFT),
                 ("LINEBEFORE", (0, 0), (0, 0), 2.5, c),
@@ -8390,7 +8409,7 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
                 cell_t = Table(
                     [[Paragraph(me.get("label", ""), metric_lbl)],
                      [Paragraph(me.get("value", ""), val_style)]],
-                    colWidths=[(content_w - 4) / 3])
+                    colWidths=[(card_inner_w - 4) / 3])
                 cell_t.setStyle(TableStyle([
                     ("BACKGROUND", (0, 0), (-1, -1), C_CARD),
                     ("BOX", (0, 0), (-1, -1), 0.4, C_LINE),
@@ -8408,7 +8427,7 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
                 while len(row) < 3:
                     row.append(Paragraph("", cell))
                 met_rows.append(row)
-            met_tbl = Table(met_rows, colWidths=[content_w / 3] * 3)
+            met_tbl = Table(met_rows, colWidths=[card_inner_w / 3] * 3)
             met_tbl.setStyle(TableStyle([
                 ("LEFTPADDING", (0, 0), (-1, -1), 0),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 0),
@@ -8427,10 +8446,29 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
             action = issue.get("action", "")
             sev_color = {"异常": "#dc2626", "错误": "#7f1d1d",
                          "警告": "#ea580c", "信息": "#64748b"}.get(sev, "#64748b")
+            sev_c = colors.HexColor(sev_color)
+            issue_dot = Table([[""]], colWidths=[2.5 * mm],
+                              rowHeights=[2.5 * mm])
+            issue_dot.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), sev_c),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+            issue_line = Table(
+                [[issue_dot,
+                  Paragraph(
+                      f"<b><font color='{sev_color}'>[{sev}]</font></b> {text}",
+                      warn_style if sev == "警告" else err_style)]],
+                colWidths=[5 * mm, card_inner_w - 5 * mm])
+            issue_line.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 1),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 1)]))
             head_elems.append(Spacer(1, 2))
-            head_elems.append(Paragraph(
-                f"<b><font color='{sev_color}'>● [{sev}]</font></b> {text}",
-                warn_style if sev == "警告" else err_style))
+            head_elems.append(issue_line)
             if impact:
                 head_elems.append(Paragraph(
                     f"<b>影响:</b> {impact}", cell))
@@ -8439,43 +8477,101 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
                     f"<b><font color='#b45309'>建议:</font></b> {action}",
                     action_style))
 
-        # 技术细节 (弱化为简表, PDF 不能折叠)
+        # 技术细节 (客户版 PDF 只放简化摘要, 完整数据见 JSON)
         if m.get("has_tech_details"):
             pres = MODULE_PRESENTATION.get(m["key"], {})
             tech_keys = pres.get("tech_keys", [])
             raw = m.get("raw", {})
-            tech_parts = []
+            tech_elems = []
             for k in tech_keys:
                 v = raw.get(k)
                 if v is None:
                     continue
-                tech_parts.append(f"<b>{HEADER_MAP.get(k, k)}</b>")
-                if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
-                    rt = _record_table(v)
+                label = HEADER_MAP.get(k, k)
+                tech_elems.append(Paragraph(
+                    f"<b>{_html_esc(label)}</b>", detail_sec))
+
+                if isinstance(v, list) and v:
+                    if all(isinstance(x, dict) for x in v):
+                        rt = _record_table(v)
+                    else:
+                        rt = None
                     if rt:
-                        h, rs = rt
-                        tech_parts.append("  " + " / ".join(h))
-                        for r in rs[:3]:  # 最多 3 行, 防止 PDF 巨大
-                            tech_parts.append("  " + "  ".join(str(x) for x in r))
-                        if len(rs) > 3:
-                            tech_parts.append(f"  … (还有 {len(rs) - 3} 行, 详见 JSON 报告)")
-                elif isinstance(v, dict):
-                    for kk, vv in list(v.items())[:5]:
+                        headers, rows = rt
+                        show = rows[:3]
+                        cell_data = [[Paragraph(_html_esc(h), th)
+                                      for h in headers]]
+                        for r in show:
+                            cell_data.append([
+                                Paragraph(_html_esc(str(c)[:60]), tech_cell)
+                                for c in r])
+                        n_cols = len(headers)
+                        cw = card_inner_w / max(n_cols, 1)
+                        rtbl = Table(cell_data,
+                                     colWidths=[cw] * n_cols,
+                                     repeatRows=1)
+                        rtbl.setStyle(TableStyle([
+                            ("BACKGROUND", (0, 0), (-1, 0), C_PRI_SOFT),
+                            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("BOX", (0, 0), (-1, -1), 0.4, C_LINE),
+                            ("INNERGRID", (0, 0), (-1, -1), 0.3, C_LINE),
+                            ("TOPPADDING", (0, 0), (-1, -1), 3),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                        ]))
+                        tech_elems.append(Spacer(1, 2))
+                        tech_elems.append(rtbl)
+                        if len(rows) > 3:
+                            tech_elems.append(Paragraph(
+                                f"<font color='#94a3b8'>"
+                                f"⋯ 还有 {len(rows) - 3} 行, 详见 JSON 报告</font>",
+                                detail_cap))
+                        continue
+                    # 标量列表: 逗号分隔, 避免 Python repr
+                    s = ", ".join(str(x) for x in v)
+                    tech_elems.append(Paragraph(
+                        _html_esc(s[:150]), tech_cell))
+                    continue
+
+                if isinstance(v, dict):
+                    pairs = []
+                    for kk, vv in list(v.items())[:6]:
                         if vv is None or vv == "":
                             continue
-                        s = str(vv)[:100]
-                        tech_parts.append(f"  {HEADER_MAP.get(kk, kk)}: {s}")
+                        pairs.append((HEADER_MAP.get(kk, kk),
+                                      _fmt_val(vv, 80)))
+                    if pairs:
+                        p_rows = []
+                        for lbl, val in pairs:
+                            p_rows.append([
+                                Paragraph(f"<b>{_html_esc(lbl)}</b>",
+                                          metric_lbl),
+                                Paragraph(_html_esc(val), tech_cell),
+                            ])
+                        ptbl = Table(p_rows,
+                                     colWidths=[26 * mm,
+                                                card_inner_w - 26 * mm])
+                        ptbl.setStyle(TableStyle([
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("TOPPADDING", (0, 0), (-1, -1), 1),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+                        ]))
+                        tech_elems.append(Spacer(1, 2))
+                        tech_elems.append(ptbl)
                 else:
-                    tech_parts.append(f"  {str(v)[:200]}")
-            if tech_parts:
-                head_elems.append(Spacer(1, 2))
+                    tech_elems.append(Paragraph(
+                        _html_esc(str(v)[:150]), tech_cell))
+
+            if tech_elems:
+                head_elems.append(Spacer(1, 4))
                 head_elems.append(Paragraph(
-                    f"<font color='#94a3b8'><b>技术细节</b> "
-                    f"(完整数据见 .json 报告)</font>", detail_cap))
-                head_elems.append(Paragraph(
-                    "<font color='#64748b'>" +
-                    "<br/>".join(tech_parts).replace("<", "&lt;").replace(">", "&gt;") +
-                    "</font>", cell))
+                    "<font color='#94a3b8'>"
+                    "技术细节（完整数据见 .json 报告）</font>",
+                    detail_cap))
+                for elem in tech_elems:
+                    head_elems.append(elem)
 
         # 整块卡片 (KeepTogether 让标题/结论/指标不被截断)
         head_tbl = Table([[head_elems]], colWidths=[content_w])
