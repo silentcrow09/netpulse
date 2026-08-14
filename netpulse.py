@@ -45,6 +45,8 @@ from datetime import datetime
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.request import urlopen, Request
+import http.client
+import webbrowser
 
 # 可选依赖 — 缺失时自动降级
 try:
@@ -88,12 +90,17 @@ PORT_PROBE_CONFIG = {"targets": [], "proto": "tcp", "count": 2,
                      "force": False, "max_total_time": 60.0,
                      "max_concurrency": 8}
 
-# 测速模块的运行参数 (由 CLI --iperf3-server / --speedtest-net 写入, runner 读取)
-# - iperf3_server: 提供后测速模块会用 iperf3 测上下行 (iperf3 是唯一可靠的上行测量)
+# 测速模块的运行参数 (由 CLI --iperf3-server / --speedtest-net / --speedtest-node 写入, runner 读取)
+# - iperf3_server: 提供后测速模块会用 iperf3 测上下行 (iperf3 是最准的上行测量)
 # - use_speedtest_net: 默认关闭 — 国内网络下 speedtest-cli 常选中海外服务器,
 #   结果严重偏低 (本机实测 100M 宽带测出 5 Mbps), 仅作参考
+# - node: 手动指定测速服务器 (speedtest 服务器 ID 或 host:port); 默认自动选国内运营商节点
+# - duration_down / duration_up: 上下行测速时长 (秒)
+# - live_ui: 单独运行测速模块时启用终端实时可视化 (由 run_diagnostics 写入)
 SPEEDTEST_CONFIG = {"iperf3_server": None, "iperf3_port": 5201,
-                    "use_speedtest_net": False}
+                    "use_speedtest_net": False,
+                    "node": None, "duration_down": 8.0, "duration_up": 8.0,
+                    "live_ui": False}
 
 
 def _is_admin():
@@ -721,24 +728,312 @@ _CMD_CACHE = {}
 _CMD_CACHE_TTL = 5.0  # 秒
 
 
+# ============================================================
+# 测速辅助: TCP ping / 延迟采样 / 国内节点选择 / 多连接上传
+# ============================================================
+
+def _tcping_ms(host_port, timeout=3.0):
+    """TCP 握手测延迟 (毫秒)。host_port 形如 '1.2.3.4:8080' 或 '1.2.3.4'。"""
+    host, _, port = host_port.rpartition(":")
+    if not port or not port.isdigit():
+        host, port = host_port, "80"
+    try:
+        t0 = time.perf_counter()
+        s = socket.create_connection((host, int(port)), timeout=timeout)
+        lat = (time.perf_counter() - t0) * 1000
+        s.close()
+        return round(lat, 1)
+    except Exception:
+        return None
+
+
+class LatencyMonitor:
+    """后台持续 ping 目标主机, 逐行解析 RTT, 供测速期间采样延迟变化。
+
+    用 ``ping -t`` 流式输出 (Windows), 每个样本约 1s 间隔。测速的
+    bufferbloat 联动: 空闲基线 → 下行负载 → 上行负载 各取一段样本。
+    """
+
+    def __init__(self, target):
+        self.target = target
+        self._samples = []          # [(timestamp, rtt_ms)]
+        self._lock = threading.Lock()
+        self._proc = None
+        self._thread = None
+        self._stop = threading.Event()
+
+    def start(self):
+        try:
+            self._proc = subprocess.Popen(
+                ["ping", "-t", "-w", "2000", self.target],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, encoding="gbk", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            return False
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+        return True
+
+    def _read_loop(self):
+        try:
+            for line in self._proc.stdout:
+                if self._stop.is_set():
+                    break
+                m = re.search(r"time[=<\s]+([\d.]+)\s*ms", line, re.I)
+                if m:
+                    try:
+                        rtt = float(m.group(1))
+                    except ValueError:
+                        continue
+                    with self._lock:
+                        self._samples.append((time.time(), rtt))
+        except Exception:
+            pass
+
+    def wait_samples(self, count, timeout=6.0):
+        """等待收集到至少 count 个样本, 返回这些样本的 rtt 列表 (按时间序)。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                if len(self._samples) >= count:
+                    break
+            time.sleep(0.1)
+        with self._lock:
+            return [s[1] for s in self._samples[-count:]]
+
+    def median_rtt(self, since=None):
+        """返回自 since (时间戳) 以来的样本中位数 rtt; 无样本返回 None。"""
+        with self._lock:
+            vals = [s[1] for s in self._samples if since is None or s[0] >= since]
+        if not vals:
+            return None
+        vals = sorted(vals)
+        n = len(vals)
+        return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2.0
+
+    def series_since(self, since):
+        """返回自 since 以来的 [(t_off, rtt)] 时间序列 (相对 since 的秒数)。"""
+        with self._lock:
+            return [(round(s[0] - since, 1), s[1])
+                    for s in self._samples if s[0] >= since]
+
+    def stop(self):
+        self._stop.set()
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+
+
+# 运营商宽带常用档位 (Mbps) — 预估带宽就近取整用
+BANDWIDTH_TIERS = [30, 50, 100, 200, 300, 500, 1000, 2000, 3000]
+
+
+def estimate_bandwidth(download_mbps, upload_mbps=None):
+    """由实测速率预估签约宽带带宽档位 (Mbps)。
+
+    思路 (市面测速软件口径): 实测值通常比签约值低 5-15% (协议开销/服务器
+    瓶颈), 乘 1.1 修正后向上就近取运营商档位; 上行做交叉校验提示非对称。
+    返回 dict 或 None (无有效下行数据时)。
+    """
+    if not download_mbps or download_mbps <= 0:
+        return None
+    adj = download_mbps * 1.1
+    tier = next((t for t in BANDWIDTH_TIERS if adj <= t), None)
+    if tier is None:
+        tier = BANDWIDTH_TIERS[-1]
+    result = {
+        "tier_mbps": tier,
+        "text": f"约 {tier} 兆",
+        "basis_download_mbps": round(download_mbps, 1),
+        "adjusted_mbps": round(adj, 1),
+    }
+    # 上行交叉校验: 家宽常见非对称比例 5:1 ~ 20:1; 上行异常低时给出提示
+    if upload_mbps and upload_mbps > 0:
+        ratio = download_mbps / upload_mbps
+        if ratio > 20:
+            result["note"] = ("上下行比例悬殊 ({:.0f}:1), 符合家宽非对称套餐特征; "
+                              "若办理的是对称专线请检查上行链路".format(ratio))
+        elif ratio < 1.5:
+            result["note"] = "上下行接近对称, 符合专线/政企宽带特征"
+    return result
+
+
+def bufferbloat_grade(idle_rtt, loaded_rtt):
+    """由空闲/负载延迟计算 Bufferbloat 评级 (口径与 BufferbloatTester 一致)。
+
+    返回 (grade_text, bloat_ms)。
+    """
+    if idle_rtt is None or loaded_rtt is None:
+        return "无法判定 (延迟数据不足)", None
+    bloat = loaded_rtt - idle_rtt
+    if bloat < 5:
+        return "A (优秀, 无缓冲膨胀)", bloat
+    if bloat < 30:
+        return "B (良好)", bloat
+    if bloat < 60:
+        return "C (一般)", bloat
+    if bloat < 100:
+        return "D (较差)", bloat
+    return "F (很差, 负载下延迟飙升)", bloat
+
+
+# 国内运营商官方测速节点 (speedtest 协议, host:port, 路径 /upload.php)
+# 来源: 电信/联通/移动公开测速服务, 长期稳定; 运行时按 TCP 握手延迟选优。
+# 内置列表 = 上行测速零第三方依赖, 不依赖 Ookla 动态列表 (该接口常被限流/403,
+# 且代理环境下会选到海外节点导致结果严重偏低)。
+DOMESTIC_SPEEDTEST_NODES = [
+    # 中国电信
+    ("电信", "speedtest1.online.sh.cn:8080"),            # 上海电信
+    ("电信", "speedtest2.online.sh.cn:8080"),            # 上海电信 2
+    ("电信", "tjrate.tjtele.com:8080"),                  # 天津电信
+    ("电信", "5gnanjing.speedtest.jsinfo.net:8080"),     # 江苏电信 5G
+    # 中国联通
+    ("联通", "5g.shunicomtest.com:8080"),                # 上海联通
+    ("联通", "speedtest1.gd165.com:8080"),               # 广东联通
+    ("联通", "speedtest2.gd165.com:8080"),               # 广东联通 2
+    ("联通", "speedtest02.js165.com:8080"),              # 江苏联通
+    # 中国移动
+    ("移动", "speedtest.bmcc.com.cn:8080"),              # 北京移动
+    ("移动", "speedtest1.js.chinamobile.com:8080"),      # 江苏移动
+    ("移动", "speedtest2.js.chinamobile.com:8080"),      # 江苏移动 2
+    ("移动", "speedtest.zjmobile.com:8080"),             # 浙江移动
+]
+
+
+def _select_domestic_speedtest_server(callback=None):
+    """从内置国内运营商节点列表挑选延迟最低的节点 (不依赖外部列表服务)。
+
+    运营商顺序 (电信/联通/移动) 优先, 再按 TCP 握手延迟排序, 返回延迟最低者。
+    返回 (server_dict, None) 或 (None, 错误信息)。
+    """
+    best, best_lat = None, None
+    for isp, host in DOMESTIC_SPEEDTEST_NODES:
+        lat = _tcping_ms(host, timeout=2.5)
+        if lat is None:
+            continue
+        if callback:
+            callback(f"  节点 中国{isp} ({host}) {lat:.0f}ms")
+        if best is None or lat < best_lat:
+            best = {"host": host, "sponsor": f"中国{isp}", "cc": "CN",
+                    "country": "中国", "isp": isp}
+            best_lat = lat
+    if best is None:
+        return None, "国内测速节点均不可达 (网络不通或服务器离线)"
+    return best, None
+
+
+def _upload_speed_multi(host_port, threads=4, duration=8.0, chunk_size=256 * 1024,
+                        on_sample=None, series=None):
+    """多连接 HTTP POST 上传测速 (speedtest 协议, 参考 speedtest-cli 做法)。
+
+    向测速服务器 /upload.php 持续 POST 数据: 声明 100MB Content-Length,
+    客户端持续 send, 达到 duration 后断开。多连接并发才能打满高速上行的
+    拥塞窗口。每 0.2s 采样一次累计字节 → 瞬时速率 (实时动画 + 时间序列)。
+
+    返回 dict (upload_mbps / uploaded_bytes / uploaded_mb / elapsed_s /
+    threads / server) 或 None。
+    """
+    host, _, port = host_port.rpartition(":")
+    if not port or not port.isdigit():
+        host, port = host_port, "8080"
+    port = int(port)
+
+    total_uploaded = [0]
+    bytes_lock = threading.Lock()
+    errors = [0]
+
+    def worker():
+        conn = None
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=20)
+            conn.putrequest("POST", "/upload.php")
+            conn.putheader("Content-Length", "104857600")   # 声明 100MB
+            conn.putheader("User-Agent", "NetPulse/1.0")
+            conn.endheaders()
+            payload = os.urandom(chunk_size)
+            deadline = time.time() + duration
+            while time.time() < deadline:
+                conn.send(payload)
+                with bytes_lock:
+                    total_uploaded[0] += len(payload)
+        except Exception:
+            with bytes_lock:
+                errors[0] += 1
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    ts = [threading.Thread(target=worker, daemon=True) for _ in range(threads)]
+    start = time.time()
+    for t in ts:
+        t.start()
+
+    # 采样线程: 每 0.2s 读累计字节, 计算瞬时速率
+    # 采样窗口固定为 duration: 不追踪线程退出 (打满带宽时 send 可能阻塞导致
+    # 线程延迟退出, 追踪会采到尾部速率下降/掉 0 的假象)
+    last_bytes, last_t = 0, start
+    while time.time() < start + duration:
+        time.sleep(0.2)
+        if errors[0] >= threads:
+            break
+        now = time.time()
+        with bytes_lock:
+            cur = total_uploaded[0]
+        dt = now - last_t
+        if dt > 0:
+            inst = (cur - last_bytes) * 8 / 1e6 / dt
+            if on_sample:
+                on_sample(inst, now - start, cur)
+            if series is not None:
+                series.append((round(now - start, 2), round(inst, 2)))
+        last_bytes, last_t = cur, now
+
+    for t in ts:
+        t.join(timeout=5)
+    elapsed = time.time() - start
+    total = total_uploaded[0]
+    if total <= 0:
+        return None
+    speed_mbps = total * 8 / 1e6 / elapsed
+    return {
+        "upload_mbps": round(speed_mbps, 2),
+        "uploaded_bytes": total,
+        "uploaded_mb": round(total / 1e6, 2),
+        "elapsed_s": round(elapsed, 2),
+        "threads": threads,
+        "server": host_port,
+    }
+
+
 def _download_speed_test(url, target_bytes=5 * 1024 * 1024, chunk_size=64 * 1024,
-                         overall_timeout=20, callback=None, connect_timeout=10):
-    """下载测速通用函数: chunked read 累计到 target_bytes 就 stop, 不等下完。
+                         overall_timeout=20, callback=None, connect_timeout=10,
+                         chunk_cb=None, max_duration=None):
+    """下载测速通用函数: chunked read, 达到 max_duration 时长或 target_bytes 字节就停。
 
     与 ``resp.read()`` 一次读完的区别:
       - 旧版 resp.read() 必须等服务器发完全部数据, 10MB 文件在 1Mbps 链路
         需要 80s, 国际 CDN 从国内访问 5-10 分钟
-      - 新版累计下载到 target_bytes (默认 5MB) 就 break 退出, 100Mbps 链路
-        不到 1s 出结果, 10Mbps ~4s, 1Mbps ~40s (并伴随进度反馈)
+      - 新版到时长 (max_duration) 或字节量 (target_bytes) 就 break 退出
 
     参数:
       url: 测速源 URL
-      target_bytes: 累计下载到这么多字节就停 (默认 5MB, 测速精度足够)
+      target_bytes: 字节上限, 累计下载到这么多字节就停 (默认 5MB; 测速时作为
+                    "最多下载量" 防止千兆链路无上限拉取)
       chunk_size: 每次 read 的块大小 (默认 64KB)
-      overall_timeout: 数据传输阶段超时秒数 (默认 20s, 超过就 break 用已下载
-                       数据; 连接/TLS 握手不计入)
+      overall_timeout: 数据传输阶段兜底超时秒数 (默认 20s, 超过就 break 用
+                       已下载数据; 连接/TLS 握手不计入)
+      max_duration: 目标测速时长 (秒)。给定后测速窗口 = 该时长 (而非字节数),
+                    保证速率曲线足够长、能反映稳定性; None = 仅按字节停
+                    (向后兼容)
       callback: 进度回调, 接受 str (每 1MB 或每 1s 报一次)
       connect_timeout: 连接 + TLS 握手 + 响应头超时 (默认 10s)
+      chunk_cb: 每读一块字节数的回调 (实时采样用)
 
     返回 dict (含 download_mbps / downloaded_bytes / downloaded_mb / elapsed_s)
     或 None (失败)。计时从收到第一个数据字节开始, 排除 TCP/TLS/HTTP 头开销,
@@ -749,7 +1044,8 @@ def _download_speed_test(url, target_bytes=5 * 1024 * 1024, chunk_size=64 * 1024
         # 连接 + TLS 握手 + 响应头: 不计入测速窗口 (单独超时)
         resp = urlopen(req, timeout=connect_timeout)
         start = time.time()          # 首个数据字节到达, 测速窗口从这里开始
-        deadline = start + overall_timeout
+        # 测速窗口: max_duration 优先 (固定时长测速), 否则 overall_timeout 兜底
+        deadline = start + (max_duration if max_duration else overall_timeout)
         downloaded = 0
         last_report_time = start
         last_report_bytes = 0
@@ -766,6 +1062,8 @@ def _download_speed_test(url, target_bytes=5 * 1024 * 1024, chunk_size=64 * 1024
             if not chunk:
                 break  # EOF
             downloaded += len(chunk)
+            if chunk_cb:
+                chunk_cb(len(chunk))
             # 进度 callback: 每 1MB 或每 1s 报一次
             if callback and (downloaded - last_report_bytes >= 1024 * 1024
                              or now - last_report_time >= 1.0):
@@ -794,8 +1092,10 @@ def _download_speed_test(url, target_bytes=5 * 1024 * 1024, chunk_size=64 * 1024
 
 def _download_speed_multi(url, threads=4, target_bytes=5 * 1024 * 1024,
                           chunk_size=64 * 1024, overall_timeout=20,
-                          connect_timeout=10):
-    """多连接下载测速: 对同一 URL 并发开 threads 个连接, 各自下到 target_bytes 停。
+                          connect_timeout=10, on_sample=None, series=None,
+                          max_duration=None):
+    """多连接下载测速: 对同一 URL 并发开 threads 个连接, 达到 max_duration 时长
+    或 target_bytes 字节后各自停止。
 
     为什么需要多连接:
       - 单 TCP 连接吞吐受拥塞窗口/RTT 限制, 300M+ 宽带下打不满
@@ -806,39 +1106,71 @@ def _download_speed_multi(url, threads=4, target_bytes=5 * 1024 * 1024,
     聚合方式: 总字节 = 各连接之和; 耗时 = 各连接中最长的数据传输耗时 (每个
     连接计时均从各自首字节开始, 已排除握手); 速率 = 总字节 * 8 / 1e6 / 耗时。
 
+    max_duration: 目标测速时长 (秒), 透传给每个连接; 测速窗口由时长决定,
+    保证速率曲线足够长 (快链路也不提前停)。
+
+    on_sample: 实时采样回调 (instant_mbps, elapsed_s, cumulative_bytes), 每
+    0.2s 一次, 供终端实时动画; series: 追加 (t_off, mbps) 采样点到列表。
+
     返回 dict (含 download_mbps / downloaded_bytes / downloaded_mb / elapsed_s
     / threads / url) 或 None (全部连接失败)。
     """
     results = []
     results_lock = threading.Lock()
+    bytes_lock = threading.Lock()
+    total_bytes = [0]
 
     def worker():
+        def _chunk_cb(n):
+            with bytes_lock:
+                total_bytes[0] += n
         r = _download_speed_test(
             url, target_bytes=target_bytes, chunk_size=chunk_size,
             overall_timeout=overall_timeout, callback=None,
-            connect_timeout=connect_timeout)
+            connect_timeout=connect_timeout, chunk_cb=_chunk_cb,
+            max_duration=max_duration)
         if r and r.get("downloaded_bytes", 0) > 0:
             with results_lock:
                 results.append(r)
 
     ts = [threading.Thread(target=worker, daemon=True) for _ in range(threads)]
+    start = time.time()
     for t in ts:
         t.start()
+
+    # 采样线程: 每 0.2s 读累计字节, 计算瞬时速率
+    last_bytes, last_t = 0, start
+    while time.time() < start + overall_timeout + 2:
+        time.sleep(0.2)
+        if not any(t.is_alive() for t in ts):
+            break
+        now = time.time()
+        with bytes_lock:
+            cur = total_bytes[0]
+        dt = now - last_t
+        if dt > 0:
+            inst = (cur - last_bytes) * 8 / 1e6 / dt
+            if on_sample:
+                on_sample(inst, now - start, cur)
+            if series is not None:
+                series.append((round(now - start, 2), round(inst, 2)))
+        last_bytes, last_t = cur, now
+
     for t in ts:
         t.join()
 
     if not results:
         return None
-    total_bytes = sum(r["downloaded_bytes"] for r in results)
+    total_bytes_v = sum(r["downloaded_bytes"] for r in results)
     elapsed = max(r["elapsed_s"] for r in results)
     if elapsed <= 0:
         return None
-    speed_mbps = (total_bytes * 8) / 1e6 / elapsed
+    speed_mbps = (total_bytes_v * 8) / 1e6 / elapsed
     return {
         "url": url,
         "download_mbps": round(speed_mbps, 2),
-        "downloaded_bytes": total_bytes,
-        "downloaded_mb": round(total_bytes / 1e6, 2),
+        "downloaded_bytes": total_bytes_v,
+        "downloaded_mb": round(total_bytes_v / 1e6, 2),
         "elapsed_s": round(elapsed, 2),
         "threads": threads,
     }
@@ -1692,13 +2024,27 @@ class DHCPDetector:
         servers = []
         errors = []
         method = "unknown"
+        current_dhcp = None       # ipconfig 显示的当前生效 DHCP 服务器
+        offer_sources = []        # scapy 实际响应 Offer 的服务器
+        dhcp_conflict = False     # 当前生效者 ≠ Offer 源 (存在抢答)
 
         if SCAPY_AVAILABLE:
             servers, err = self.detect_scapy(timeout=10)
             if err:
                 errors.append(err)
             method = "scapy"
-            if not servers:
+            if servers:
+                # 对比: ipconfig 显示的当前 DHCP 服务器 vs 实际 Offer 源。
+                # 两者不一致 = 有第二个 DHCP 在抢答 (如误开 DHCP 的家用路由),
+                # 是装维定位"IP 段/网关/DNS 异常"的高价值线索。
+                for fs in self.detect_fallback():
+                    if fs.get("source") == "ipconfig":
+                        current_dhcp = fs["server_ip"]
+                        break
+                offer_sources = sorted({s["server_ip"] for s in servers})
+                if current_dhcp and current_dhcp not in offer_sources:
+                    dhcp_conflict = True
+            else:
                 servers = self.detect_fallback()
                 method = "scapy+fallback"
         else:
@@ -1708,14 +2054,22 @@ class DHCPDetector:
 
         # 分析结果
         interference = len(servers) > 1
+        if dhcp_conflict:
+            errors.append(
+                f"检测到 DHCP 抢答: 实际响应 Offer 的服务器 ({', '.join(offer_sources)}) "
+                f"与系统当前使用的 {current_dhcp} 不一致 — 可能存在误开 DHCP 的设备")
         self.results = {
             "servers": servers,
             "interference": interference,
+            "current_dhcp_server": current_dhcp,
+            "offer_sources": offer_sources,
+            "dhcp_conflict": dhcp_conflict,
             "method": method,
             "errors": errors,
             "timestamp": datetime.now().isoformat(),
             "summary": f"发现 {len(servers)} 个 DHCP 服务器" +
-                       (" — 存在多服务器干扰!" if interference else " — 正常"),
+                       (" — 存在多服务器干扰!" if interference else "") +
+                       (" — 检测到 DHCP 抢答!" if dhcp_conflict else " — 正常"),
         }
         if callback:
             callback(self.results["summary"])
@@ -1729,7 +2083,7 @@ class GatewayTester:
         self.name = "网关延迟检测"
         self.results = {}
 
-    def detect(self, count=30, callback=None):
+    def detect(self, count=20, callback=None):
         if callback:
             callback("正在检测网关延迟...")
         gateway = get_default_gateway()
@@ -1874,11 +2228,26 @@ class LoopDetector:
             if ping_result["loss_pct"] > 0 and ping_result["loss_pct"] < 50:
                 # 间歇性丢包可能是环路的征兆
                 if ping_result["jitter_ms"] > ping_result["avg_ms"]:
+                    # WiFi 链路抖动天然偏高 (2.4G 干扰/信道拥塞/距离), 环路
+                    # 征兆判定在有线链路上更可信; 无线链路降级措辞避免误报
+                    wifi_connected = False
+                    try:
+                        wifi_out = get_wifi_interfaces()
+                        wifi_connected = any(
+                            "SSID" in ln and "BSSID" not in ln
+                            for ln in wifi_out.split("\n"))
+                    except Exception:
+                        pass
+                    detail = ("间歇性丢包 + 高抖动是网络环路的典型征兆, 建议进一步排查"
+                              if not wifi_connected
+                              else "当前为 WiFi 链路, 抖动高更可能来自无线干扰/拥塞"
+                                   "(属常见现象); 若为有线连接建议排查环路")
                     issues.append({
                         "type": "intermittent_loss",
                         "severity": "warning",
-                        "message": f"网关存在间歇性丢包 ({ping_result['loss_pct']}%) 且抖动较大 ({ping_result['jitter_ms']}ms)",
-                        "detail": "间歇性丢包 + 高抖动是网络环路的典型征兆，建议进一步排查"
+                        "message": f"网关存在间歇性丢包 ({ping_result['loss_pct']}%) "
+                                   f"且抖动较大 ({ping_result['jitter_ms']}ms)",
+                        "detail": detail,
                     })
 
         loop_detected = any(i["severity"] == "critical" for i in issues)
@@ -2080,43 +2449,78 @@ class LinkSpeedDetector:
         adapters = get_network_adapters()
         wifi_info = get_wifi_interfaces()
 
-        # 解析 WiFi 接口信息
-        wifi_details = {}
-        current_section = None
+        # 解析 WiFi 接口信息 (按接口分段 — 多 WiFi 网卡时互不覆盖)
+        # netsh wlan show interfaces 每个接口以 "名称/Name" 行开始新段
+        wifi_interfaces = []
+        cur = None
         for line in wifi_info.split("\n"):
             line_s = line.strip()
+            m = re.match(r"名称\s*:\s*(.*)|Name\s*:\s*(.*)", line_s)
+            if m:
+                if cur:
+                    wifi_interfaces.append(cur)
+                cur = {"name": (m.group(1) or m.group(2) or "").strip()}
+                continue
+            if cur is None:
+                continue
             if "SSID" in line_s and "BSSID" not in line_s:
-                m = re.match(r"SSID\s*:\s*(.*)", line_s)
-                if m:
-                    wifi_details["connected_ssid"] = m.group(1).strip()
+                m2 = re.match(r"SSID\s*:\s*(.*)", line_s)
+                if m2:
+                    cur["connected_ssid"] = m2.group(1).strip()
             elif "接收速率" in line_s or "Receive rate" in line_s:
-                m = re.search(r":\s*([\d.]+)\s*", line_s)
-                if m:
-                    wifi_details["rx_rate"] = float(m.group(1))
+                m2 = re.search(r":\s*([\d.]+)\s*", line_s)
+                if m2:
+                    cur["rx_rate"] = float(m2.group(1))
             elif "发送速率" in line_s or "Transmit rate" in line_s:
-                m = re.search(r":\s*([\d.]+)\s*", line_s)
-                if m:
-                    wifi_details["tx_rate"] = float(m.group(1))
+                m2 = re.search(r":\s*([\d.]+)\s*", line_s)
+                if m2:
+                    cur["tx_rate"] = float(m2.group(1))
             elif "信号" in line_s or "Signal" in line_s:
-                m = re.search(r":\s*(\d+)%", line_s)
-                if m:
-                    wifi_details["signal_pct"] = int(m.group(1))
+                m2 = re.search(r":\s*(\d+)%", line_s)
+                if m2:
+                    cur["signal_pct"] = int(m2.group(1))
             elif "频道" in line_s or "Channel" in line_s:
-                m = re.search(r":\s*(\d+)", line_s)
-                if m:
-                    wifi_details["channel"] = int(m.group(1))
+                m2 = re.search(r":\s*(\d+)", line_s)
+                if m2:
+                    cur["channel"] = int(m2.group(1))
             elif "无线电类型" in line_s or "Radio type" in line_s:
-                m = re.match(r".*:\s*(.*)", line_s)
-                if m:
-                    wifi_details["radio_type"] = m.group(1).strip()
+                m2 = re.match(r".*:\s*(.*)", line_s)
+                if m2:
+                    cur["radio_type"] = m2.group(1).strip()
             elif "身份验证" in line_s or "Authentication" in line_s:
-                m = re.match(r".*:\s*(.*)", line_s)
-                if m:
-                    wifi_details["auth"] = m.group(1).strip()
+                m2 = re.match(r".*:\s*(.*)", line_s)
+                if m2:
+                    cur["auth"] = m2.group(1).strip()
             elif "加密" in line_s or "Cipher" in line_s:
-                m = re.match(r".*:\s*(.*)", line_s)
-                if m:
-                    wifi_details["encryption"] = m.group(1).strip()
+                m2 = re.match(r".*:\s*(.*)", line_s)
+                if m2:
+                    cur["encryption"] = m2.group(1).strip()
+        if cur:
+            wifi_interfaces.append(cur)
+
+        # 信号质量分级 + 频段判定 (每块 WiFi 接口)
+        for w in wifi_interfaces:
+            sig = w.get("signal_pct")
+            if sig is not None:
+                if sig > 80:
+                    w["signal_quality"] = "良好"
+                elif sig >= 50:
+                    w["signal_quality"] = "中等"
+                else:
+                    w["signal_quality"] = "较弱"
+            ch = w.get("channel")
+            if ch:
+                w["band"] = "5GHz" if is_5ghz_channel(ch) else "2.4GHz"
+
+        # 主 WiFi 信息 (第一个已连接的接口), 兼容旧结构 key
+        wifi_details = {}
+        for w in wifi_interfaces:
+            if w.get("connected_ssid"):
+                wifi_details = w
+                break
+        else:
+            if wifi_interfaces:
+                wifi_details = wifi_interfaces[0]
 
         # 解析适配器速率
         adapter_details = []
@@ -2200,10 +2604,13 @@ class LinkSpeedDetector:
         self.results = {
             "adapters": adapter_details,
             "wifi_details": wifi_details,
+            "wifi_interfaces": wifi_interfaces,
             "issues": issues,
             "timestamp": datetime.now().isoformat(),
             "summary": f"检测到 {len(adapter_details)} 个网络适配器" +
-                       (f", WiFi 信号: {wifi_details.get('signal_pct', 'N/A')}" if wifi_details else ""),
+                       (f", WiFi 信号: {wifi_details.get('signal_pct', 'N/A')}"
+                        f" ({wifi_details.get('signal_quality', 'N/A')})"
+                        if wifi_details else ""),
         }
         if callback:
             callback(self.results["summary"])
@@ -2328,6 +2735,27 @@ class WiFiAnalyzer:
         elif max_score >= 4:
             overall_interference = "存在干扰"
 
+        # summary: 当前信道 vs 推荐信道对比 (同频段, 装维可直接给结论)
+        cur_band = None
+        if current_channel:
+            cur_band = "5GHz" if is_5ghz_channel(current_channel) else "2.4GHz"
+        channel_advice = ""
+        if best_2g and cur_band == "2.4GHz" \
+                and best_2g["channel"] != current_channel and best_2g["interference_score"] > 0:
+            channel_advice = (f" (当前 2.4G 信道 {current_channel} 干扰较大, "
+                              f"建议换到信道 {best_2g['channel']})")
+        elif best_5g and cur_band == "5GHz" \
+                and best_5g["channel"] != current_channel and best_5g["interference_score"] > 0:
+            channel_advice = (f" (当前 5G 信道 {current_channel} 干扰较大, "
+                              f"建议换到信道 {best_5g['channel']})")
+
+        summary = f"发现 {len(all_bssids)} 个 BSSID, 干扰等级: {overall_interference}"
+        if best_2g:
+            summary += f", 建议 2.4G 信道 {best_2g['channel']}"
+        if best_5g:
+            summary += f", 建议 5G 信道 {best_5g['channel']}"
+        summary += channel_advice
+
         self.results = {
             "networks": all_bssids,
             "network_count": len(all_bssids),
@@ -2338,13 +2766,52 @@ class WiFiAnalyzer:
             "current_ssid": current_ssid,
             "overall_interference": overall_interference,
             "timestamp": datetime.now().isoformat(),
-            "summary": ("发现 " + str(len(all_bssids)) + " 个 BSSID, "
-                       "干扰等级: " + str(overall_interference) +
-                       ((", 建议使用信道 " + str(best_2g["channel"])) if best_2g else "")),
+            "summary": summary,
         }
         if callback:
             callback(self.results["summary"])
         return self.results
+
+
+class _LiveUI:
+    """测速过程的终端实时可视化 (ANSI 动画)。
+
+    仅在"单独运行测速模块 + TTY + 非 JSON/非 verbose"时启用 (live_ui=True)。
+    速率柱状图 + 实时数字 + 阶段/延迟提示, 每 0.15s 最多刷新一次。
+    """
+
+    def __init__(self, enabled):
+        self.enabled = bool(enabled) and sys.stdout.isatty() and not _C_NOCOLOR
+        self._last = 0.0
+
+    def draw(self, down=None, up=None, phase="", idle_rtt=None, loaded_rtt=None):
+        if not self.enabled:
+            return
+        now = time.time()
+        if now - self._last < 0.15:
+            return
+        self._last = now
+        d = down if down is not None else 0
+        u = up if up is not None else 0
+        scale = max(d, u, 1.0)
+        n = int(d / scale * 18)
+        bar_d = "#" * n + "-" * (18 - n)
+        n = int(u / scale * 18)
+        bar_u = "#" * n + "-" * (18 - n)
+        rtt_str = ""
+        if idle_rtt is not None:
+            rtt_str = f"延迟 {idle_rtt:.0f}ms"
+            if loaded_rtt is not None:
+                rtt_str += f" → {loaded_rtt:.0f}ms"
+        line = (f"\r\033[K  \033[96m↓ {d:8.1f} Mbps {bar_d}   "
+                f"↑ {u:8.1f} Mbps {bar_u}   {phase}  {rtt_str}\033[0m")
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+    def finish(self):
+        if self.enabled:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
 
 
 class SpeedTester:
@@ -2404,7 +2871,7 @@ class SpeedTester:
         except Exception as e:
             return {"error": str(e), "method": "speedtest_lib"}
 
-    def test_http(self, callback=None):
+    def test_http(self, callback=None, on_sample=None, series=None):
         """HTTP 多连接下载测速 (默认主测速路径)。
 
         旧版问题 (用户已踩):
@@ -2421,6 +2888,7 @@ class SpeedTester:
           - Cloudflare __down 仅作最后兜底 (从国内访问实测只有 ~1Mbps, 结果
             会标注"海外源"提示)
           - 计时从首字节开始 (排除 TCP/TLS 握手), 慢链路也能给出"低速率"结果
+          - on_sample / series: 实时速率采样回调与时间序列 (终端动画 + 报告曲线)
         """
         if callback:
             callback("HTTP 下载测速中...（国内镜像多连接）")
@@ -2434,11 +2902,20 @@ class SpeedTester:
         for url in test_urls:
             if callback:
                 callback(f"  测速源: {url[:60]}{'...' if len(url) > 60 else ''}")
+            seg_series = []
             result = _download_speed_multi(
-                url, threads=4, target_bytes=5 * 1024 * 1024,
-                overall_timeout=20)
+                url, threads=4,
+                target_bytes=800 * 1024 * 1024,   # 字节上限 (防失控), 实际窗口由时长决定
+                overall_timeout=20,
+                max_duration=SPEEDTEST_CONFIG.get("duration_down", 8.0),
+                on_sample=on_sample, series=seg_series)
             if result and result.get("downloaded_mb", 0) > 0.1:
                 # 至少下到 100KB 才认为有效 (避免空响应/被劫持的短响应)
+                # 合并本段采样点到总序列 (时间偏移 = 前面各段累计时长)
+                if series is not None:
+                    base_t = series[-1][0] if series else 0.0
+                    for t, v in seg_series:
+                        series.append((round(base_t + t, 2), v))
                 if "cloudflare" in url:
                     result["note"] = ("测速源为海外 CDN (Cloudflare), 国内链路下"
                                       "结果偏低, 不代表真实宽带速率")
@@ -2537,6 +3014,15 @@ class SpeedTester:
             sum_data = end.get("sum_sent", end.get("sum", {}))
             if sum_data:
                 result["retransmits"] = sum_data.get("retransmits", 0)
+            # 时间序列: 每秒间隔的速率 (供报告曲线)
+            intervals = data.get("intervals") or []
+            series = []
+            for iv in intervals:
+                s = iv.get("sum", {})
+                bps = s.get("bits_per_second", 0)
+                series.append(round(bps / 1e6, 2))
+            if series:
+                result["intervals_mbps"] = series
             if not result:
                 # JSON 解析成功但没有速率数据 (例如 iperf3 跑一半超时)
                 return {"error": "iperf3 输出无速率数据", "method": "iperf3"}
@@ -2554,85 +3040,491 @@ class SpeedTester:
                 return {"bitrate_mbps": round(val, 2)}
             return {"error": "iperf3 输出无法解析", "method": "iperf3"}
 
-    def detect(self, iperf3_server=None, iperf3_port=5201,
-               use_speedtest_net=False, callback=None):
-        """执行完整测速。
+    def test_upload_domestic(self, callback=None, duration=8.0, node=None,
+                             on_sample=None, series=None):
+        """国内运营商节点上行测速: 多连接 HTTP POST 上传 (speedtest 协议)。
 
-        测速优先级 (国内网络环境适配):
-          1. 国内镜像 HTTP 多连接下载 (主, 准确且快) — 始终执行
-          2. iperf3 (仅当用户显式提供 --iperf3-server; 可测上下行)
-          3. Speedtest.net (仅当 --speedtest-net; 默认关闭, 结果可能严重偏低)
-        上行: 只有 iperf3 / Speedtest.net 能测; 都没有时显示"未测"。
+        零第三方依赖: 节点来自内置的 DOMESTIC_SPEEDTEST_NODES (电信/联通/
+        移动官方测速服务器), 不依赖 Ookla 动态列表 (代理环境会选到海外节点,
+        且该接口常被限流)。自动选延迟最低节点, 也可用 --speedtest-node
+        手动指定 host:port。
+
+        on_sample / series: 实时速率采样回调与时间序列 (终端动画 + 报告曲线)。
         """
         if callback:
-            callback("开始网络测速...")
-        results = {}
+            callback("探测国内测速节点 (电信/联通/移动)...")
+        try:
+            if node:
+                server = self._resolve_node(node)
+                if not server:
+                    return {"error": f"无法解析测速节点: {node} (支持 host:port, "
+                                     "如 112.25.80.50:8080)", "method": "upload_cn"}
+            else:
+                server, err = _select_domestic_speedtest_server(callback)
+                if not server:
+                    return {"error": err, "method": "upload_cn"}
+            host = server.get("host", "")
+            if not host:
+                return {"error": "测速节点缺少 host 信息", "method": "upload_cn"}
+            sponsor = server.get("sponsor", "") or host
+            if callback:
+                callback(f"上行测速: {sponsor} ({host})")
+            lat = _tcping_ms(host, timeout=3)
+            res = _upload_speed_multi(host, threads=4, duration=duration,
+                                      on_sample=on_sample, series=series)
+            if not res:
+                return {"error": f"上行测速失败: {host}", "method": "upload_cn"}
+            res.update({
+                "method": "speedtest-cn",
+                "sponsor": sponsor,
+                "server_host": host,
+                "server_latency_ms": lat,
+            })
+            return res
+        except Exception as e:
+            return {"error": str(e), "method": "upload_cn"}
 
-        # 1. HTTP 国内镜像多连接下载测速 (主路径, 始终执行)
-        http_result = self.test_http(callback)
-        results["http"] = http_result
+    def _resolve_node(self, node):
+        """解析 --speedtest-node: host:port → 手工构造 server dict; 数字 ID 不支持。"""
+        node = str(node).strip()
+        host, _, port = node.rpartition(":")
+        if not host or not port.isdigit():
+            return None
+        return {"host": f"{host}:{port}", "sponsor": node, "cc": "CN",
+                "country": "手动指定"}
 
-        # 2. Speedtest.net (可选, 默认关闭; 国内结果仅作参考)
-        if use_speedtest_net:
-            st_result = self.test_speedtest(callback)
-            results["speedtest"] = st_result
+    def detect(self, iperf3_server=None, iperf3_port=5201,
+               use_speedtest_net=False, node=None, live_ui=False,
+               save_report=True, callback=None):
+        """新版完整测速 (带宽体检)。
 
-        # 3. iperf3 (显式指定服务器才跑; 能测上下行)
-        if iperf3_server:
-            iperf3_result = self.test_iperf3(iperf3_server, iperf3_port, callback=callback)
-            results["iperf3"] = iperf3_result
+        流程: ① 空闲延迟基线 → ② 下行测速 (国内镜像多连接, 并行采样负载延迟)
+        → ③ 上行测速 (iperf3 优先, 否则国内运营商节点) → ④ 汇总评级
+        (下行/上行/预估带宽/bufferbloat A-F) → ⑤ 本地 HTML+JSON 报告。
 
-        # 汇总: 下行优先取 iperf3 (最准), 其次国内 HTTP; 上行仅 iperf3/Speedtest
-        download = 0.0
-        upload = None          # None = 未测
-        method_bits = []
-        if "error" not in results.get("http", {}):
-            download = results["http"].get("download_mbps", 0)
-            method_bits.append("国内HTTP")
-        if "iperf3" in results and "error" not in results["iperf3"]:
-            if results["iperf3"].get("download_mbps"):
-                download = results["iperf3"]["download_mbps"]
-            upload = results["iperf3"].get("upload_mbps")
-            method_bits.append("iperf3")
-        elif "speedtest" in results and "error" not in results["speedtest"]:
-            upload = results["speedtest"].get("upload_mbps")
-            method_bits.append("Speedtest参考")
+        live_ui: 单独运行本模块时终端实时动画 (由 run_diagnostics 置位)。
+        save_report: 结束后保存独立测速报告到 reports/YYYY-MM-DD/。
+        """
+        # live_ui 时抑制阶段文本 callback, 避免与终端实时动画 (\r 刷新) 互相覆盖
+        def _cb(msg):
+            if live_ui:
+                return
+            if callback:
+                callback(msg)
 
-        # 有效性提示: speedtest 选了海外服务器 / http 用了海外兜底源
-        issues = []
-        if "speedtest" in results and "error" not in results["speedtest"]:
-            if not results["speedtest"].get("valid", True):
-                issues.append({
-                    "severity": "warning",
-                    "message": "Speedtest.net 测速结果可能无效（服务器位于海外）",
-                    "detail": results["speedtest"].get("note", ""),
-                    "action": "下行以国内 HTTP 测速为准；上行建议用 iperf3 复测",
-                })
-        if "http" in results and "error" not in results["http"]:
-            note = results["http"].get("note", "")
-            if note:
-                issues.append({
-                    "severity": "warning",
-                    "message": note,
-                    "detail": f"测速源: {results['http'].get('url', '')}",
-                    "action": "国内镜像暂时不可用，可稍后重试或检查镜像连通性",
-                })
-        if issues:
-            results["issues"] = issues
-
-        if not method_bits:
-            results["error"] = "测速失败: 所有测速方法均不可用 (http/speedtest/iperf3)"
-            results["summary"] = "测速失败: 所有测速方法均不可用"
-        else:
-            method = "+".join(method_bits)
-            up_str = f"↑{format_speed(upload)}" if upload is not None else "↑未测"
-            results["summary"] = (f"测速 ({method}): ↓{format_speed(download)}, "
-                                  f"{up_str}")
-        results["timestamp"] = datetime.now().isoformat()
         if callback:
-            callback(results["summary"])
+            callback("开始宽带测速 (带宽体检)...")
+        t_start = time.time()
+
+        # 延迟采样目标: 网关优先 (bufferbloat 的测量对象), 无网关用公共 DNS
+        lat_target = get_default_gateway() or "223.5.5.5"
+        monitor = LatencyMonitor(lat_target)
+        monitor_ok = monitor.start()
+
+        # ① 空闲延迟基线 (约 3 个样本, ~3s)
+        if callback:
+            callback("测量空闲延迟基线...")
+        if monitor_ok:
+            monitor.wait_samples(3, timeout=6)
+        idle_rtt = monitor.median_rtt() if monitor_ok else None
+
+        ui = _LiveUI(live_ui)
+        ui.draw(phase="准备", idle_rtt=idle_rtt)
+
+        # ② 下行测速 (并行采样负载延迟)
+        down_series = []
+        up_series = []
+
+        def _down_sample(inst, t_off, cum):
+            ui.draw(down=inst, phase="下行测速", idle_rtt=idle_rtt)
+
+        down_start = time.time()
+        http_result = self.test_http(_cb, on_sample=_down_sample,
+                                     series=down_series)
+        down_end = time.time()
+        loaded_down_rtt = monitor.median_rtt(since=down_start) if monitor_ok else None
+        down_lat_series = monitor.series_since(down_start) if monitor_ok else []
+
+        # ③ 上行测速 (iperf3 优先, 否则国内运营商节点)
+        upload = None
+        up_result = None
+        loaded_up_rtt = None
+        up_lat_series = []
+        iperf3_result = None
+
+        def _up_sample(inst, t_off, cum):
+            ui.draw(up=inst, phase="上行测速", idle_rtt=idle_rtt)
+
+        up_start = time.time()
+        if iperf3_server:
+            iperf3_result = self.test_iperf3(iperf3_server, iperf3_port,
+                                             callback=_cb)
+            if "error" not in iperf3_result:
+                upload = iperf3_result.get("upload_mbps")
+                ivs = iperf3_result.get("intervals_mbps") or []
+                up_series = [(i + 1, v) for i, v in enumerate(ivs)]
+        else:
+            up_result = self.test_upload_domestic(
+                _cb, duration=SPEEDTEST_CONFIG.get("duration_up", 8.0),
+                node=node, on_sample=_up_sample, series=up_series)
+            if "error" not in up_result:
+                upload = up_result.get("upload_mbps")
+        up_end = time.time()
+        if monitor_ok:
+            loaded_up_rtt = monitor.median_rtt(since=up_start)
+            up_lat_series = monitor.series_since(up_start)
+        monitor.stop()
+
+        # ④ 汇总评级
+        download = 0.0
+        method_bits = []
+        if "error" not in http_result:
+            download = http_result.get("download_mbps", 0)
+            method_bits.append("国内HTTP")
+        if iperf3_result and "error" not in iperf3_result:
+            if iperf3_result.get("download_mbps"):
+                download = iperf3_result["download_mbps"]
+            method_bits.append("iperf3")
+        if up_result and "error" not in up_result:
+            method_bits.append("国内节点上行")
+        if not method_bits:
+            method_bits.append("失败")
+
+        # 延迟: 取下行/上行负载中较差者
+        loaded_rtt = None
+        loaded_phase = None
+        if loaded_down_rtt is not None and loaded_up_rtt is not None:
+            if loaded_up_rtt >= loaded_down_rtt:
+                loaded_rtt, loaded_phase = loaded_up_rtt, "上行"
+            else:
+                loaded_rtt, loaded_phase = loaded_down_rtt, "下行"
+        elif loaded_down_rtt is not None:
+            loaded_rtt, loaded_phase = loaded_down_rtt, "下行"
+        elif loaded_up_rtt is not None:
+            loaded_rtt, loaded_phase = loaded_up_rtt, "上行"
+        grade_text, bloat_ms = bufferbloat_grade(idle_rtt, loaded_rtt)
+
+        est = estimate_bandwidth(download, upload)
+
+        # 延迟时间序列 (空闲 + 下行 + 上行 全段)
+        lat_series = monitor.series_since(t_start) if monitor_ok else []
+
+        # Speedtest.net 参考 (可选)
+        speedtest_result = None
+        if use_speedtest_net:
+            speedtest_result = self.test_speedtest(_cb)
+
+        results = {
+            "download_mbps": round(download, 2),
+            "upload_mbps": round(upload, 2) if upload is not None else None,
+            "download_method": "国内HTTP多连接",
+            "upload_method": ("iperf3" if iperf3_server
+                              else (up_result.get("method", "未知")
+                                    if up_result else "未测")),
+            "upload_server": (up_result.get("sponsor", "") if up_result else
+                              (iperf3_server or "未测")),
+            "estimated_bandwidth": est,
+            "idle_rtt_ms": (round(idle_rtt, 1) if idle_rtt is not None else None),
+            "loaded_rtt_ms": (round(loaded_rtt, 1) if loaded_rtt is not None else None),
+            "loaded_phase": loaded_phase,
+            "bufferbloat_grade": grade_text,
+            "bufferbloat_ms": (round(bloat_ms, 1) if bloat_ms is not None else None),
+            "down_series": down_series,
+            "up_series": up_series,
+            "lat_series": lat_series,
+            "http": http_result,
+            "iperf3": iperf3_result,
+            "speedtest": speedtest_result,
+            "up_result": up_result,
+            "latency_target": lat_target,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        up_str = f"↑{format_speed(upload)}" if upload is not None else "↑未测"
+        est_str = f", 预估宽带 {est['text']}" if est else ""
+        bb_str = f", 缓冲膨胀 {grade_text}" if idle_rtt is not None else ""
+        results["summary"] = (f"测速 ({'+'.join(method_bits)}): "
+                              f"↓{format_speed(download)}, {up_str}"
+                              f"{est_str}{bb_str}")
+
+        # ⑤ 报告保存 (在 summary 赋值之后, 保证 JSON 快照完整)
+        if save_report:
+            try:
+                paths = save_speedtest_report(results)
+                if paths:
+                    results["report_html"] = paths[0]
+                    results["report_json"] = paths[1]
+                    _cb(f"测速报告已保存: {paths[0]}")
+                    if live_ui and sys.stdout.isatty():
+                        try:
+                            webbrowser.open("file:///" + paths[0].replace("\\", "/"))
+                        except Exception:
+                            pass
+            except Exception as e:
+                _cb(f"测速报告保存失败: {e}")
+
+        ui.finish()
+        results["timestamp"] = datetime.now().isoformat()
+        _cb(results["summary"])
         self.results = results    # 关键: 同步到 self.results (其它模块都用这个)
         return results
+
+
+# ============================================================
+# 独立测速报告 (HTML + JSON) — "带宽体检单"
+# ============================================================
+
+def _render_speedtest_html(res):
+    """渲染独立测速报告 HTML (内联 JS canvas 画曲线, 完全离线可用)。
+
+    面向装维人员留档/给客户看: 三大指标仪表盘 + 速率曲线 + 延迟曲线
+    (bufferbloat) + 预估带宽 + 测试参数, 不含"达标判定"的结论, 只给客观数据。
+    """
+    download = res.get("download_mbps") or 0
+    upload = res.get("upload_mbps")
+    est = res.get("estimated_bandwidth") or {}
+    grade = str(res.get("bufferbloat_grade") or "—")
+    idle_rtt = res.get("idle_rtt_ms")
+    loaded_rtt = res.get("loaded_rtt_ms")
+    bloat_ms = res.get("bufferbloat_ms")
+    down_series = res.get("down_series") or []
+    up_series = res.get("up_series") or []
+    lat_series = res.get("lat_series") or []
+    ts_raw = res.get("timestamp", "")
+    try:
+        ts_disp = datetime.fromisoformat(ts_raw).strftime("%Y-%m-%d %H:%M:%S") if ts_raw else "—"
+    except Exception:
+        ts_disp = ts_raw or "—"
+    local_ip = get_local_ip() or "未知"
+    gateway = get_default_gateway() or "未知"
+    up_mbps = upload if upload is not None else "未测"
+    est_text = est.get("text", "—") if est else "—"
+    est_note = est.get("note", "") if est else ""
+    upload_server = res.get("upload_server") or "未测"
+    upload_method = res.get("upload_method") or "未测"
+    idle_str = f"{idle_rtt:.0f} ms" if idle_rtt is not None else "—"
+    loaded_str = f"{loaded_rtt:.0f} ms" if loaded_rtt is not None else "—"
+    bloat_str = f"{bloat_ms:+.0f} ms" if bloat_ms is not None else "—"
+    # 测速源信息: 下行 (国内镜像多连接) / 上行 (国内运营商节点)
+    src_url = (res.get("http") or {}).get("url", "")
+    src_domain = src_url.split("/")[2] if src_url.startswith("http") else "国内镜像"
+    down_threads = (res.get("http") or {}).get("threads", 4)
+    up_threads = (res.get("up_result") or {}).get("threads", 4)
+    down_note = f"{down_threads} 连接 × {src_domain}"
+    # 大数字指标 (主流测速报告风格: 下行/上行/延迟)
+    up_big = f"{upload:.1f}" if upload is not None else "未测"
+    ping_big = f"{idle_rtt:.0f}" if idle_rtt is not None else "—"
+
+    # 速率曲线: 下行段 (蓝) + 上行段 (橙, 时间轴偏移到下行之后)
+    down_data = [[round(t, 2), v] for t, v in down_series]
+    base_t = down_series[-1][0] if down_series else 0.0
+    up_data = [[round(t + base_t + 1, 2), v] for t, v in up_series]
+
+    data_js = json.dumps({
+        "down": down_data,
+        "up": up_data,
+        "lat": lat_series,
+    }, ensure_ascii=False)
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetPulse 宽带测速报告</title>
+<style>
+  body {{ font-family: "Microsoft YaHei", "Segoe UI", sans-serif; margin: 0; background: #eef2f6; color: #1c2430; }}
+  .wrap {{ max-width: 880px; margin: 0 auto; padding: 28px 20px 48px; }}
+  h1 {{ font-size: 23px; margin: 0; font-weight: 600; letter-spacing: .3px; }}
+  h1 .dot {{ color: #0a84ff; margin-right: 6px; }}
+  .sub {{ color: #7b8794; font-size: 12.5px; margin: 6px 0 22px; }}
+  .metric-row {{ display: flex; gap: 12px; margin-bottom: 12px; }}
+  .metric {{ flex: 1; background: #fff; border-radius: 14px; padding: 18px 20px 14px;
+             box-shadow: 0 1px 3px rgba(16,42,67,.08); border-top: 3px solid #d3dae2; }}
+  .metric .label {{ color: #7b8794; font-size: 12px; margin-bottom: 4px; }}
+  .metric .big {{ font-size: 40px; font-weight: 600; line-height: 1.12; letter-spacing: -1px; }}
+  .metric .big .unit {{ font-size: 14px; color: #7b8794; font-weight: 400; letter-spacing: 0; }}
+  .metric .note {{ color: #98a2af; font-size: 11.5px; margin-top: 4px; }}
+  .metric.down {{ border-top-color: #0a84ff; }} .metric.down .big {{ color: #0a84ff; }}
+  .metric.up {{ border-top-color: #ff9500; }} .metric.up .big {{ color: #ff9500; }}
+  .metric.ping {{ border-top-color: #34c759; }} .metric.ping .big {{ color: #34c759; }}
+  .info-row {{ display: flex; gap: 12px; margin-bottom: 18px; }}
+  .info {{ flex: 1; background: #fff; border-radius: 14px; padding: 14px 18px;
+           box-shadow: 0 1px 3px rgba(16,42,67,.08); }}
+  .info .label {{ color: #7b8794; font-size: 12px; margin-bottom: 3px; }}
+  .info .value {{ font-size: 17px; font-weight: 500; }}
+  .info .note {{ color: #98a2af; font-size: 11.5px; margin-top: 2px; }}
+  .panel {{ background: #fff; border-radius: 14px; padding: 18px 20px; margin-bottom: 18px;
+            box-shadow: 0 1px 3px rgba(16,42,67,.08); }}
+  .panel h3 {{ margin: 0 0 14px; font-size: 15px; color: #1c2430; font-weight: 500; }}
+  canvas {{ width: 100%; height: auto; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
+  td {{ padding: 8px 10px; border-bottom: 1px solid #f0f2f5; }}
+  td:first-child {{ color: #7b8794; width: 160px; }}
+  .legend {{ font-size: 12px; color: #7b8794; margin-top: 10px; }}
+  .legend .sw {{ display: inline-block; width: 16px; height: 4px; border-radius: 2px;
+                 margin: 0 6px 2px 14px; vertical-align: middle; }}
+  .legend .sw:first-of-type {{ margin-left: 0; }}
+  .footer {{ color: #a4aeb8; font-size: 12px; text-align: center; margin-top: 28px; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span class="dot">●</span>NetPulse 宽带测速报告</h1>
+  <div class="sub">测试时间: {ts_disp} &nbsp;·&nbsp; 本机 IP: {local_ip} &nbsp;·&nbsp; 网关: {gateway}</div>
+
+  <div class="metric-row">
+    <div class="metric down">
+      <div class="label">下载速率 Download</div>
+      <div class="big">{download:.1f}<span class="unit"> Mbps</span></div>
+      <div class="note">{down_note}</div>
+    </div>
+    <div class="metric up">
+      <div class="label">上传速率 Upload</div>
+      <div class="big">{up_big}<span class="unit"> Mbps</span></div>
+      <div class="note">{upload_server} · {up_threads} 连接</div>
+    </div>
+    <div class="metric ping">
+      <div class="label">延迟 Ping</div>
+      <div class="big">{ping_big}<span class="unit"> ms</span></div>
+      <div class="note">空闲基线延迟</div>
+    </div>
+  </div>
+
+  <div class="info-row">
+    <div class="info">
+      <div class="label">预估宽带</div>
+      <div class="value">{est_text}</div>
+      <div class="note">按运营商档位估算{(' · ' + est_note) if est_note else ''}</div>
+    </div>
+    <div class="info">
+      <div class="label">缓冲膨胀 Bufferbloat</div>
+      <div class="value">{grade}</div>
+      <div class="note">空闲 {idle_str} → 负载 {loaded_str} ({bloat_str})</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>速率曲线 <span class="tag">Mbps</span></h3>
+    <canvas id="speedChart" width="840" height="280"></canvas>
+    <div class="legend">
+      <span class="sw" style="background:#0a84ff"></span>下行 · {down_note}
+      <span class="sw" style="background:#ff9500"></span>上行 · {up_threads} 连接 × 国内运营商节点
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>延迟变化 <span class="tag">ms · 负载期间延迟上升越多, 缓冲膨胀越严重</span></h3>
+    <canvas id="latChart" width="840" height="200"></canvas>
+  </div>
+
+  <div class="panel">
+    <h3>测试详情</h3>
+    <table>
+      <tr><td>下行测速方式</td><td>国内镜像多连接 HTTP 下载 ({down_threads} 连接 × {src_domain})</td></tr>
+      <tr><td>上行测速方式</td><td>{upload_method} ({upload_server}) · {up_threads} 连接</td></tr>
+      <tr><td>延迟采样目标</td><td>{res.get("latency_target", "—")}</td></tr>
+      <tr><td>空闲延迟 / 负载延迟</td><td>{idle_str} / {loaded_str} ({res.get("loaded_phase") or "—"} 阶段)</td></tr>
+      <tr><td>延迟采样阶段</td><td>空闲基线 → 下行 → 上行 (全程并行采样)</td></tr>
+      <tr><td>缓冲膨胀增量</td><td>{bloat_str}</td></tr>
+    </table>
+  </div>
+
+  <div class="footer">由 NetPulse 生成 · 报告仅为客观测速数据, 不包含达标判定</div>
+</div>
+
+<script>
+var DATA = {data_js};
+function multiLineChart(id, datasets) {{
+  var canvas = document.getElementById(id);
+  var ctx = canvas.getContext("2d");
+  var W = canvas.width, H = canvas.height;
+  var pad = {{l: 56, r: 16, t: 16, b: 30}};
+  var iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+  ctx.clearRect(0, 0, W, H);
+  var all = [];
+  datasets.forEach(function(ds) {{ all = all.concat(ds.data); }});
+  if (all.length < 2) {{
+    ctx.fillStyle = "#999"; ctx.font = "13px sans-serif";
+    ctx.fillText("无有效数据", pad.l, pad.t + 20);
+    return;
+  }}
+  var xmin = all[0][0], xmax = all[all.length - 1][0];
+  if (xmax === xmin) xmax = xmin + 1;
+  var ymax = 0;
+  all.forEach(function(p) {{ if (p[1] > ymax) ymax = p[1]; }});
+  if (ymax <= 0) ymax = 1;
+  ymax = Math.ceil(ymax * 1.15);
+  ctx.strokeStyle = "#e8ecf1"; ctx.lineWidth = 1;
+  for (var i = 0; i <= 4; i++) {{
+    var gy = pad.t + (1 - i / 4) * ih;
+    ctx.beginPath(); ctx.moveTo(pad.l, gy); ctx.lineTo(W - pad.r, gy); ctx.stroke();
+    ctx.fillStyle = "#98a2af"; ctx.font = "11px sans-serif"; ctx.textAlign = "right";
+    ctx.fillText(Math.round(ymax * i / 4), pad.l - 6, gy + 4);
+  }}
+  ctx.strokeStyle = "#d3dae2";
+  ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, H - pad.b);
+  ctx.lineTo(W - pad.r, H - pad.b); ctx.stroke();
+  datasets.forEach(function(ds) {{
+    if (ds.data.length < 2) return;
+    var pts = ds.data.map(function(p) {{
+      return [pad.l + (p[0] - xmin) / (xmax - xmin) * iw,
+              pad.t + (1 - p[1] / ymax) * ih];
+    }});
+    if (ds.fill) {{
+      var grad = ctx.createLinearGradient(0, pad.t, 0, H - pad.b);
+      grad.addColorStop(0, ds.fillTop || "rgba(10,132,255,0.18)");
+      grad.addColorStop(1, ds.fillBottom || "rgba(10,132,255,0.02)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], H - pad.b);
+      pts.forEach(function(p) {{ ctx.lineTo(p[0], p[1]); }});
+      ctx.lineTo(pts[pts.length - 1][0], H - pad.b);
+      ctx.closePath();
+      ctx.fill();
+    }}
+    ctx.strokeStyle = ds.color; ctx.lineWidth = 2; ctx.lineJoin = "round";
+    ctx.beginPath();
+    pts.forEach(function(p, i) {{ if (i === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]); }});
+    ctx.stroke();
+  }});
+  ctx.fillStyle = "#98a2af"; ctx.font = "11px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("0s", pad.l, H - 8);
+  ctx.fillText(Math.round(xmax) + "s", W - pad.r, H - 8);
+}}
+multiLineChart("speedChart", [
+  {{data: DATA.down, color: "#0a84ff", fill: true, fillTop: "rgba(10,132,255,0.16)", fillBottom: "rgba(10,132,255,0.01)"}},
+  {{data: DATA.up, color: "#ff9500", fill: true, fillTop: "rgba(255,149,0,0.16)", fillBottom: "rgba(255,149,0,0.01)"}}
+]);
+multiLineChart("latChart", [{{data: DATA.lat, color: "#34c759", fill: true, fillTop: "rgba(52,199,89,0.14)", fillBottom: "rgba(52,199,89,0.01)"}}]);
+</script>
+</body>
+</html>"""
+
+
+def save_speedtest_report(res):
+    """保存独立测速报告 (HTML + JSON) 到 reports/YYYY-MM-DD/, 返回 (html_path, json_path)。
+
+    报告是装维留档/给客户看的: HTML 为"带宽体检单" (含曲线), JSON 为原始
+    时间序列 (供技术归档/脚本分析)。
+    """
+    try:
+        day_dir = os.path.join("reports", datetime.now().strftime("%Y-%m-%d"))
+        os.makedirs(day_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_path = os.path.join(day_dir, f"speedtest_{stamp}.json")
+        html_path = os.path.join(day_dir, f"speedtest_{stamp}.html")
+        # JSON 快照: 附加自身路径 (HTML 渲染用原始 res, 不含附加字段)
+        snapshot = dict(res)
+        snapshot["report_html"] = html_path
+        snapshot["report_json"] = json_path
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2, default=str)
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(_render_speedtest_html(res))
+        return html_path, json_path
+    except Exception:
+        return None
 
 
 class TCPConnectionAnalyzer:
@@ -2838,13 +3730,14 @@ class MultiEgressDetector:
                 "detail": "VPN 可能创建额外的网络出口，流量可能通过 VPN 隧道转发"
             })
 
-        # 3. 检查公网 IP (多个服务并发)
+        # 3. 检查公网 IP (多个服务并发, 冗余避免单一服务挂掉)
         if callback:
             callback("检测公网出口 IP...")
         public_ips = []
         ip_services = [
             ("https://qifu-api.baidubce.com/ip/local/geo/v1/district", "json"),
             ("https://myip.ipip.net", "text"),
+            ("https://www.cip.cc", "text"),
         ]
 
         def _probe_pub(url, mode):
@@ -2861,7 +3754,7 @@ class MultiEgressDetector:
             except Exception:
                 return ""
 
-        with ThreadPoolExecutor(max_workers=2) as ex:
+        with ThreadPoolExecutor(max_workers=len(ip_services)) as ex:
             for ip in ex.map(lambda t: _probe_pub(*t), ip_services):
                 if ip and ip not in public_ips:
                     public_ips.append(ip)
@@ -3062,6 +3955,20 @@ class DNSTester:
                 "severity": "critical",
                 "message": f"系统 DNS 对公网域名返回私有 IP ({sample})",
                 "detail": "可能存在透明代理/DNS 劫持, 系统 DNS 未返回真实公网解析结果",
+            })
+
+        # 解析不一致提示: 同一域名在不同 DNS 下返回多个不同 IP。
+        # 注意 CDN 轮询 (按地域/运营商返回不同节点) 是正常现象, 因此只做
+        # info 级提示且措辞保守, 不当作故障。
+        inconsistent = [(d, len(ips)) for d, ips in domain_ips.items() if len(ips) >= 2]
+        if inconsistent and not dns_hijack:
+            sample = ", ".join(f"{d}({n} 个结果)" for d, n in inconsistent[:3])
+            issues.append({
+                "type": "dns_inconsistent",
+                "severity": "info",
+                "message": f"部分域名在不同 DNS 下解析结果不一致 ({sample})",
+                "detail": "多为 CDN 按地域/运营商轮询 (正常现象); 若某 DNS 长期返回"
+                          "固定异常 IP 而其它 DNS 正常, 可怀疑该 DNS 被污染",
             })
 
         assessment = "正常"
@@ -3278,12 +4185,22 @@ class ARPAnalyzer:
         mac_to_ips = defaultdict(list)
         ip_to_mac = {}
 
+        # Windows `arp -a` 会按接口分组重复输出同一 (IP,MAC,type) 条目
+        # (如同时连 WiFi + 有线, 同一网段条目出现两次)。不去重会导致:
+        #   - total_entries 重复计数
+        #   - mac_to_ips 里同一 IP 重复 -> multi_ip_macs 误判"多 IP 同 MAC"
+        # LoopDetector 已处理该问题, 这里保持一致。
+        seen_entries = set()
         for line in out.split("\n"):
             m = re.match(r"\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F-]{17})\s+(\S+)", line)
             if m:
                 ip = m.group(1)
                 mac = m.group(2).lower()
                 arp_type = m.group(3)
+                key = (ip, mac, arp_type)
+                if key in seen_entries:
+                    continue
+                seen_entries.add(key)
                 entries.append({"ip": ip, "mac": mac, "type": arp_type})
                 mac_to_ips[mac].append(ip)
                 ip_to_mac[ip] = mac
@@ -3316,8 +4233,9 @@ class ARPAnalyzer:
                         "detail": f"IP 列表: {', '.join(same_mac_ips[:5])}。可能是路由器/交换机的多个接口"
                     })
 
-                # ARP 欺骗检测: 检查是否有 IP 的 MAC 频繁变化
-                # (需要多次采样)
+                # ARP 欺骗检测 (MAC 频繁变化) 未实现: 需要多次采样对比同一 IP 的
+                # MAC 是否漂移。单次 arp -a 快照无法判断, 且正常场景 (DHCP 重连、
+                # 多网卡轮询) 也会引起 MAC 变化, 误报风险高。留待 --arp-rescan 模式。
 
             # 检测 ARP 冲突 (同一 IP 多个 MAC — 从 ARP 表可能看不到)
             # 检查静态 ARP 条目: 排除广播/组播/协议保留 MAC
@@ -3531,16 +4449,28 @@ class IPv6Tester:
         code, out, _ = run_cmd("ipconfig")
         has_global_ipv6 = False
         has_link_local = False
+        # 只收集真正的"本机 IPv6 地址"行 — 不能简单用 "IPv6" in line 匹配,
+        # 否则 "IPv6 默认网关 / IPv6 Default Gateway" 行 (fe80:: 或全局地址)
+        # 也会被当作本机地址, 导致 local_ipv6 列表污染、has_global_ipv6 误判
+        ipv6_addr_prefixes = (
+            "IPv6 地址", "临时 IPv6 地址", "本地链接 IPv6 地址",
+            "IPv6 Address", "Temporary IPv6 Address", "Link-local IPv6 Address",
+        )
         for line in out.split("\n"):
             line = line.strip()
-            if "IPv6" in line and ":" in line:
+            if line.startswith(ipv6_addr_prefixes):
+                # 形如 "IPv6 地址 . . . : 240e:xxx:xxx" 或带作用域 "fe80::1%12"
                 m = re.search(r":\s*([0-9a-fA-F:]+)", line)
                 if m:
                     addr = m.group(1)
+                    # 去掉 %scope 后缀 (如 fe80::1%12 → fe80::1)
+                    addr = addr.split("%")[0]
+                    if addr.startswith("::1"):
+                        continue
                     local_ipv6.append(addr)
                     if addr.startswith("fe80"):
                         has_link_local = True
-                    elif not addr.startswith("::1"):
+                    else:
                         has_global_ipv6 = True
 
         # 2. 检查 IPv6 路由
@@ -3548,18 +4478,21 @@ class IPv6Tester:
         has_ipv6_route = "::/0" in route_out
 
         # 3. IPv6 连通性测试
+        # 用 TCP 53 (DNS 服务) 而非 443 — 2400:3200::1 是阿里 DNS, 通常只开
+        # 53, 测 443 会误判"IPv6 不可连通"。53 失败时 443 兜底。
         ipv6_connectivity = False
         ipv6_dns = False
-        try:
-            # 尝试连接 IPv6 地址
-            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            s.settimeout(5)
-            # 2400:3200::1 = 阿里 DNS IPv6
-            s.connect(("2400:3200::1", 443))
-            s.close()
-            ipv6_connectivity = True
-        except Exception:
-            ipv6_connectivity = False
+        ipv6_target = "2400:3200::1"
+        for port in (53, 443):
+            try:
+                s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                s.settimeout(4)
+                s.connect((ipv6_target, port))
+                s.close()
+                ipv6_connectivity = True
+                break
+            except Exception:
+                continue
 
         # 4. IPv6 DNS 解析
         try:
@@ -3598,6 +4531,7 @@ class IPv6Tester:
             "has_ipv6_route": has_ipv6_route,
             "ipv6_connectivity": ipv6_connectivity,
             "ipv6_dns": ipv6_dns,
+            "ipv6_target": ipv6_target,
             "issues": issues,
             "assessment": assessment,
             "timestamp": datetime.now().isoformat(),
@@ -3709,14 +4643,17 @@ class RouteTableAnalyzer:
             })
 
         # 检查路由环路 (A 的网关是 B, B 的网关是 A)
+        # 局限性: 路由表里 destination 是网段、gateway 是下一跳 IP, 下一跳 IP
+        # 一般不会同时出现在 destination 中, 因此该判定在 Windows 上几乎不会
+        # 命中 (保留作为极端配置的兜底, 不构成误报来源)。
         route_map = {r["destination"]: r["gateway"] for r in routes}
         for dest, gw in route_map.items():
             if gw in route_map and route_map[gw] == dest and dest != gw:
                 issues.append({
                     "type": "route_loop",
-                    "severity": "critical",
-                    "message": f"检测到路由环路: {dest} -> {gw} -> {dest}",
-                    "detail": "路由表存在环路，可能导致数据包循环"
+                    "severity": "warning",
+                    "message": f"疑似路由环路: {dest} -> {gw} -> {dest}",
+                    "detail": "路由表存在 A↔B 互指网关的配置, 可能导致数据包循环"
                 })
 
         # 检查无效路由 (网关不可达)
@@ -4311,14 +5248,14 @@ class LANDeviceScanner:
             callback("扫描局域网设备 (ARP 表)...")
         local_ip = get_local_ip()
         gateway = get_default_gateway()
-        parts = local_ip.split(".")
-        base = ".".join(parts[:3]) if len(parts) == 4 else None
+        # 用真实子网掩码过滤 (而非硬编码 /24 — 大子网 /16 /23 会漏掉设备)
+        local_net = _get_local_subnet(local_ip)
         devices = []
 
         # 以 ARP 表为主 (一次命令获取全部近期通信设备, 避免 254 次 ping sweep)
         arp_map = self._get_arp_map()
         for ip, mac in sorted(arp_map.items()):
-            if base and not ip.startswith(base + "."):
+            if local_net and ipaddress.IPv4Address(ip) not in local_net:
                 continue
             # 过滤广播/组播/协议保留 MAC (用统一 helper, 比手写前缀更稳):
             #   - ff-ff-ff-ff-ff-ff  L2 广播
@@ -4348,7 +5285,7 @@ class LANDeviceScanner:
         self.results = {
             "local_ip": local_ip,
             "gateway": gateway,
-            "subnet": f"{base}.0/24" if base else "",
+            "subnet": str(local_net) if local_net else "",
             "devices": devices,
             "device_count": len(devices),
             "issues": issues,
@@ -4767,6 +5704,9 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
     print(_c("-" * 60, C_GRAY))
 
     IS_TTY = sys.stdout.isatty()
+    # 单独运行测速模块时启用终端实时可视化 (多模块/JSON/verbose/非 TTY 时关闭)
+    SPEEDTEST_CONFIG["live_ui"] = (len(keys) == 1 and keys[0] == "speedtest"
+                                   and IS_TTY and not as_json and not verbose)
     results = {}
     full = {}  # key -> 完整结果 dict (供报告使用)
 
@@ -4845,6 +5785,8 @@ def _module_detect_kwargs(key):
             iperf3_server=SPEEDTEST_CONFIG.get("iperf3_server"),
             iperf3_port=SPEEDTEST_CONFIG.get("iperf3_port", 5201),
             use_speedtest_net=SPEEDTEST_CONFIG.get("use_speedtest_net", False),
+            node=SPEEDTEST_CONFIG.get("node"),
+            live_ui=SPEEDTEST_CONFIG.get("live_ui", False),
         )
     return {}
 
@@ -7770,6 +8712,10 @@ def main():
     parser.add_argument("--speedtest-net", action="store_true",
                         help="启用 Speedtest.net 测速 (默认关闭: 国内网络下常选中"
                              "海外服务器, 结果严重偏低, 仅作参考)")
+    parser.add_argument("--speedtest-node", metavar="ID|HOST:PORT",
+                        help="指定上行测速服务器 (可选): speedtest 服务器 ID 或 "
+                             "host:port (如 3633 或 112.25.80.50:8080); "
+                             "默认自动选择延迟最低的国内运营商节点")
     args = parser.parse_args()
 
     # 禁用 scapy 二层抓包 (避免 Npcap 不稳定导致段错误)
@@ -7804,6 +8750,7 @@ def main():
         else:
             SPEEDTEST_CONFIG["iperf3_server"] = spec
     SPEEDTEST_CONFIG["use_speedtest_net"] = bool(args.speedtest_net)
+    SPEEDTEST_CONFIG["node"] = getattr(args, "speedtest_node", None) or None
 
     if args.list:
         _print_module_list()
