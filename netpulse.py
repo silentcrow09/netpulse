@@ -88,6 +88,13 @@ PORT_PROBE_CONFIG = {"targets": [], "proto": "tcp", "count": 2,
                      "force": False, "max_total_time": 60.0,
                      "max_concurrency": 8}
 
+# 测速模块的运行参数 (由 CLI --iperf3-server / --speedtest-net 写入, runner 读取)
+# - iperf3_server: 提供后测速模块会用 iperf3 测上下行 (iperf3 是唯一可靠的上行测量)
+# - use_speedtest_net: 默认关闭 — 国内网络下 speedtest-cli 常选中海外服务器,
+#   结果严重偏低 (本机实测 100M 宽带测出 5 Mbps), 仅作参考
+SPEEDTEST_CONFIG = {"iperf3_server": None, "iperf3_port": 5201,
+                    "use_speedtest_net": False}
+
 
 def _is_admin():
     """检测当前是否以管理员权限运行 (安装 Npcap 需要)"""
@@ -715,7 +722,7 @@ _CMD_CACHE_TTL = 5.0  # 秒
 
 
 def _download_speed_test(url, target_bytes=5 * 1024 * 1024, chunk_size=64 * 1024,
-                         overall_timeout=20, callback=None):
+                         overall_timeout=20, callback=None, connect_timeout=10):
     """下载测速通用函数: chunked read 累计到 target_bytes 就 stop, 不等下完。
 
     与 ``resp.read()`` 一次读完的区别:
@@ -728,17 +735,21 @@ def _download_speed_test(url, target_bytes=5 * 1024 * 1024, chunk_size=64 * 1024
       url: 测速源 URL
       target_bytes: 累计下载到这么多字节就停 (默认 5MB, 测速精度足够)
       chunk_size: 每次 read 的块大小 (默认 64KB)
-      overall_timeout: 整体超时秒数 (默认 20s, 超过就 break 用已下载数据)
+      overall_timeout: 数据传输阶段超时秒数 (默认 20s, 超过就 break 用已下载
+                       数据; 连接/TLS 握手不计入)
       callback: 进度回调, 接受 str (每 1MB 或每 1s 报一次)
+      connect_timeout: 连接 + TLS 握手 + 响应头超时 (默认 10s)
 
-    返回 dict (含 download_mbps / downloaded_mb / elapsed_s) 或 None (失败)。
+    返回 dict (含 download_mbps / downloaded_bytes / downloaded_mb / elapsed_s)
+    或 None (失败)。计时从收到第一个数据字节开始, 排除 TCP/TLS/HTTP 头开销,
+    避免高速链路上握手耗时压低测速均值。
     """
     try:
         req = Request(url, headers={"User-Agent": "NetPulse/1.0"})
-        start = time.time()
+        # 连接 + TLS 握手 + 响应头: 不计入测速窗口 (单独超时)
+        resp = urlopen(req, timeout=connect_timeout)
+        start = time.time()          # 首个数据字节到达, 测速窗口从这里开始
         deadline = start + overall_timeout
-        # connect timeout 短一点 (10s 足够建立连接)
-        resp = urlopen(req, timeout=10)
         downloaded = 0
         last_report_time = start
         last_report_bytes = 0
@@ -770,6 +781,7 @@ def _download_speed_test(url, target_bytes=5 * 1024 * 1024, chunk_size=64 * 1024
             return {
                 "url": url,
                 "download_mbps": round(speed_mbps, 2),
+                "downloaded_bytes": downloaded,
                 "downloaded_mb": round(downloaded / 1e6, 2),
                 "elapsed_s": round(elapsed, 2),
             }
@@ -778,6 +790,58 @@ def _download_speed_test(url, target_bytes=5 * 1024 * 1024, chunk_size=64 * 1024
         if callback:
             callback(f"  测速失败 ({url[:40]}...): {e}")
         return None
+
+
+def _download_speed_multi(url, threads=4, target_bytes=5 * 1024 * 1024,
+                          chunk_size=64 * 1024, overall_timeout=20,
+                          connect_timeout=10):
+    """多连接下载测速: 对同一 URL 并发开 threads 个连接, 各自下到 target_bytes 停。
+
+    为什么需要多连接:
+      - 单 TCP 连接吞吐受拥塞窗口/RTT 限制, 300M+ 宽带下打不满
+      - 多连接 (类似浏览器/迅雷) 才能逼近真实可用带宽; 国内镜像对并发连接
+        支持良好, 本机实测 4 连接可把 100M 链路利用率拉到 90%+ (单连接只有
+        约 65%)
+
+    聚合方式: 总字节 = 各连接之和; 耗时 = 各连接中最长的数据传输耗时 (每个
+    连接计时均从各自首字节开始, 已排除握手); 速率 = 总字节 * 8 / 1e6 / 耗时。
+
+    返回 dict (含 download_mbps / downloaded_bytes / downloaded_mb / elapsed_s
+    / threads / url) 或 None (全部连接失败)。
+    """
+    results = []
+    results_lock = threading.Lock()
+
+    def worker():
+        r = _download_speed_test(
+            url, target_bytes=target_bytes, chunk_size=chunk_size,
+            overall_timeout=overall_timeout, callback=None,
+            connect_timeout=connect_timeout)
+        if r and r.get("downloaded_bytes", 0) > 0:
+            with results_lock:
+                results.append(r)
+
+    ts = [threading.Thread(target=worker, daemon=True) for _ in range(threads)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+    if not results:
+        return None
+    total_bytes = sum(r["downloaded_bytes"] for r in results)
+    elapsed = max(r["elapsed_s"] for r in results)
+    if elapsed <= 0:
+        return None
+    speed_mbps = (total_bytes * 8) / 1e6 / elapsed
+    return {
+        "url": url,
+        "download_mbps": round(speed_mbps, 2),
+        "downloaded_bytes": total_bytes,
+        "downloaded_mb": round(total_bytes / 1e6, 2),
+        "elapsed_s": round(elapsed, 2),
+        "threads": threads,
+    }
 
 
 def _tcp_probe(host, port=80, timeout=2.0):
@@ -2291,9 +2355,16 @@ class SpeedTester:
         self.results = {}
 
     def test_speedtest(self, callback=None):
-        """使用 speedtest 库测速"""
+        """speedtest-cli 测速 (可选, 默认关闭; 国内网络下结果仅作参考)。
+
+        国内现状: speedtest-cli 的服务器选点常指向海外服务器 (本机实测选中
+        美国亚利桑那州服务器, 100M 宽带测出 5 Mbps, 而国内镜像实测 64.6
+        Mbps)。因此:
+          - 只在 use_speedtest_net=True 时运行 (默认不跑, 避免输出误导数字)
+          - 选中服务器非中国大陆/港澳台时, 结果标记 valid=False 并附 note
+        """
         if callback:
-            callback("Speedtest.net 测速中...")
+            callback("Speedtest.net 测速中 (可选, 结果仅供参考)...")
         if not SPEEDTEST_LIB_AVAILABLE:
             return {"error": "speedtest 库未安装", "method": "speedtest_lib"}
 
@@ -2302,25 +2373,39 @@ class SpeedTester:
             if callback:
                 callback("选择最优服务器...")
             st.get_best_server()
+            server = st.best
+            country = str(server.get("country", "") or "")
+            cc = str(server.get("cc", "") or "").upper()
+            # 中国大陆 + 港澳台视为"国内可达", 其它 (海外) 标记结果无效
+            valid = (cc in ("CN", "HK", "MO", "TW")
+                     or "中国" in country or "Hong Kong" in country
+                     or "Macao" in country or "Macau" in country
+                     or "Taiwan" in country)
             if callback:
                 callback("下载测速中...")
             download_speed = st.download() / 1e6  # Mbps
             if callback:
                 callback("上传测速中...")
             upload_speed = st.upload() / 1e6
-            server = st.best
-            return {
+            result = {
                 "method": "speedtest.net",
-                "server": f"{server.get('sponsor', '')} ({server.get('name', '')}, {server.get('country', '')})",
+                "server": f"{server.get('sponsor', '')} ({server.get('name', '')}, {country})",
+                "server_country": country,
+                "server_cc": cc,
                 "server_latency_ms": round(server.get('latency', 0), 1),
                 "download_mbps": round(download_speed, 2),
                 "upload_mbps": round(upload_speed, 2),
+                "valid": valid,
             }
+            if not valid:
+                result["note"] = (f"Speedtest.net 选中服务器位于海外 ({country}), "
+                                  "跨境链路测速结果不代表本地宽带速率, 仅供参考")
+            return result
         except Exception as e:
             return {"error": str(e), "method": "speedtest_lib"}
 
     def test_http(self, callback=None):
-        """HTTP 下载测速 (降级方案)。
+        """HTTP 多连接下载测速 (默认主测速路径)。
 
         旧版问题 (用户已踩):
           - 测速源 speedtest.tele2.net / cachefly.cachefly.net 是国外 CDN,
@@ -2328,36 +2413,35 @@ class SpeedTester:
           - resp.read() 一次读完全部数据, 必须等服务器发完才返回
           - timeout=15s 在慢链路上必然超时, 但用户只看到 "HTTP 下载测速中...",
             不知道是卡了还是快好了
+          - 单连接测速, 高速宽带 (300M+) 下打不满, 数字偏低
 
-        修复:
-          - 测速源改为国内 (清华/阿里/腾讯镜像, 700MB boot.iso 支持 range)
-            + Cloudflare __down 按需返回 N 字节作为兜底
-          - chunked read, 累计下载到 target_bytes (5MB) 就 stop, 不等下完
-          - 进度 callback: 每 1MB 或每 1s 报告一次当前速率
-          - 整体 overall_timeout=20s 兜底, 慢链路也能给出"低速率"结果
+        当前实现:
+          - 国内大文件镜像 (腾讯/华为, 实测在线, ~790MB boot.iso) 多连接并发,
+            每个连接累计 target_bytes 就停, 不等下完
+          - Cloudflare __down 仅作最后兜底 (从国内访问实测只有 ~1Mbps, 结果
+            会标注"海外源"提示)
+          - 计时从首字节开始 (排除 TCP/TLS 握手), 慢链路也能给出"低速率"结果
         """
         if callback:
-            callback("HTTP 下载测速中...")
-        # 国内大文件镜像 + Cloudflare 兜底; 全部 HTTPS, 安全 + 不被劫持。
-        # 候选列表按实测速率排序 (腾讯主域 > 华为云 > 腾讯子域 > Cloudflare),
-        # 旧版用国外 speedtest.tele2.net / cachefly.cachefly.net 国内只有
-        # 17KB/s, 完整下 10MB 要 10 分钟, 是用户报告卡顿的根因。
-        # 注意: centos 8 已 EOL, 清华/USTC/163/阿里部分路径已下线, 优先用
-        # 还在线的腾讯/华为/Cloudflare 源。
+            callback("HTTP 下载测速中...（国内镜像多连接）")
+        # 候选列表按实测速率排序: 腾讯主域 > 华为云 > Cloudflare (兜底)。
+        # centos 8 已 EOL, 清华/阿里部分路径已下线 (实测 404 / 拒连), 已移除。
         test_urls = [
             "https://mirrors.tencent.com/centos/8/BaseOS/x86_64/os/images/boot.iso",
             "https://mirrors.huaweicloud.com/centos/8/BaseOS/x86_64/os/images/boot.iso",
-            "https://mirrors.cloud.tencent.com/centos/8/BaseOS/x86_64/os/images/boot.iso",
             "https://speed.cloudflare.com/__down?bytes=10485760",
         ]
         for url in test_urls:
             if callback:
                 callback(f"  测速源: {url[:60]}{'...' if len(url) > 60 else ''}")
-            result = _download_speed_test(
-                url, target_bytes=5 * 1024 * 1024,
-                overall_timeout=20, callback=callback)
-            if result and result.get("downloaded_mb", 0) > 0.05:
-                # 至少下到 50KB 才认为有效 (避免空响应/被劫持的短响应)
+            result = _download_speed_multi(
+                url, threads=4, target_bytes=5 * 1024 * 1024,
+                overall_timeout=20)
+            if result and result.get("downloaded_mb", 0) > 0.1:
+                # 至少下到 100KB 才认为有效 (避免空响应/被劫持的短响应)
+                if "cloudflare" in url:
+                    result["note"] = ("测速源为海外 CDN (Cloudflare), 国内链路下"
+                                      "结果偏低, 不代表真实宽带速率")
                 return result
         return {"error": "所有 HTTP 测速服务器均不可用或太慢", "method": "http_download"}
 
@@ -2383,6 +2467,12 @@ class SpeedTester:
         cmd = f'"{iperf3_path}" -c {server} -p {port} -t {duration} -J'
         _, out, _ = run_cmd(cmd, timeout=duration + 15)
         upload_result = self._parse_iperf3_json(out)
+
+        # 双方向都解析失败 -> 整体判失败 (否则 detect() 会把 0/0 当成功结果)
+        if "error" in download_result and "error" in upload_result:
+            return {"error": (f"iperf3 双向均无有效输出: {download_result['error']}; "
+                              f"{upload_result['error']}"),
+                    "method": "iperf3"}
 
         return {
             "method": "iperf3",
@@ -2464,41 +2554,80 @@ class SpeedTester:
                 return {"bitrate_mbps": round(val, 2)}
             return {"error": "iperf3 输出无法解析", "method": "iperf3"}
 
-    def detect(self, iperf3_server=None, iperf3_port=5201, callback=None):
-        """执行完整测速"""
+    def detect(self, iperf3_server=None, iperf3_port=5201,
+               use_speedtest_net=False, callback=None):
+        """执行完整测速。
+
+        测速优先级 (国内网络环境适配):
+          1. 国内镜像 HTTP 多连接下载 (主, 准确且快) — 始终执行
+          2. iperf3 (仅当用户显式提供 --iperf3-server; 可测上下行)
+          3. Speedtest.net (仅当 --speedtest-net; 默认关闭, 结果可能严重偏低)
+        上行: 只有 iperf3 / Speedtest.net 能测; 都没有时显示"未测"。
+        """
         if callback:
             callback("开始网络测速...")
         results = {}
 
-        # Speedtest.net
-        st_result = self.test_speedtest(callback)
-        results["speedtest"] = st_result
+        # 1. HTTP 国内镜像多连接下载测速 (主路径, 始终执行)
+        http_result = self.test_http(callback)
+        results["http"] = http_result
 
-        # 如果 speedtest 失败，用 HTTP 降级
-        if "error" in st_result:
-            http_result = self.test_http(callback)
-            results["http"] = http_result
+        # 2. Speedtest.net (可选, 默认关闭; 国内结果仅作参考)
+        if use_speedtest_net:
+            st_result = self.test_speedtest(callback)
+            results["speedtest"] = st_result
 
-        # iperf3
+        # 3. iperf3 (显式指定服务器才跑; 能测上下行)
         if iperf3_server:
             iperf3_result = self.test_iperf3(iperf3_server, iperf3_port, callback=callback)
             results["iperf3"] = iperf3_result
 
-        # 汇总
-        download = 0
-        upload = 0
-        method = ""
-        if "error" not in results.get("speedtest", {}):
-            download = results["speedtest"].get("download_mbps", 0)
-            upload = results["speedtest"].get("upload_mbps", 0)
-            method = "Speedtest.net"
-        elif "error" not in results.get("http", {}):
+        # 汇总: 下行优先取 iperf3 (最准), 其次国内 HTTP; 上行仅 iperf3/Speedtest
+        download = 0.0
+        upload = None          # None = 未测
+        method_bits = []
+        if "error" not in results.get("http", {}):
             download = results["http"].get("download_mbps", 0)
-            method = "HTTP"
+            method_bits.append("国内HTTP")
         if "iperf3" in results and "error" not in results["iperf3"]:
-            method += " + iperf3"
+            if results["iperf3"].get("download_mbps"):
+                download = results["iperf3"]["download_mbps"]
+            upload = results["iperf3"].get("upload_mbps")
+            method_bits.append("iperf3")
+        elif "speedtest" in results and "error" not in results["speedtest"]:
+            upload = results["speedtest"].get("upload_mbps")
+            method_bits.append("Speedtest参考")
 
-        results["summary"] = f"测速 ({method}): ↓{format_speed(download)}, ↑{format_speed(upload)}"
+        # 有效性提示: speedtest 选了海外服务器 / http 用了海外兜底源
+        issues = []
+        if "speedtest" in results and "error" not in results["speedtest"]:
+            if not results["speedtest"].get("valid", True):
+                issues.append({
+                    "severity": "warning",
+                    "message": "Speedtest.net 测速结果可能无效（服务器位于海外）",
+                    "detail": results["speedtest"].get("note", ""),
+                    "action": "下行以国内 HTTP 测速为准；上行建议用 iperf3 复测",
+                })
+        if "http" in results and "error" not in results["http"]:
+            note = results["http"].get("note", "")
+            if note:
+                issues.append({
+                    "severity": "warning",
+                    "message": note,
+                    "detail": f"测速源: {results['http'].get('url', '')}",
+                    "action": "国内镜像暂时不可用，可稍后重试或检查镜像连通性",
+                })
+        if issues:
+            results["issues"] = issues
+
+        if not method_bits:
+            results["error"] = "测速失败: 所有测速方法均不可用 (http/speedtest/iperf3)"
+            results["summary"] = "测速失败: 所有测速方法均不可用"
+        else:
+            method = "+".join(method_bits)
+            up_str = f"↑{format_speed(upload)}" if upload is not None else "↑未测"
+            results["summary"] = (f"测速 ({method}): ↓{format_speed(download)}, "
+                                  f"{up_str}")
         results["timestamp"] = datetime.now().isoformat()
         if callback:
             callback(results["summary"])
@@ -5092,15 +5221,24 @@ def _verdict_speedtest(res):
 
 def _metrics_speedtest(res):
     out = []
-    for k, label in (("speedtest", "Speedtest"), ("http", "HTTP"), ("iperf3", "iperf3")):
+    for k, label in (("speedtest", "Speedtest.net"), ("http", "国内HTTP"),
+                     ("iperf3", "iperf3")):
         sub = res.get(k, {})
         if not sub or "error" in sub:
             continue
         down = sub.get("download_mbps", 0)
-        up = sub.get("upload_mbps", 0)
-        if down or up:
-            out.append((f"{label} 下载", f"{down} Mbps", "ok" if down >= 10 else "warn"))
-            out.append((f"{label} 上传", f"{up} Mbps", "ok" if up >= 5 else "warn"))
+        up = sub.get("upload_mbps")     # None = 未测
+        if down:
+            out.append((f"{label} 下载", f"{down} Mbps",
+                        "ok" if down >= 10 else "warn"))
+        if up is not None:
+            out.append((f"{label} 上传", f"{up} Mbps",
+                        "ok" if up >= 5 else "warn"))
+    # 备注 (海外服务器 / 海外兜底源等有效性提示)
+    for k in ("speedtest", "http"):
+        sub = res.get(k, {})
+        if sub and sub.get("note"):
+            out.append(("备注", sub["note"], "warn"))
     return out
 
 

@@ -101,7 +101,7 @@ python netpulse.py --install
 | 13 | `bufferbloat` | Bufferbloat | 负载下延迟测试，评级 A–F |
 | 14 | `ipv6` | IPv6 检测 | IPv6 地址 / 路由 / 连通性 / DNS 全面检测 |
 | 15 | `route` | 路由表 | 路由环路检测、异常路由、网关子网验证 |
-| 16 | `speedtest` | 测速 | Speedtest.net + HTTP 降级测速 |
+| 16 | `speedtest` | 测速 | 国内镜像多连接下载测速（可选 iperf3 上下行 / Speedtest.net 参考） |
 | 17 | `lan` | LAN 设备扫描 | `arp -a` 发现局域网设备，结合 MAC OUI 识别厂商 |
 | 18 | `tcpstats` | TCP 传输质量 | 解析 `netstat -s` 重传率、错误段、连接失败数 |
 
@@ -270,7 +270,7 @@ irm https://<bucket>.oss-cn-hangzhou.aliyuncs.com/netpulse/v1-beta/install.ps1 |
 | 依赖 | 用途 | 缺失时 |
 |------|------|--------|
 | `scapy` | DHCP 完整检测（发送 Discover） | DHCP 降级为仅读取当前 DHCP 服务器 |
-| `speedtest-cli` | Speedtest.net 测速 | 改用 HTTP 下载测速 |
+| `speedtest-cli` | Speedtest.net 测速（可选，`--speedtest-net`） | 不启用；仅用国内镜像测速 |
 | `pyinstaller` | 打包为单文件 EXE | 不影响直接运行 |
 
 ## 💻 系统要求
