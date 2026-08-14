@@ -5547,17 +5547,45 @@ def _cli_status_badge(status):
     return _c(f"[{status}]", code)
 
 
-def _cli_print_result(res, verbose=False, as_json=False):
-    """打印单个诊断结果 (精简展示 + 可选 JSON 完整输出)"""
+def _cli_print_result(res, verbose=False, as_json=False, key=None):
+    """打印单个诊断结果 (面向一线装维人员)。
+
+    默认模式: 只显示 ① 一句话结论 (verdict) ② 关键指标 (metrics, 按阈值着色)
+    ③ 问题/警告清单。原始字段不进命令行 — 细节在 HTML/JSON 报告里。
+    --verbose 打印全部原始字段 (调试用); --json 输出完整 JSON。
+    """
     if as_json:
         out = {k: v for k, v in res.items() if k != "callback"}
         print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
         return
-    # 摘要
-    summary = res.get("summary") or res.get("error") or ""
-    if summary:
-        print(_c("  " + summary, C_WHITE))
-    # 问题列表 (最重要的可操作信息)
+    # 1. 一句话结论 (客户视图 verdict 优先, 兜底 summary)
+    text = None
+    if key:
+        pres = MODULE_PRESENTATION.get(key, {})
+        vfn = pres.get("verdict_fn")
+        if vfn:
+            try:
+                text = vfn(res)
+            except Exception:
+                text = None
+    if not text:
+        text = res.get("summary") or res.get("error") or ""
+    if text:
+        print(_c("  " + text, C_WHITE))
+    # 2. 关键指标 (客户视图 metrics, 按 ok/warn/err 着色)
+    if key and not verbose:
+        pres = MODULE_PRESENTATION.get(key, {})
+        mfn = pres.get("metrics_fn")
+        if mfn:
+            try:
+                metrics = mfn(res)
+                for label, value, level in metrics:
+                    code = {"ok": C_GREEN, "warn": C_YELLOW,
+                            "err": C_RED}.get(level, C_WHITE)
+                    print(f"    {_c(label, C_GRAY)}: {_c(value, code)}")
+            except Exception:
+                pass
+    # 3. 问题列表 (最重要的可操作信息)
     issues = res.get("issues")
     if isinstance(issues, list) and issues:
         for it in issues:
@@ -5568,20 +5596,21 @@ def _cli_print_result(res, verbose=False, as_json=False):
                 print(_c(f"  ! [{sev}] {msg}", scode))
             else:
                 print(_c(f"  ! {it}", C_YELLOW))
-    # 其余字段
-    skip = {"summary", "error", "issues", "timestamp", "callback"}
-    for k, v in res.items():
-        if k in skip:
-            continue
-        if isinstance(v, (dict, list)):
-            s = json.dumps(v, ensure_ascii=False, default=str)
-            if len(s) > 200 and not verbose:
-                s = s[:200] + f"... (共 {len(s)} 字符, 加 --verbose 查看)"
-        else:
-            s = str(v)
-            if len(s) > 200 and not verbose:
-                s = s[:200] + "..."
-        print(_c(f"  {k}: ", C_CYAN) + s)
+    # 4. 其余原始字段: 仅 --verbose 打印 (装维人员不需要, 细节进报告)
+    if verbose:
+        skip = {"summary", "error", "issues", "timestamp", "callback"}
+        for k, v in res.items():
+            if k in skip:
+                continue
+            if isinstance(v, (dict, list)):
+                s = json.dumps(v, ensure_ascii=False, default=str)
+                if len(s) > 200:
+                    s = s[:200] + f"... (共 {len(s)} 字符)"
+            else:
+                s = str(v)
+                if len(s) > 200:
+                    s = s[:200] + "..."
+            print(_c(f"  {k}: ", C_CYAN) + s)
 
 
 def _print_module_list():
@@ -5760,7 +5789,7 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
         else:
             pass  # 顺序模式也已经在 detect() 前/后打了
         print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge(status))
-        _cli_print_result(res, verbose=verbose, as_json=as_json)
+        _cli_print_result(res, verbose=verbose, as_json=as_json, key=key)
 
     # 汇总
     print()
@@ -6245,30 +6274,31 @@ def _verdict_speedtest(res):
             if "error" in sub:
                 return f"测速失败 ({k}): {sub['error']}"
         return res.get("error", "测速失败")
-    method = res.get("summary", "")
-    return method
+    return res.get("summary", "测速")
 
 
 def _metrics_speedtest(res):
+    """测速关键指标 (新结构: 顶层 download/upload/预估带宽/bufferbloat)"""
     out = []
-    for k, label in (("speedtest", "Speedtest.net"), ("http", "国内HTTP"),
-                     ("iperf3", "iperf3")):
-        sub = res.get(k, {})
-        if not sub or "error" in sub:
-            continue
-        down = sub.get("download_mbps", 0)
-        up = sub.get("upload_mbps")     # None = 未测
-        if down:
-            out.append((f"{label} 下载", f"{down} Mbps",
-                        "ok" if down >= 10 else "warn"))
-        if up is not None:
-            out.append((f"{label} 上传", f"{up} Mbps",
-                        "ok" if up >= 5 else "warn"))
-    # 备注 (海外服务器 / 海外兜底源等有效性提示)
-    for k in ("speedtest", "http"):
-        sub = res.get(k, {})
-        if sub and sub.get("note"):
-            out.append(("备注", sub["note"], "warn"))
+    if "error" in res:
+        return out
+    down = res.get("download_mbps")
+    up = res.get("upload_mbps")
+    est = res.get("estimated_bandwidth") or {}
+    grade = res.get("bufferbloat_grade") or ""
+    idle = res.get("idle_rtt_ms")
+    if down:
+        out.append(("下载", f"{down} Mbps", "ok" if down >= 10 else "warn"))
+    if up is not None:
+        out.append(("上传", f"{up} Mbps", "ok" if up >= 5 else "warn"))
+    if est.get("text"):
+        out.append(("预估宽带", est["text"], "ok"))
+    if idle is not None:
+        out.append(("延迟(网关)", f"{idle:.0f} ms",
+                    "ok" if idle < 30 else "warn"))
+    if grade:
+        lv = "ok" if grade.startswith(("A", "B")) else "warn"
+        out.append(("缓冲膨胀", grade, lv))
     return out
 
 

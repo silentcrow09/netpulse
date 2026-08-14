@@ -83,7 +83,7 @@ python netpulse.py --install
 | `modules` | 要运行的模块 key 或序号；`all` 表示全部；省略则进入交互菜单 |
 | `--list` | 列出所有可用模块后退出 |
 | `--json` | 以 JSON 格式输出每个模块的完整结果 |
-| `--verbose` | 完整输出，不截断长字段 |
+| `--verbose` | 显示完整原始字段（默认仅显示结论 + 关键指标 + 问题清单，细节保存在 HTML/JSON 报告中） |
 | `--no-color` | 禁用彩色输出（兼容老旧终端） |
 | `--install` | 自动安装缺失依赖 |
 | `--no-scapy` | 禁用 scapy 二层抓包，DHCP 检测降级 |
