@@ -274,8 +274,12 @@ def _npcap_installed():
     return False
 
 
-def _urlopen_with_proxy(url, timeout=120):
-    """带环境变量代理支持的下载 (兼容企业代理网络)"""
+def _urlopen_with_proxy(url, timeout=120, ua="NetPulse/1.0"):
+    """带环境变量代理支持的下载 (兼容企业代理网络)。
+
+    ua: User-Agent 字符串, 默认 "NetPulse/1.0"。个别站点 (如 mac.bmcx.com)
+    对非浏览器 UA 响应异常, 调用方可传入浏览器 UA。
+    """
     import urllib.request as ur
     proxies = {}
     for env_key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
@@ -285,7 +289,7 @@ def _urlopen_with_proxy(url, timeout=120):
             proxies[scheme] = val
     handlers = [ur.ProxyHandler(proxies)] if proxies else []
     opener = ur.build_opener(*handlers)
-    req = Request(url, headers={"User-Agent": "NetPulse/1.0"})
+    req = Request(url, headers={"User-Agent": ua})
     return opener.open(req, timeout=timeout)
 
 
@@ -5228,6 +5232,61 @@ def _oui_vendor(mac):
     return _OUI_VENDORS.get(prefix, "")
 
 
+# ============================================================
+# 在线 OUI 补查 (mac.bmcx.com)
+# 本地表仅覆盖约 30 个常见前缀, 覆盖面极小; 未命中时按 OUI 在线查询,
+# 从页面 "组织名称" 表格解析厂商名。收录的 MAC 返回 200 + 表格,
+# 未收录返回 404。OUI 级缓存避免同前缀设备重复请求。
+# ============================================================
+_OUI_ONLINE_CACHE = {}          # prefix6 -> vendor ("" = 已确认未收录, 不再重复请求)
+_OUI_ONLINE_LOCK = threading.Lock()
+_BMCX_TIMEOUT = 6               # 单次查询超时 (秒)
+_BMCX_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+
+def _oui_vendor_online(mac):
+    """按 MAC 在线查询 mac.bmcx.com 解析厂商; 未收录/失败返回空串。
+
+    - 200 + 组织名称   -> 缓存厂商名
+    - 404 (未收录)     -> 缓存空串, 不再重查
+    - 网络异常         -> 不缓存 (下次可重试)
+    """
+    if not mac:
+        return ""
+    prefix = mac.replace("-", "").replace(":", "").upper()[:6]
+    if prefix in _OUI_ONLINE_CACHE:
+        return _OUI_ONLINE_CACHE[prefix]
+    vendor = ""
+    cached = False
+    try:
+        url = f"https://mac.bmcx.com/{mac}__mac/"
+        with _urlopen_with_proxy(url, timeout=_BMCX_TIMEOUT, ua=_BMCX_UA) as resp:
+            status = getattr(resp, "status", 200)
+            if status == 404:
+                cached = True  # 确定未收录
+            elif status == 200:
+                html = resp.read().decode("utf-8", errors="replace")
+                m = re.search(
+                    r">组织名称</td>\s*<td[^>]*>\s*([^<]*?)\s*</td>",
+                    html, re.S)
+                if m:
+                    vendor = re.sub(r"\s+", " ", m.group(1)).strip()
+                cached = bool(vendor)  # 200 但解析不到组织名称 = 页面异常, 不缓存
+    except Exception as e:
+        # urllib 对 4xx 直接抛 HTTPError: 404 = 确定未收录, 缓存空串避免重复请求
+        try:
+            from urllib.error import HTTPError
+            if isinstance(e, HTTPError) and e.code == 404:
+                cached = True
+        except Exception:
+            cached = False
+    if cached:
+        with _OUI_ONLINE_LOCK:
+            _OUI_ONLINE_CACHE[prefix] = vendor
+    return vendor
+
+
 class LANDeviceScanner:
     """局域网设备扫描 (ping sweep + ARP 表交叉 + MAC 厂商识别)。"""
 
@@ -5274,6 +5333,40 @@ class LANDeviceScanner:
                 "ip": ip, "mac": mac, "vendor": _oui_vendor(mac),
                 "is_gateway": "是" if ip == gateway else "",
             })
+
+        # 在线补查本地表未命中的厂商 (mac.bmcx.com): OUI 级去重 + 并发,
+        # 失败/离线时静默保持"未知", 不影响扫描主流程。
+        unknown_ouis = {}
+        for d in devices:
+            if not d.get("vendor") and d.get("mac"):
+                p6 = d["mac"].replace("-", "").replace(":", "").upper()[:6]
+                unknown_ouis.setdefault(p6, d["mac"])
+        if unknown_ouis:
+            hits = {}
+
+            def _lookup(pair):
+                p6, mac = pair
+                return p6, _oui_vendor_online(mac)
+
+            if len(unknown_ouis) == 1:
+                p6, mac = next(iter(unknown_ouis.items()))
+                hits[p6] = _oui_vendor_online(mac)
+            else:
+                with ThreadPoolExecutor(max_workers=4) as _ex:
+                    _futs = [_ex.submit(_lookup, (p6, mac))
+                             for p6, mac in unknown_ouis.items()]
+                    for _f in as_completed(_futs):
+                        try:
+                            _p6, _v = _f.result()
+                            if _v:
+                                hits[_p6] = _v
+                        except Exception:
+                            pass
+            for d in devices:
+                if not d.get("vendor") and d.get("mac"):
+                    p6 = d["mac"].replace("-", "").replace(":", "").upper()[:6]
+                    if hits.get(p6):
+                        d["vendor"] = hits[p6]
 
         # 评估
         issues = []
@@ -5350,6 +5443,24 @@ class TCPStatsTester:
                     for k, v in parsed.items():
                         if v:
                             stats[k] = v
+
+        # 当前连接数修正: Get-NetTCPStatistics 在多数 Windows 上不存在该 cmdlet
+        # (NetTCPIP 模块只提供 Get-NetTCPConnection), 之前 CurrentConnections 取不到时
+        # 静默落为 0, 与「TCP 连接数检测」模块 (netstat -ano) 矛盾, 属"假零"。
+        # 改为从 netstat -ano 计数 (与 TCPConnectionAnalyzer 口径一致);
+        # 计数失败/为 0 时回退 Get-NetTCPStatistics 原值, 都没有则置 None (报告渲染为 —)。
+        try:
+            cc_orig = stats.get("current_connections")
+            _code, _out, _ = run_cmd("netstat -ano", timeout=15)
+            tcp_cnt = 0
+            for _l in _out.split("\n"):
+                _ls = _l.strip()
+                if _ls.startswith("TCP") and len(_ls.split()) >= 5:
+                    tcp_cnt += 1
+            stats["current_connections"] = (tcp_cnt if tcp_cnt > 0
+                                            else (cc_orig if cc_orig else None))
+        except Exception:
+            stats["current_connections"] = stats.get("current_connections")
 
         sent = stats.get("segments_sent", 0)
         retrans = stats.get("retransmitted", 0)
@@ -6821,11 +6932,13 @@ def _verdict_tcpstats(res):
 
 
 def _metrics_tcpstats(res):
+    cur = res.get("current_connections")
+    cur_str = "—" if cur is None else f"{cur}"
     out = [
         ("重传率", f"{res.get('retrans_rate_pct', 0)}%",
          "err" if res.get("retrans_rate_pct", 0) >= 5 else
          "warn" if res.get("retrans_rate_pct", 0) >= 1 else "ok"),
-        ("当前连接", f"{res.get('current_connections', 0)}"),
+        ("当前连接", cur_str),
     ]
     return out
 
