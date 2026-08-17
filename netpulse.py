@@ -36,6 +36,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 import argparse
 import tempfile
 import ipaddress
@@ -5476,6 +5477,45 @@ C_CYAN   = "96"
 C_WHITE  = "97"
 C_BLUE   = "94"
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _disp_width(s):
+    """计算字符串在终端中的显示宽度 (ANSI 不计, 东亚宽字符计 2)。"""
+    w = 0
+    for ch in _ANSI_RE.sub("", s):
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def _pad_disp(s, width):
+    """按显示宽度右补齐字符串到 width (用于多列对齐)。"""
+    pad = width - _disp_width(s)
+    return s + (" " * pad if pad > 0 else "")
+
+
+def _columnize(cells, columns=2, gap=3):
+    """把若干 (可能含 ANSI 颜色) 字符串按多列排成若干行。
+
+    行优先填充 (先左后右、再换行), 每列按最长 cell 的显示宽度对齐。
+    返回字符串列表, 调用方自行加缩进后打印。
+    """
+    if not cells:
+        return []
+    columns = max(1, columns)
+    width = max(_disp_width(c) for c in cells)
+    rows = (len(cells) + columns - 1) // columns
+    out = []
+    for r in range(rows):
+        parts = []
+        for c in range(columns):
+            i = r * columns + c
+            if i < len(cells):
+                parts.append(_pad_disp(cells[i], width))
+        out.append((" " * gap).join(parts).rstrip())
+    return out
+
+
 STATUS_STYLE = {
     "完成": C_GREEN, "正常": C_GREEN,
     "警告": C_YELLOW,
@@ -5627,7 +5667,7 @@ def _cli_print_result(res, verbose=False, as_json=False, key=None):
 
 
 def _print_module_list():
-    """打印所有可用诊断模块 (按三大类分组展示, 序号全局连续 1-18)"""
+    """打印所有可用诊断模块 (按三大类分组展示, 序号全局连续 1-18, 双列排版)"""
     print(_c(f"{APP_NAME} v{APP_VERSION} — 可用诊断模块:", C_BOLD))
     idx = 0
     for cat_name, keys, desc in MODULE_CATEGORIES:
@@ -5635,10 +5675,15 @@ def _print_module_list():
         tag = _c(f"[{letter}]", C_CYAN) if letter else ""
         print()
         print(_c(f"  {tag} {cat_name}", C_BOLD) + _c(f"  {desc}", C_GRAY))
+        cells = []
         for k in keys:
             idx += 1
             n = MODULE_MAP[k][0]
-            print(f"    {_c(str(idx).rjust(2), C_CYAN)}. {_c(n, C_WHITE)}  {_c('(' + k + ')', C_GRAY)}")
+            cells.append(
+                _c(str(idx).rjust(2), C_CYAN) + ". " +
+                _c(n, C_WHITE) + " " + _c("(" + k + ")", C_GRAY))
+        for line in _columnize(cells, columns=2, gap=4):
+            print("    " + line)
     print()
     print(_c("  分类快捷: 输入 a/b/c 按分类运行; all / 0 / * 运行全部。", C_GRAY))
 
@@ -5816,10 +5861,13 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
     print(_c("  诊断汇总", C_BOLD))
     print(_c("-" * 60, C_GRAY))
     cnt = {}
+    cells = []
     for key, st in results.items():
         n = MODULE_MAP[key][0]
-        print(f"  {_cli_status_badge(st)}  {_c(n, C_WHITE)}")
+        cells.append(_cli_status_badge(st) + " " + _c(n, C_WHITE))
         cnt[st] = cnt.get(st, 0) + 1
+    for line in _columnize(cells, columns=2, gap=4):
+        print("  " + line)
     print(_c("-" * 60, C_GRAY))
     summ = []
     if cnt.get("完成"): summ.append(_c(f"正常 {cnt['完成']}", C_GREEN))
@@ -6398,7 +6446,7 @@ def _metrics_linkspeed(res):
             level = "ok" if speed >= 150 else "warn" if speed >= 54 else "err"
         else:
             level = "ok" if speed >= 1000 else "warn" if speed >= 100 else "err"
-        out.append((f"{kind} · {a.get('name', '?')[:18]}",
+        out.append((f"{kind} · {_short_iface(a.get('name', '?'))}",
                     f"{speed} Mbps", level))
     wifi = res.get("wifi_details", {})
     if wifi.get("signal_pct") is not None:
@@ -6627,7 +6675,7 @@ def _metrics_mtu(res):
     local = res.get("local_mtus", [])
     if local:
         m = local[0]
-        out.append((f"本机 {m.get('interface', '?')[:14]}", f"MTU {m.get('mtu', '?')}",
+        out.append((f"本机 {_short_iface(m.get('interface', '?'), 18)}", f"MTU {m.get('mtu', '?')}",
                     "ok" if m.get("mtu", 1500) >= 1500 else "warn"))
     return out
 
@@ -6944,33 +6992,49 @@ HEALTH_GRADE_TABLE = [
     (0,  "F", "严重"),
 ]
 
-def compute_health_score(counts):
-    """根据状态计数算健康分和等级。counts: {"完成": 14, "警告": 3, "异常": 1, ...}"""
+def compute_health_score(counts, issues_count=None):
+    """根据状态计数算健康分和等级。
+
+    counts: {"完成": 14, "警告": 3, "异常": 1, ...}
+    issues_count: 各模块实际 issue 总数 (含警告/异常/错误)。
+                 若提供, verdict 文案会精确显示此项数。
+    """
     score = 100
     score -= counts.get("异常", 0) * 20
     score -= counts.get("错误", 0) * 30
     score -= counts.get("警告", 0) * 5
     score -= counts.get("未检测", 0) * 2
     score = max(0, min(100, score))
+
+    # 计算真实需关注的条目数 (异常+错误, 警告; 不计"信息")
+    err_cnt = counts.get("异常", 0) + counts.get("错误", 0)
+    warn_cnt = counts.get("警告", 0)
+    if issues_count is None:
+        issues_count = err_cnt + warn_cnt
+
     for threshold, grade, label in HEALTH_GRADE_TABLE:
         if score >= threshold:
-            # 一句话结论
-            if counts.get("异常", 0) == 0 and counts.get("错误", 0) == 0:
-                if counts.get("警告", 0) == 0:
-                    verdict = "网络良好, 无问题"
+            # 一句话结论: 精确反映真实问题数 (而非模块数), 避免分数/verdict/问题数三者打架
+            if err_cnt == 0 and warn_cnt == 0:
+                verdict = "网络良好, 无问题"
+            elif err_cnt > 0:
+                if issues_count == 0:
+                    verdict = "存在异常模块"
                 else:
-                    verdict = f"网络可用, {counts.get('警告', 0)} 项可优化"
-            elif counts.get("错误", 0) > 0:
-                verdict = f"存在 {counts.get('错误', 0)} 项严重问题"
+                    verdict = f"{issues_count} 项需关注 (含 {err_cnt} 项异常)"
             else:
-                verdict = f"{counts.get('异常', 0)} 项需关注"
+                if issues_count == 0:
+                    verdict = f"{warn_cnt} 个模块提示警告"
+                else:
+                    verdict = f"{issues_count} 项需关注"
             return {
                 "score": score,
                 "grade": grade,
                 "label": label,
                 "verdict": f"{label} · {verdict}",
             }
-    return {"score": 0, "grade": "F", "label": "严重", "verdict": "严重"}
+    return {"score": 0, "grade": "F", "label": "严重",
+            "verdict": "严重 · 存在多项严重问题"}
 
 
 def build_report():
@@ -6998,11 +7062,10 @@ def build_report():
         return None
     run = LAST_RUN
 
-    # 状态计数
+    # 状态计数 (按模块状态)
     counts = {}
     for st in run["status"].values():
         counts[st] = counts.get(st, 0) + 1
-    health = compute_health_score(counts)
 
     # 客户视图模块列表
     modules = []
@@ -7011,6 +7074,19 @@ def build_report():
         res = run["results"].get(key, {})
         status = run["status"].get(key, "未检测")
         modules.append(_present_module(key, res, status))
+
+    # 汇总真实 issue 数 (用于 health.verdict 精确文案, 避免分数/verdict/问题数三者打架)
+    # 既统计 issues 列表里的条目, 也包含"模块级异常"但没有 issue 的情况 (如 IPv6 状态异常但 issues 全是 info)
+    issue_total = 0
+    for m in modules:
+        mod_status = m.get("status", "")
+        if mod_status in ("异常", "错误"):
+            issue_total += 1  # 模块级异常
+        for issue in m.get("issues", []) or []:
+            sev = issue.get("severity", "信息")
+            if sev in ("异常", "错误", "警告"):
+                issue_total += 1
+    health = compute_health_score(counts, issues_count=issue_total)
 
     return {
         "app": run["app"],
@@ -7585,6 +7661,20 @@ HEADER_MAP = {
     "tcp_port": "TCP 端口", "reachability": "可达性",
     "tcp_ok": "TCP 通", "tcp_total": "目标数",
     "unreachable_count": "不可达数", "icmp_blocked_count": "禁拼数",
+    # 网络适配器
+    "description": "描述", "media_type": "媒体类型",
+    "is_wifi": "无线网卡", "link_speed_raw": "链路速率原始值",
+    "speed_mbps": "速率(Mbps)",
+    # 端口探测
+    "tcp_used_port": "实际端口", "rtt_min_ms": "最小 RTT(ms)", "rtt_max_ms": "最大 RTT(ms)",
+    # MTU
+    "max_payload": "最大负载", "path_mtu": "路径 MTU",
+    "fragmentation_risk": "分片风险", "indeterminate_pct": "不确定(%)",
+    "probes": "探测次数", "mtu": "MTU",
+    # 路由表（补充）
+    "is_default": "是否默认",
+    # IPv6
+    "ipv6_global": "IPv6 全局", "ipv6_reachable": "IPv6 可达",
 }
 
 
@@ -7627,6 +7717,20 @@ def _record_table(v):
 #   - 每模块只显示: 状态 + 一句话结论 + 3-5 个关键指标 + 问题/建议
 #   - 技术细节默认折叠 (工程师点开看)
 #   - 字段名 100% 中文化, 颜色按阈值
+def _short_iface(name, max_len=22):
+    """缩短网络接口名: 保留关键前缀 + 后 8 字符, 避免长哈希占满 metric。"""
+    if not name:
+        return "?"
+    if len(name) <= max_len:
+        return name
+    if "[" in name and name.endswith("]"):
+        prefix, inside = name.split("[", 1)
+        inside = inside.rstrip("]")
+        keep = inside[-8:] if len(inside) > 8 else inside
+        return f"{prefix.strip()} [..{keep}]"
+    return name[:max_len - 1] + "…"
+
+
 def _html_esc(s):
     """HTML escape, 中文和空格安全。"""
     import html as _html
@@ -7635,15 +7739,16 @@ def _html_esc(s):
     return _html.escape(str(s), quote=False)
 
 
-def _render_html_tech_block(key, raw_result, tech_keys):
+def _render_html_tech_block(key, raw_result, tech_keys, auto_open=True):
     """把模块的 raw 原始数据按 tech_keys 渲染成可折叠的 <details> 块。
 
-    只在客户报告里"展开技术细节"折叠时显示。
+    auto_open=True: 默认展开, 便于装维留档时数据完整可见 (用户可手动折叠)。
     """
     if not raw_result or not tech_keys:
         return ""
     out = []
-    out.append("<details class='collapse'>")
+    open_attr = " data-auto-open=" + chr(34) + "1" + chr(34) + " open" if auto_open else ""
+    out.append(f"<details class='collapse'{open_attr}>")
     out.append(f"<summary>技术细节 <span class='cnt'>{len(tech_keys)} 项</span></summary>")
     out.append("<div class='body'>")
     for k in tech_keys:
@@ -7663,7 +7768,7 @@ def _render_html_tech_block(key, raw_result, tech_keys):
                 )
                 out.append(f"<table class='tbl'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
                 if len(rows) > 20:
-                    out.append(f"<p class='muted'>… 还有 {len(rows) - 20} 条 (JSON 报告里有完整 {len(rows)} 条)</p>")
+                    out.append(f"<p class='muted'>… 还有 {len(rows) - 20} 条 (如需完整数据, 导出 JSON 报告 {len(rows)} 条)</p>")
         elif isinstance(v, dict):
             # 嵌套字典 → KV 表格
             rows = []
@@ -7695,6 +7800,10 @@ def render_report_html_customer(report):
     输入: build_report() 的输出 (双视图)
     输出: 完整可独立打开的 HTML 字符串
     """
+    # 评分卡配色: A/B=good(绿), C=warn(橙), D/F=bad(红)
+    def _score_class(grade):
+        return {"A": "good", "B": "good", "C": "warn"}.get(grade, "bad")
+
     if not report:
         return "<p>尚无诊断数据，请先运行诊断</p>"
 
@@ -7735,7 +7844,7 @@ def render_report_html_customer(report):
     {geo_line}
     {ipv6_line}
   </div>
-  <div class="score">
+  <div class="score {_html_esc(_score_class(health["grade"]))}">
     <div class="score-num">{health['score']}</div>
     <div class="score-grade">{_html_esc(health['grade'])}</div>
     <div class="score-text">{_html_esc(health['verdict'])}</div>
@@ -7743,19 +7852,30 @@ def render_report_html_customer(report):
 </header>"""
 
     # ── 待办问题 ──
+    # 1) 收集所有 issue; 2) 按 (severity, text) 去重避免多模块重复同一警告;
+    # 3) 顶部列表只展示异常/错误/警告, 信息级不进顶部 (详情里仍可见)
     todo_issues = []
+    seen_keys = set()
     for m in modules:
-        for issue in m.get("issues", []):
+        for issue in m.get("issues", []) or []:
+            text = (issue.get("text", "") or "").strip()
+            dedup_key = (issue.get("severity", "信息"), text)
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
             todo_issues.append({**issue, "_module": m["name"], "_status": m["status"]})
-    # 按严重度排序
+
     sev_order = {"异常": 0, "错误": 0, "警告": 1, "信息": 2}
     todo_issues.sort(key=lambda i: sev_order.get(i.get("severity", "信息"), 3))
 
-    if todo_issues:
+    # 顶部只展示需关注条目 (异常/错误/警告), 信息级不进顶部列表
+    top_issues = [i for i in todo_issues if i.get("severity", "信息") in ("异常", "错误", "警告")][:10]
+
+    if top_issues:
         todo_blocks = []
-        for issue in todo_issues[:10]:   # 最多展示 10 条
+        for issue in top_issues:
             sev = issue.get("severity", "信息")
-            sev_class = "err" if sev in ("异常", "错误") else "warn" if sev == "警告" else "info"
+            sev_class = "err" if sev in ("异常", "错误") else "warn"
             impact = issue.get("impact", "")
             action = issue.get("action", "")
             text = issue.get("text", "")
@@ -7767,9 +7887,20 @@ def render_report_html_customer(report):
   {f"<div class='impact'>📌 影响: {_html_esc(impact)}</div>" if impact else ""}
   {f"<div class='action'>💡 建议: {_html_esc(action)}</div>" if action else ""}
 </div>""")
+        info_extra = ""
+        info_cnt = sum(1 for i in todo_issues if i.get("severity", "信息") == "信息")
+        if info_cnt > 0:
+            info_extra = f" <span class='extra-count'>(另有 {info_cnt} 条信息项可查看下方模块详情)</span>"
         todo_section = f"""
-<div class="sec"><h2><span class="icon">⚠</span>{len(todo_issues)} 个问题需要您关注</h2></div>
+<div class="sec"><h2><span class="icon">⚠</span>{len(top_issues)} 项需要您关注{info_extra}</h2></div>
 <div class="todo">{"".join(todo_blocks)}</div>"""
+    elif todo_issues:
+        todo_section = """
+<div class="sec"><h2><span class="icon">✓</span>所有核心检测通过</h2></div>
+<div class="todo ok">
+  <div class="todo-head">✓ 网络状态良好</div>
+  <div class="impact">所有核心检测均正常, 部分提示项可在下方模块详情查看。</div>
+</div>"""
     else:
         todo_section = """
 <div class="sec"><h2><span class="icon">✓</span>所有检测通过</h2></div>
@@ -7820,23 +7951,32 @@ def render_report_html_customer(report):
         else:
             metrics_html = ""
 
-        # 问题
-        issues = m.get("issues", [])
+        # 问题: 按 (severity, text, action) 去重, 避免 IPv6 等场景同一建议被多次写出
+        issues = m.get("issues", []) or []
         if issues:
             issue_html = []
+            seen_issue_keys = set()
             for issue in issues:
                 sev = issue.get("severity", "信息")
                 sev_class = "err" if sev in ("异常", "错误") else "warn" if sev == "警告" else ""
-                text = issue.get("text", "")
-                impact = issue.get("impact", "")
-                action = issue.get("action", "")
-                if sev_class:
+                text = issue.get("text", "") or ""
+                action = issue.get("action", "") or ""
+                # 去重策略:
+                #   1) 同一 (sev, action) 只展示一次 — 避免 IPv6 等场景同一建议多次出现
+                #   2) 同一 (sev, text) 但 action 为空时, 也只展示一次 (避免重复条目)
+                act_key = (sev, action.strip()) if action.strip() else (sev, text.strip())
+                if act_key in seen_issue_keys:
+                    continue
+                seen_issue_keys.add(act_key)
+                # 始终显示 info 级别条目 (info 也加灰色 impact-line), 让用户知道为什么
+                if text.strip():
+                    info_cls = sev_class if sev_class else "info"
                     issue_html.append(
-                        f"<div class='impact-line {sev_class}'>"
+                        f"<div class='impact-line {info_cls}'>"
                         f"<b>[{_html_esc(sev)}]</b> {_html_esc(text)}"
                         f"</div>"
                     )
-                if action:
+                if action.strip():
                     issue_html.append(
                         f"<div class='action-line'>💡 {_html_esc(action)}</div>"
                     )
@@ -7844,26 +7984,37 @@ def render_report_html_customer(report):
         else:
             issues_html = ""
 
-        # 技术细节折叠
+        # 技术细节折叠 (默认展开, 便于装维留档时一眼看全; 用户可手动折叠)
         tech_html = ""
         if m.get("has_tech_details"):
             pres = MODULE_PRESENTATION.get(m["key"], {})
             tech_keys = pres.get("tech_keys", [])
-            tech_html = _render_html_tech_block(m["key"], m.get("raw", {}), tech_keys)
+            tech_html = _render_html_tech_block(
+                m["key"], m.get("raw", {}), tech_keys, auto_open=True)
+
+        # WiFi 等模块原始数据全空时, 给出友好提示而非空列表
+        empty_note_html = ""
+        if m["key"] == "wifi":
+            raw = m.get("raw", {}) or {}
+            nets = raw.get("networks") or []
+            chans = raw.get("channel_analysis") or []
+            if not nets and not chans:
+                empty_note_html = "<div class='impact-line warn'><b>[提示]</b> 当前未连接 Wi-Fi, 因此未扫描周边网络与信道占用 (这是正常现象, 而非故障)。</div>"
 
         # 整个模块卡
         verdict = m.get("verdict", "")
         mod_blocks.append(f"""
-<div class="mod {sk}">
+<div class="mod {sk}" id="mod-{_html_esc(m["key"])}">
   <div class="mod-head">
     <span class="dot {sk}"></span>
-    <span class="name">{_html_esc(m['name'])}</span>
+    <span class="name">{_html_esc(m['name'])}<a class="anchor" href="#mod-{_html_esc(m["key"])}" title="复制此模块链接">🔗</a></span>
     <span class="badge {sk}">{_html_esc(st)}</span>
   </div>
   <div class="mod-body">
     <div class="verdict"><span class="tag">结论</span>{_html_esc(verdict)}</div>
     {metrics_html}
     {issues_html}
+    {empty_note_html}
     {tech_html}
   </div>
 </div>""")
@@ -7908,13 +8059,13 @@ body{background:#f6f8fa;color:#1e293b;font:14px/1.6 -apple-system,BlinkMacSystem
 .hero .sub{font-size:13px;opacity:.9}
 .hero .host{margin-top:10px;font-size:12px;opacity:.85;font-family:Cascadia Mono,Consolas,monospace}
 .hero .geo{margin-top:4px;font-size:12px;opacity:.85}
-.score{background:rgba(255,255,255,.15);border-radius:14px;padding:16px 26px;text-align:center;min-width:150px;backdrop-filter:blur(8px)}
+.score{background:rgba(255,255,255,.15);border-radius:14px;padding:16px 26px;text-align:center;min-width:150px;backdrop-filter:blur(8px)}.score.good{background:rgba(34,197,94,.25)}.score.warn{background:rgba(234,88,12,.25)}.score.bad{background:rgba(220,38,38,.3)}
 .score-num{font-size:48px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
 .score-grade{font-size:20px;font-weight:700;margin-top:4px;letter-spacing:2px}
 .score-text{font-size:11.5px;opacity:.9;margin-top:6px;line-height:1.4}
 .sec{margin:32px 0 12px}
 .sec h2{font-size:17px;font-weight:700;display:flex;align-items:center;gap:10px;color:#0f172a}
-.sec h2 .icon{width:26px;height:26px;border-radius:7px;background:#e0e7ff;color:#4338ca;display:inline-flex;align-items:center;justify-content:center;font-size:14px}
+.sec h2 .icon{width:26px;height:26px;border-radius:7px;background:#e0e7ff;color:#4338ca;display:inline-flex;align-items:center;justify-content:center;font-size:14px}.sec h2 .extra-count{font-size:12px;font-weight:400;color:#64748b;margin-left:6px}
 .todo{background:linear-gradient(180deg,#fef2f2 0%,#fff5f5 100%);border:1px solid #fecaca;border-radius:14px;padding:18px 22px;margin-bottom:8px}
 .todo.ok{background:linear-gradient(180deg,#f0fdf4 0%,#f7fee7 100%);border-color:#bbf7d0}
 .todo-head{font-size:15px;font-weight:700;color:#991b1b;margin-bottom:12px}
@@ -7953,21 +8104,21 @@ body{background:#f6f8fa;color:#1e293b;font:14px/1.6 -apple-system,BlinkMacSystem
 .mod.fatal{border-left:4px solid #7f1d1d}
 .mod.idle{border-left:4px solid #94a3b8}
 .mod-head{padding:14px 20px;display:flex;align-items:center;gap:10px;border-bottom:1px solid #f1f5f9}
-.mod-head .name{font-size:15px;font-weight:700;color:#0f172a}
+.mod-head .name{font-size:15px;font-weight:700;color:#0f172a}.mod-head a.anchor{color:#94a3b8;font-size:13px;text-decoration:none;margin-left:6px}.mod-head a.anchor:hover{color:#2563eb}.mod{scroll-margin-top:80px}
 .mod-head .badge{margin-left:auto;padding:3px 12px;border-radius:999px;font-size:11.5px;font-weight:700;letter-spacing:.5px}
 .mod-body{padding:16px 20px}
 .verdict{font-size:14px;line-height:1.7;color:#1e293b;margin-bottom:12px}
 .verdict .tag{display:inline-block;padding:2px 9px;border-radius:5px;font-size:11px;font-weight:700;background:#e0e7ff;color:#4338ca;margin-right:8px;vertical-align:1px}
 .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-bottom:8px}
 .metric{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:9px 13px;display:flex;justify-content:space-between;align-items:center;gap:8px}
-.metric .lab{font-size:12px;color:#64748b}
+.metric .lab{font-size:12px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
 .metric .v{font-size:14px;font-weight:700;font-family:Cascadia Mono,Consolas,monospace;text-align:right}
 .metric .v.ok{color:#15803d}.metric .v.warn{color:#c2410c}.metric .v.err{color:#b91c1c}.metric .v.idle{color:#94a3b8}
 .metric .hint{font-size:11px;color:#94a3b8;margin-left:4px;font-weight:400}
 .impact-line{background:#fef2f2;border-left:3px solid #dc2626;padding:6px 12px;border-radius:0 6px 6px 0;font-size:12.5px;color:#7f1d1d;margin:8px 0}
-.impact-line.warn{background:#fffbeb;border-left-color:#f59e0b;color:#78350f}
+.impact-line.warn{background:#fffbeb;border-left-color:#f59e0b;color:#78350f}.impact-line.info{background:#f1f5f9;border-left-color:#94a3b8;color:#475569;font-size:12px}
 .action-line{background:#f0f9ff;border-left:3px solid #0284c7;padding:6px 12px;border-radius:0 6px 6px 0;font-size:12.5px;color:#0c4a6e;margin:4px 0 8px;line-height:1.6}
-details.collapse{margin-top:10px;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:8px}
+details.collapse{margin-top:10px;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:8px}details.collapse[data-auto-open="1"]{border-style:solid;border-color:#cbd5e1}
 details.collapse summary{padding:9px 14px;font-size:12.5px;color:#475569;cursor:pointer;font-weight:600;user-select:none;list-style:none;display:flex;align-items:center;gap:6px}
 details.collapse summary::-webkit-details-marker{display:none}
 details.collapse summary::before{content:"▸";color:#64748b;transition:transform .15s;display:inline-block}
@@ -7984,9 +8135,9 @@ details.collapse p.muted{color:#94a3b8;font-size:11.5px;margin-top:6px}
 .host-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
 .host-card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:11px 14px;box-shadow:0 1px 2px rgba(15,23,42,.04)}
 .host-card .lab{font-size:11px;color:#94a3b8;margin-bottom:3px;font-weight:500}
-.host-card .val{font-size:13px;font-weight:600;font-family:Cascadia Mono,Consolas,monospace;color:#0f172a}
+.host-card .val{font-size:13px;font-weight:600;font-family:Cascadia Mono,Consolas,monospace;color:#0f172a;cursor:pointer;word-break:break-all}.host-card .val:hover{color:#2563eb;background:#f1f5f9}.host-card .val.copied{color:#16a34a !important}
 @media(max-width:600px){.hero{grid-template-columns:1fr;text-align:center}.score{justify-self:center}}
-@media print{body{background:#fff;padding:0;font-size:12px}.hero{background:#1e3a8a !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.mod,.host-card,.todo{box-shadow:none;break-inside:avoid}.mod-head{break-after:avoid}details.collapse[open] .body{display:block}}
+@media print{body{background:#fff;padding:0;font-size:12px}.hero{background:#1e3a8a !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.mod,.host-card,.todo{box-shadow:none;break-inside:avoid}.mod-head{break-after:avoid}details.collapse .body{display:block !important}details.collapse>summary::before{display:none}details.collapse{border-style:solid}.score{background:rgba(255,255,255,.2) !important}}
 footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-top:20px;border-top:1px solid #e2e8f0}
 """
 
@@ -8007,12 +8158,85 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 {host_section}
 <footer>由 {_html_esc(report['app'])} v{_html_esc(report['version'])} 自动生成 · {_html_esc(g)}</footer>
 </div>
+<script>
+// IP/MAC 值点击复制
+(function(){{
+  document.querySelectorAll('.host-card .val').forEach(function(el){{
+    el.addEventListener('click', function(){{
+      var txt = el.textContent.trim();
+      if (!txt || txt === '—') return;
+      if (navigator.clipboard && navigator.clipboard.writeText){{
+        navigator.clipboard.writeText(txt).then(function(){{
+          var orig = el.textContent;
+          el.textContent = '✓ 已复制';
+          el.classList.add('copied');
+          setTimeout(function(){{ el.textContent = orig; el.classList.remove('copied'); }}, 1200);
+        }}).catch(function(){{ fallbackCopy(txt, el); }});
+      }} else {{
+        fallbackCopy(txt, el);
+      }}
+    }});
+    el.title = '点击复制: ' + el.textContent.trim();
+  }});
+  function fallbackCopy(txt, el){{
+    var ta = document.createElement('textarea');
+    ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try {{ document.execCommand('copy'); }} catch(e) {{}}
+    document.body.removeChild(ta);
+    var orig = el.textContent;
+    el.textContent = '✓ 已复制';
+    el.classList.add('copied');
+    setTimeout(function(){{ el.textContent = orig; el.classList.remove('copied'); }}, 1200);
+  }}
+  // 顶部问题锚点: 点击 h3 平滑滚动到对应模块
+  document.querySelectorAll('.todo .issue').forEach(function(issue){{}});
+}})();
+</script>
 </body>
 </html>"""
 
 
+def _register_pdf_cjk_font():
+    """注册 PDF 中文字体: 优先微软雅黑 (TTF 内嵌, 无阅读器字体依赖),
+    缺失/失败时回退 STSong-Light (CID 宋体, 不内嵌)。
+
+    返回 (font_name, has_bold):
+      - font_name: 报告正文/标题统一使用的字体名
+      - has_bold: 是否注册了独立粗体 (True 时 <b> 会真正加粗)
+    """
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+    windir = os.environ.get("WINDIR") or r"C:\Windows"
+    fonts_dir = os.path.join(windir, "Fonts")
+    regular = os.path.join(fonts_dir, "msyh.ttc")
+    bold = os.path.join(fonts_dir, "msyhbd.ttc")
+    try:
+        if os.path.exists(regular):
+            pdfmetrics.registerFont(TTFont("MSYaHei", regular, subfontIndex=0))
+            if os.path.exists(bold):
+                pdfmetrics.registerFont(
+                    TTFont("MSYaHei-Bold", bold, subfontIndex=0))
+                pdfmetrics.registerFontFamily(
+                    "MSYaHei", normal="MSYaHei", bold="MSYaHei-Bold",
+                    italic="MSYaHei", boldItalic="MSYaHei-Bold")
+                return "MSYaHei", True
+            # 无粗体文件: 常规字重同时充当粗体 (保证中文正常渲染)
+            pdfmetrics.registerFontFamily(
+                "MSYaHei", normal="MSYaHei", bold="MSYaHei",
+                italic="MSYaHei", boldItalic="MSYaHei")
+            return "MSYaHei", False
+    except Exception:
+        pass
+    # 回退: 宋体 CID 字体 (不内嵌, 依赖阅读器内置字体)
+    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+    return "STSong-Light", False
+
+
 def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
-    """客户版 PDF 报告 (浅色主题 + 模块卡片, 内置中文字体 STSong-Light)。
+    """客户版 PDF 报告 (浅色主题 + 模块卡片, 内置中文字体微软雅黑)。
 
     与老版的差异:
       - 用 build_report 的双视图 (customer_view + tech_view), 不再吃 raw result
@@ -8032,11 +8256,8 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
     from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame,
                                     Paragraph, Spacer, Table, TableStyle,
                                     KeepTogether, HRFlowable, CondPageBreak)
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
-    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
-    FONT = "STSong-Light"
+    FONT, _has_bold = _register_pdf_cjk_font()
 
     # ── 配色 (与 HTML 客户版一致) ──
     C_INK = colors.HexColor("#1e293b")
@@ -8764,10 +8985,15 @@ def interactive_menu(install=False, pip_mirror=None):
             tag = _c(f"[{letter}]", C_CYAN) if letter else ""
             print(_c(f"  {tag} {cat_name}", C_BOLD) +
                   _c(f"  {desc}", C_GRAY))
+            cells = []
             for k in keys:
                 idx += 1
                 n = MODULE_MAP[k][0]
-                print(f"    {_c(str(idx).rjust(2), C_CYAN)}. {n}  {_c('(' + k + ')', C_GRAY)}")
+                cells.append(
+                    _c(str(idx).rjust(2), C_CYAN) + ". " +
+                    _c(n, C_WHITE) + " " + _c("(" + k + ")", C_GRAY))
+            for line in _columnize(cells, columns=2, gap=4):
+                print("    " + line)
         print()
         print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发)', C_GRAY)}")
         print(f"    {_c(' e', C_CYAN)}. 导出上次诊断报告")
