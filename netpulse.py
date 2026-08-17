@@ -5505,7 +5505,7 @@ class TCPStatsTester:
             "segments_received": r"(Segments Received|接收的分段)\D+(\d+)",
             "retransmitted": r"(Segments Retransmitted|重新传输的分段)\D+(\d+)",
             "error_segments": r"(Errors|错误的分段)\D+(\d+)",
-            "conn_failures": r"(Failures|失败)\D+(\d+)",
+            "conn_failures": r"(Connections Failed|Failures|失败)\D+(\d+)",
         }
         for key, pat in patterns.items():
             m = re.search(pat, out)
@@ -7763,7 +7763,7 @@ HEADER_MAP = {
     "retrans_rate_pct": "重传率(%)", "current_connections": "当前连接",
     "connections_initiated": "发起连接", "connections_accepted": "接受连接",
     # 外网路径
-    "traceroute": "路径追踪", "hop": "跳", "node": "节点", "avg_ms": "平均(ms)",
+    "traceroute": "路径追踪", "hop": "跳", "node": "节点",
     "target": "目标", "loss_pct": "丢包(%)", "hop_count": "跳数",
     "dns_time_ms": "DNS(ms)", "avg_rtt_ms": "平均延迟(ms)",
     "avg_loss_pct": "平均丢包(%)",
