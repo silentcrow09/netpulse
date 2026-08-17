@@ -7076,16 +7076,15 @@ def build_report():
         modules.append(_present_module(key, res, status))
 
     # 汇总真实 issue 数 (用于 health.verdict 精确文案, 避免分数/verdict/问题数三者打架)
-    # 既统计 issues 列表里的条目, 也包含"模块级异常"但没有 issue 的情况 (如 IPv6 状态异常但 issues 全是 info)
+    # 统计各模块非 info 级 issue; 模块状态异常但没有任何非 info issue 时 (如 IPv6 状态异常
+    # 但 issues 全是 info) 才补计 1 条模块级异常, 避免与 issue 条目重复计数
     issue_total = 0
     for m in modules:
-        mod_status = m.get("status", "")
-        if mod_status in ("异常", "错误"):
-            issue_total += 1  # 模块级异常
-        for issue in m.get("issues", []) or []:
-            sev = issue.get("severity", "信息")
-            if sev in ("异常", "错误", "警告"):
-                issue_total += 1
+        n_noninfo = sum(1 for issue in m.get("issues", []) or []
+                        if issue.get("severity", "信息") in ("异常", "错误", "警告"))
+        issue_total += n_noninfo
+        if n_noninfo == 0 and m.get("status", "") in ("异常", "错误"):
+            issue_total += 1  # 模块级异常但无对应 issue 条目
     health = compute_health_score(counts, issues_count=issue_total)
 
     return {
@@ -7868,8 +7867,9 @@ def render_report_html_customer(report):
     sev_order = {"异常": 0, "错误": 0, "警告": 1, "信息": 2}
     todo_issues.sort(key=lambda i: sev_order.get(i.get("severity", "信息"), 3))
 
-    # 顶部只展示需关注条目 (异常/错误/警告), 信息级不进顶部列表
-    top_issues = [i for i in todo_issues if i.get("severity", "信息") in ("异常", "错误", "警告")][:10]
+    # 顶部只展示需关注条目 (异常/错误/警告), 信息级不进顶部列表; 最多展示 10 条, 溢出时给出提示
+    need_attention = [i for i in todo_issues if i.get("severity", "信息") in ("异常", "错误", "警告")]
+    top_issues = need_attention[:10]
 
     if top_issues:
         todo_blocks = []
@@ -7887,12 +7887,17 @@ def render_report_html_customer(report):
   {f"<div class='impact'>📌 影响: {_html_esc(impact)}</div>" if impact else ""}
   {f"<div class='action'>💡 建议: {_html_esc(action)}</div>" if action else ""}
 </div>""")
-        info_extra = ""
+        extra_bits = []
+        hidden_cnt = len(need_attention) - len(top_issues)
+        if hidden_cnt > 0:
+            extra_bits.append(f"顶部仅展示前 10 条, 另有 {hidden_cnt} 条见下方模块详情")
         info_cnt = sum(1 for i in todo_issues if i.get("severity", "信息") == "信息")
         if info_cnt > 0:
-            info_extra = f" <span class='extra-count'>(另有 {info_cnt} 条信息项可查看下方模块详情)</span>"
+            extra_bits.append(f"另有 {info_cnt} 条信息项可查看下方模块详情")
+        info_extra = (f" <span class='extra-count'>({'；'.join(extra_bits)})</span>"
+                      if extra_bits else "")
         todo_section = f"""
-<div class="sec"><h2><span class="icon">⚠</span>{len(top_issues)} 项需要您关注{info_extra}</h2></div>
+<div class="sec"><h2><span class="icon">⚠</span>{len(need_attention)} 项需要您关注{info_extra}</h2></div>
 <div class="todo">{"".join(todo_blocks)}</div>"""
     elif todo_issues:
         todo_section = """
@@ -8189,8 +8194,6 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
     el.classList.add('copied');
     setTimeout(function(){{ el.textContent = orig; el.classList.remove('copied'); }}, 1200);
   }}
-  // 顶部问题锚点: 点击 h3 平滑滚动到对应模块
-  document.querySelectorAll('.todo .issue').forEach(function(issue){{}});
 }})();
 </script>
 </body>
