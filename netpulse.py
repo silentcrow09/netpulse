@@ -3513,14 +3513,17 @@ multiLineChart("latChart", [{{data: DATA.lat, color: "#34c759", fill: true, fill
 
 
 def save_speedtest_report(res):
-    """保存独立测速报告 (HTML + JSON) 到 reports/YYYY-MM-DD/, 返回 (html_path, json_path)。
+    """保存独立测速报告 (HTML + JSON), 返回 (html_path, json_path)。
+
+    落点与诊断报告统一走 _report_dir() (EXE 模式下为 EXE 所在目录,
+    源码模式下为 netpulse.py 所在目录), 避免此前用相对路径 "reports"
+    导致报告落点随当前工作目录 (cwd) 漂移的问题。
 
     报告是装维留档/给客户看的: HTML 为"带宽体检单" (含曲线), JSON 为原始
     时间序列 (供技术归档/脚本分析)。
     """
     try:
-        day_dir = os.path.join("reports", datetime.now().strftime("%Y-%m-%d"))
-        os.makedirs(day_dir, exist_ok=True)
+        day_dir = _report_dir()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         json_path = os.path.join(day_dir, f"speedtest_{stamp}.json")
         html_path = os.path.join(day_dir, f"speedtest_{stamp}.html")
@@ -5659,13 +5662,20 @@ def determine_status(result):
         if result.get(issue_key) is True:
             _raise("异常")
 
-    # 2. issues 列表: 任一 critical -> 异常; 否则有 issue -> 警告
+    # 2. issues 列表: 任一 critical -> 异常; 存在 warning 或字符串 issue -> 警告;
+    #    纯 info 级 issue 不改变状态 (与 HTML/PDF 卡片及顶部"需关注"口径一致,
+    #    避免"徽章标警告、卡片里却只有灰色[信息]"的割裂观感)。
+    #    字符串 issue 视为真实问题 (MTU/Bufferbloat/IPv6/LAN/TCPQuality 用字符串)。
     issues = result.get("issues")
     if isinstance(issues, list) and issues:
         if any(isinstance(i, dict) and i.get("severity") == "critical"
                for i in issues):
             _raise("异常")
-        else:
+        elif any(
+            (isinstance(i, dict) and i.get("severity") == "warning")
+            or isinstance(i, str)
+            for i in issues
+        ):
             _raise("警告")
 
     # 3. assessment 关键词 (只升不降)
@@ -6726,11 +6736,17 @@ def _issues_port(res):
 def _verdict_egress(res):
     if "error" in res:
         return res.get("error", "检测失败")
-    multi = res.get("multiple_egress", False)
     issues = res.get("issues", [])
-    if multi:
-        return f"检测到多外网出口 ({len(issues)} 个问题)"
-    return "单一外网出口, 正常" if not issues else "单一外网出口, 有问题"
+    # 只统计真实问题 (warning/critical/字符串); info 级 (VPN 占位/假网关) 不算"问题",
+    # 与 determine_status 的徽章口径保持一致
+    n_real = sum(
+        1 for i in issues
+        if isinstance(i, str)
+        or (isinstance(i, dict) and i.get("severity") in ("warning", "critical"))
+    )
+    if n_real:
+        return f"检测到多外网出口 ({n_real} 个问题)"
+    return "单一真实外网出口, 正常"
 
 
 def _metrics_egress(res):
@@ -6809,9 +6825,15 @@ def _verdict_arp(res):
         return res.get("error", "检测失败")
     n_total = res.get("total_entries", 0)
     n_mac = res.get("unique_macs", 0)
-    n_issue = len(res.get("issues", []))
-    if n_issue:
-        return f"ARP 表 {n_total} 条 / {n_mac} MAC, {n_issue} 个问题"
+    issues = res.get("issues", [])
+    # 只统计真实问题 (warning/critical/字符串); info 级 (静态 ARP 记录等) 不算"问题"
+    n_real = sum(
+        1 for i in issues
+        if isinstance(i, str)
+        or (isinstance(i, dict) and i.get("severity") in ("warning", "critical"))
+    )
+    if n_real:
+        return f"ARP 表 {n_total} 条 / {n_mac} MAC, {n_real} 个问题"
     return f"ARP 表 {n_total} 条 / {n_mac} MAC, 正常"
 
 
@@ -6875,10 +6897,16 @@ def _verdict_route(res):
         return res.get("error", "检测失败")
     n = res.get("route_count", 0)
     issues = res.get("issues", [])
-    if any(i.get("severity") == "critical" for i in issues if isinstance(i, dict)):
+    if any(isinstance(i, dict) and i.get("severity") == "critical" for i in issues):
         return f"路由表 {n} 条, 检测到路由环路!"
-    if issues:
-        return f"路由表 {n} 条, {len(issues)} 个问题"
+    # 只统计真实问题 (warning/critical/字符串); info 级 (ZeroTier 假网关等) 不算"问题"
+    n_real = sum(
+        1 for i in issues
+        if isinstance(i, str)
+        or (isinstance(i, dict) and i.get("severity") in ("warning", "critical"))
+    )
+    if n_real:
+        return f"路由表 {n} 条, {n_real} 个问题"
     return f"路由表 {n} 条, 正常"
 
 
