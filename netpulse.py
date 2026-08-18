@@ -7112,11 +7112,16 @@ def compute_health_score(counts, issues_count=None):
     issues_count: 各模块实际 issue 总数 (含警告/异常/错误)。
                  若提供, verdict 文案会精确显示此项数。
     """
+    # 评分口径:
+    #   - 异常 -20, 错误 -30: 硬故障, 一票否决
+    #   - 警告 -2: 仅提示, 不应压垮整体分数 (旧版 -5 偏重,
+    #              1 异常 + 6 警告 = 50 分, 给人"网络不能用"的错觉)
+    #   - 未检测不扣分: 环境缺测 (如无 WiFi 网卡) 不应被记过
     score = 100
     score -= counts.get("异常", 0) * 20
     score -= counts.get("错误", 0) * 30
-    score -= counts.get("警告", 0) * 5
-    score -= counts.get("未检测", 0) * 2
+    score -= counts.get("警告", 0) * 2
+    # counts.get("未检测", 0) * 0  # 环境原因不扣分
     score = max(0, min(100, score))
 
     # 计算真实需关注的条目数 (异常+错误, 警告; 不计"信息")
@@ -7829,8 +7834,15 @@ def _record_table(v):
 #   - 每模块只显示: 状态 + 一句话结论 + 3-5 个关键指标 + 问题/建议
 #   - 技术细节默认折叠 (工程师点开看)
 #   - 字段名 100% 中文化, 颜色按阈值
-def _short_iface(name, max_len=22):
-    """缩短网络接口名: 保留关键前缀 + 后 8 字符, 避免长哈希占满 metric。"""
+def _short_iface(name, max_len=32):
+    """缩短网络接口名, 避免长哈希/长描述占满 metric。
+
+    旧版 max_len=22 偏短, "VirtualBox Host-Only Network" (27字符) 等常见名
+    会被截成 "VirtualBox Host-Only …" 显示不全。改 32 后:
+      - "VirtualBox Host-Only Network" 完整保留
+      - "ZeroTier One [9f77fc393e225015]" (31字符) 也完整保留
+      - 极长的虚拟网卡名 (如 Hyper-V 桥接) 才走截断逻辑
+    """
     if not name:
         return "?"
     if len(name) <= max_len:
@@ -7838,8 +7850,12 @@ def _short_iface(name, max_len=22):
     if "[" in name and name.endswith("]"):
         prefix, inside = name.split("[", 1)
         inside = inside.rstrip("]")
-        keep = inside[-8:] if len(inside) > 8 else inside
-        return f"{prefix.strip()} [..{keep}]"
+        # 保留前缀 + 方括号里前后各 6 位 (中间用 .. 表示截断)
+        if len(inside) > 12:
+            keep = f"{inside[:6]}..{inside[-6:]}"
+        else:
+            keep = inside
+        return f"{prefix.strip()} [{keep}]"
     return name[:max_len - 1] + "…"
 
 
@@ -8059,8 +8075,10 @@ def render_report_html_customer(report):
                 level = me.get("level", "ok")
                 hint = me.get("hint", "")
                 hint_html = f"<span class='hint'>{_html_esc(hint)}</span>" if hint else ""
+                # title 提示完整名/值, 防止窄屏 ellipsis 截断后看不到原值
+                full_title = f"{me.get('label','')}: {me.get('value','')}"
                 metric_html.append(
-                    f"<div class='metric'>"
+                    f"<div class='metric' title='{_html_esc(full_title)}'>"
                     f"<span class='lab'>{_html_esc(me['label'])}</span>"
                     f"<span><span class='v {level}'>{_html_esc(me['value'])}</span>{hint_html}</span>"
                     f"</div>"
@@ -8167,6 +8185,43 @@ def render_report_html_customer(report):
 <div class="sec"><h2><span class="icon">🖥</span>主机信息</h2></div>
 <div class="host-grid">{host_cards}</div>"""
 
+    # ── 诊断标准表 (THRESHOLDS + _metrics_linkspeed 硬编码阈值, 折叠显示) ──
+    standards_rows = []
+    for mod_key, mod_th in THRESHOLDS.items():
+        if not mod_th:
+            continue
+        mod_name = MODULE_MAP.get(mod_key, (mod_key,))[0]
+        for metric_key, cfg in mod_th.items():
+            label = cfg.get("label", metric_key)
+            warn = cfg.get("warn", "—")
+            err = cfg.get("err", "—")
+            unit = cfg.get("unit", "")
+            lower = cfg.get("lower_better", True)
+            direction = "越低越差 (≥ 触发)" if lower else "越低越好 (≤ 触发)"
+            standards_rows.append((mod_name, label, str(warn), str(err), unit, direction))
+    # 链路速率阈值在 _metrics_linkspeed 硬编码, THRESHOLDS 里是空, 补进来
+    standards_rows.append(("链路速率", "有线协商速率", "100", "1000", "Mbps", "越低越差 (≥ 触发)"))
+    standards_rows.append(("链路速率", "WiFi 协商速率", "54",  "150",  "Mbps", "越低越差 (≥ 触发)"))
+
+    std_body = "".join(
+        f"<tr><td>{_html_esc(m)}</td><td>{_html_esc(l)}</td>"
+        f"<td class='num'>{_html_esc(w)}</td><td class='num'>{_html_esc(e)}</td>"
+        f"<td>{_html_esc(u)}</td><td>{_html_esc(d)}</td></tr>"
+        for m, l, w, e, u, d in standards_rows
+    )
+    standards_section = f"""
+<div class="sec"><h2><span class="icon">📐</span>本报告诊断标准</h2></div>
+<details class="collapse" data-auto-open="0"><summary>查看判定阈值与口径 <span class='cnt'>{len(standards_rows)} 项指标</span></summary>
+<div class="body">
+  <div class='subcap'>判定规则: "越低越差"的指标 (延迟/丢包/重传/抖动), 超过<span class='kw warn'>警告阈值</span>标 ⚠️ 警告, 超过<span class='kw err'>异常阈值</span>标 ❌ 异常; "越高越好"的指标 (速率/TCP 可达数), 低于警告阈值标警告, 低于异常阈值标异常。所有阈值集中维护在 <code>THRESHOLDS</code>, 链路速率另在 <code>_metrics_linkspeed</code> 硬编码。</div>
+  <table class='tbl std'>
+    <thead><tr><th>模块</th><th>指标</th><th>警告阈值</th><th>异常阈值</th><th>单位</th><th>判定方向</th></tr></thead>
+    <tbody>{std_body}</tbody>
+  </table>
+  <div class='subcap' style='margin-top:12px'>评分规则 (本次已调整): 起始 100 分, 异常 -20/项, 错误 -30/项, 警告 -2/项, 未检测不扣分。等级: A≥90 优秀, B≥75 良好, C≥60 一般, D≥40 欠佳, F&lt;40 严重。</div>
+</div>
+</details>"""
+
     # ── CSS ──
     CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
@@ -8216,11 +8271,7 @@ body{background:#f6f8fa;color:#1e293b;font:14px/1.6 -apple-system,BlinkMacSystem
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
 .dot.ok{background:#16a34a}.dot.warn{background:#ea580c}.dot.err{background:#dc2626}.dot.fatal{background:#7f1d1d}.dot.idle{background:#94a3b8}
 .mod{background:#fff;border:1px solid #e2e8f0;border-radius:14px;margin-bottom:12px;box-shadow:0 1px 3px rgba(15,23,42,.05);overflow:hidden}
-.mod.ok{border-left:4px solid #16a34a}
-.mod.warn{border-left:4px solid #ea580c}
-.mod.err{border-left:4px solid #dc2626}
-.mod.fatal{border-left:4px solid #7f1d1d}
-.mod.idle{border-left:4px solid #94a3b8}
+/* 状态色靠头部 .dot 小圆点 + 右侧徽章传递, 不再用左边框 (像中括号的视觉) */
 .mod-head{padding:14px 20px;display:flex;align-items:center;gap:10px;border-bottom:1px solid #f1f5f9}
 .mod-head .name{font-size:15px;font-weight:700;color:#0f172a}.mod-head a.anchor{color:#94a3b8;font-size:13px;text-decoration:none;margin-left:6px}.mod-head a.anchor:hover{color:#2563eb}.mod{scroll-margin-top:80px}
 .mod-head .badge{margin-left:auto;padding:3px 12px;border-radius:999px;font-size:11.5px;font-weight:700;letter-spacing:.5px}
@@ -8254,6 +8305,16 @@ details.collapse p.muted{color:#94a3b8;font-size:11.5px;margin-top:6px}
 .host-card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:11px 14px;box-shadow:0 1px 2px rgba(15,23,42,.04)}
 .host-card .lab{font-size:11px;color:#94a3b8;margin-bottom:3px;font-weight:500}
 .host-card .val{font-size:13px;font-weight:600;font-family:Cascadia Mono,Consolas,monospace;color:#0f172a;cursor:pointer;word-break:break-all}.host-card .val:hover{color:#2563eb;background:#f1f5f9}.host-card .val.copied{color:#16a34a !important}
+/* 诊断标准表 */
+.tbl.std{font-size:12px}
+.tbl.std th{background:#1e293b;color:#f1f5f9;font-weight:600;padding:7px 10px}
+.tbl.std td{padding:6px 10px;border-top:1px solid #e2e8f0;vertical-align:top}
+.tbl.std td.num{font-family:Cascadia Mono,Consolas,monospace;text-align:center;font-weight:600;color:#1e293b}
+.tbl.std tbody tr:nth-child(odd){background:#f8fafc}
+.kw{display:inline-block;padding:0 6px;border-radius:4px;font-weight:600;font-size:11.5px}
+.kw.warn{background:#fed7aa;color:#9a3412}
+.kw.err{background:#fecaca;color:#991b1b}
+details.collapse .subcap code{background:#fff;padding:1px 6px;border-radius:3px;border:1px solid #cbd5e1;font-size:11.5px;color:#475569}
 @media(max-width:600px){.hero{grid-template-columns:1fr;text-align:center}.score{justify-self:center}}
 @media print{body{background:#fff;padding:0;font-size:12px}.hero{background:#1e3a8a !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.mod,.host-card,.todo{box-shadow:none;break-inside:avoid}.mod-head{break-after:avoid}details.collapse .body{display:block !important}details.collapse>summary::before{display:none}details.collapse{border-style:solid}.score{background:rgba(255,255,255,.2) !important}}
 footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-top:20px;border-top:1px solid #e2e8f0}
@@ -8274,6 +8335,7 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 {overview_section}
 {modules_section}
 {host_section}
+{standards_section}
 <footer>由 {_html_esc(report['app'])} v{_html_esc(report['version'])} 自动生成 · {_html_esc(g)}</footer>
 </div>
 <script>
