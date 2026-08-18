@@ -2123,10 +2123,59 @@ class GatewayTester:
         else:
             assessment = "正常"
 
+        # issues 与 _issues_gateway 同一数据源: determine_status 只看
+        # result["issues"], 若只放在展示层推导, 徽章 (完成) 会与卡片内容
+        # (警告/异常行) 对不上。
+        issues = []
+        if avg >= 30:
+            issues.append({
+                "type": "gateway_high_latency", "severity": "critical",
+                "message": f"网关平均延迟 {avg}ms 超过阈值 30ms",
+                "detail": "网页加载变慢、视频会议可能卡顿、在线游戏高延迟",
+                "action": ("① 检查网线是否松动 ② 查看 WiFi 信号强度 (<-65dBm 为弱) "
+                           "③ 登录路由器后台查看 CPU 占用率 ④ 如仍未改善请联系运营商"),
+            })
+        elif avg >= 10:
+            issues.append({
+                "type": "gateway_latency_high", "severity": "warning",
+                "message": f"网关平均延迟 {avg}ms 略高 (阈值 10ms)",
+                "detail": "对一般上网无明显影响, 实时游戏可能有轻微延迟",
+                "action": "如果频繁出现卡顿, 可检查网线质量或考虑 5GHz WiFi",
+            })
+        if loss >= 5:
+            issues.append({
+                "type": "gateway_packet_loss", "severity": "critical",
+                "message": f"网关丢包 {loss}%",
+                "detail": "丢包会直接导致网页加载失败、视频卡顿",
+                "action": "检查网线/WiFi 信号; 排除路由器/交换机过载",
+            })
+        elif loss >= 1:
+            issues.append({
+                "type": "gateway_packet_loss", "severity": "warning",
+                "message": f"网关丢包 {loss}%",
+                "detail": "丢包会直接导致网页加载失败、视频卡顿",
+                "action": "检查网线/WiFi 信号; 排除路由器/交换机过载",
+            })
+        if jitter >= 50:
+            issues.append({
+                "type": "gateway_jitter", "severity": "critical",
+                "message": f"网关抖动 {jitter}ms 超过阈值 20ms",
+                "detail": "视频会议卡顿、VoIP 通话断续、在线游戏跳ping",
+                "action": "优先排查 WiFi 信号/网线质量; 路由器 QoS 设置可能也有影响",
+            })
+        elif jitter >= 20:
+            issues.append({
+                "type": "gateway_jitter", "severity": "warning",
+                "message": f"网关抖动 {jitter}ms 超过阈值 20ms",
+                "detail": "视频会议卡顿、VoIP 通话断续、在线游戏跳ping",
+                "action": "优先排查 WiFi 信号/网线质量; 路由器 QoS 设置可能也有影响",
+            })
+
         self.results = {
             "gateway": gateway,
             "ping": ping_result,
             "assessment": assessment,
+            "issues": issues,
             "timestamp": datetime.now().isoformat(),
             "summary": f"网关 {gateway}: 平均 {ping_result['avg_ms']}ms, "
                        f"丢包 {ping_result['loss_pct']}%, 抖动 {ping_result['jitter_ms']}ms",
@@ -2740,6 +2789,20 @@ class WiFiAnalyzer:
         elif max_score >= 4:
             overall_interference = "存在干扰"
 
+        # issues 与 _issues_wifi 同一数据源: determine_status 只看 result["issues"],
+        # 否则"干扰高/严重"时卡片有警告行、徽章却仍是"完成"。
+        issues = []
+        if "严重" in overall_interference or "较高" in overall_interference:
+            issues.append({
+                "type": "wifi_interference",
+                "severity": "critical" if "严重" in overall_interference else "warning",
+                "message": f"WiFi 信道干扰{overall_interference}",
+                "detail": "WiFi 速率下降、延迟增加, 设备连接不稳定",
+                "action": ("① 在路由器后台将信道切换到推荐信道 "
+                           "② 优先使用 5GHz 频段 (穿墙弱但干扰少) "
+                           "③ 路由器放在房屋中心位置, 远离微波炉/蓝牙设备"),
+            })
+
         # summary: 当前信道 vs 推荐信道对比 (同频段, 装维可直接给结论)
         cur_band = None
         if current_channel:
@@ -2770,6 +2833,7 @@ class WiFiAnalyzer:
             "current_channel": current_channel,
             "current_ssid": current_ssid,
             "overall_interference": overall_interference,
+            "issues": issues,
             "timestamp": datetime.now().isoformat(),
             "summary": summary,
         }
@@ -6280,36 +6344,15 @@ def _issues_gateway(res):
         return [{"severity": "异常", "text": res["error"],
                  "impact": "无法评估网关质量", "action": "检查网络连接是否正常"}]
     out = []
-    p = res.get("ping", {})
-    if p.get("avg_ms", 0) >= 30:
-        out.append({
-            "severity": "异常",
-            "text": f"网关平均延迟 {p['avg_ms']}ms 超过阈值 30ms",
-            "impact": "网页加载变慢、视频会议可能卡顿、在线游戏高延迟",
-            "action": ("① 检查网线是否松动 ② 查看 WiFi 信号强度 (&lt;-65dBm 为弱) "
-                       "③ 登录路由器后台查看 CPU 占用率 ④ 如仍未改善请联系运营商")
-        })
-    elif p.get("avg_ms", 0) >= 10:
-        out.append({
-            "severity": "警告",
-            "text": f"网关平均延迟 {p['avg_ms']}ms 略高 (阈值 10ms)",
-            "impact": "对一般上网无明显影响, 实时游戏可能有轻微延迟",
-            "action": "如果频繁出现卡顿, 可检查网线质量或考虑 5GHz WiFi"
-        })
-    if p.get("loss_pct", 0) >= 1:
-        out.append({
-            "severity": "警告" if p["loss_pct"] < 5 else "异常",
-            "text": f"网关丢包 {p['loss_pct']}%",
-            "impact": "丢包会直接导致网页加载失败、视频卡顿",
-            "action": "检查网线/WiFi 信号; 排除路由器/交换机过载"
-        })
-    if p.get("jitter_ms", 0) >= 20:
-        out.append({
-            "severity": "警告" if p["jitter_ms"] < 50 else "异常",
-            "text": f"网关抖动 {p['jitter_ms']}ms 超过阈值 20ms",
-            "impact": "视频会议卡顿、VoIP 通话断续、在线游戏跳ping",
-            "action": "优先排查 WiFi 信号/网线质量; 路由器 QoS 设置可能也有影响"
-        })
+    for issue in res.get("issues", []) or []:
+        if isinstance(issue, dict):
+            sev = issue.get("severity", "")
+            out.append({
+                "severity": "异常" if sev == "critical" else "警告" if sev == "warning" else "信息",
+                "text": issue.get("message", ""),
+                "impact": issue.get("detail", ""),
+                "action": issue.get("action", ""),
+            })
     return out
 
 
@@ -6407,6 +6450,26 @@ def _issues_dns(res):
             "impact": "网页/APP 加载慢, 部分域名可能无法访问",
             "action": "尝试更换 DNS 服务器 (阿里/腾讯/114)"
         })
+    # 慢响应: 与 assessment "DNS 响应慢" (avg>100ms) 口径一致, 补出卡片行,
+    # 避免"徽章警告、卡片无内容" (该场景成功率正常时原实现不输出任何 issue)
+    avg = res.get("avg_time_ms", 0)
+    if tot and succ >= tot * 0.8 and avg > 100:
+        out.append({
+            "severity": "警告",
+            "text": f"DNS 平均响应 {avg:.0f}ms 较慢",
+            "impact": "网页/APP 首次加载可能偏慢",
+            "action": "尝试更换 DNS 服务器 (阿里/腾讯/114)"
+        })
+    # info 级: 不同 DNS 解析结果不一致 (多为 CDN 轮询, 正常现象) —
+    # 原实现丢弃了这条原始 info, 导致顶部"信息项"计数与卡片内容对不上
+    for issue in res.get("issues", []) or []:
+        if isinstance(issue, dict) and issue.get("type") == "dns_inconsistent":
+            out.append({
+                "severity": "信息",
+                "text": issue.get("message", ""),
+                "impact": issue.get("detail", ""),
+                "action": "",
+            })
     return out
 
 
@@ -6441,16 +6504,15 @@ def _metrics_wifi(res):
 
 def _issues_wifi(res):
     out = []
-    inter = res.get("overall_interference", "")
-    if "严重" in inter or "高" in inter:
-        out.append({
-            "severity": "警告" if "高" in inter else "异常",
-            "text": f"WiFi 信道干扰{inter}",
-            "impact": "WiFi 速率下降、延迟增加, 设备连接不稳定",
-            "action": ("① 在路由器后台将信道切换到推荐信道 "
-                       "② 优先使用 5GHz 频段 (穿墙弱但干扰少) "
-                       "③ 路由器放在房屋中心位置, 远离微波炉/蓝牙设备")
-        })
+    for issue in res.get("issues", []) or []:
+        if isinstance(issue, dict):
+            sev = issue.get("severity", "")
+            out.append({
+                "severity": "异常" if sev == "critical" else "警告" if sev == "warning" else "信息",
+                "text": issue.get("message", ""),
+                "impact": issue.get("detail", ""),
+                "action": issue.get("action", ""),
+            })
     return out
 
 
@@ -6881,10 +6943,20 @@ def _metrics_ipv6(res):
 
 def _issues_ipv6(res):
     out = []
+    # 严重级别与 determine_status 徽章口径一致: assessment 含"异常" -> 异常,
+    # 含"正常" -> 信息, 其它 (不支持/仅链路本地等) -> 警告。
+    # 原实现一律标"信息", 导致"徽章异常/警告、卡片里却是灰色[信息]"对不齐。
+    assessment = res.get("assessment", "")
+    if "异常" in assessment:
+        sev = "异常"
+    elif "正常" in assessment:
+        sev = "信息"
+    else:
+        sev = "警告"
     for issue in res.get("issues", []):
         if isinstance(issue, str):
             out.append({
-                "severity": "信息",
+                "severity": sev,
                 "text": issue,
                 "impact": "如果不需要 IPv6 可忽略; 否则影响部分纯 IPv6 网站",
                 "action": "联系运营商开通 IPv6 或检查路由器/防火墙配置"
@@ -8115,7 +8187,11 @@ def render_report_html_customer(report):
         else:
             metrics_html = ""
 
-        # 问题: 按 (severity, text, action) 去重, 避免 IPv6 等场景同一建议被多次写出
+        # 问题: 按 (severity, text) 去重 — 与顶部"需关注/信息项"计数口径一致
+        # (顶部按 (severity, text) 去重), 保证"计数 = 卡片实际渲染行数"。
+        # 注意: 不再按 action 去重 — 多条不同问题共享同一建议时 (如 IPv6/
+        # 多出口模块的同 action 信息项), 每条都必须可见, 否则顶部计数
+        # 与卡片内容对不上。
         issues = m.get("issues", []) or []
         if issues:
             issue_html = []
@@ -8125,10 +8201,7 @@ def render_report_html_customer(report):
                 sev_class = "err" if sev in ("异常", "错误") else "warn" if sev == "警告" else ""
                 text = issue.get("text", "") or ""
                 action = issue.get("action", "") or ""
-                # 去重策略:
-                #   1) 同一 (sev, action) 只展示一次 — 避免 IPv6 等场景同一建议多次出现
-                #   2) 同一 (sev, text) 但 action 为空时, 也只展示一次 (避免重复条目)
-                act_key = (sev, action.strip()) if action.strip() else (sev, text.strip())
+                act_key = (sev, text.strip())
                 if act_key in seen_issue_keys:
                     continue
                 seen_issue_keys.add(act_key)
