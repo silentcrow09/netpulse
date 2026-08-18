@@ -4322,13 +4322,20 @@ class ARPAnalyzer:
             static_valid = [e for e in static_entries
                             if _is_valid_unicast_mac(e["mac"])]
             static_reserved = len(static_entries) - len(static_valid)
-            if static_valid:
-                detail = f"其中 {static_reserved} 条为广播/组播/协议保留 (已忽略)。" \
-                         f"静态 ARP 可以防止 ARP 欺骗，但也可能导致 IP 变更后无法通信"
+            if static_entries:
+                # 真实看到的 static 总数 (含 Windows 把广播/组播也标成 static 的协议保留)。
+                # 报告给用户的文案必须把这两层都说清楚, 否则 "发现 1 条静态 ARP"
+                # 会让用户以为只有 1 条 static, 实际上 arp -a 里 N 条都标了 static,
+                # 只是其中 N-1 条是协议保留, 过滤掉了。
+                detail = (f"arp -a 共显示 {len(static_entries)} 条 static 类型记录, "
+                          f"其中 {static_reserved} 条为广播/组播/协议保留 MAC "
+                          f"(已忽略, 非用户配置), {len(static_valid)} 条为真实单播 MAC。"
+                          f"静态 ARP 可以防止 ARP 欺骗，但也可能导致 IP 变更后无法通信")
                 issues.append({
                     "type": "static_arp",
                     "severity": "info",
-                    "message": f"发现 {len(static_valid)} 条静态 ARP 记录",
+                    "message": (f"发现 {len(static_valid)} 条静态 ARP 记录"
+                                f" (共 {len(static_entries)} 条 static, 已过滤 {static_reserved} 条协议保留)"),
                     "detail": detail
                 })
 
@@ -7198,7 +7205,50 @@ def _present_module(key, raw_result, status):
         if m["level"] != "ok" and not m["hint"]:
             m["hint"] = "超过阈值" if m["level"] == "err" else "略超阈值"
 
+    # ARP 模块专用: 给"ARP 条目"和"MAC 数"加 hint, 让用户一眼看出
+    # MAC 数 < ARP 条目 是因为过滤了广播/组播/协议保留 MAC (避免
+    # "多 IP 同 MAC"误报)。统计口径不直观, 必须用 hint 解释。
+    if key == "arp" and raw_result:
+        entries = raw_result.get("entries") or []
+        total_entries = raw_result.get("total_entries", 0)
+        unique_macs = raw_result.get("unique_macs", 0)
+        reserved_macs = len({
+            e["mac"] for e in entries
+            if e.get("mac") and not _is_valid_unicast_mac(e["mac"])
+        })
+        for m in metrics:
+            if m["label"] == "ARP 条目":
+                if reserved_macs:
+                    m["hint"] = (f"含 {reserved_macs} 个协议保留 MAC "
+                                 f"(广播/组播, 见技术细节)")
+                else:
+                    m["hint"] = "全部为有效单播 MAC"
+            elif m["label"] == "MAC 数":
+                if total_entries != unique_macs:
+                    m["hint"] = "已扣除协议保留 MAC, 仅保留单播"
+                else:
+                    m["hint"] = "全部为单播 MAC"
+
+    # ARP 模块卡片顶部追加一条自解释 info, 告诉用户"MAC 数 < ARP 条目"
+    # 不是丢数据, 是过滤协议保留 MAC 的统计口径。
+    # 注意: 必须放在 issues_fn(...) 之前, 否则会被覆盖。
+    arp_auto_inject = None
+    if key == "arp" and raw_result:
+        total_entries = raw_result.get("total_entries", 0)
+        unique_macs = raw_result.get("unique_macs", 0)
+        if total_entries != unique_macs:
+            arp_auto_inject = {
+                "severity": "信息",
+                "text": (f"MAC 数 ({unique_macs}) 少于 ARP 条目 ({total_entries}), "
+                         f"差额已扣除广播/组播/协议保留 MAC (避免误报 '多 IP 同 MAC')"),
+                "impact": "",
+                "action": "",
+            }
+
     issues = issues_fn(raw_result) if raw_result else []
+    if arp_auto_inject:
+        # 插到列表首位, 让这条解释最先被看到
+        issues = [arp_auto_inject] + list(issues)
 
     return {
         "key": key,
