@@ -5667,9 +5667,21 @@ def _disp_width(s):
 
 
 def _pad_disp(s, width):
-    """按显示宽度右补齐字符串到 width (用于多列对齐)。"""
-    pad = width - _disp_width(s)
-    return s + (" " * pad if pad > 0 else "")
+    """按显示宽度右补齐字符串到 width (用于多列对齐)。
+
+    旧版用 ASCII 空格 (1 char = 1 显示宽) 补齐, 在中英混排的 cell 上会导致
+    "字符数"和"显示宽"不成比例, _columnize 把多行拼成多列时, 不同行
+    第二个 cell 起点参差不齐 (e.g. "链路速率" 后 8 空格, "路由表" 后 10 空格
+    但显示宽一样)。改用全角空格 (U+3000, 1 char = 2 显示宽) 补齐,
+    跟汉字同比例, 字符位置与显示列一致。
+    """
+    need = width - _disp_width(s)
+    if need <= 0:
+        return s
+    # 优先用全角空格补 (1 char = 2 disp), 剩余 1 用 ASCII 空格
+    full = need // 2
+    half = need % 2
+    return s + ("　" * full) + (" " * half)
 
 
 def _columnize(cells, columns=2, gap=3):
@@ -5677,6 +5689,13 @@ def _columnize(cells, columns=2, gap=3):
 
     行优先填充 (先左后右、再换行), 每列按最长 cell 的显示宽度对齐。
     返回字符串列表, 调用方自行加缩进后打印。
+
+    实现细节:
+      - _pad_disp 用全角空格 (1 char = 2 disp) 补齐, 与汉字同比例, 避免
+        ASCII 空格 (1 char = 1 disp) 在中英混排 cell 上 pad 出多余的
+        "字符数", 导致行间 char 位置不齐。
+      - gap 仍用 ASCII 空格 (1 char = 1 disp), 保持列间距紧凑。
+        视觉对齐靠"所有 cell 1 显示宽 = max_width"保证。
     """
     if not cells:
         return []
@@ -5852,7 +5871,7 @@ def _cli_print_result(res, verbose=False, as_json=False, key=None):
 
 
 def _print_module_list():
-    """打印所有可用诊断模块 (按三大类分组展示, 序号全局连续 1-18, 双列排版)"""
+    """打印所有可用诊断模块 (按三大类分组展示, 序号全局连续 1-18, 单列排版)"""
     print(_c(f"{APP_NAME} v{APP_VERSION} — 可用诊断模块:", C_BOLD))
     idx = 0
     for cat_name, keys, desc in MODULE_CATEGORIES:
@@ -5860,14 +5879,12 @@ def _print_module_list():
         tag = _c(f"[{letter}]", C_CYAN) if letter else ""
         print()
         print(_c(f"  {tag} {cat_name}", C_BOLD) + _c(f"  {desc}", C_GRAY))
-        cells = []
         for k in keys:
             idx += 1
             n = MODULE_MAP[k][0]
-            cells.append(
+            line = (
                 _c(str(idx).rjust(2), C_CYAN) + ". " +
                 _c(n, C_WHITE) + " " + _c("(" + k + ")", C_GRAY))
-        for line in _columnize(cells, columns=2, gap=4):
             print("    " + line)
     print()
     print(_c("  分类快捷: 输入 a/b/c 按分类运行; all / 0 / * 运行全部。", C_GRAY))
@@ -9264,14 +9281,12 @@ def interactive_menu(install=False, pip_mirror=None):
             tag = _c(f"[{letter}]", C_CYAN) if letter else ""
             print(_c(f"  {tag} {cat_name}", C_BOLD) +
                   _c(f"  {desc}", C_GRAY))
-            cells = []
             for k in keys:
                 idx += 1
                 n = MODULE_MAP[k][0]
-                cells.append(
+                line = (
                     _c(str(idx).rjust(2), C_CYAN) + ". " +
                     _c(n, C_WHITE) + " " + _c("(" + k + ")", C_GRAY))
-            for line in _columnize(cells, columns=2, gap=4):
                 print("    " + line)
         print()
         print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发)', C_GRAY)}")
