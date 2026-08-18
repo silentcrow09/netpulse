@@ -5878,7 +5878,13 @@ def _cli_print_result(res, verbose=False, as_json=False, key=None):
 
 
 def _print_module_list():
-    """打印所有可用诊断模块 (按三大类分组展示, 序号全局连续 1-18, 单列排版)"""
+    """打印所有可用诊断模块 (按三大类分组展示, 序号全局连续 1-18, 双列排版)。
+
+    双列: 序号 1 2 / 3 4 / 5 6 ... 分别落在左右两列, 每列左侧对齐到该列的
+    序号起始位 (列内已 rjust(2), 所以 "1" "2" "10" 在同一列内对齐)。
+    _columnize 内部用 _pad_disp (全角空格) 按显示宽 pad, 保证两列右边界对齐
+    — 不会因为列内含中文而错位 (旧版用 ASCII 空格 pad 才会错位)。
+    """
     print(_c(f"{APP_NAME} v{APP_VERSION} — 可用诊断模块:", C_BOLD))
     idx = 0
     for cat_name, keys, desc in MODULE_CATEGORIES:
@@ -5886,12 +5892,14 @@ def _print_module_list():
         tag = _c(f"[{letter}]", C_CYAN) if letter else ""
         print()
         print(_c(f"  {tag} {cat_name}", C_BOLD) + _c(f"  {desc}", C_GRAY))
+        cells = []
         for k in keys:
             idx += 1
             n = MODULE_MAP[k][0]
-            line = (
+            cells.append(
                 _c(str(idx).rjust(2), C_CYAN) + ". " +
                 _c(n, C_WHITE) + " " + _c("(" + k + ")", C_GRAY))
+        for line in _columnize(cells, columns=2, gap=4):
             print("    " + line)
     print()
     print(_c("  分类快捷: 输入 a/b/c 按分类运行; all / 0 / * 运行全部。", C_GRAY))
@@ -9331,12 +9339,14 @@ def interactive_menu(install=False, pip_mirror=None):
             tag = _c(f"[{letter}]", C_CYAN) if letter else ""
             print(_c(f"  {tag} {cat_name}", C_BOLD) +
                   _c(f"  {desc}", C_GRAY))
+            cells = []
             for k in keys:
                 idx += 1
                 n = MODULE_MAP[k][0]
-                line = (
+                cells.append(
                     _c(str(idx).rjust(2), C_CYAN) + ". " +
                     _c(n, C_WHITE) + " " + _c("(" + k + ")", C_GRAY))
+            for line in _columnize(cells, columns=2, gap=4):
                 print("    " + line)
         print()
         print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发)', C_GRAY)}")
