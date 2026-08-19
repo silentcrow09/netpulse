@@ -78,7 +78,7 @@ Write-Host "  NetPulse 单文件 EXE 构建脚本" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
-# ---- 1/5: 查找 Python ----
+# ---- 1/6: 查找 Python ----
 Step-Start 1 6 "查找 Python"
 $py = Find-Python
 if (-not $py) {
@@ -87,7 +87,7 @@ if (-not $py) {
 }
 Step-Ok "($($py.Ver)  via: $($py.Cmd))"
 
-# ---- 2/5: 检查/安装依赖 ----
+# ---- 2/6: 检查/安装依赖 ----
 Step-Start 2 6 "检查依赖"
 $pip = Find-Pip $py.Cmd
 if (-not $pip) {
@@ -98,12 +98,15 @@ if (-not $pip) {
 $pipDisplay = if ($pip.ExtraArgs.Count -gt 0) { "$($pip.Cmd) $($pip.ExtraArgs -join ' ')" } else { $pip.Cmd }
 
 # 用 import 测试代替 pip show
+# key = pip 安装名, value = import 测试名 (两者不同的: speedtest-cli 的 import 名是
+# speedtest; pyinstaller 的 import 名是 PyInstaller)。注意 PyPI 上的 'speedtest'
+# 是 2020 年的 1.3 kB 占位空包, 绝不能直接 pip install speedtest
 $required = @{
-    'scapy'        = 'scapy'
-    'cryptography' = 'cryptography'
-    'speedtest'    = 'speedtest'        # speedtest-cli 包名是 speedtest
-    'reportlab'    = 'reportlab'
-    'pyinstaller'  = 'PyInstaller'      # import 名是 PyInstaller
+    'scapy'         = 'scapy'
+    'cryptography'  = 'cryptography'
+    'speedtest-cli' = 'speedtest'
+    'reportlab'     = 'reportlab'
+    'pyinstaller'   = 'PyInstaller'
 }
 $missing = @()
 foreach ($entry in $required.GetEnumerator()) {
@@ -131,10 +134,10 @@ if ($missing.Count -gt 0) {
     }
     Write-Host " 完成" -ForegroundColor Green
 } else {
-    Step-Ok "(scapy, cryptography, speedtest, reportlab, pyinstaller 全部就位)"
+    Step-Ok "(scapy, cryptography, speedtest-cli, reportlab, pyinstaller 全部就位)"
 }
 
-# ---- 3/5: 清理旧构建 ----
+# ---- 3/6: 清理旧构建 ----
 Step-Start 3 6 "清理旧构建"
 try {
     if (Test-Path build) { Remove-Item -Recurse -Force build }
@@ -146,10 +149,10 @@ try {
     Read-Host "`n  按 Enter 退出"; exit 1
 }
 
-# ---- 4/5: 打包 EXE ----
+# ---- 4/6: 打包 EXE ----
 Step-Start 4 6 "打包 EXE (单文件, 通常 30-90 秒)"
 
-# 关键: --log-level ERROR 把 INFO/WARNING 压到日志, 只让 ERROR 漏出来
+# 关键: --log-level WARN 把 INFO 压到日志, 详细输出走 build_last.log, 失败时回显
 # --noconfirm 避免覆盖 dist 时询问
 $piArgs = @(
     '--onefile', '--console', '--noconfirm',
@@ -160,7 +163,6 @@ $piArgs = @(
     '--collect-all', 'scapy',
     '--hidden-import', 'reportlab',
     '--collect-all', 'reportlab',
-    '--noconfirm',
     '--log-level', 'WARN',
     'netpulse.py'
 )
@@ -255,7 +257,7 @@ if ($piExit -ne 0) {
 }
 Step-Ok
 
-# ---- 5/5: 验证 EXE ----
+# ---- 5/6: 验证 EXE ----
 Step-Start 5 6 "验证 EXE"
 $exePath = Join-Path $PSScriptRoot 'dist\NetPulse.exe'
 if (-not (Test-Path $exePath)) {

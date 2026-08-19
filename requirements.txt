@@ -6,6 +6,8 @@
 # scapy: DHCP 多服务器检测 (需要先安装 Npcap)
 # 安装 Npcap: https://npcap.com/dist/npcap-1.79.exe (勾选 "WinPcap API-compatible Mode")
 scapy>=2.5.0
+# cryptography: 修 scapy.modules.krack 的 ImportError (scapy 可选依赖)
+cryptography>=3.4
 
 # speedtest: Speedtest.net 测速
 speedtest-cli>=2.1.3

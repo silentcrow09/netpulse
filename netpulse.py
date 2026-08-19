@@ -3330,7 +3330,7 @@ class Iperf3Tester:
         return parsed
 
     def detect(self, server=None, port=5201, duration=10,
-               callback=None, save_report=True, _unused=None):
+               callback=None, save_report=True):
         """iperf3 点对点吞吐测试主流程。
 
         server: iperf3 服务器地址 (必填, 由 CLI --iperf3-server 或菜单输入提供)。
@@ -3683,6 +3683,8 @@ def _render_iperf3_html(res):
     """渲染 iperf3 链路吞吐报告 HTML (内联 canvas 曲线, 完全离线可用)。"""
     ts_disp = (res.get("timestamp") or "")[:19].replace("T", " ")
     server = res.get("server", "—")
+    # banner/sub 直接插入 HTML, 必须转义 (detail_rows 那路已有 _esc_html, 别双转义)
+    server_html = _esc_html(str(server))
     port = res.get("port", 5201)
     duration = res.get("duration_s", 10)
     dl = res.get("download_mbps")
@@ -3751,9 +3753,9 @@ def _render_iperf3_html(res):
 <body>
 <div class="wrap">
   <h1><span class="dot">●</span>NetPulse iperf3 链路吞吐报告</h1>
-  <div class="sub">测试时间: {ts_disp} &nbsp;·&nbsp; 到服务器 {server}:{port}</div>
+  <div class="sub">测试时间: {ts_disp} &nbsp;·&nbsp; 到服务器 {server_html}:{port}</div>
 
-  <div class="banner">⚠️ iperf3 测量的是<b>到指定服务器 {server} 的链路吞吐</b>,
+  <div class="banner">⚠️ iperf3 测量的是<b>到指定服务器 {server_html} 的链路吞吐</b>,
     不代表互联网宽带速率。服务器在内网时数值会远高于出口宽带, 属正常现象。</div>
 
   <div class="metric-row">
@@ -5906,7 +5908,7 @@ class TCPStatsTester:
 # ============================================================
 
 # 模块注册表 (key, 显示名, 检测器类)
-# 顺序 = 装维工作流分类顺序 (先看 → 再测 → 后查), 序号 1-18 全局连续,
+# 顺序 = 装维工作流分类顺序 (先看 → 再测 → 后查), 序号 1-19 全局连续,
 # CLI/菜单的序号解析与此保持一致。
 MODULE_REGISTRY = [
     # ── 基础信息: 环境快照 ──
@@ -6191,7 +6193,7 @@ def _cli_print_result(res, verbose=False, as_json=False, key=None):
 
 
 def _print_module_list():
-    """打印所有可用诊断模块 (按三大类分组展示, 序号全局连续 1-18, 双列排版)。
+    """打印所有可用诊断模块 (按三大类分组展示, 序号全局连续 1-19, 双列排版)。
 
     与 interactive_menu 同款: 全局 nameMax (按 _disp_width) 让所有 cell
     模块名右端对齐到同一列, 行内两 cell 起点也一致。
@@ -6458,6 +6460,11 @@ def _module_detect_kwargs(key):
 
 
 def _module_timeout(key):
+    if key == "iperf3":
+        # 时长随 --iperf3-duration 动态伸缩: 双向 2×(duration + run_cmd 15s 余量)
+        # + 定位/下载 iperf3.exe + 报告落盘。静态 120s 会让 duration≥50 必然超时。
+        d = SPEEDTEST_CONFIG.get("iperf3_duration", 10)
+        return 2 * (d + 15) + 90
     return MODULE_TIMEOUTS.get(key, DEFAULT_MODULE_TIMEOUT)
 
 
@@ -6561,7 +6568,7 @@ def _run_diagnostics_parallel(keys, max_workers, total):
             completed[key] = (name, status, res)
         return key
 
-    # 启动行: 主线程按 keys 顺序打 (1-18 整齐一行)
+    # 启动行: 主线程按 keys 顺序打 (1-19 整齐一行)
     for i, key in enumerate(keys, 1):
         name = MODULE_MAP[key][0]
         _safe_print(_c(f"  [{i}/{total}] 正在 {name} …", C_GRAY))
@@ -6572,7 +6579,7 @@ def _run_diagnostics_parallel(keys, max_workers, total):
         for fut in as_completed(futs):
             fut.result()  # 等待, 不打印
 
-    # 完成行: 主线程按 keys 顺序打 (1-18 整齐一行)
+    # 完成行: 主线程按 keys 顺序打 (1-19 整齐一行)
     for i, key in enumerate(keys, 1):
         if key not in completed:
             # 理论上不会到这里 (except 块也存了), 但兜底
@@ -9710,7 +9717,7 @@ def interactive_menu(install=False, pip_mirror=None):
             # key 长度参差 (3-11 字符) 后 cell 实际像素宽差异过大, pad
             # 整数 ASCII 空格无法在 Consolas 下做到像素级行间对齐, 故
             # 移除 (key) 段以减小 cell 宽差异 (现仅 0.06 字符位, 肉眼看不出)。
-            # 用户仍可通过序号 (1-18) 或分类字母 (a/b/c) 选模块, 不受影响。
+            # 用户仍可通过序号 (1-19) 或分类字母 (a/b/c) 选模块, 不受影响。
             name_max_w = name_max_w_global
             for k in keys:
                 idx += 1
@@ -9773,8 +9780,9 @@ def interactive_menu(install=False, pip_mirror=None):
                 PORT_PROBE_CONFIG["proto"] = proto
                 PORT_PROBE_CONFIG["count"] = cnt
         # iperf3 模块: 菜单模式运行 iperf3 时询问服务器 (默认不测, 缺服务器会明确报错)
-        # 已被 CLI --iperf3-server 预设过就不重复问
-        if "iperf3" in keys and not SPEEDTEST_CONFIG.get("iperf3_server"):
+        # 已被 CLI --iperf3-server 预设过就不重复问; 非 TTY 不问 (否则会吃掉管道输入)
+        if ("iperf3" in keys and not SPEEDTEST_CONFIG.get("iperf3_server")
+                and sys.stdout.isatty()):
             iperf3 = _prompt_for_iperf3()
             if iperf3 is not None:
                 host, port = iperf3
@@ -9793,7 +9801,7 @@ def interactive_menu(install=False, pip_mirror=None):
             # 单独跑测速时跳过"生成综合诊断报告"询问: 测速已自动保存独立的
             # 专业测速报告 (HTML+JSON), 再问会产生冗余的 netdiag_report_*
             if keys == ["speedtest"] or keys == ["iperf3"]:
-                print(_c("  测速报告已自动保存至 reports/ 目录 (speedtest_时间戳.html/.json)。",
+                print(_c(f"  测速报告已自动保存至 reports/ 目录 ({keys[0]}_时间戳.html/.json)。",
                          C_GRAY))
             else:
                 prompt_export_report(auto_install=install, pip_mirror=pip_mirror)
