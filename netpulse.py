@@ -11,7 +11,7 @@ NetPulse - Windows 网络诊断工具
   4.  外网延迟 / 路径 / 丢包检测
   5.  有线 / WiFi 协商速率检测
   6.  WiFi 干扰分析
-  7.  内外网测速 (iperf3 + Speedtest + HTTP)
+  7.  互联网宽带测速 (Speedtest, 国内镜像 + 国内节点)
   8.  TCP 连接数探测
   9.  多外网出口检测
   10. DNS 解析诊断 (补充)
@@ -91,14 +91,15 @@ PORT_PROBE_CONFIG = {"targets": [], "proto": "tcp", "count": 2,
                      "force": False, "max_total_time": 60.0,
                      "max_concurrency": 8}
 
-# 测速模块的运行参数 (由 CLI --iperf3-server / --speedtest-net / --speedtest-node 写入, runner 读取)
-# - iperf3_server: 提供后测速模块会用 iperf3 测上下行 (iperf3 是最准的上行测量)
+# 测速 / iperf3 模块的运行参数 (由 CLI 写入, runner 读取)
+# - iperf3_server / iperf3_port / iperf3_duration: iperf3 独立模块用, 由 --iperf3-server 提供;
+#   提供后 iperf3 模块测到该服务器的上下行吞吐 (iperf3 是最准的链路吞吐测量)
 # - use_speedtest_net: 默认关闭 — 国内网络下 speedtest-cli 常选中海外服务器,
 #   结果严重偏低 (本机实测 100M 宽带测出 5 Mbps), 仅作参考
-# - node: 手动指定测速服务器 (speedtest 服务器 ID 或 host:port); 默认自动选国内运营商节点
+# - node: 手动指定上行测速服务器 (speedtest 服务器 ID 或 host:port); 默认自动选国内运营商节点
 # - duration_down / duration_up: 上下行测速时长 (秒)
 # - live_ui: 单独运行测速模块时启用终端实时可视化 (由 run_diagnostics 写入)
-SPEEDTEST_CONFIG = {"iperf3_server": None, "iperf3_port": 5201,
+SPEEDTEST_CONFIG = {"iperf3_server": None, "iperf3_port": 5201, "iperf3_duration": 10,
                     "use_speedtest_net": False,
                     "node": None, "duration_down": 8.0, "duration_up": 8.0,
                     "live_ui": False}
@@ -467,12 +468,19 @@ def _download_iperf3(target_dir=None):
     if os.path.exists(dst) and os.path.getsize(dst) > 1000:
         return True, dst
 
-    # 候选下载源: GitHub 官方 + 国内镜像 (ghproxy)
-    version = "3.17.1"
-    zip_name = f"iperf-{version}-win64.zip"
+    # 候选下载源:
+    # - ar51an/iperf3-win-builds (社区维护, 跟 esnet/iperf 同步发 Windows 预编译)
+    # - ghproxy 国内镜像 (加速, 但偶尔 SSL 不稳, 失败自动回退)
+    # 注: esnet/iperf 官方已不发布 Windows 二进制, 只发 .tar.gz 源码;
+    #     历史 URL 形如 /esnet/iperf/releases/download/X/iperf-X-win64.zip 已 404。
+    # 选 static-auth 版: 单文件无 cygwin1.dll 依赖, 部署干净; auth 默认不用, 行为同普通版
+    IPERF3_VERSION = "3.21"
+    IPERF3_WIN_REPO = "ar51an/iperf3-win-builds"  # Windows 预编译维护者
+    zip_name = f"iperf-{IPERF3_VERSION}-win64-static-auth.zip"
+    base_zip_url = f"https://github.com/{IPERF3_WIN_REPO}/releases/download/{IPERF3_VERSION}/{zip_name}"
     candidates = [
-        f"https://github.com/esnet/iperf/releases/download/{version}/{zip_name}",
-        f"https://mirror.ghproxy.com/https://github.com/esnet/iperf/releases/download/{version}/{zip_name}",
+        base_zip_url,
+        f"https://gh-proxy.com/{base_zip_url}",
     ]
     tmp_zip = os.path.join(tempfile.gettempdir(), zip_name)
     downloaded_from = None
@@ -486,18 +494,24 @@ def _download_iperf3(target_dir=None):
     if not downloaded_from:
         return False, "所有 iperf3 下载源均失败"
 
-    # 解压找 iperf3.exe (zip 内通常在子目录里)
+    # 解压: 提取所有 .exe + .dll (防御 future zip 改名 / 多文件依赖如 cygwin1.dll)
     try:
         with zipfile.ZipFile(tmp_zip, "r") as zf:
-            target_member = None
-            for name in zf.namelist():
-                if name.lower().replace("\\", "/").endswith("iperf3.exe"):
-                    target_member = name
-                    break
-            if not target_member:
+            extracted_iperf3 = False
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                fname = os.path.basename(info.filename).lower()
+                # 只解 .exe / .dll 到目标目录 (扁平化, 不创建子目录)
+                if not (fname.endswith(".exe") or fname.endswith(".dll")):
+                    continue
+                out_path = os.path.join(target_dir, os.path.basename(info.filename))
+                with zf.open(info) as src, open(out_path, "wb") as f:
+                    shutil.copyfileobj(src, f)
+                if fname == "iperf3.exe":
+                    extracted_iperf3 = True
+            if not extracted_iperf3:
                 return False, f"zip 内未找到 iperf3.exe (含 {len(zf.namelist())} 个文件)"
-            with zf.open(target_member) as src, open(dst, "wb") as f:
-                shutil.copyfileobj(src, f)
         try:
             os.remove(tmp_zip)
         except OSError:
@@ -2991,124 +3005,6 @@ class SpeedTester:
                 return result
         return {"error": "所有 HTTP 测速服务器均不可用或太慢", "method": "http_download"}
 
-    def test_iperf3(self, server, port=5201, duration=10, callback=None):
-        """iperf3 客户端测速"""
-        if callback:
-            callback(f"iperf3 测速: {server}:{port}...")
-        # 检查 iperf3 是否可用
-        iperf3_path = self._find_iperf3()
-        if not iperf3_path:
-            return {"error": "iperf3 未找到，请下载 iperf3.exe 并放入 PATH 或程序目录", "method": "iperf3"}
-
-        # 下载测试 (反向)
-        if callback:
-            callback("iperf3 下载测速 (reverse)...")
-        cmd = f'"{iperf3_path}" -c {server} -p {port} -t {duration} -R -J'
-        _, out, _ = run_cmd(cmd, timeout=duration + 15)
-        download_result = self._parse_iperf3_json(out)
-
-        # 上传测试
-        if callback:
-            callback("iperf3 上传测速...")
-        cmd = f'"{iperf3_path}" -c {server} -p {port} -t {duration} -J'
-        _, out, _ = run_cmd(cmd, timeout=duration + 15)
-        upload_result = self._parse_iperf3_json(out)
-
-        # 双方向都解析失败 -> 整体判失败 (否则 detect() 会把 0/0 当成功结果)
-        if "error" in download_result and "error" in upload_result:
-            return {"error": (f"iperf3 双向均无有效输出: {download_result['error']}; "
-                              f"{upload_result['error']}"),
-                    "method": "iperf3"}
-
-        return {
-            "method": "iperf3",
-            "server": server,
-            "port": port,
-            "download_mbps": download_result.get("bitrate_mbps", 0),
-            "upload_mbps": upload_result.get("bitrate_mbps", 0),
-            "download_retransmits": download_result.get("retransmits", 0),
-            "upload_retransmits": upload_result.get("retransmits", 0),
-        }
-
-    def _find_iperf3(self, auto_download=True):
-        """查找 iperf3.exe (auto_download=True 时找不到则交互式询问下载)"""
-        # 当前目录
-        exe_name = "iperf3.exe"
-        if os.path.exists(exe_name):
-            return os.path.abspath(exe_name)
-        # 程序目录
-        app_dir = os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, 'frozen', False) else __file__))
-        path = os.path.join(app_dir, exe_name)
-        if os.path.exists(path):
-            return path
-        # PATH
-        code, out, _ = run_cmd("where iperf3", timeout=5)
-        if code == 0 and out.strip():
-            return out.strip().split("\n")[0].strip()
-
-        # 都找不到 — 尝试自动下载
-        if not auto_download:
-            return None
-        try:
-            ans = input(_c("  未找到 iperf3.exe, 是否自动下载到程序目录? [Y/n] ",
-                           C_GREEN)).strip().lower()
-        except (EOFError, RuntimeError):
-            return None
-        if ans and ans not in ("y", "yes", ""):
-            return None
-        print(_c("  正在下载 iperf3 (~2MB)...", C_GRAY))
-        ok, result = _download_iperf3()
-        if ok:
-            print(_c(f"  ✓ iperf3 已就绪: {result}", C_GREEN))
-            return result
-        print(_c(f"  ✗ 自动下载失败: {result}", C_RED))
-        print(_c("    可手动下载: https://iperf.fr/iperf-download.php "
-                 "(解压后将 iperf3.exe 放到本程序同目录)", C_GRAY))
-        return None
-
-    def _parse_iperf3_json(self, output):
-        """解析 iperf3 JSON 输出"""
-        if not output or not output.strip():
-            return {"error": "iperf3 无输出", "method": "iperf3"}
-        try:
-            data = json.loads(output)
-            end = data.get("end", {})
-            result = {}
-            # 接收端 (下载)
-            recv = end.get("sum_received", end.get("sum", {}))
-            if recv:
-                bits_per_sec = recv.get("bits_per_second", 0)
-                result["bitrate_mbps"] = round(bits_per_sec / 1e6, 2)
-            # 重传
-            sum_data = end.get("sum_sent", end.get("sum", {}))
-            if sum_data:
-                result["retransmits"] = sum_data.get("retransmits", 0)
-            # 时间序列: 每秒间隔的速率 (供报告曲线)
-            intervals = data.get("intervals") or []
-            series = []
-            for iv in intervals:
-                s = iv.get("sum", {})
-                bps = s.get("bits_per_second", 0)
-                series.append(round(bps / 1e6, 2))
-            if series:
-                result["intervals_mbps"] = series
-            if not result:
-                # JSON 解析成功但没有速率数据 (例如 iperf3 跑一半超时)
-                return {"error": "iperf3 输出无速率数据", "method": "iperf3"}
-            return result
-        except Exception:
-            # 尝试解析文本输出
-            m = re.search(r"([\d.]+)\s*(Mbits/sec|Gbits/sec|Kbits/sec)", output)
-            if m:
-                val = float(m.group(1))
-                unit = m.group(2)
-                if "Gbits" in unit:
-                    val *= 1000
-                elif "Kbits" in unit:
-                    val /= 1000
-                return {"bitrate_mbps": round(val, 2)}
-            return {"error": "iperf3 输出无法解析", "method": "iperf3"}
-
     def test_upload_domestic(self, callback=None, duration=8.0, node=None,
                              on_sample=None, series=None):
         """国内运营商节点上行测速: 多连接 HTTP POST 上传 (speedtest 协议)。
@@ -3162,13 +3058,12 @@ class SpeedTester:
         return {"host": f"{host}:{port}", "sponsor": node, "cc": "CN",
                 "country": "手动指定"}
 
-    def detect(self, iperf3_server=None, iperf3_port=5201,
-               use_speedtest_net=False, node=None, live_ui=False,
+    def detect(self, use_speedtest_net=False, node=None, live_ui=False,
                save_report=True, callback=None):
-        """新版完整测速 (带宽体检)。
+        """完整测速 (带宽体检) — 纯互联网宽带测速, 不含 iperf3 (iperf3 已是独立模块)。
 
         流程: ① 空闲延迟基线 → ② 下行测速 (国内镜像多连接, 并行采样负载延迟)
-        → ③ 上行测速 (iperf3 优先, 否则国内运营商节点) → ④ 汇总评级
+        → ③ 上行测速 (国内运营商节点) → ④ 汇总评级
         (下行/上行/预估带宽/bufferbloat A-F) → ⑤ 本地 HTML+JSON 报告。
 
         live_ui: 单独运行本模块时终端实时动画 (由 run_diagnostics 置位)。
@@ -3214,30 +3109,21 @@ class SpeedTester:
         loaded_down_rtt = monitor.median_rtt(since=down_start) if monitor_ok else None
         down_lat_series = monitor.series_since(down_start) if monitor_ok else []
 
-        # ③ 上行测速 (iperf3 优先, 否则国内运营商节点)
+        # ③ 上行测速 (国内运营商节点, 零依赖)
         upload = None
         up_result = None
         loaded_up_rtt = None
         up_lat_series = []
-        iperf3_result = None
 
         def _up_sample(inst, t_off, cum):
             ui.draw(up=inst, phase="上行测速", idle_rtt=idle_rtt)
 
         up_start = time.time()
-        if iperf3_server:
-            iperf3_result = self.test_iperf3(iperf3_server, iperf3_port,
-                                             callback=_cb)
-            if "error" not in iperf3_result:
-                upload = iperf3_result.get("upload_mbps")
-                ivs = iperf3_result.get("intervals_mbps") or []
-                up_series = [(i + 1, v) for i, v in enumerate(ivs)]
-        else:
-            up_result = self.test_upload_domestic(
-                _cb, duration=SPEEDTEST_CONFIG.get("duration_up", 8.0),
-                node=node, on_sample=_up_sample, series=up_series)
-            if "error" not in up_result:
-                upload = up_result.get("upload_mbps")
+        up_result = self.test_upload_domestic(
+            _cb, duration=SPEEDTEST_CONFIG.get("duration_up", 8.0),
+            node=node, on_sample=_up_sample, series=up_series)
+        if "error" not in up_result:
+            upload = up_result.get("upload_mbps")
         up_end = time.time()
         if monitor_ok:
             loaded_up_rtt = monitor.median_rtt(since=up_start)
@@ -3250,10 +3136,6 @@ class SpeedTester:
         if "error" not in http_result:
             download = http_result.get("download_mbps", 0)
             method_bits.append("国内HTTP")
-        if iperf3_result and "error" not in iperf3_result:
-            if iperf3_result.get("download_mbps"):
-                download = iperf3_result["download_mbps"]
-            method_bits.append("iperf3")
         if up_result and "error" not in up_result:
             method_bits.append("国内节点上行")
         if not method_bits:
@@ -3287,11 +3169,9 @@ class SpeedTester:
             "download_mbps": round(download, 2),
             "upload_mbps": round(upload, 2) if upload is not None else None,
             "download_method": "国内HTTP多连接",
-            "upload_method": ("iperf3" if iperf3_server
-                              else (up_result.get("method", "未知")
-                                    if up_result else "未测")),
-            "upload_server": (up_result.get("sponsor", "") if up_result else
-                              (iperf3_server or "未测")),
+            "upload_method": (up_result.get("method", "未知")
+                              if up_result else "未测"),
+            "upload_server": (up_result.get("sponsor", "") if up_result else "未测"),
             "estimated_bandwidth": est,
             "idle_rtt_ms": (round(idle_rtt, 1) if idle_rtt is not None else None),
             "loaded_rtt_ms": (round(loaded_rtt, 1) if loaded_rtt is not None else None),
@@ -3302,7 +3182,6 @@ class SpeedTester:
             "up_series": up_series,
             "lat_series": lat_series,
             "http": http_result,
-            "iperf3": iperf3_result,
             "speedtest": speedtest_result,
             "up_result": up_result,
             "latency_target": lat_target,
@@ -3336,6 +3215,202 @@ class SpeedTester:
         results["timestamp"] = datetime.now().isoformat()
         _cb(results["summary"])
         self.results = results    # 关键: 同步到 self.results (其它模块都用这个)
+        return results
+
+
+class Iperf3Tester:
+    """iperf3 点对点吞吐测试 (到指定服务器的链路吞吐, 非互联网宽带)。
+
+    与 SpeedTester(宽带测速) 完全解耦: 本模块只回答"到某台 iperf3 服务器的
+    上下行吞吐是多少", 不掺任何互联网宽带数字, 也不参与"预估宽带/Buffferbloat"
+    之类的宽带体检评级。iperf3 服务器通常部署在出口/IDC/内网, 测的是这一段链路的
+    真实带宽, 数值高低取决于服务器位置 (内网会很高、公网才接近宽带)。
+    """
+
+    def __init__(self):
+        self.name = "iperf3 吞吐"
+        self.results = {}
+
+    # ── iperf3.exe 定位 (优先当前目录 → 程序目录 → PATH → 交互式下载) ──
+    def _find_iperf3(self, auto_download=True):
+        """查找 iperf3.exe (auto_download=True 时找不到则交互式询问下载)"""
+        exe_name = "iperf3.exe"
+        if os.path.exists(exe_name):
+            return os.path.abspath(exe_name)
+        app_dir = os.path.dirname(os.path.abspath(
+            sys.argv[0] if getattr(sys, 'frozen', False) else __file__))
+        path = os.path.join(app_dir, exe_name)
+        if os.path.exists(path):
+            return path
+        # 程序目录不可写时 _download_iperf3 的回退落点: %LOCALAPPDATA%\NetPulse\
+        # (补上这层查找, 避免"上次自动下载成功, 这次又提示未找到"反复询问)
+        fallback = os.path.join(
+            os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
+            "NetPulse", exe_name)
+        if os.path.exists(fallback):
+            return fallback
+        code, out, _ = run_cmd("where iperf3", timeout=5)
+        if code == 0 and out.strip():
+            return out.strip().split("\n")[0].strip()
+
+        if not auto_download:
+            return None
+        try:
+            ans = input(_c("  未找到 iperf3.exe, 是否自动下载到程序目录? [Y/n] ",
+                           C_GREEN)).strip().lower()
+        except (EOFError, RuntimeError):
+            return None
+        if ans and ans not in ("y", "yes", ""):
+            return None
+        print(_c("  正在下载 iperf3 (~2MB)...", C_GRAY))
+        ok, result = _download_iperf3()
+        if ok:
+            print(_c(f"  ✓ iperf3 已就绪: {result}", C_GREEN))
+            return result
+        print(_c(f"  ✗ 自动下载失败: {result}", C_RED))
+        print(_c("    可手动下载: https://iperf.fr/iperf-download.php "
+                 "(解压后将 iperf3.exe 放到本程序同目录)", C_GRAY))
+        return None
+
+    # ── 解析单方向 iperf3 JSON 输出 ──
+    def _parse_iperf3_json(self, output, direction):
+        """解析 iperf3 JSON 输出 (direction: 'download' 取 sum_received / 'upload' 取 sum_sent)。
+
+        修复旧版 bug: 旧 SpeedTester.test_iperf3 内部算出了 intervals_mbps 但返回值里
+        没带上, 导致报告上行曲线为空。这里直接按方向返回 bitrate/retransmits/时序。
+        """
+        if not output or not output.strip():
+            return {"error": "iperf3 无输出 (服务器不可达? 防火墙拦截?)"}
+        try:
+            data = json.loads(output)
+            end = data.get("end", {})
+            if direction == "download":
+                rate_block = end.get("sum_received", end.get("sum", {}))
+            else:
+                rate_block = end.get("sum_sent", end.get("sum", {}))
+            bits = (rate_block or {}).get("bits_per_second", 0)
+            result = {"bitrate_mbps": round(bits / 1e6, 2)}
+            # 重传永远看 sum_sent (发送方才有重传); 下载方向客户端几乎不重传 → 近 0 属正常
+            sent = end.get("sum_sent", {})
+            result["retransmits"] = (sent or {}).get("retransmits", 0)
+            intervals = data.get("intervals") or []
+            series = []
+            for iv in intervals:
+                s = iv.get("sum", {})
+                series.append(round((s.get("bits_per_second", 0)) / 1e6, 2))
+            if series:
+                result["intervals_mbps"] = series
+            if not result.get("bitrate_mbps"):
+                return {"error": "iperf3 输出无速率数据 (跑一半超时?)"}
+            return result
+        except Exception:
+            m = re.search(r"([\d.]+)\s*(Mbits/sec|Gbits/sec|Kbits/sec)", output)
+            if m:
+                val = float(m.group(1))
+                unit = m.group(2)
+                if "Gbits" in unit:
+                    val *= 1000
+                elif "Kbits" in unit:
+                    val /= 1000
+                return {"bitrate_mbps": round(val, 2)}
+            return {"error": "iperf3 输出无法解析"}
+
+    def _run_one_direction(self, iperf3_path, server, port, duration, reverse, callback):
+        label = "下载" if reverse else "上传"
+        if callback:
+            callback(f"iperf3 {label}测速 (到 {server}:{port}, {duration}s)...")
+        cmd = f'"{iperf3_path}" -c {server} -p {port} -t {duration}'
+        if reverse:
+            cmd += " -R"
+        cmd += " -J"
+        _, out, err = run_cmd(cmd, timeout=duration + 15)
+        parsed = self._parse_iperf3_json(out, "download" if reverse else "upload")
+        if "error" in parsed and err and err.strip():
+            parsed["stderr"] = err.strip().split("\n")[-1][:200]
+        return parsed
+
+    def detect(self, server=None, port=5201, duration=10,
+               callback=None, save_report=True, _unused=None):
+        """iperf3 点对点吞吐测试主流程。
+
+        server: iperf3 服务器地址 (必填, 由 CLI --iperf3-server 或菜单输入提供)。
+        port/duration: 服务器端口 / 单方向时长。
+        返回结构顶层字段即最终结论, 单方向失败不影响另一方向, 双失败才报顶层 error。
+        """
+        if not server:
+            res = {
+                "error": "未指定 iperf3 服务器。请在菜单中选择 iperf3 时输入服务器地址, "
+                         "或用 CLI: netpulse.py iperf3 --iperf3-server HOST[:PORT]",
+                "method": "iperf3",
+            }
+            self.results = res
+            return res
+        iperf3_path = self._find_iperf3()
+        if not iperf3_path:
+            res = {"error": "iperf3.exe 未找到 (请放入 PATH 或程序目录, "
+                            "或在菜单中选择 iperf3 时按 Y 自动下载)",
+                   "method": "iperf3"}
+            self.results = res
+            return res
+
+        down = self._run_one_direction(iperf3_path, server, port, duration, True, callback)
+        up = self._run_one_direction(iperf3_path, server, port, duration, False, callback)
+
+        # 双方向都失败 → 整体失败 (否则会把 0/0 当成功结果)
+        if "error" in down and "error" in up:
+            results = {
+                "method": "iperf3",
+                "server": server, "port": port, "duration_s": duration,
+                "download_mbps": None, "upload_mbps": None,
+                "download_error": down.get("error"),
+                "upload_error": up.get("error"),
+                "error": (f"iperf3 双向均失败 — 下载: {down.get('error')}; "
+                          f"上传: {up.get('error')}"),
+                "note": "iperf3 测的是到服务器的链路吞吐, 非互联网宽带; 双向失败通常是"
+                        "服务器未启动 / 地址端口错 / 防火墙拦截 TCP 5201。",
+                "timestamp": datetime.now().isoformat(),
+            }
+            self.results = results
+            return results
+
+        dl = down.get("bitrate_mbps") if "error" not in down else None
+        ul = up.get("bitrate_mbps") if "error" not in up else None
+        summary = (f"iperf3 链路吞吐 (到 {server}:{port}): "
+                   f"↓{format_speed(dl) if dl is not None else '失败'}, "
+                   f"↑{format_speed(ul) if ul is not None else '失败'}")
+        results = {
+            "method": "iperf3",
+            "server": server,
+            "port": port,
+            "duration_s": duration,
+            "download_mbps": dl,
+            "upload_mbps": ul,
+            "download_retransmits": down.get("retransmits", 0) if "error" not in down else None,
+            "upload_retransmits": up.get("retransmits", 0) if "error" not in up else None,
+            "download_intervals_mbps": down.get("intervals_mbps"),
+            "upload_intervals_mbps": up.get("intervals_mbps"),
+            "download_error": down.get("error") if "error" in down else None,
+            "upload_error": up.get("error") if "error" in up else None,
+            "note": "iperf3 测量的是到服务器 %s 的链路吞吐, 不代表互联网宽带速率"
+                    % server,
+            "summary": summary,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        if save_report:
+            try:
+                paths = save_iperf3_report(results)
+                if paths:
+                    results["report_html"] = paths[0]
+                    results["report_json"] = paths[1]
+                    if callback:
+                        callback(f"iperf3 报告已保存: {paths[0]}")
+            except Exception as e:
+                if callback:
+                    callback(f"iperf3 报告保存失败: {e}")
+        if callback:
+            callback(summary)
+        self.results = results
         return results
 
 
@@ -3599,6 +3674,203 @@ def save_speedtest_report(res):
             json.dump(snapshot, f, ensure_ascii=False, indent=2, default=str)
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(_render_speedtest_html(res))
+        return html_path, json_path
+    except Exception:
+        return None
+
+
+def _render_iperf3_html(res):
+    """渲染 iperf3 链路吞吐报告 HTML (内联 canvas 曲线, 完全离线可用)。"""
+    ts_disp = (res.get("timestamp") or "")[:19].replace("T", " ")
+    server = res.get("server", "—")
+    port = res.get("port", 5201)
+    duration = res.get("duration_s", 10)
+    dl = res.get("download_mbps")
+    ul = res.get("upload_mbps")
+    dl_str = f"{dl:.1f}" if dl is not None else "失败"
+    ul_str = f"{ul:.1f}" if ul is not None else "失败"
+    dl_re = res.get("download_retransmits")
+    ul_re = res.get("upload_retransmits")
+    dl_err = res.get("download_error")
+    ul_err = res.get("upload_error")
+
+    down_intervals = res.get("download_intervals_mbps") or []
+    up_intervals = res.get("upload_intervals_mbps") or []
+    down_data = [[i + 1, v] for i, v in enumerate(down_intervals)]
+    base_t = len(down_intervals)
+    up_data = [[i + 1 + base_t, v] for i, v in enumerate(up_intervals)]
+    data_js = json.dumps({"down": down_data, "up": up_data}, ensure_ascii=False)
+
+    detail_rows = [
+        ("服务器", f"{server}:{port}"),
+        ("单方向时长", f"{duration} s"),
+        ("下载 (到服务器)", dl_str + " Mbps" + (f" · 重传 {dl_re}" if dl_re else "")),
+        ("上传 (到服务器)", ul_str + " Mbps" + (f" · 重传 {ul_re}" if ul_re else "")),
+        ("下载备注", dl_err or "正常"),
+        ("上传备注", ul_err or "正常"),
+    ]
+    detail_html = "\n".join(
+        f"      <tr><td>{k}</td><td>{_esc_html(str(v))}</td></tr>" for k, v in detail_rows)
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetPulse iperf3 链路吞吐报告</title>
+<style>
+  body {{ font-family: "Microsoft YaHei", "Segoe UI", sans-serif; margin: 0; background: #eef2f6; color: #1c2430; }}
+  .wrap {{ max-width: 880px; margin: 0 auto; padding: 28px 20px 48px; }}
+  h1 {{ font-size: 23px; margin: 0; font-weight: 600; }}
+  h1 .dot {{ color: #0a84ff; margin-right: 6px; }}
+  .sub {{ color: #7b8794; font-size: 12.5px; margin: 6px 0 22px; }}
+  .banner {{ background: #fff7e6; border: 1px solid #ffe0a3; color: #8a5a00;
+            border-radius: 12px; padding: 12px 16px; font-size: 13px; margin-bottom: 18px; }}
+  .metric-row {{ display: flex; gap: 12px; margin-bottom: 12px; }}
+  .metric {{ flex: 1; background: #fff; border-radius: 14px; padding: 18px 20px 14px;
+             box-shadow: 0 1px 3px rgba(16,42,67,.08); border-top: 3px solid #d3dae2; }}
+  .metric .label {{ color: #7b8794; font-size: 12px; margin-bottom: 4px; }}
+  .metric .big {{ font-size: 40px; font-weight: 600; line-height: 1.12; letter-spacing: -1px; }}
+  .metric .big .unit {{ font-size: 14px; color: #7b8794; font-weight: 400; }}
+  .metric.down {{ border-top-color: #0a84ff; }} .metric.down .big {{ color: #0a84ff; }}
+  .metric.up {{ border-top-color: #ff9500; }} .metric.up .big {{ color: #ff9500; }}
+  .panel {{ background: #fff; border-radius: 14px; padding: 18px 20px; margin-bottom: 18px;
+            box-shadow: 0 1px 3px rgba(16,42,67,.08); }}
+  .panel h3 {{ margin: 0 0 14px; font-size: 15px; color: #1c2430; font-weight: 500; }}
+  canvas {{ width: 100%; height: auto; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
+  td {{ padding: 8px 10px; border-bottom: 1px solid #f0f2f5; }}
+  td:first-child {{ color: #7b8794; width: 160px; }}
+  .legend {{ font-size: 12px; color: #7b8794; margin-top: 10px; }}
+  .legend .sw {{ display: inline-block; width: 16px; height: 4px; border-radius: 2px;
+                 margin: 0 6px 2px 14px; vertical-align: middle; }}
+  .legend .sw:first-of-type {{ margin-left: 0; }}
+  .footer {{ color: #a4aeb8; font-size: 12px; text-align: center; margin-top: 28px; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span class="dot">●</span>NetPulse iperf3 链路吞吐报告</h1>
+  <div class="sub">测试时间: {ts_disp} &nbsp;·&nbsp; 到服务器 {server}:{port}</div>
+
+  <div class="banner">⚠️ iperf3 测量的是<b>到指定服务器 {server} 的链路吞吐</b>,
+    不代表互联网宽带速率。服务器在内网时数值会远高于出口宽带, 属正常现象。</div>
+
+  <div class="metric-row">
+    <div class="metric down">
+      <div class="label">下载 (到服务器)</div>
+      <div class="big">{dl_str}<span class="unit"> Mbps</span></div>
+      <div class="note">服务器 → 本机 (reverse)</div>
+    </div>
+    <div class="metric up">
+      <div class="label">上传 (到服务器)</div>
+      <div class="big">{ul_str}<span class="unit"> Mbps</span></div>
+      <div class="note">本机 → 服务器</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>吞吐速率曲线 <span class="tag">Mbps · 每秒采样</span></h3>
+    <canvas id="tpChart" width="840" height="280"></canvas>
+    <div class="legend">
+      <span class="sw" style="background:#0a84ff"></span>下载
+      <span class="sw" style="background:#ff9500"></span>上传
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>测试详情</h3>
+    <table>
+{detail_html}
+    </table>
+  </div>
+
+  <div class="footer">由 NetPulse 生成 · 链路吞吐实测数据, 不含达标判定</div>
+</div>
+
+<script>
+var DATA = {data_js};
+var multiLineChart = {_iperf3_chart_js()};
+multiLineChart("tpChart", [
+  {{data: DATA.down, color: "#0a84ff", fill: true, fillTop: "rgba(10,132,255,0.16)", fillBottom: "rgba(10,132,255,0.01)"}},
+  {{data: DATA.up, color: "#ff9500", fill: true, fillTop: "rgba(255,149,0,0.16)", fillBottom: "rgba(255,149,0,0.01)"}}
+]);
+</script>
+</body>
+</html>"""
+
+
+def _iperf3_chart_js():
+    """复用 speedtest 报告的通用折线绘图函数 (返回 JS 源码字符串)。"""
+    return """
+function(ctxId, datasets) {
+  var canvas = document.getElementById(ctxId);
+  var ctx = canvas.getContext("2d");
+  var W = canvas.width, H = canvas.height;
+  var pad = {l: 56, r: 16, t: 16, b: 30};
+  var iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+  ctx.clearRect(0, 0, W, H);
+  var all = [];
+  datasets.forEach(function(ds){ all = all.concat(ds.data); });
+  if (all.length < 2) {
+    ctx.fillStyle = "#999"; ctx.font = "13px sans-serif";
+    ctx.fillText("无有效数据", pad.l, pad.t + 20); return;
+  }
+  var xmin = all[0][0], xmax = all[all.length-1][0];
+  if (xmax === xmin) xmax = xmin + 1;
+  var ymax = 0; all.forEach(function(p){ if (p[1] > ymax) ymax = p[1]; });
+  if (ymax <= 0) ymax = 1; ymax = Math.ceil(ymax * 1.15);
+  ctx.strokeStyle = "#e8ecf1"; ctx.lineWidth = 1;
+  for (var i = 0; i <= 4; i++) {
+    var gy = pad.t + (1 - i/4) * ih;
+    ctx.beginPath(); ctx.moveTo(pad.l, gy); ctx.lineTo(W - pad.r, gy); ctx.stroke();
+    ctx.fillStyle = "#98a2af"; ctx.font = "11px sans-serif"; ctx.textAlign = "right";
+    ctx.fillText(Math.round(ymax * i / 4), pad.l - 6, gy + 4);
+  }
+  ctx.strokeStyle = "#d3dae2";
+  ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, H - pad.b);
+  ctx.lineTo(W - pad.r, H - pad.b); ctx.stroke();
+  datasets.forEach(function(ds){
+    if (ds.data.length < 2) return;
+    var pts = ds.data.map(function(p){
+      return [pad.l + (p[0]-xmin)/(xmax-xmin)*iw, pad.t + (1 - p[1]/ymax)*ih];
+    });
+    if (ds.fill) {
+      var grad = ctx.createLinearGradient(0, pad.t, 0, H - pad.b);
+      grad.addColorStop(0, ds.fillTop); grad.addColorStop(1, ds.fillBottom);
+      ctx.fillStyle = grad; ctx.beginPath(); ctx.moveTo(pts[0][0], H - pad.b);
+      pts.forEach(function(p){ ctx.lineTo(p[0], p[1]); });
+      ctx.lineTo(pts[pts.length-1][0], H - pad.b); ctx.closePath(); ctx.fill();
+    }
+    ctx.strokeStyle = ds.color; ctx.lineWidth = 2; ctx.lineJoin = "round";
+    ctx.beginPath();
+    pts.forEach(function(p, i){ if (i === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]); });
+    ctx.stroke();
+  });
+  ctx.fillStyle = "#98a2af"; ctx.font = "11px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText("0s", pad.l, H - 8);
+  ctx.fillText(Math.round(xmax) + "s", W - pad.r, H - 8);
+}"""
+
+
+def _esc_html(s):
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def save_iperf3_report(res):
+    """保存 iperf3 链路吞吐报告 (HTML + JSON), 返回 (html_path, json_path)。"""
+    try:
+        day_dir = _report_dir()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_path = os.path.join(day_dir, f"iperf3_{stamp}.json")
+        html_path = os.path.join(day_dir, f"iperf3_{stamp}.html")
+        snapshot = dict(res)
+        snapshot["report_html"] = html_path
+        snapshot["report_json"] = json_path
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2, default=str)
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(_render_iperf3_html(res))
         return html_path, json_path
     except Exception:
         return None
@@ -4923,6 +5195,46 @@ def _prompt_for_port_targets():
     return valid, proto, cnt
 
 
+def _prompt_for_iperf3():
+    """交互式询问 iperf3 服务器地址。返回 (host, port) 或 None。
+
+    iperf3 是独立模块: 测到指定服务器的链路吞吐 (非互联网宽带), 需要部署
+    iperf3 服务器 (通常在出口网关/IDC/内网)。不提供服务器则模块明确报缺服务器,
+    不会回退成宽带测速 (两者已彻底分离)。
+
+    用法: 交互菜单选 iperf3 模块, 且 CLI 未传 --iperf3-server 时调用。
+    非 TTY 场景不应调用 (调用方需先 sys.stdout.isatty() 判断)。
+    """
+    print(_c("  iperf3 链路吞吐测试: 需 iperf3 服务器 (通常部署在出口/IDC)", C_YELLOW))
+    print(_c("  提示: 没 iperf3 服务器直接回车, 该模块将提示缺少服务器", C_GRAY))
+    try:
+        ans = input(_c("  是否配置 iperf3 服务器? [y/N] > ", C_GREEN)).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if ans not in ('y', 'yes'):
+        return None
+    # 询问 server 地址
+    try:
+        spec = input(_c("  iperf3 server (HOST 或 HOST:PORT, 缺省 :5201) > ", C_GREEN)).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not spec:
+        return None
+    # 解析 host:port
+    if ':' in spec:
+        host, _, port_s = spec.rpartition(':')
+        port = int(port_s) if port_s.isdigit() else 5201
+    else:
+        host = spec
+        port = 5201
+    if not host:
+        print(_c("  ! server 为空, 已跳过 iperf3", C_YELLOW))
+        return None
+    return (host, port)
+
+
 class PortProbeTester:
     """端口连通性探测: 对每个 host:port 发起 TCP/UDP 探测 (类 tcping / udpping)。
 
@@ -5607,6 +5919,8 @@ MODULE_REGISTRY = [
     # ── 宽带测速: 带宽达标验证 (装维核心高频) ──
     ("speedtest",  "测速",          SpeedTester),
     ("bufferbloat","Bufferbloat",   BufferbloatTester),
+    # iperf3: 到指定服务器的点对点吞吐 (归类 b 宽带测速, 但测的是链路吞吐非互联网宽带)
+    ("iperf3",     "iperf3 吞吐",   Iperf3Tester),
     # ── 故障诊断: 定位故障根源 ──
     ("gateway",    "网关检测",      GatewayTester),
     ("external",   "外网检测",      ExternalNetworkTester),
@@ -5626,7 +5940,7 @@ MODULE_MAP = {k: (n, c) for k, n, c in MODULE_REGISTRY}
 MODULE_CATEGORIES = [
     ("基础信息", ["linkspeed", "dhcp", "lan", "wifi", "ipv6", "egress"],
      "环境快照 · 看清网络状态"),
-    ("宽带测速", ["speedtest", "bufferbloat"],
+    ("宽带测速", ["speedtest", "bufferbloat", "iperf3"],
      "带宽达标验证 · 装维核心高频"),
     ("故障诊断", ["gateway", "external", "dns", "arp", "loop", "tcp",
                   "port", "route", "tcpstats", "mtu"],
@@ -5676,19 +5990,18 @@ def _disp_width(s):
 def _pad_disp(s, width):
     """按显示宽度右补齐字符串到 width (用于多列对齐)。
 
-    旧版用 ASCII 空格 (1 char = 1 显示宽) 补齐, 在中英混排的 cell 上会导致
-    "字符数"和"显示宽"不成比例, _columnize 把多行拼成多列时, 不同行
-    第二个 cell 起点参差不齐 (e.g. "链路速率" 后 8 空格, "路由表" 后 10 空格
-    但显示宽一样)。改用全角空格 (U+3000, 1 char = 2 显示宽) 补齐,
-    跟汉字同比例, 字符位置与显示列一致。
+    统一用 ASCII 空格 (1 char = 1 显示宽) 补齐, 不混全角空格。
+    原因: 全角空格 (U+3000) 在等宽字体下的实际渲染宽度并不稳定 --
+    Windows Consolas 下仅约 0.37 倍 ASCII 字符宽 (远小于理论 2 倍),
+    跨终端/字体波动更大, 用它补齐会引入字宽漂移。
+    ASCII 空格在所有终端的等宽字体下严格 1:1, 复制粘贴到任意编辑器
+    (记事本/VSCode/飞书) 也保持等宽, 对齐效果稳定。
+    中英混排 cell 的"模块名"宽度差由调用方在生成 cell 时预先按显示宽 pad。
     """
     need = width - _disp_width(s)
     if need <= 0:
         return s
-    # 优先用全角空格补 (1 char = 2 disp), 剩余 1 用 ASCII 空格
-    full = need // 2
-    half = need % 2
-    return s + ("　" * full) + (" " * half)
+    return s + (" " * need)
 
 
 def _columnize(cells, columns=2, gap=3):
@@ -5880,13 +6193,16 @@ def _cli_print_result(res, verbose=False, as_json=False, key=None):
 def _print_module_list():
     """打印所有可用诊断模块 (按三大类分组展示, 序号全局连续 1-18, 双列排版)。
 
-    双列: 序号 1 2 / 3 4 / 5 6 ... 分别落在左右两列, 每列左侧对齐到该列的
-    序号起始位 (列内已 rjust(2), 所以 "1" "2" "10" 在同一列内对齐)。
-    _columnize 内部用 _pad_disp (全角空格) 按显示宽 pad, 保证两列右边界对齐
-    — 不会因为列内含中文而错位 (旧版用 ASCII 空格 pad 才会错位)。
+    与 interactive_menu 同款: 全局 nameMax (按 _disp_width) 让所有 cell
+    模块名右端对齐到同一列, 行内两 cell 起点也一致。
+    不带 (key) 段 (与 menu 一致: 防止 cmd + Consolas 字体下像素错位)。
     """
     print(_c(f"{APP_NAME} v{APP_VERSION} — 可用诊断模块:", C_BOLD))
     idx = 0
+    all_names = [MODULE_MAP[k][0]
+                 for _cat_keys in (kc[1] for kc in MODULE_CATEGORIES)
+                 for k in _cat_keys]
+    name_max_w = max((_disp_width(n) for n in all_names), default=0)
     for cat_name, keys, desc in MODULE_CATEGORIES:
         letter = MODULE_NAME_LETTER.get(cat_name, "")
         tag = _c(f"[{letter}]", C_CYAN) if letter else ""
@@ -5896,9 +6212,10 @@ def _print_module_list():
         for k in keys:
             idx += 1
             n = MODULE_MAP[k][0]
+            name_padded = n + " " * (name_max_w - _disp_width(n))
             cells.append(
                 _c(str(idx).rjust(2), C_CYAN) + ". " +
-                _c(n, C_WHITE) + " " + _c("(" + k + ")", C_GRAY))
+                _c(name_padded, C_WHITE))
         for line in _columnize(cells, columns=2, gap=4):
             print("    " + line)
     print()
@@ -6126,11 +6443,16 @@ def _module_detect_kwargs(key):
     """模块 detect() 的额外参数 (由 CLI/全局配置注入)。"""
     if key == "speedtest":
         return dict(
-            iperf3_server=SPEEDTEST_CONFIG.get("iperf3_server"),
-            iperf3_port=SPEEDTEST_CONFIG.get("iperf3_port", 5201),
             use_speedtest_net=SPEEDTEST_CONFIG.get("use_speedtest_net", False),
             node=SPEEDTEST_CONFIG.get("node"),
             live_ui=SPEEDTEST_CONFIG.get("live_ui", False),
+        )
+    if key == "iperf3":
+        return dict(
+            server=SPEEDTEST_CONFIG.get("iperf3_server"),
+            port=SPEEDTEST_CONFIG.get("iperf3_port", 5201),
+            duration=SPEEDTEST_CONFIG.get("iperf3_duration", 10),
+            save_report=True,
         )
     return {}
 
@@ -6551,7 +6873,7 @@ def _issues_wifi(res):
 def _verdict_speedtest(res):
     if "error" in res:
         # 顶层 error 时, 子模块里也可能有 error
-        for k in ("speedtest", "http", "iperf3"):
+        for k in ("speedtest", "http"):
             sub = res.get(k, {})
             if "error" in sub:
                 return f"测速失败 ({k}): {sub['error']}"
@@ -6581,6 +6903,35 @@ def _metrics_speedtest(res):
     if grade:
         lv = "ok" if grade.startswith(("A", "B")) else "warn"
         out.append(("缓冲膨胀", grade, lv))
+    return out
+
+
+def _verdict_iperf3(res):
+    if "error" in res:
+        return res.get("error", "iperf3 测试失败")
+    if not res.get("download_mbps") and not res.get("upload_mbps"):
+        return "iperf3 无有效结果"
+    return res.get("summary", "iperf3 链路吞吐")
+
+
+def _metrics_iperf3(res):
+    """iperf3 关键指标: 明确标注是到服务器的链路吞吐 (非宽带)。"""
+    out = []
+    if "error" in res:
+        return out
+    dl = res.get("download_mbps")
+    ul = res.get("upload_mbps")
+    if dl is not None:
+        out.append(("下载(到服务器)", f"{dl} Mbps", "ok"))
+    if ul is not None:
+        out.append(("上传(到服务器)", f"{ul} Mbps", "ok"))
+    if res.get("download_error"):
+        out.append(("下载", res["download_error"], "warn"))
+    if res.get("upload_error"):
+        out.append(("上传", res["upload_error"], "warn"))
+    out.append(("链路", f"{res.get('server')}:{res.get('port')}", "ok"))
+    out.append(("时长", f"{res.get('duration_s')} s", "ok"))
+    out.append(("说明", "链路吞吐非宽带", "ok"))
     return out
 
 
@@ -7179,7 +7530,10 @@ MODULE_PRESENTATION = {
                    "tech_keys": ["routes"]},
     "speedtest":  {"verdict_fn": _verdict_speedtest,  "metrics_fn": _metrics_speedtest,
                    "issues_fn": _generic_issues,
-                   "tech_keys": ["speedtest", "http", "iperf3"]},
+                   "tech_keys": ["speedtest", "http"]},
+    "iperf3":     {"verdict_fn": _verdict_iperf3,     "metrics_fn": _metrics_iperf3,
+                   "issues_fn": _generic_issues,
+                   "tech_keys": ["download_intervals_mbps", "upload_intervals_mbps"]},
     "lan":        {"verdict_fn": _verdict_lan,        "metrics_fn": _metrics_lan,
                    "issues_fn": _generic_issues,
                    "tech_keys": ["devices"]},
@@ -9332,6 +9686,12 @@ def interactive_menu(install=False, pip_mirror=None):
         print(_c(bar, C_BLUE))
         print(_c("  请选择要执行的诊断 (输入数字 / 分类 a,b,c / 模块 key):", C_WHITE))
         idx = 0
+        # 全局模块名最大显示宽, 跨分类统一 (保证所有 cell 内的模块名
+        # 右端对齐到同一显示列, 行内/行间都齐)
+        all_names = [MODULE_MAP[k][0]
+                     for _cat_keys in (kc[1] for kc in MODULE_CATEGORIES)
+                     for k in _cat_keys]
+        name_max_w_global = max((_disp_width(n) for n in all_names), default=0)
         for ci, (cat_name, keys, desc) in enumerate(MODULE_CATEGORIES):
             if ci > 0:
                 print()
@@ -9340,12 +9700,25 @@ def interactive_menu(install=False, pip_mirror=None):
             print(_c(f"  {tag} {cat_name}", C_BOLD) +
                   _c(f"  {desc}", C_GRAY))
             cells = []
+            # 模块名按显示宽 pad 到全局一致 (e.g. "链路速率" 8 宽 vs
+            # "LAN 设备扫描" 12 宽, 不 pad 会让行间左列模块名右端参差)。
+            # 用 ASCII 空格 pad: 跨终端/跨字体渲染稳定 (全角空格在
+            # Windows Consolas 下仅 0.37 倍 ASCII 宽, 不能用作 pad)。
+            #
+            # 历史上 cell 末尾还跟了 " (key)" 一段, 后因 cmd + Consolas
+            # 字体下汉字实际仅 1.629 倍 ASCII 宽 (非理论 2.0 倍), 加上
+            # key 长度参差 (3-11 字符) 后 cell 实际像素宽差异过大, pad
+            # 整数 ASCII 空格无法在 Consolas 下做到像素级行间对齐, 故
+            # 移除 (key) 段以减小 cell 宽差异 (现仅 0.06 字符位, 肉眼看不出)。
+            # 用户仍可通过序号 (1-18) 或分类字母 (a/b/c) 选模块, 不受影响。
+            name_max_w = name_max_w_global
             for k in keys:
                 idx += 1
                 n = MODULE_MAP[k][0]
+                name_padded = n + " " * (name_max_w - _disp_width(n))
                 cells.append(
                     _c(str(idx).rjust(2), C_CYAN) + ". " +
-                    _c(n, C_WHITE) + " " + _c("(" + k + ")", C_GRAY))
+                    _c(name_padded, C_WHITE))
             for line in _columnize(cells, columns=2, gap=4):
                 print("    " + line)
         print()
@@ -9399,6 +9772,19 @@ def interactive_menu(install=False, pip_mirror=None):
                 PORT_PROBE_CONFIG["targets"] = tgt
                 PORT_PROBE_CONFIG["proto"] = proto
                 PORT_PROBE_CONFIG["count"] = cnt
+        # iperf3 模块: 菜单模式运行 iperf3 时询问服务器 (默认不测, 缺服务器会明确报错)
+        # 已被 CLI --iperf3-server 预设过就不重复问
+        if "iperf3" in keys and not SPEEDTEST_CONFIG.get("iperf3_server"):
+            iperf3 = _prompt_for_iperf3()
+            if iperf3 is not None:
+                host, port = iperf3
+                SPEEDTEST_CONFIG["iperf3_server"] = host
+                SPEEDTEST_CONFIG["iperf3_port"] = port
+                print(_c(f"  → iperf3 server: {host}:{port}", C_GRAY))
+                # 提前确保 iperf3.exe 就位 (避免测速进度被 input("未找到 iperf3.exe") 打断)
+                Iperf3Tester()._find_iperf3(auto_download=True)
+            else:
+                print(_c("  → 未提供 iperf3 服务器, 该模块运行时会提示缺少服务器", C_GRAY))
         # 菜单模式: 多模块默认并发 (与 CLI `all --parallel` 对齐)。
         # run_diagnostics 内部 `parallel and len(keys) > 1` 会自动避免
         # 单模块走并发 (无意义且会浪费线程开销)。
@@ -9406,7 +9792,7 @@ def interactive_menu(install=False, pip_mirror=None):
         if sys.stdout.isatty():
             # 单独跑测速时跳过"生成综合诊断报告"询问: 测速已自动保存独立的
             # 专业测速报告 (HTML+JSON), 再问会产生冗余的 netdiag_report_*
-            if keys == ["speedtest"]:
+            if keys == ["speedtest"] or keys == ["iperf3"]:
                 print(_c("  测速报告已自动保存至 reports/ 目录 (speedtest_时间戳.html/.json)。",
                          C_GRAY))
             else:
@@ -9466,9 +9852,12 @@ def main():
                         help="pip 镜像 URL, 显式覆盖自动选源。"
                              "例: --pip-mirror https://pypi.tuna.tsinghua.edu.cn/simple")
     parser.add_argument("--iperf3-server", metavar="HOST[:PORT]",
-                        help="iperf3 服务器地址 (可选): 提供后测速模块会用 iperf3 "
-                             "测量上下行 (iperf3.exe 缺失时会交互式询问自动下载)。"
+                        help="iperf3 服务器地址: 提供后 iperf3 模块测到该服务器的上下行吞吐"
+                             "(iperf3.exe 缺失时会交互式询问自动下载)。这是独立模块, "
+                             "与互联网宽带测速 (speedtest) 分开, 测的是链路吞吐而非宽带。"
                              "例: 192.168.1.10 或 192.168.1.10:5201")
+    parser.add_argument("--iperf3-duration", type=int, default=10, metavar="SEC",
+                        help="iperf3 单方向测速时长 (秒, 默认 10)")
     parser.add_argument("--speedtest-net", action="store_true",
                         help="启用 Speedtest.net 测速 (默认关闭: 国内网络下常选中"
                              "海外服务器, 结果严重偏低, 仅作参考)")
@@ -9511,6 +9900,7 @@ def main():
             SPEEDTEST_CONFIG["iperf3_server"] = spec
     SPEEDTEST_CONFIG["use_speedtest_net"] = bool(args.speedtest_net)
     SPEEDTEST_CONFIG["node"] = getattr(args, "speedtest_node", None) or None
+    SPEEDTEST_CONFIG["iperf3_duration"] = max(1, int(getattr(args, "iperf3_duration", 10)))
 
     if args.list:
         _print_module_list()

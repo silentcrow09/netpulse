@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 18 项诊断模块 · v1.0.0
+> 单文件 Windows 网络诊断命令行工具 · 内置 19 项诊断模块 · v1.0.0
 
 NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `netpulse.py` 文件即可运行**（核心功能仅依赖 Python 标准库），覆盖局域网、网关、DNS、外网、WiFi、测速、TCP、路由等常见排障场景，并可将结果导出为 HTML / PDF / TXT 报告。
 
@@ -10,6 +10,8 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 - **18 个诊断模块**：从局域网设备扫描到 TCP 传输质量，覆盖端到端排障链路。
 - **宽带测速 = 带宽体检**：上下行测速 + 预估宽带 + Bufferbloat 评级一体化；
   上行用内置国内运营商节点（电信/联通/移动官方测速服务器），零第三方依赖。
+- **iperf3 链路吞吐（独立模块）**：`iperf3` 模块测量到指定服务器的点对点上下行吞吐
+  （需自建 iperf3 服务器），与互联网宽带测速完全分开，报告明确标注"链路吞吐非宽带"。
 - **测速实时可视化**：单独测速时终端实时刷新速率/进度，结束自动生成独立测速报告。
 - **原生 UDP DNS 探测**：自构造 DNS 报文，并行查询多家国内 DNS，速度快、无需 `nslookup` 进程。
 - **双运行模式**：交互式菜单（适合新手）+ 命令行参数（适合脚本/自动化）。
@@ -73,6 +75,11 @@ python netpulse.py speedtest --speedtest-node 112.25.80.50:8080
 # 启用 Speedtest.net 参考测速 (可选, 国内常选海外服务器, 结果仅供参考)
 python netpulse.py speedtest --speedtest-net
 
+# iperf3 链路吞吐测试 (独立模块): 测到指定服务器的上下行吞吐, 非互联网宽带
+python netpulse.py iperf3 --iperf3-server 192.168.1.10:5201
+python netpulse.py iperf3 --iperf3-server 10.0.0.1 --iperf3-duration 15   # 单方向 15s
+# 缺 iperf3.exe 时会询问自动下载; 服务器不可达时明确报"双向均失败"并给出排查提示
+
 # 禁用 scapy 二层抓包 (Npcap 不稳定导致崩溃时使用, DHCP 降级)
 python netpulse.py dhcp --no-scapy
 
@@ -97,12 +104,13 @@ python netpulse.py --install
 | `--port-proto` | 端口探测协议：`tcp`（默认）/ `udp` / `both` |
 | `--port-count` | 每个目标采样次数（默认 4） |
 | `--port-force` | 强制执行端口探测（即使展开后目标数超过 1000 上限） |
-| `--iperf3-server` | iperf3 服务器地址 (可选): 提供后测速模块改用 iperf3 测上下行 (iperf3.exe 缺失时会交互式询问自动下载) |
+| `--iperf3-server` | iperf3 服务器地址 (iperf3 独立模块必填): 测到该服务器的上下行吞吐 (iperf3.exe 缺失时会交互式询问自动下载)。例: `192.168.1.10` 或 `192.168.1.10:5201` |
+| `--iperf3-duration` | iperf3 单方向测速时长秒数 (默认 10) |
 | `--speedtest-node` | 指定上行测速服务器 (可选): speedtest 服务器 host:port (如 112.25.80.50:8080); 默认自动选延迟最低的国内运营商节点 |
 | `--speedtest-net` | 启用 Speedtest.net 参考测速 (默认关闭: 国内网络下常选中海外服务器, 结果严重偏低) |
 | `--export` | 诊断后导出报告，逗号分隔多格式（`report.pdf,report.html`） |
 
-## 📋 诊断模块（18 项）
+## 📋 诊断模块（19 项）
 
 > 按装维工作流分三大类，菜单 / CLI 均可用分类字母快捷运行：**a=基础信息、b=宽带测速、c=故障诊断**。
 
@@ -124,8 +132,9 @@ python netpulse.py --install
 | 14 | `ipv6` | IPv6 检测 | IPv6 地址 / 路由 / 连通性 / DNS 全面检测 |
 | 15 | `route` | 路由表 | 路由环路检测、异常路由、网关子网验证 |
 | 16 | `speedtest` | 测速 | 带宽体检: 上下行测速 + 预估宽带 + Bufferbloat 评级 (上行用内置国内运营商节点, 零依赖) |
-| 17 | `lan` | LAN 设备扫描 | `arp -a` 发现局域网设备，结合 MAC OUI 识别厂商 |
-| 18 | `tcpstats` | TCP 传输质量 | 解析 `netstat -s` 重传率、错误段、连接失败数 |
+| 17 | `iperf3` | iperf3 吞吐 | 到指定 iperf3 服务器的点对点上下行吞吐 (链路吞吐非宽带, 需 `--iperf3-server`) |
+| 18 | `lan` | LAN 设备扫描 | `arp -a` 发现局域网设备，结合 MAC OUI 识别厂商 |
+| 19 | `tcpstats` | TCP 传输质量 | 解析 `netstat -s` 重传率、错误段、连接失败数 |
 
 ## 🔌 端口探测 `--port-target` 语法
 
@@ -208,9 +217,10 @@ build_exe.bat
 > 若需 DHCP 完整检测，目标机需安装 [Npcap](https://npcap.com/)（勾选 WinPcap API 兼容模式）；
 > 默认测速 = 带宽体检：下行（国内镜像多连接）+ 上行（内置国内运营商节点）+ 预估宽带 +
 > Bufferbloat 评级，全程零第三方依赖。
-> 若需 iperf3 测速（更准的上下行，需自建服务器），用 `--iperf3-server HOST[:PORT]` 指定，
-> 缺少 `iperf3.exe` 时程序会询问是否自动下载（或手动放到 EXE 同目录）；
-> `--speedtest-net` 可开启 Speedtest.net 作参考（国内网络下常选中海外服务器，结果会严重偏低并给出提示）。
+> iperf3 是独立模块（`netpulse.py iperf3 --iperf3-server HOST[:PORT]`）：测到指定服务器的
+> 链路吞吐（非互联网宽带），需自建 iperf3 服务器；缺少 `iperf3.exe` 时程序会询问是否自动下载
+> （或手动放到 EXE 同目录）。`--speedtest-net` 可开启 Speedtest.net 作参考（国内网络下常选中
+> 海外服务器，结果会严重偏低并给出提示）。
 
 ## 🚀 一键分发部署
 
