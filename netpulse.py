@@ -4,22 +4,11 @@
 NetPulse - Windows 网络诊断工具
 单文件便携版 v1.0.0
 
-功能模块:
-  1.  局域网 DHCP 多服务器干扰检测
-  2.  内网网关延迟 / 丢包检测
-  3.  内网环路检测
-  4.  外网延迟 / 路径 / 丢包检测
-  5.  有线 / WiFi 协商速率检测
-  6.  WiFi 干扰分析
-  7.  互联网宽带测速 (Speedtest, 国内镜像 + 国内节点)
-  8.  TCP 连接数探测
-  9.  多外网出口检测
-  10. DNS 解析诊断 (补充)
-  11. MTU 路径发现 (补充)
-  12. ARP 表分析 / 欺骗检测 (补充)
-  13. Bufferbloat 负载延迟检测 (补充)
-  14. IPv6 连通性检测 (补充)
-  15. 路由表异常分析 (补充)
+功能模块 (23 项, 序号与 --list 一致):
+  基础信息:  链路速率 / DHCP / LAN 扫描 / WiFi / IPv6 / 多出口
+  宽带测速:  测速 / Bufferbloat / iperf3 吞吐 / TCP 并发 (NAT 表上限压测)
+  故障诊断:  网关 / 外网 / DNS / 网页体检 (L7 分段) / ARP / 环路 / TCP 连接 /
+             端口探测 / 路由表 / TCP 传输质量 / MTU / 代理检测 / NAT 类型 (STUN)
 """
 
 # ============================================================
@@ -46,7 +35,10 @@ from datetime import datetime
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.request import urlopen, Request
+from urllib.parse import urlsplit, urlunsplit, urljoin
 import http.client
+import ssl
+import asyncio
 import webbrowser
 
 # 可选依赖 — 缺失时自动降级
@@ -103,6 +95,18 @@ SPEEDTEST_CONFIG = {"iperf3_server": None, "iperf3_port": 5201, "iperf3_duration
                     "use_speedtest_net": False,
                     "node": None, "duration_down": 8.0, "duration_up": 8.0,
                     "live_ui": False}
+
+# NAT 类型模块的运行参数 (由 CLI --nattype-server 写入, runner 读取)
+# 为空时用内置候选 (实测可用的排前), 给 1~2 台则覆盖
+NATTYPE_CONFIG = {"servers": []}
+
+# 网页体检模块的运行参数 (由 CLI --web-target 写入, 追加到默认 3 目标后)
+WEB_CONFIG = {"targets": []}
+
+# TCP 并发模块的运行参数 (由 CLI --tcpcc-max / --tcpcc-target 写入)
+# - max: 阶梯上限 (默认 1600, 硬上限 8000; Windows 临时端口 ~16k, 高上限勿短时重复跑)
+# - target: 自定义目标 host:port (默认自动挑公网 anycast DNS 的 TCP 53)
+TCPCC_CONFIG = {"max": 1600, "target": None}
 
 
 def _is_admin():
@@ -771,11 +775,25 @@ class LatencyMonitor:
 
     用 ``ping -t`` 流式输出 (Windows), 每个样本约 1s 间隔。测速的
     bufferbloat 联动: 空闲基线 → 下行负载 → 上行负载 各取一段样本。
+    盯障模式 (MonitorSession) 复用本类并额外消费丢包流 (_loss_events)。
+
+    历史坑: 中文 Windows 的 ping 输出是 "字节=32 时间=25ms" (GBK), 不含
+    ASCII "time" — 旧正则在中文系统上从未采到过样本 (bufferbloat 静默
+    降级为 —)。parse_ping_output 早就是双语的, 这里补齐。
     """
+
+    # 超时/失败行 (双语): 盯障模式的丢包判定就靠这些
+    _LOSS_RE = re.compile(
+        r"请求超时|timed out|无法访问|unreachable|一般故障|general failure|"
+        r"传输失败|transmit failed|找不到主机|could not find host", re.I)
 
     def __init__(self, target):
         self.target = target
-        self._samples = []          # [(timestamp, rtt_ms)]
+        self._samples = []          # [(timestamp, rtt_ms)] 仅成功样本
+        self._loss_events = []      # [timestamp] 丢包/超时时刻 (独立存放,
+                                    #  不进 _samples — median_rtt/series_since
+                                    #  的调用方 (测速) 假设样本全是数值)
+        self._last_line_ts = None   # 最近一行输出时间 (ping 卡死/睡眠检测)
         self._lock = threading.Lock()
         self._proc = None
         self._thread = None
@@ -799,14 +817,19 @@ class LatencyMonitor:
             for line in self._proc.stdout:
                 if self._stop.is_set():
                     break
-                m = re.search(r"time[=<\s]+([\d.]+)\s*ms", line, re.I)
+                now = time.time()
+                self._last_line_ts = now
+                m = re.search(r"(?:time|时间)[=<]\s*([\d.]+)\s*ms", line, re.I)
                 if m:
                     try:
                         rtt = float(m.group(1))
                     except ValueError:
                         continue
                     with self._lock:
-                        self._samples.append((time.time(), rtt))
+                        self._samples.append((now, rtt))
+                elif self._LOSS_RE.search(line):
+                    with self._lock:
+                        self._loss_events.append(now)
         except Exception:
             pass
 
@@ -836,6 +859,33 @@ class LatencyMonitor:
         with self._lock:
             return [(round(s[0] - since, 1), s[1])
                     for s in self._samples if s[0] >= since]
+
+    # ── 盯障模式新增的只读访问器 (测速路径不使用) ──
+    def losses_since(self, since=None):
+        """返回自 since 以来的丢包时刻列表 [timestamp]。"""
+        with self._lock:
+            return [t for t in self._loss_events if since is None or t >= since]
+
+    def stream_since(self, since=None):
+        """返回归并排序的完整流 [("ok", t, rtt) | ("loss", t, None)]。
+
+        事件检测用: 成功与丢包按时间交织, 才能判定"连续丢包段"与恢复时刻。
+        """
+        with self._lock:
+            merged = ([("ok", s[0], s[1]) for s in self._samples
+                       if since is None or s[0] >= since]
+                      + [("loss", t, None) for t in self._loss_events
+                         if since is None or t >= since])
+        merged.sort(key=lambda x: x[1])
+        return merged
+
+    def alive(self):
+        """ping 进程是否仍在运行。"""
+        return bool(self._proc) and self._proc.poll() is None
+
+    def last_line_age(self):
+        """距最近一行输出的秒数; 从无输出返回 None (ping 卡死/系统睡眠检测)。"""
+        return None if self._last_line_ts is None else time.time() - self._last_line_ts
 
     def stop(self):
         self._stop.set()
@@ -2646,6 +2696,38 @@ class LinkSpeedDetector:
 
             adapter_details.append(detail)
 
+        # 网卡收发错误/丢弃计数 (Get-NetAdapterStatistics, 自开机累计):
+        # 网线质量差/接口接触不良的硬证据 — 速率协商正常但错误持续增长
+        total_errors = total_discarded = 0
+        stats_by_name = {}
+        code, stats_out, _ = run_ps(
+            "Get-NetAdapterStatistics | Select-Object Name, "
+            "ReceivedPacketErrors, SentPacketErrors, "
+            "ReceivedDiscardedPackets, SentDiscardedPackets | ConvertTo-Json")
+        if stats_out and stats_out.strip():
+            try:
+                sdata = json.loads(stats_out)
+                if not isinstance(sdata, list):
+                    sdata = [sdata]
+                for item in sdata:
+                    if isinstance(item, dict) and item.get("Name"):
+                        stats_by_name[item["Name"]] = {
+                            "rx_errors": int(item.get("ReceivedPacketErrors") or 0),
+                            "tx_errors": int(item.get("SentPacketErrors") or 0),
+                            "rx_discarded": int(item.get("ReceivedDiscardedPackets") or 0),
+                            "tx_discarded": int(item.get("SentDiscardedPackets") or 0),
+                        }
+            except Exception:
+                pass                       # 无该 cmdlet / 解析失败 → 静默跳过, 不影响主功能
+        for d in adapter_details:
+            st = stats_by_name.get(d["name"])
+            if not st:
+                continue
+            d.update(st)
+            if d["status"] in ("Up", "已启用"):
+                total_errors += st["rx_errors"] + st["tx_errors"]
+                total_discarded += st["rx_discarded"] + st["tx_discarded"]
+
         # 收集需要被 status 检测器识别的告警 (determine_status 只看 result.issues 和
         # result.assessment, 不会下钻到 adapters[].assessment, 因此极低速/异常需要
         # 显式提升到顶层 issues 才能触发"警告/异常"状态)
@@ -2668,14 +2750,26 @@ class LinkSpeedDetector:
                     "message": f"有线适配器 {d['name']} 协商速率仅 {d.get('speed_mbps', 0):.1f} Mbps",
                     "detail": "有线协商到非千兆可能是网线/端口/驱动降速, 建议检查网线类别 (千兆需 Cat5e+) 与端口",
                 })
+            if (d.get("rx_errors", 0) + d.get("tx_errors", 0)) > 0:
+                issues.append({
+                    "type": "nic_errors",
+                    "severity": "warning",
+                    "message": (f"网卡 {d['name']} 收发错误 {d['rx_errors'] + d['tx_errors']} 个"
+                                f" (自开机累计)"),
+                    "detail": "错误计数是网线质量差/接口接触不良/驱动异常的硬证据, "
+                              "速率协商正常但错误持续增长同样影响传输",
+                })
 
         self.results = {
             "adapters": adapter_details,
             "wifi_details": wifi_details,
             "wifi_interfaces": wifi_interfaces,
+            "nic_errors": {"total_errors": total_errors,
+                           "total_discarded": total_discarded},
             "issues": issues,
             "timestamp": datetime.now().isoformat(),
             "summary": f"检测到 {len(adapter_details)} 个网络适配器" +
+                       (f", 网卡错误 {total_errors}" if total_errors else "") +
                        (f", WiFi 信号: {wifi_details.get('signal_pct', 'N/A')}"
                         f" ({wifi_details.get('signal_quality', 'N/A')})"
                         if wifi_details else ""),
@@ -3273,26 +3367,34 @@ class Iperf3Tester:
         return None
 
     # ── 解析单方向 iperf3 JSON 输出 ──
-    def _parse_iperf3_json(self, output, direction):
+    def _parse_iperf3_json(self, output, direction, udp=False):
         """解析 iperf3 JSON 输出 (direction: 'download' 取 sum_received / 'upload' 取 sum_sent)。
 
         修复旧版 bug: 旧 SpeedTester.test_iperf3 内部算出了 intervals_mbps 但返回值里
         没带上, 导致报告上行曲线为空。这里直接按方向返回 bitrate/retransmits/时序。
+        UDP 模式 (--iperf3-udp): end.sum 直接含 jitter_ms/lost_percent (TCP 无这两项);
+        1 Mbps 固定发包率下速率无意义, 重点是抖动/丢包质量指标。
         """
         if not output or not output.strip():
             return {"error": "iperf3 无输出 (服务器不可达? 防火墙拦截?)"}
         try:
             data = json.loads(output)
             end = data.get("end", {})
-            if direction == "download":
+            if udp:
+                rate_block = end.get("sum", {}) or {}
+            elif direction == "download":
                 rate_block = end.get("sum_received", end.get("sum", {}))
             else:
                 rate_block = end.get("sum_sent", end.get("sum", {}))
             bits = (rate_block or {}).get("bits_per_second", 0)
             result = {"bitrate_mbps": round(bits / 1e6, 2)}
-            # 重传永远看 sum_sent (发送方才有重传); 下载方向客户端几乎不重传 → 近 0 属正常
-            sent = end.get("sum_sent", {})
-            result["retransmits"] = (sent or {}).get("retransmits", 0)
+            if udp:
+                result["jitter_ms"] = round(rate_block.get("jitter_ms") or 0, 2)
+                result["loss_pct"] = round(rate_block.get("lost_percent") or 0, 2)
+            else:
+                # 重传永远看 sum_sent (发送方才有重传); 下载方向客户端几乎不重传 → 近 0 属正常
+                sent = end.get("sum_sent", {})
+                result["retransmits"] = (sent or {}).get("retransmits", 0)
             intervals = data.get("intervals") or []
             series = []
             for iv in intervals:
@@ -3315,22 +3417,28 @@ class Iperf3Tester:
                 return {"bitrate_mbps": round(val, 2)}
             return {"error": "iperf3 输出无法解析"}
 
-    def _run_one_direction(self, iperf3_path, server, port, duration, reverse, callback):
+    def _run_one_direction(self, iperf3_path, server, port, duration, reverse,
+                           callback, udp=False):
         label = "下载" if reverse else "上传"
+        mode = "UDP 抖动/丢包" if udp else "吞吐"
         if callback:
-            callback(f"iperf3 {label}测速 (到 {server}:{port}, {duration}s)...")
+            callback(f"iperf3 {label}测速 ({mode}, 到 {server}:{port}, {duration}s)...")
         cmd = f'"{iperf3_path}" -c {server} -p {port} -t {duration}'
         if reverse:
             cmd += " -R"
+        if udp:
+            # 1 Mbps 固定发包率: 测质量 (抖动/丢包) 不测吞吐, 不打满链路
+            cmd += " -u -b 1M"
         cmd += " -J"
         _, out, err = run_cmd(cmd, timeout=duration + 15)
-        parsed = self._parse_iperf3_json(out, "download" if reverse else "upload")
+        parsed = self._parse_iperf3_json(out, "download" if reverse else "upload",
+                                         udp=udp)
         if "error" in parsed and err and err.strip():
             parsed["stderr"] = err.strip().split("\n")[-1][:200]
         return parsed
 
     def detect(self, server=None, port=5201, duration=10,
-               callback=None, save_report=True):
+               callback=None, save_report=True, udp=False):
         """iperf3 点对点吞吐测试主流程。
 
         server: iperf3 服务器地址 (必填, 由 CLI --iperf3-server 或菜单输入提供)。
@@ -3353,8 +3461,10 @@ class Iperf3Tester:
             self.results = res
             return res
 
-        down = self._run_one_direction(iperf3_path, server, port, duration, True, callback)
-        up = self._run_one_direction(iperf3_path, server, port, duration, False, callback)
+        down = self._run_one_direction(iperf3_path, server, port, duration, True,
+                                       callback, udp=udp)
+        up = self._run_one_direction(iperf3_path, server, port, duration, False,
+                                     callback, udp=udp)
 
         # 双方向都失败 → 整体失败 (否则会把 0/0 当成功结果)
         if "error" in down and "error" in up:
@@ -3375,16 +3485,29 @@ class Iperf3Tester:
 
         dl = down.get("bitrate_mbps") if "error" not in down else None
         ul = up.get("bitrate_mbps") if "error" not in up else None
-        summary = (f"iperf3 链路吞吐 (到 {server}:{port}): "
-                   f"↓{format_speed(dl) if dl is not None else '失败'}, "
-                   f"↑{format_speed(ul) if ul is not None else '失败'}")
+        if udp:
+            summary = (f"iperf3 UDP 质量 (到 {server}:{port}): "
+                       + " / ".join(filter(None, [
+                           f"↓抖动 {down['jitter_ms']}ms 丢包 {down['loss_pct']}%"
+                           if "error" not in down else None,
+                           f"↑抖动 {up['jitter_ms']}ms 丢包 {up['loss_pct']}%"
+                           if "error" not in up else None]) or ["双向失败"]))
+        else:
+            summary = (f"iperf3 链路吞吐 (到 {server}:{port}): "
+                       f"↓{format_speed(dl) if dl is not None else '失败'}, "
+                       f"↑{format_speed(ul) if ul is not None else '失败'}")
         results = {
             "method": "iperf3",
             "server": server,
             "port": port,
             "duration_s": duration,
+            "udp": bool(udp),
             "download_mbps": dl,
             "upload_mbps": ul,
+            "download_jitter_ms": down.get("jitter_ms") if "error" not in down else None,
+            "download_loss_pct": down.get("loss_pct") if "error" not in down else None,
+            "upload_jitter_ms": up.get("jitter_ms") if "error" not in up else None,
+            "upload_loss_pct": up.get("loss_pct") if "error" not in up else None,
             "download_retransmits": down.get("retransmits", 0) if "error" not in down else None,
             "upload_retransmits": up.get("retransmits", 0) if "error" not in up else None,
             "download_intervals_mbps": down.get("intervals_mbps"),
@@ -5904,6 +6027,2002 @@ class TCPStatsTester:
 
 
 # ============================================================
+# SECTION 4c: 新增诊断模块 (proxy / nattype / web / tcpcc)
+# ============================================================
+
+class ProxyDetector:
+    """系统代理 / 加速器残留检测。
+
+    四个来源全清点: WinINET 注册表 (浏览器/系统代理)、WinHTTP (系统服务层)、
+    环境变量 (命令行程序)、VPN/TAP 虚拟网卡。对已启用的代理再做
+    "可达性 + 转发能力" 探测 — "代理挂着但服务器没了" 是
+    '能连 WiFi 但打不开网页' 的高频根因。
+    """
+
+    PROBE_HOST = "www.baidu.com"   # 经代理转发 / 直连对照的探测目标
+
+    def __init__(self):
+        self.name = "代理检测"
+        self.results = {}
+
+    # ── 来源 1: WinINET (HKCU Internet Settings, 浏览器/系统代理) ──
+    def _read_wininet(self):
+        out = {}
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+            try:
+                for reg_name, field in (("ProxyEnable", "proxy_enable"),
+                                        ("ProxyServer", "proxy_server_raw"),
+                                        ("ProxyOverride", "proxy_override"),
+                                        ("AutoConfigURL", "auto_config_url")):
+                    try:
+                        out[field] = winreg.QueryValueEx(key, reg_name)[0]
+                    except FileNotFoundError:
+                        pass
+            finally:
+                key.Close()
+        except Exception as e:
+            out["read_error"] = str(e)
+            return out
+        # ProxyServer 两种格式都解析:
+        #   "host:port" (全部协议同代理) / "http=a:80; https=b:443; socks=c:1080"
+        raw = str(out.get("proxy_server_raw") or "")
+        server, endpoint = {}, None
+        if raw:
+            if "=" in raw:
+                for part in raw.split(";"):
+                    k, _, v = part.partition("=")
+                    k, v = k.strip().lower(), v.strip()
+                    if k and v:
+                        server[k] = v
+            else:
+                server = {"http": raw, "https": raw, "ftp": raw, "socks": raw}
+            endpoint = server.get("http") or server.get("https") or raw
+        out["proxy_server"] = server
+        out["proxy_endpoint"] = endpoint
+        return out
+
+    # ── 来源 2: WinHTTP (系统服务层代理, netsh 查看) ──
+    def _read_winhttp(self):
+        out = {}
+        code, raw, _ = run_cmd("netsh winhttp show proxy", timeout=10)
+        out["raw"] = (raw or "").strip()
+        text = out["raw"]
+        if not text:
+            out["summary"] = "无法读取"
+        elif re.search(r"直接访问|Direct access", text):
+            out["summary"] = "直接访问 (无代理)"
+        else:
+            m = re.search(r"代理服务器|Proxy Server\(s\)\s*[:：]\s*(.+)", text)
+            out["summary"] = (f"代理: {m.group(1).strip()}" if m
+                              else "已配置 (见原始输出)")
+            b = re.search(r"绕过|Bypass[^\n]*[:：]\s*(.+)", text)
+            if b:
+                out["bypass"] = b.group(1).strip()
+        return out
+
+    # ── 来源 3: 环境变量 (只影响命令行程序, 不影响浏览器) ──
+    def _read_env(self):
+        found = {}
+        for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                  "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+            v = os.environ.get(k)
+            if v:
+                found[k] = v
+        return found
+
+    # ── 来源 4: VPN / TAP 虚拟网卡 (加速器/企业 VPN 常驻) ──
+    def _read_vpn_adapters(self):
+        vpns = []
+        for a in get_network_adapters():
+            if str(a.get("status", "")).lower() not in ("up", ""):
+                continue
+            name, desc = a.get("name", ""), a.get("description", "")
+            if _is_vpn_interface(name) or _is_vpn_interface(desc):
+                vpns.append({"name": name, "description": desc,
+                             "status": a.get("status", "")})
+        return vpns
+
+    # ── 来源 5: hosts 文件劫持检测 ──
+    # 知名域名出现在 hosts 里本身就是异常 (正常用户不需要手写);
+    # 指向私网/回环 = 明确劫持或屏蔽 (广告/钓鱼/家长控制残留);
+    # 指向公网 = 可疑覆盖, 需人工确认。
+    KNOWN_DOMAINS = frozenset((
+        "baidu.com", "www.baidu.com", "qq.com", "www.qq.com",
+        "weixin.qq.com", "wx.qq.com", "mail.qq.com",
+        "taobao.com", "www.taobao.com", "tmall.com", "alipay.com",
+        "jd.com", "www.jd.com", "weibo.com", "www.weibo.com",
+        "bilibili.com", "www.bilibili.com", "163.com", "www.163.com",
+        "zhihu.com", "www.zhihu.com", "douyin.com", "www.douyin.com",
+        "12306.cn", "www.12306.cn", "icloud.com", "www.icloud.com",
+    ))
+
+    def _read_hosts(self):
+        out = {"total_entries": 0, "hijacked": [], "suspicious": []}
+        path = os.path.join(os.environ.get("SYSTEMROOT", r"C:\Windows"),
+                            r"System32\drivers\etc\hosts")
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except Exception as e:
+            out["error"] = f"读取失败: {e}"[:60]
+            return out
+        for line in lines:
+            line = line.split("#", 1)[0].strip()      # 去注释
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            ip, hosts = parts[0], [h.lower().rstrip(".") for h in parts[1:]]
+            out["total_entries"] += 1
+            for h in hosts:
+                if h not in self.KNOWN_DOMAINS:
+                    continue
+                try:
+                    addr = ipaddress.ip_address(ip)
+                    bad = addr.is_private or addr.is_loopback
+                except ValueError:
+                    bad = True                # 不是合法 IP 的映射更可疑
+                entry = {"domain": h, "ip": ip}
+                (out["hijacked"] if bad else out["suspicious"]).append(entry)
+        return out
+
+    # ── 代理可用性探测: TCP 可达 + 经代理转发 + 直连对照 ──
+    def _probe(self, endpoint):
+        res = {"performed": True, "proxy_endpoint": endpoint}
+        res["tcp_ms"] = _tcping_ms(endpoint, timeout=3.0)
+        res["tcp_ok"] = res["tcp_ms"] is not None
+        host, _, port = endpoint.rpartition(":")
+        if not port.isdigit():
+            host, port = endpoint, "80"
+        # 经代理转发: HTTP 代理对绝对 URI 的 GET (200/3xx 均算通)
+        try:
+            t0 = time.perf_counter()
+            conn = http.client.HTTPConnection(host, int(port), timeout=8)
+            conn.request("GET", f"http://{self.PROBE_HOST}/",
+                         headers={"User-Agent": "NetPulse/1.0",
+                                  "Host": self.PROBE_HOST})
+            resp = conn.getresponse()
+            resp.read(4096)
+            res["via_proxy_status"] = resp.status
+            res["via_proxy_ms"] = round((time.perf_counter() - t0) * 1000)
+            conn.close()
+        except Exception as e:
+            res["via_proxy_status"] = None
+            res["via_proxy_error"] = str(e)[:80]
+        res["via_proxy_ok"] = res.get("via_proxy_status") in (200, 301, 302, 303, 307, 308)
+        # 直连对照
+        try:
+            t0 = time.perf_counter()
+            conn = http.client.HTTPConnection(self.PROBE_HOST, 80, timeout=8)
+            conn.request("GET", "/", headers={"User-Agent": "NetPulse/1.0"})
+            resp = conn.getresponse()
+            resp.read(4096)
+            res["direct_status"] = resp.status
+            res["direct_ms"] = round((time.perf_counter() - t0) * 1000)
+            conn.close()
+        except Exception as e:
+            res["direct_status"] = None
+            res["direct_error"] = str(e)[:80]
+        res["direct_ok"] = res.get("direct_status") in (200, 301, 302, 303, 307, 308)
+        return res
+
+    def _probe_pac(self, url):
+        try:
+            with _urlopen_with_proxy(url, timeout=4) as resp:
+                resp.read(1024)
+            return True
+        except Exception:
+            return False
+
+    def detect(self, callback=None):
+        if callback:
+            callback("读取系统代理配置...")
+        wininet = self._read_wininet()
+        winhttp = self._read_winhttp()
+        env = self._read_env()
+        if callback:
+            callback("检查 VPN/虚拟网卡...")
+        vpns = self._read_vpn_adapters()
+
+        wininet_on = bool(wininet.get("proxy_enable")) and wininet.get("proxy_endpoint")
+        env_ep = None
+        for k in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+                  "HTTPS_PROXY", "https_proxy"):
+            v = env.get(k)
+            if v:
+                env_ep = v.split("://", 1)[-1].rstrip("/")
+                break
+        endpoint = wininet.get("proxy_endpoint") if wininet_on else env_ep
+        if callback:
+            callback("检查 hosts 文件...")
+        hosts_check = self._read_hosts()
+
+        probe = None
+        if endpoint:
+            if callback:
+                callback(f"探测代理可用性 {endpoint} ...")
+            probe = self._probe(endpoint)
+        pac_url = wininet.get("auto_config_url")
+        pac_reachable = self._probe_pac(pac_url) if pac_url else None
+
+        # 探测结论 (判定矩阵见 _verdict_proxy 的注释)
+        if probe:
+            if not probe["tcp_ok"]:
+                verdict = "unreachable"      # 代理服务器都没了
+            elif not probe["via_proxy_ok"] and probe["direct_ok"]:
+                verdict = "no_forward"       # 代理在但不转发
+            elif probe["via_proxy_ok"] and probe["direct_ok"]:
+                verdict = "ok_both"          # 双通, 代理正常
+            elif probe["via_proxy_ok"]:
+                verdict = "only_proxy"       # 只能经代理上网
+            else:
+                verdict = "both_fail"        # 双败 = 上游链路问题, 非代理本身
+        elif pac_url:
+            verdict = "pac"
+        else:
+            verdict = "none"
+
+        # issues (detect 侧存结构化记录, 客户视图文案在 _issues_proxy)
+        issues = []
+        if verdict == "unreachable":
+            assessment = "代理不可用(异常)"
+            issues.append({"type": "proxy_unreachable", "severity": "critical",
+                           "message": f"系统代理已开启但代理服务器 {endpoint} 不可达",
+                           "detail": "疑似断网根因: 浏览器/走系统代理的应用会全部断网"})
+        elif verdict == "no_forward":
+            assessment = "代理不可用(异常)"
+            issues.append({"type": "proxy_no_forward", "severity": "critical",
+                           "message": f"代理 {endpoint} 可达但拒绝转发请求",
+                           "detail": "疑似断网根因: 代理进程异常或认证失效"})
+        elif verdict == "only_proxy":
+            assessment = "仅能经代理上网"
+            issues.append({"type": "proxy_only_path", "severity": "warning",
+                           "message": "仅能经代理上网 (直连失败)",
+                           "detail": "关闭代理会断网, 排障时勿直接关代理"})
+        elif verdict == "both_fail":
+            assessment = "代理与直连均失败"
+            issues.append({"type": "upstream_down", "severity": "warning",
+                           "message": "经代理与直连均失败",
+                           "detail": "上游链路问题, 非代理本身"})
+        elif verdict in ("ok_both", "pac"):
+            assessment = "代理可用" if verdict == "ok_both" else "PAC 自动配置模式"
+        else:
+            assessment = "无代理直连环境"
+        if vpns:
+            issues.append({"type": "vpn_adapter", "severity": "warning",
+                           "message": f"检测到 {len(vpns)} 块 VPN/虚拟网卡 "
+                                      f"({', '.join(v['name'] for v in vpns)})",
+                           "detail": "流量可能经 VPN 隧道, 各模块测得的是隧道链路而非物理宽带"})
+        if pac_url:
+            reach = "可达" if pac_reachable else "不可达"
+            issues.append({"type": "pac", "severity": "info",
+                           "message": f"检测到 PAC 自动配置 ({pac_url}, {reach})",
+                           "detail": "PAC 脚本决定分流, 注册表静态值不代表实际代理"})
+        if env:
+            issues.append({"type": "env_proxy", "severity": "info",
+                           "message": "环境变量代理: " + ", ".join(f"{k}={v}" for k, v in env.items()),
+                           "detail": "仅影响命令行程序 (curl/pip 等), 不影响浏览器"})
+        for e in hosts_check.get("hijacked", []):
+            issues.append({"type": "hosts_hijack", "severity": "critical",
+                           "message": f"hosts 劫持: {e['domain']} → {e['ip']} (私网/回环地址)",
+                           "detail": "浏览器访问该域名会被导向内网或黑洞 — "
+                                     "'网页打不开/被导向错误页面'的直接根因"})
+        for e in hosts_check.get("suspicious", []):
+            issues.append({"type": "hosts_suspicious", "severity": "warning",
+                           "message": f"hosts 可疑覆盖: {e['domain']} → {e['ip']}",
+                           "detail": "正常使用不需要在 hosts 里写知名域名, 疑似软件/人为篡改"})
+        total_hosts = hosts_check.get("total_entries", 0)
+        if total_hosts > 30:
+            issues.append({"type": "hosts_bulk", "severity": "info",
+                           "message": f"hosts 文件有 {total_hosts} 条有效记录",
+                           "detail": "被某些工具 (加速器/去广告/破解补丁) 大量写入, 建议检查来源"})
+
+        if verdict == "none":
+            summary = "未配置系统代理 (WinINET/WinHTTP/环境变量)"
+        elif verdict == "ok_both":
+            summary = (f"系统代理开启且可用 ({endpoint}: 经代理 "
+                       f"{probe.get('via_proxy_status')} / 直连 {probe.get('direct_status')})")
+        elif verdict == "pac":
+            summary = f"PAC 自动配置模式 ({pac_url})"
+        elif verdict == "unreachable":
+            summary = f"系统代理开启但代理服务器 {endpoint} 不可达 — 疑似断网根因"
+        elif verdict == "no_forward":
+            summary = f"系统代理开启但无法转发请求 ({endpoint}) — 疑似断网根因"
+        elif verdict == "only_proxy":
+            summary = "仅能经代理上网 (直连失败), 关闭代理会断网"
+        else:
+            summary = "经代理与直连均失败 — 上游链路问题, 非代理本身"
+
+        self.results = {
+            "method": "winreg + netsh + 环境变量 + hosts + 转发探测",
+            "wininet": wininet,
+            "winhttp": winhttp,
+            "env_proxies": env,
+            "vpn_adapters": vpns,
+            "hosts_check": hosts_check,
+            "probe": probe,
+            "pac_reachable": pac_reachable,
+            "verdict": verdict,
+            "issues": issues,
+            "assessment": assessment,
+            "timestamp": datetime.now().isoformat(),
+            "summary": summary,
+        }
+        if callback:
+            callback(self.results["summary"])
+        return self.results
+
+
+class NATTypeTester:
+    """NAT 类型检测 (STUN Binding, RFC3489/5389 兼容, 纯标准库实现)。
+
+    用同一个 UDP socket 先后向两台不同 STUN 服务器发 Binding Request,
+    对比各自回报的映射地址 (ip, port):
+      - 完全相同 → 锥形 (EIM, 对 P2P 友好)
+      - 不同 → 对称型 (每个目标分配不同映射, P2P 打洞难)
+    同时回答 "UDP 出网是否受阻" (全部服务器无响应) — 游戏联机/语音
+    通话不通的两大根因一次判定。服务器支持 CHANGE-REQUEST (响应带
+    CHANGED-ADDRESS) 时再细分全锥形/受限锥形, 否则明确标"未细分"不猜。
+    """
+
+    # 前两台 2026-08 实测可用 (qq/小米当时超时, 留作替补); 全部自动回退
+    CANDIDATE_SERVERS = [
+        ("stun.chat.bilibili.com", 3478),
+        ("stun.hitv.com", 3478),
+        ("stun.qq.com", 3478),
+        ("stun.miwifi.com", 3478),
+    ]
+    TIMEOUT_S, RETRIES = 2.0, 2
+
+    def __init__(self):
+        self.name = "NAT 类型"
+        self.results = {}
+
+    @staticmethod
+    def _binding_request():
+        # 带 RFC5389 magic cookie: 新服务器按 5389 回 XOR-MAPPED-ADDRESS;
+        # 老 RFC3489 服务器把 cookie+txid 当 16 字节 txid 原样回显, 两种都兼容
+        return struct.pack(">HH", 0x0001, 0) + b"\x21\x12\xa4\x42" + os.urandom(12)
+
+    @staticmethod
+    def _parse_binding(resp, req):
+        """解析 Binding Success Response → (mapped, changed); 非法返回 None。"""
+        if len(resp) < 20 or resp[:2] != b"\x01\x01":
+            return None
+        if resp[4:20] != req[4:20]:        # txid 回显校验, 防串包
+            return None
+        mapped = changed = None
+        off = 20
+        while off + 4 <= len(resp):
+            atype, alen = struct.unpack(">HH", resp[off:off + 4])
+            val = resp[off + 4:off + 4 + alen]
+            if atype in (0x0001, 0x0020) and alen >= 8 and val[1] == 0x01:
+                port = struct.unpack(">H", val[2:4])[0]
+                ipn = struct.unpack(">I", val[4:8])[0]
+                if atype == 0x0020:        # XOR-MAPPED-ADDRESS: 异或还原
+                    port ^= 0x2112
+                    ipn ^= 0x2112A442
+                mapped = (str(ipaddress.ip_address(ipn)), port)
+            elif atype == 0x0005 and alen >= 8 and val[1] == 0x01:
+                port = struct.unpack(">H", val[2:4])[0]
+                ipn = struct.unpack(">I", val[4:8])[0]
+                changed = (str(ipaddress.ip_address(ipn)), port)
+            off += 4 + alen + ((4 - alen % 4) % 4)
+        return mapped, changed
+
+    def _query(self, sock, server):
+        """向 server 发 Binding (最多 RETRIES 次) → (mapped, changed, rtt_ms, err)。"""
+        for _ in range(self.RETRIES):
+            req = self._binding_request()
+            t0 = time.perf_counter()
+            try:
+                sock.sendto(req, server)
+                resp, src = sock.recvfrom(2048)
+                if src[0] != server[0]:
+                    continue                # 响应来自别的 IP (负载均衡错配), 丢弃重试
+                parsed = self._parse_binding(resp, req)
+                if parsed and parsed[0]:
+                    return parsed[0], parsed[1], round((time.perf_counter() - t0) * 1000), ""
+            except socket.timeout:
+                continue
+            except OSError as e:
+                return None, None, None, str(e)[:60]
+        return None, None, None, "无响应"
+
+    def _cone_refine(self, sock, server):
+        """CHANGE-REQUEST (改 IP+改端口) 细分: 有响应 = 全锥形, 超时 = 受限锥形。"""
+        req = (struct.pack(">HH", 0x0001, 4) + b"\x21\x12\xa4\x42" + os.urandom(12)
+               + struct.pack(">HHI", 0x0003, 4, 0x0006))
+        try:
+            sock.sendto(req, server)
+            resp, _src = sock.recvfrom(2048)
+            if self._parse_binding(resp, req):
+                return "全锥形"
+        except Exception:
+            pass
+        return "受限锥形(未细分)"
+
+    def detect(self, servers=None, callback=None):
+        # 候选: 用户指定 (--nattype-server, 最多取两台) 或内置列表
+        candidates = []
+        for s in (servers or [])[:2]:
+            host, _, port = s.rpartition(":")
+            candidates.append((host, int(port)) if port.isdigit() else (s, 3478))
+        if not candidates:
+            candidates = list(self.CANDIDATE_SERVERS)
+
+        records, alive = [], []            # alive: [(addr, mapped, changed)]
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(self.TIMEOUT_S)
+        try:
+            # 并行取 TCP/HTTP 出口 IP, 与 STUN 互不等待
+            pub_box = {}
+            pub_t = threading.Thread(
+                target=lambda: pub_box.update(ip=get_public_ip()),
+                daemon=True)
+            pub_t.start()
+
+            for host, port in candidates:
+                label = f"{host}:{port}"
+                if len(alive) >= 2:
+                    records.append({"server": label, "ok": None, "mapped_addr": "",
+                                    "rtt_ms": None, "error": "未测 (已取到两台)",
+                                    "changed_addr": ""})
+                    continue
+                try:
+                    addr = socket.getaddrinfo(host, port, socket.AF_INET,
+                                              socket.SOCK_DGRAM)[0][4]
+                except Exception as e:
+                    records.append({"server": label, "ok": False, "mapped_addr": "",
+                                    "rtt_ms": None,
+                                    "error": f"解析失败: {str(e)[:40]}",
+                                    "changed_addr": ""})
+                    continue
+                if any(addr[0] == a[0][0] for a in alive):
+                    records.append({"server": label, "ok": None, "mapped_addr": "",
+                                    "rtt_ms": None, "error": "与已选服务器同 IP",
+                                    "changed_addr": ""})
+                    continue
+                if callback:
+                    callback(f"查询 STUN {label} ...")
+                mapped, changed, rtt, err = self._query(s, addr)
+                records.append({
+                    "server": label, "ok": mapped is not None,
+                    "mapped_addr": f"{mapped[0]}:{mapped[1]}" if mapped else "",
+                    "rtt_ms": rtt, "error": err,
+                    "changed_addr": f"{changed[0]}:{changed[1]}" if changed else ""})
+                if mapped:
+                    alive.append((addr, mapped, changed))
+
+            udp_blocked = len(alive) == 0
+            mapped_ip = mapped_port = None
+            nat_behavior, cone_type = "未知(UDP受阻)", "—"
+            if len(alive) >= 2:
+                m1, m2 = alive[0][1], alive[1][1]
+                mapped_ip, mapped_port = m1
+                if m1 == m2:
+                    nat_behavior = "EIM(锥形)"
+                    # 只有响应里带 CHANGED-ADDRESS (支持 CHANGE-REQUEST) 才细分
+                    cone_type = (self._cone_refine(s, alive[0][0])
+                                 if (alive[0][2] or alive[1][2]) else "未细分")
+                else:
+                    nat_behavior = "对称型"
+            elif len(alive) == 1:
+                mapped_ip, mapped_port = alive[0][1]
+                nat_behavior = "未知(单服务器)"
+        finally:
+            s.close()
+        pub_t.join(6)
+        public_ip = pub_box.get("ip")
+        ip_match = None if (not mapped_ip or not public_ip) else (mapped_ip == public_ip)
+
+        issues = []
+        if udp_blocked:
+            assessment = "UDP 出网异常"
+            # 只测过 1 台时无法区分 "UDP 受阻" 和 "该服务器恰好不可用", 措辞留余地
+            if len(candidates) == 1:
+                msg = (f"指定的 STUN 服务器 ({candidates[0][0]}) 无响应 — "
+                       "UDP 出网受阻或仅该服务器不可用")
+            else:
+                msg = (f"{len(candidates)} 台 STUN 服务器均无响应 — UDP 出网疑似受阻")
+            issues.append({"type": "udp_blocked", "severity": "critical",
+                           "message": msg,
+                           "detail": "UDP 无法出网是游戏联机/语音通话不通的常见根因 (防火墙/路由器 UDP 过滤)"})
+        elif nat_behavior == "对称型":
+            assessment = "NAT 为对称型"
+            issues.append({"type": "symmetric", "severity": "warning",
+                           "message": "NAT 疑似对称型 — 不同目标分配不同映射 "
+                                      f"({alive[0][1][0]}:{alive[0][1][1]} vs {alive[1][1][0]}:{alive[1][1][1]})",
+                           "detail": "P2P 打洞成功率低, 游戏/语音直连难, 通常需中继 (RELAY)"})
+        elif nat_behavior == "EIM(锥形)":
+            assessment = "NAT 为锥形(EIM)"
+            issues.append({"type": "eim", "severity": "info",
+                           "message": "NAT 为锥形 (EIM) — 对 P2P 友好", "detail": ""})
+        else:
+            assessment = "无法判定 NAT 类型"
+            issues.append({"type": "single_server", "severity": "info",
+                           "message": "仅一台 STUN 服务器可达, 无法判定锥形/对称 (需两台不同服务器对比)",
+                           "detail": ""})
+        if ip_match is False:
+            issues.append({"type": "egress_mismatch", "severity": "warning",
+                           "message": f"UDP 映射 IP ({mapped_ip}) 与 HTTP 出口 ({public_ip}) 不一致",
+                           "detail": "多出口链路或 UDP 走了代理/加速器"})
+
+        if udp_blocked:
+            summary = (f"指定的 STUN 服务器无响应 ({candidates[0][0]})"
+                       if len(candidates) == 1
+                       else f"UDP 出网受阻: {len(candidates)} 台 STUN 服务器均无响应")
+        elif nat_behavior in ("EIM(锥形)", "对称型"):
+            tail = f", UDP 出口 {mapped_ip} ≠ HTTP 出口 {public_ip}" if ip_match is False else ""
+            summary = f"NAT 类型: {nat_behavior} — 映射 {mapped_ip}:{mapped_port}{tail}"
+        elif nat_behavior == "未知(单服务器)":
+            summary = f"无法判定锥形/对称 (仅一台服务器可达) — 映射 {mapped_ip}:{mapped_port}"
+        else:
+            summary = "NAT 类型检测未完成"
+
+        self.results = {
+            "method": "STUN Binding (RFC3489/5389 兼容)",
+            "servers": records,
+            "nat_behavior": nat_behavior,
+            "cone_type": cone_type,
+            "udp_blocked": udp_blocked,
+            "mapped_ip": mapped_ip,
+            "mapped_port": mapped_port,
+            "mapped_addr": f"{mapped_ip}:{mapped_port}" if mapped_ip else "",
+            "public_ip_tcp": public_ip,
+            "ip_match": ip_match,
+            "local_lan_ip": get_local_ip(),
+            "issues": issues,
+            "assessment": assessment,
+            "timestamp": datetime.now().isoformat(),
+            "summary": summary,
+        }
+        if callback:
+            callback(self.results["summary"])
+        return self.results
+
+
+class WebPageTester:
+    """网页体检: DNS → TCP → TLS → TTFB 分段计时 + 状态码/重定向/证书。
+
+    把"ping 通但网页打不开"拆到具体层: DNS 解析失败 vs TCP 连不上 vs
+    TLS 握手失败 (证书/中间盒) vs 首字节慢 (服务端/链路)。
+    分段计时的三个关键实现细节:
+      - 只用 http.client + 手动跟随重定向 (urlopen 会自动重定向并自动走
+        系统代理, 污染分段计时);
+      - 自己解析 IP 后把预连 socket 注入 conn.sock (跳过 HTTPConnection
+        内部二次 getaddrinfo + IPv4/IPv6 双栈遍历);
+      - GET + Range 限量读 + TCP_NODELAY (防 Nagle/delayed-ACK 干扰 TTFB)。
+    """
+
+    DEFAULT_TARGETS = ["https://www.qq.com", "https://www.baidu.com",
+                       "https://www.aliyun.com"]
+    MAX_TARGETS, MAX_REDIRECTS = 8, 5
+    DNS_TIMEOUT, TCP_TIMEOUT, TLS_TIMEOUT, TTFB_TIMEOUT = 5, 5, 8, 10   # 秒
+    BUDGET_S = 60            # 单目标总预算 (含全部重定向跳)
+
+    def __init__(self):
+        self.name = "网页体检"
+        self.results = {}
+
+    def _probe_hop(self, scheme, host, port, path):
+        """单跳分段探测; 失败时结果含 fail_stage (dns/tcp/tls/http)。"""
+        seg = {"dns_ms": None, "tcp_ms": None, "tls_ms": None, "ttfb_ms": None}
+        # 1) DNS
+        t0 = time.perf_counter()
+        try:
+            infos = socket.getaddrinfo(host, port, socket.AF_INET,
+                                       socket.SOCK_STREAM)
+        except Exception as e:
+            return {**seg, "fail_stage": "dns", "error": f"DNS 解析失败: {e}"[:80]}
+        seg["dns_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        seg["resolved_ip"] = infos[0][4][0]
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        conn = None
+        try:
+            # 2) TCP
+            sock.settimeout(self.TCP_TIMEOUT)
+            t0 = time.perf_counter()
+            sock.connect((seg["resolved_ip"], port))
+            seg["tcp_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+
+            # 3) TLS (仅 https)
+            if scheme == "https":
+                t0 = time.perf_counter()
+                try:
+                    ctx = ssl.create_default_context()
+                    sock = ctx.wrap_socket(sock, server_hostname=host)
+                except ssl.SSLCertVerificationError:
+                    seg["fail_stage"] = "tls"
+                    seg["error"] = "证书校验失败 (过期/域名不符/中间人/系统时间错误)"
+                    return seg
+                except ssl.SSLError as e:
+                    seg["fail_stage"] = "tls"
+                    seg["error"] = f"TLS 握手失败: {e}"[:80]
+                    return seg
+                seg["tls_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+                seg["tls_version"] = sock.version()
+                cert = sock.getpeercert() or {}
+                if cert.get("notAfter"):
+                    try:
+                        remain = ssl.cert_time_to_seconds(cert["notAfter"]) - time.time()
+                        seg["cert_days_left"] = round(remain / 86400, 1)
+                        seg["cert_not_after"] = cert["notAfter"]
+                        issuer = cert.get("issuer") or ()
+                        if issuer:
+                            seg["cert_issuer"] = str(issuer[-1][-1])
+                    except Exception:
+                        pass
+
+            # 4) HTTP — 注入预连 socket, 跳过 conn.connect() 的二次解析
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+            sock.settimeout(self.TTFB_TIMEOUT)   # socket 超时从 TCP 段的 5s 放宽到 TTFB 预算
+            conn = http.client.HTTPConnection(host, port, timeout=self.TTFB_TIMEOUT)
+            conn.sock = sock
+            t0 = time.perf_counter()
+            try:
+                conn.request("GET", path or "/", headers={
+                    "Host": host, "User-Agent": "NetPulse/1.0",
+                    "Range": "bytes=0-65535", "Connection": "close"})
+                resp = conn.getresponse()
+                seg["ttfb_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+                seg["status_code"] = resp.status
+                seg["location"] = resp.getheader("Location")
+                resp.read(65536)          # 限量读, 不下载整页
+            except Exception as e:
+                seg["fail_stage"] = "http"
+                seg["error"] = f"HTTP 请求失败: {e}"[:80]
+            return seg
+        except (socket.timeout, ConnectionRefusedError, OSError) as e:
+            if not seg.get("fail_stage"):
+                seg["fail_stage"] = "tcp"
+                seg["error"] = f"TCP 连接失败: {e}"[:80]
+            return seg
+        finally:
+            # conn.close() 连带关闭底层 socket; TLS 失败等提前 return 的路径补关
+            try:
+                if conn is not None:
+                    conn.close()
+                else:
+                    sock.close()
+            except Exception:
+                pass
+
+    def _probe_one(self, url):
+        """完整探测一个 URL: 手动跟随重定向 (上限 MAX_REDIRECTS 跳)。
+        分段耗时取首跳值 (用户输入的 URL 才是计时对象), 跳数单列。"""
+        record = {"url": url, "final_url": url, "redirects": 0}
+        chain = []
+        current = url
+        t_start = time.perf_counter()
+        deadline = time.monotonic() + self.BUDGET_S
+        for _hop in range(self.MAX_REDIRECTS + 1):
+            if time.monotonic() > deadline:
+                record["fail_stage"] = "http"
+                record["error"] = "总耗时超预算 (60s)"
+                break
+            try:
+                parts = urlsplit(current)
+                scheme = (parts.scheme.lower() or "http")
+                host = parts.hostname or ""
+                port = parts.port or (443 if scheme == "https" else 80)
+                path = urlunsplit(("", "", parts.path or "/", parts.query, ""))
+            except ValueError as e:
+                record["fail_stage"] = "dns"
+                record["error"] = f"URL 无效: {e}"[:80]
+                break
+            if not host:
+                record["fail_stage"] = "dns"
+                record["error"] = "URL 缺少主机名"
+                break
+            seg = self._probe_hop(scheme, host, port, path)
+            for k in ("dns_ms", "tcp_ms", "tls_ms", "ttfb_ms", "resolved_ip",
+                      "tls_version", "cert_days_left", "cert_issuer",
+                      "cert_not_after", "status_code"):
+                if seg.get(k) is not None and record.get(k) is None:
+                    record[k] = seg[k]
+            if seg.get("fail_stage"):
+                record["fail_stage"] = seg["fail_stage"]
+                record["error"] = seg.get("error", "")
+                break
+            if seg.get("status_code") in (301, 302, 303, 307, 308) and seg.get("location"):
+                nxt = urljoin(current, seg["location"])
+                chain.append({"url": current, "next_url": nxt,
+                              "status": seg["status_code"]})
+                record["redirects"] += 1
+                current = nxt
+                continue
+            record["final_url"] = current
+            break
+        else:
+            record["fail_stage"] = "http"
+            record["error"] = f"重定向超过 {self.MAX_REDIRECTS} 跳"
+            record["final_url"] = current
+        record["total_ms"] = round((time.perf_counter() - t_start) * 1000, 1)
+        if chain:
+            record["redirect_chain"] = chain
+        return record
+
+    def detect(self, extra_targets=None, callback=None):
+        targets = list(self.DEFAULT_TARGETS)
+        for u in (extra_targets or []):
+            u = (u or "").strip()
+            if u and u not in targets:
+                targets.append(u)
+        targets = targets[:self.MAX_TARGETS]
+        if callback:
+            callback(f"体检 {len(targets)} 个网页目标 (DNS/TCP/TLS/TTFB 分段)...")
+
+        records, chains = [], []
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futs = {pool.submit(self._probe_one, u): u for u in targets}
+            for fut in as_completed(futs):
+                try:
+                    rec = fut.result()
+                except Exception as e:
+                    rec = {"url": futs[fut], "redirects": 0,
+                           "fail_stage": "http", "error": f"探测异常: {e}"[:80]}
+                if rec.get("redirect_chain"):
+                    chains.extend(rec.pop("redirect_chain"))
+                records.append(rec)
+        records.sort(key=lambda r: targets.index(r["url"]) if r.get("url") in targets else 99)
+
+        ok_records = [r for r in records if not r.get("fail_stage")]
+        ok_count = len(ok_records)
+
+        def _avg(key):
+            vals = [r[key] for r in ok_records if isinstance(r.get(key), (int, float))]
+            return round(sum(vals) / len(vals), 1) if vals else None
+
+        avg = {k: _avg(k) for k in ("dns_ms", "tcp_ms", "tls_ms", "ttfb_ms")}
+        certs = [r["cert_days_left"] for r in records
+                 if isinstance(r.get("cert_days_left"), (int, float))]
+        min_cert = round(min(certs), 1) if certs else None
+        fail_stages = {}
+        for r in records:
+            if r.get("fail_stage"):
+                fail_stages[r["fail_stage"]] = fail_stages.get(r["fail_stage"], 0) + 1
+
+        # 评级 + issues (断层定位: 每类失败给指向既有模块的 action)
+        issues = []
+        total = len(records)
+        if total and ok_count == 0:
+            assessment = "网页访问异常"
+        elif ok_count < total:
+            assessment = "网页访问一般"
+        elif avg["ttfb_ms"] is not None and avg["ttfb_ms"] >= 500:
+            assessment = "网页访问偏慢"
+        else:
+            assessment = "网页访问正常"
+        for r in records:
+            url, stage = r.get("url", ""), r.get("fail_stage")
+            err = r.get("error", "")
+            if stage == "dns":
+                issues.append({"type": "dns_fail", "severity":
+                               "critical" if ok_count == 0 else "warning",
+                               "message": f"DNS 解析失败 ({url}): {err}", "detail": ""})
+            elif stage == "tcp":
+                issues.append({"type": "tcp_fail", "severity": "warning",
+                               "message": f"TCP 连接失败 ({url}): {err}", "detail": ""})
+            elif stage == "tls":
+                is_cert = "证书校验失败" in err
+                issues.append({"type": "tls_cert_fail" if is_cert else "tls_fail",
+                               "severity": "critical" if is_cert else "warning",
+                               "message": f"{'TLS 证书校验失败' if is_cert else 'TLS 握手失败'} ({url}): {err}",
+                               "detail": ""})
+            elif stage == "http":
+                issues.append({"type": "http_fail", "severity": "warning",
+                               "message": f"HTTP 请求失败 ({url}): {err}", "detail": ""})
+            elif isinstance(r.get("ttfb_ms"), (int, float)) and r["ttfb_ms"] >= 2000:
+                issues.append({"type": "ttfb_slow", "severity": "warning",
+                               "message": f"首字节慢 ({url}: {r['ttfb_ms']:.0f}ms)",
+                               "detail": "DNS/TCP/TLS 均正常时多为服务端或链路慢"})
+            if isinstance(r.get("cert_days_left"), (int, float)):
+                d = r["cert_days_left"]
+                if d < 7:
+                    issues.append({"type": "cert_expire", "severity": "critical",
+                                   "message": f"证书已过期或即将过期 ({url}, 剩 {d} 天)",
+                                   "detail": ""})
+                elif d < 30:
+                    issues.append({"type": "cert_soon", "severity": "warning",
+                                   "message": f"证书即将到期 ({url}, 剩 {d} 天)", "detail": ""})
+
+        slow = f", 平均首字节 {avg['ttfb_ms']:.0f}ms" if avg["ttfb_ms"] is not None else ""
+        self.results = {
+            "method": "http.client + ssl 分段计时",
+            "targets": records,
+            "redirect_chain": chains,
+            "ok_count": ok_count,
+            "total_count": total,
+            "avg_dns_ms": avg["dns_ms"],
+            "avg_tcp_ms": avg["tcp_ms"],
+            "avg_tls_ms": avg["tls_ms"],
+            "avg_ttfb_ms": avg["ttfb_ms"],
+            "min_cert_days": min_cert,
+            "fail_stages": fail_stages,
+            "issues": issues,
+            "assessment": assessment,
+            "timestamp": datetime.now().isoformat(),
+            "summary": f"网页体检: {ok_count}/{total} 正常{slow}",
+        }
+        if callback:
+            callback(self.results["summary"])
+        return self.results
+
+
+class TCPConcurrencyTester:
+    """TCP 并发连接能力阶梯测试: 回答"这条网络路径能同时撑多少条 TCP 连接"。
+
+    装维场景: 廉价光猫/路由器 NAT 会话表小 (典型 1024~8192), 设备一连多
+    就掉线/游戏掉线。本模块向目标 (默认公网 anycast DNS 的 TCP 53, 实测
+    扛 1000+ 并发无压力) 阶梯建立**累计保持**的并发连接, 找成功率崩塌点
+    = NAT 并发上限; 同时跑本机回环对照, 区分"本机瓶颈 (安全软件/系统
+    限制) vs 网络路径瓶颈 (NAT/网关/运营商)"。
+
+    实现要点 (Windows 高并发实测结论):
+      - select() 后端 >512 fd 报错, 必须用 asyncio Proactor (IOCP);
+      - asyncio.run 跑在 _run_module_with_timeout 的 daemon 线程里 (合法,
+        每次调用全新事件循环, 不跨循环持有对象);
+      - 连接跨级别保持打开 (NAT 表压满状态), 结束统一 SO_LINGER(1,0)
+        RST 关闭, 避免数千 TIME_WAIT 占临时端口。
+    """
+
+    CANDIDATE_TARGETS = [("223.5.5.5", 53),     # AliDNS (anycast)
+                         ("119.29.29.29", 53),   # DNSPod
+                         ("114.114.114.114", 53)]
+    LADDER_BASE = (50, 100, 200, 400, 800, 1600, 3200, 6400, 8000)
+    HARD_MAX = 8000            # 防滥用硬上限 (Windows 临时端口 ~16k)
+    SUCCESS_STOP = 0.90        # 单级成功率低于此值 → 自适应停止
+    CONNECT_TIMEOUT_S = 5.0
+    HOLD_S = 1.0               # 每级保持时长 (秒), 兼作级别间休整
+
+    def __init__(self):
+        self.name = "TCP 并发"
+        self.results = {}
+        self._family = socket.AF_INET
+
+    # ── 目标选择: 自定义优先, 否则候选逐个预检 (20 并发小波次 ≥90% 即选中) ──
+    # 预检必须测"并发友好度"而非单纯可达: 部分公网端点 (如实测中的 DNSPod)
+    # 对单 IP 快速并发连接限流, 若只做串行预检会把目标限流误诊成用户 NAT 差。
+    def _pick_target(self, custom, callback=None):
+        if custom:
+            host, _, port = custom.rpartition(":")
+            if not port.isdigit():
+                return None, custom, [{"host": custom, "port": None,
+                                       "ok": 0, "fail": 0,
+                                       "error": "目标需含端口, 例 223.5.5.5:53"}]
+            host = host.strip("[]")
+            try:
+                info = socket.getaddrinfo(host, int(port), 0, socket.SOCK_STREAM)[0]
+                self._family = info[0]
+            except Exception as e:
+                return None, custom, [{"host": host, "port": int(port),
+                                       "ok": 0, "fail": 3, "error": f"解析失败: {e}"[:60]}]
+            ok = sum(1 for _ in range(3)
+                     if _tcping_ms(f"{host}:{port}", timeout=2.0) is not None)
+            recs = [{"host": host, "port": int(port), "ok": ok, "fail": 3 - ok}]
+            return ((host, int(port)) if ok >= 2 else None), f"{host}:{port}", recs
+
+        records = []
+        for host, port in self.CANDIDATE_TARGETS:
+            if callback:
+                callback(f"预检目标 {host}:{port} (20 并发) ...")
+            rec = self._concurrency_precheck((host, port))
+            records.append(rec)
+            if rec.get("success_rate", 0) >= 90:
+                return (host, port), f"{host}:{port}", records
+        return None, "", records
+
+    def _concurrency_precheck(self, addr, n=20):
+        """候选端点并发友好度预检: n 条并发连接, 成功率 ≥90% 才算可用。"""
+        held, stats = [], {"ok": 0, "timeout": 0, "refused": 0, "other": 0, "lat": []}
+        try:
+            asyncio.run(self._client_wave(addr, n, held, stats))
+            rate = round(stats["ok"] / n * 100, 1)
+            return {"host": addr[0], "port": addr[1], "ok": stats["ok"],
+                    "fail": n - stats["ok"], "success_rate": rate}
+        except Exception as e:
+            return {"host": addr[0], "port": addr[1], "ok": 0, "fail": n,
+                    "error": str(e)[:60]}
+        finally:
+            for s in held:
+                self._rst_close(s)
+
+    @staticmethod
+    def _established_count():
+        """当前 ESTABLISHED 连接数 (背景信息: 本机已有连接也在占 NAT 表)。"""
+        try:
+            _c, out, _e = run_cmd("netstat -ano -p tcp", timeout=15, use_cache=False)
+            return sum(1 for l in (out or "").split("\n") if "ESTABLISHED" in l)
+        except Exception:
+            return None
+
+    def _ladder(self, mx):
+        return sorted({l for l in self.LADDER_BASE if l <= mx} | {mx})
+
+    @staticmethod
+    def _rst_close(sock):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                            struct.pack("ii", 1, 0))
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    async def _run_ladder(self, addr, mx, callback):
+        """阶梯主测: 每级补足到目标并发数 → 保持 → 下一级; 失败率超标即停。"""
+        held, level_records = [], []
+        try:
+            levels = self._ladder(mx)
+            for li, level in enumerate(levels):
+                need = level - len(held)
+                stats = {"ok": 0, "timeout": 0, "refused": 0, "other": 0, "lat": []}
+                t0 = time.perf_counter()
+                if need > 0:
+                    await asyncio.gather(*[self._connect_one(addr, held, stats)
+                                           for _ in range(need)])
+                wave_s = max(time.perf_counter() - t0, 1e-6)
+                lat = sorted(stats["lat"])
+                rate = stats["ok"] / need if need else 1.0
+                level_records.append({
+                    "level": level, "attempted": need, "ok": stats["ok"],
+                    "fail": need - stats["ok"] if need else 0,
+                    "success_rate": round(rate * 100, 1),
+                    "p50_ms": round(lat[len(lat) // 2], 1) if lat else None,
+                    "p95_ms": round(lat[max(int(len(lat) * 0.95), len(lat) - 1)], 1) if lat else None,
+                    "cps": round(stats["ok"] / wave_s, 1),
+                    "fail_timeout": stats["timeout"], "fail_refused": stats["refused"],
+                    "fail_other": stats["other"],
+                    "wall_ms": round(wave_s * 1000),
+                })
+                rec = level_records[-1]
+                if callback:
+                    callback(f"并发 {level}: 成功率 {rec['success_rate']}%, "
+                             f"保持 {len(held)} 条, p50 {rec['p50_ms'] or '—'}ms, "
+                             f"{rec['cps']}/s")
+                if need and rate < self.SUCCESS_STOP:
+                    break
+                if li < len(levels) - 1:
+                    await asyncio.sleep(self.HOLD_S)
+        finally:
+            for s in held:                      # RST 关闭, 不留 TIME_WAIT
+                self._rst_close(s)
+            await asyncio.sleep(0.05)           # 让取消/关闭的 IOCP 操作落地
+        return level_records
+
+    @staticmethod
+    async def _client_wave(addr, n, held, stats):
+        await asyncio.gather(*[TCPConcurrencyTester._connect_one_static(addr, held, stats)
+                               for _ in range(n)])
+
+    async def _connect_one(self, addr, held, stats):
+        await self._connect_one_static(addr, held, stats, self._family)
+
+    @staticmethod
+    async def _connect_one_static(addr, held, stats, family=socket.AF_INET):
+        """单条非阻塞连接; 成功的 socket 进 held 保持打开, 失败分类计数。"""
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        t0 = time.perf_counter()
+        try:
+            await asyncio.wait_for(asyncio.get_running_loop().sock_connect(sock, addr),
+                                   TCPConcurrencyTester.CONNECT_TIMEOUT_S)
+        except asyncio.TimeoutError:            # NAT 表满的典型症状
+            stats["timeout"] += 1
+            sock.close()
+            return False
+        except ConnectionRefusedError:          # 目标拒绝 (限流/安全软件)
+            stats["refused"] += 1
+            sock.close()
+            return False
+        except OSError:
+            stats["other"] += 1
+            sock.close()
+            return False
+        stats["ok"] += 1
+        stats["lat"].append((time.perf_counter() - t0) * 1000)
+        held.append(sock)
+        return True
+
+    def _loopback_baseline(self, level):
+        """本机回环对照: 在公网失败级别 (或最大级别) 复测, 排除/坐实本机瓶颈。
+
+        服务端用普通线程 accept 循环持有连接 (不用 asyncio.start_server —
+        大量挂起 accept 下 server.close() 会触发 proactor 断言噪声);
+        客户端仍走 asyncio (高并发连接必须 Proactor)。"""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(min(level + 64, 65535))
+        port = srv.getsockname()[1]
+        accepted, stop = [], threading.Event()
+
+        def _accept_loop():
+            srv.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    accepted.append(srv.accept()[0])   # 只持有, 不读不关
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+
+        acc_t = threading.Thread(target=_accept_loop, daemon=True)
+        acc_t.start()
+        held, stats = [], {"ok": 0, "timeout": 0, "refused": 0, "other": 0, "lat": []}
+        try:
+            asyncio.run(self._client_wave(("127.0.0.1", port), level, held, stats))
+            lat = sorted(stats["lat"])
+            return {
+                "level": level, "attempted": level, "ok": stats["ok"],
+                "fail": level - stats["ok"],
+                "success_rate": round(stats["ok"] / level * 100, 1) if level else 0.0,
+                "p50_ms": round(lat[len(lat) // 2], 1) if lat else None,
+                "p95_ms": round(lat[max(int(len(lat) * 0.95), len(lat) - 1)], 1) if lat else None,
+            }
+        finally:
+            stop.set()
+            acc_t.join(1.5)
+            for s in accepted:
+                self._rst_close(s)
+            srv.close()
+            for s in held:
+                self._rst_close(s)
+            time.sleep(0.05)
+
+    def detect(self, max_concurrency=1600, target=None, callback=None):
+        mx = max(50, min(self.HARD_MAX, int(max_concurrency or 1600)))
+        addr, target_label, precheck = self._pick_target(target, callback)
+        if not addr:
+            self.results = {
+                "error": ("无可用并发测试目标 — 候选公网端点均不可达; "
+                          "可用 --tcpcc-target host:port 指定自建服务器"),
+                "method": "asyncio-tcp 阶梯并发",
+                "target_candidates": precheck,
+                "timestamp": datetime.now().isoformat(),
+            }
+            return self.results
+
+        established_before = self._established_count()
+        if callback:
+            callback(f"目标 {target_label}, 阶梯 50→{mx} (累计保持) ...")
+        try:
+            level_records = asyncio.run(self._run_ladder(addr, mx, callback))
+        except Exception as e:
+            self.results = {"error": f"并发测试异常: {e}", "method": "asyncio-tcp 阶梯并发",
+                            "target": target_label, "timestamp": datetime.now().isoformat()}
+            return self.results
+        established_after = self._established_count()
+
+        failed_level = next((r for r in level_records
+                             if r["attempted"] and r["success_rate"] < self.SUCCESS_STOP * 100),
+                            None)
+        passed = [r for r in level_records
+                  if r["attempted"] and r["success_rate"] >= self.SUCCESS_STOP * 100]
+        max_sustained = passed[-1]["level"] if passed else 0
+        capped = failed_level is None
+        peak_cps = max((r["cps"] or 0) for r in level_records) if level_records else 0
+
+        # 本机回环对照: 失败级别 (全通过则最大级别), 双方都跑不通才是本机问题
+        base_level = failed_level["level"] if failed_level else (level_records[-1]["level"] if level_records else 0)
+        baseline = None
+        if base_level >= 50:
+            if callback:
+                callback(f"本机回环对照 {base_level} 并发 ...")
+            try:
+                baseline = self._loopback_baseline(base_level)
+            except Exception:
+                baseline = None
+
+        if failed_level is None:
+            bottleneck = "—"
+        elif baseline is None:
+            bottleneck = "未知"
+        elif baseline.get("success_rate", 0) < self.SUCCESS_STOP * 100:
+            bottleneck = "本机"
+        else:
+            bottleneck = "网络/NAT"
+
+        shown = f"≥{max_sustained}" if capped and max_sustained else str(max_sustained)
+        issues = []
+        # capped = 全级别通过 (没找到失败点): 容量"至少 N", 不能因 N 小就判差
+        if capped:
+            assessment = f"TCP 并发能力达标 (≥{max_sustained}, 达设定上限)"
+        elif max_sustained == 0:
+            assessment = "TCP 并发能力差(首个级别即失败)"
+        elif max_sustained < 512:
+            assessment = "TCP 并发能力差"
+        elif max_sustained < 1024:
+            assessment = "TCP 并发能力偏低"
+        elif max_sustained < 2048:
+            assessment = "TCP 并发能力中等"
+        else:
+            assessment = "TCP 并发能力良好"
+        if not capped and max_sustained < 512:
+            issues.append({"type": "low_concurrency", "severity": "critical",
+                           "message": f"TCP 并发能力差 (仅 {shown})",
+                           "detail": "NAT 表/中间盒并发会话限制或本机安全软件拦截, "
+                                     "多资源网页/多线程下载/P2P 会明显受限"})
+        elif not capped and max_sustained < 1024:
+            issues.append({"type": "low_concurrency", "severity": "warning",
+                           "message": f"TCP 并发能力偏低 ({shown})",
+                           "detail": "廉价光猫/路由器典型 NAT 表容量, 多设备家庭可能不够用"})
+        if failed_level:
+            ft, fr = failed_level["fail_timeout"], failed_level["fail_refused"]
+            if ft and ft >= (failed_level["fail"] or 1) * 0.5:
+                issues.append({"type": "fail_mode", "severity": "info",
+                               "message": f"失败以超时为主 ({ft}/{failed_level['fail']}) — "
+                                          "典型为 NAT/防火墙并发会话表满",
+                               "detail": ""})
+            elif fr and fr >= (failed_level["fail"] or 1) * 0.5:
+                issues.append({"type": "fail_mode", "severity": "info",
+                               "message": f"失败以拒绝对主 ({fr}/{failed_level['fail']}) — "
+                                          "目标服务器限流或本机安全软件拦截",
+                               "detail": "可换 --tcpcc-target 自建服务器复测排除目标侧因素"})
+        if bottleneck == "本机":
+            issues.append({"type": "local_bottleneck", "severity": "warning",
+                           "message": f"本机回环对照在 {base_level} 并发同样受限 — "
+                                      "疑似本机瓶颈 (安全软件/系统限制), 而非网络/NAT",
+                           "detail": ""})
+        elif bottleneck == "网络/NAT":
+            issues.append({"type": "path_bottleneck", "severity": "info",
+                           "message": f"本机回环 {base_level} 并发通过, 瓶颈在网络路径 "
+                                      "(NAT/网关/运营商)",
+                           "detail": "检查路由器/光猫 NAT 并发会话数规格, 减少长连接设备"
+                                     "(IoT/P2P), 必要时重启网关"})
+
+        self.results = {
+            "method": "asyncio-tcp 阶梯并发",
+            "target": target_label,
+            "target_candidates": precheck,
+            "max_concurrency": mx,
+            "levels": level_records,
+            "max_sustained": max_sustained,
+            "capped": capped,
+            "peak_cps": peak_cps,
+            "local_baseline": baseline,
+            "local_baseline_level": base_level if baseline else None,
+            "bottleneck": bottleneck,
+            "established_before": established_before,
+            "established_after": established_after,
+            "note": "杀毒软件/企业终端管控可能压低并发上限; 高上限 (≥3200) 勿短时间重复运行",
+            "issues": issues,
+            "assessment": assessment,
+            "timestamp": datetime.now().isoformat(),
+            "summary": (f"TCP 并发: 最大可持续 {shown}, 峰值建连 {peak_cps:.0f}/s"
+                        + (f", 瓶颈 {bottleneck}" if bottleneck != "—" else "")
+                        + f" (目标 {target_label})"),
+        }
+        if callback:
+            callback(self.results["summary"])
+        return self.results
+
+
+# ============================================================
+# SECTION 4e: 盯障模式 (长时间监测, 找偶发掉线)
+# ============================================================
+# 独立顶层运行模式 (不进 MODULE_REGISTRY, 不受模块超时/`all` 影响):
+#   python netpulse.py --monitor [SEC] [--monitor-target HOST]
+# 4 路采集: 网关 ping / 外网 ping (各 1s, LatencyMonitor) + 外网 TCP 53 +
+# DNS 解析 (各 5s, probe 线程)。落盘前做事件检测 (掉线/DNS 故障/延迟突增)
+# 与分段定位 (内网侧 / 运营商侧 / 解析侧), 输出 CSV+HTML+JSON 三件套。
+
+import atexit
+import csv as _csv
+
+
+def _monitor_pct(vals, q):
+    """手写分位数 (排序取下标), 不引依赖。"""
+    if not vals:
+        return None
+    vals = sorted(vals)
+    return vals[max(0, min(round(q * (len(vals) - 1)), len(vals) - 1))]
+
+
+def _merge_runs(stream, min_len, session_end, kind="loss"):
+    """在归并流 [(kind, t, ...) | ("ok", t, ...)] 里找连续 kind 段。
+
+    返回 [{start, n, end, open}] — end 为段后首个成功样本时刻 (即恢复时刻),
+    段到会话结束仍未恢复时 end=session_end 且 open=True。"""
+    runs, i = [], 0
+    while i < len(stream):
+        if stream[i][0] != kind:
+            i += 1
+            continue
+        j = i
+        while j < len(stream) and stream[j][0] == kind:
+            j += 1
+        if j - i >= min_len:
+            runs.append({"start": stream[i][1], "n": j - i,
+                         "end": stream[j][1] if j < len(stream) else session_end,
+                         "open": j >= len(stream)})
+        i = j
+    return runs
+
+
+def _strip_gaps(stream, gap_s):
+    """把相邻间隔 > gap_s 的区间按『未知』剔除 (ping 卡死/系统睡眠),
+    返回 (剔除后的流, gap 区间列表)。gap 两侧的丢包段不跨 gap 合并。"""
+    gaps = []
+    for a, b in zip(stream, stream[1:]):
+        if b[1] - a[1] > gap_s:
+            gaps.append((a[1], b[1]))
+    if not gaps:
+        return stream, []
+    kept = [s for s in stream if not any(g0 < s[1] < g1 for g0, g1 in gaps)]
+    return kept, gaps
+
+
+def _detect_monitor_events(snap, t0, ended_at):
+    """事件检测 (纯后处理): 输入采集快照, 输出事件列表 (按时间排序)。
+
+    事件定位口径:
+      - 网关中断 = internal (本机↔网关段, 内网侧问题)
+      - 外网中断与网关中断时间窗相交 = both_down; 窗口内网关正常 = carrier
+        (运营商/上联侧); 网关数据不足 = unknown
+      - DNS 连续失败且外网 ping 正常 = dns (独立解析故障); 否则随外网中断
+      - TCP 连续失败且 ping 正常 = policy (疑似端口策略/QoS, 信息级)
+      - 延迟突增: 前 30 个成功样本 p50 为基线, 10s 桶 p95 > max(3×基线, 200ms)
+    """
+    events = []
+    gw, gw_gaps = _strip_gaps(snap["gw_stream"], MonitorSession.GAP_S)
+    ext, ext_gaps = _strip_gaps(snap["ext_stream"], MonitorSession.GAP_S)
+
+    def _add(type_, stream, start, end, open_at_end, cls="", detail="", **extra):
+        ev = {"type": type_, "stream": stream, "cls": cls,
+              "start_ts": start, "end_ts": end,
+              "duration_s": round(end - start, 1),
+              "open_at_end": open_at_end, "detail": detail}
+        ev.update(extra)
+        events.append(ev)
+
+    for g0, g1 in sorted(set(gw_gaps + ext_gaps)):
+        _add("monitor_gap", "", g0, g1, False,
+             detail="采集间隙 (ping 无输出 — 系统睡眠/进程阻塞?), 该区间按未知处理")
+
+    def _disp(ts):
+        return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+    # 全程无回复特判 (优先于 run 拆分)
+    ext_no_reply = (len(ext) >= 5 and not any(s[0] == "ok" for s in ext))
+    gw_no_reply = (len(gw) >= 5 and not any(s[0] == "ok" for s in gw))
+    if gw_no_reply:
+        _add("outage", "gw", t0, ended_at, True, "internal",
+             f"网关全程无回复 (共 {len(gw)} 行)")
+    if ext_no_reply:
+        tcp_ok = any(s[1] is not None for s in snap["tcp"])
+        dns_ok = any(s[1] is not None for s in snap["dns"])
+        cls = "target_unreachable" if (tcp_ok or dns_ok) else "no_data"
+        _add("outage", "ext", t0, ended_at, True, cls,
+             f"外网目标全程无 ICMP 回复 (共 {len(ext)} 行)")
+
+    # 中断事件 (网关 / 外网)
+    gw_runs = ([] if gw_no_reply
+               else _merge_runs(gw, MonitorSession.MIN_LOSS_BURST, ended_at))
+    ext_runs = ([] if ext_no_reply
+                else _merge_runs(ext, MonitorSession.MIN_LOSS_BURST, ended_at))
+    for r in gw_runs:
+        _add("outage", "gw", r["start"], r["end"], r["open"], "internal",
+             f"连续丢包 {r['n']} 次 (本机到网关段)")
+    for r in ext_runs:
+        win0, win1 = r["start"] - 2, r["end"] + 2
+        overlapped = any(gr["start"] - 2 <= win1 and gr["end"] + 2 >= win0
+                         for gr in gw_runs)
+        if overlapped:
+            cls, detail = "both_down", f"连续丢包 {r['n']} 次 (与网关中断同时发生)"
+        else:
+            gw_ok = sum(1 for s in gw if s[0] == "ok" and win0 <= s[1] <= win1)
+            if gw_ok >= 3:
+                cls = "carrier"
+                detail = f"连续丢包 {r['n']} 次, 期间网关 ping 正常 — 运营商/上联侧"
+            else:
+                cls = "unknown"
+                detail = f"连续丢包 {r['n']} 次, 窗口内网关数据不足, 无法定位"
+        _add("outage", "ext", r["start"], r["end"], r["open"], cls, detail)
+
+    # DNS 事件
+    dns_stream = [("ok" if s[1] is not None else "fail", s[0], s[1])
+                  for s in snap["dns"]]
+    for r in _merge_runs(dns_stream, MonitorSession.MIN_DNS_FAIL, ended_at,
+                         kind="fail"):
+        win0, win1 = r["start"] - 2, r["end"] + 2
+        ext_ok = sum(1 for s in ext if s[0] == "ok" and win0 <= s[1] <= win1)
+        cls = "dns" if ext_ok else "with_outage"
+        detail = (f"连续失败 {r['n']} 次" +
+                  (", 期间外网 ping 正常 — 解析侧问题" if ext_ok
+                   else ", 随外网中断发生"))
+        _add("dns_fail", "dns", r["start"], r["end"], r["open"], cls, detail)
+
+    # TCP 事件 (信息级)
+    tcp_stream = [("ok" if s[1] is not None else "fail", s[0], s[1])
+                  for s in snap["tcp"]]
+    for r in _merge_runs(tcp_stream, 2, ended_at, kind="fail"):
+        win0, win1 = r["start"] - 2, r["end"] + 2
+        ext_ok = sum(1 for s in ext if s[0] == "ok" and win0 <= s[1] <= win1)
+        _add("tcp_fail", "tcp", r["start"], r["end"], r["open"],
+             "policy" if ext_ok else "with_outage",
+             f"连续失败 {r['n']} 次" +
+             ("; ICMP 正常而 TCP 失败 — 疑似端口策略/QoS" if ext_ok else ""))
+
+    # 延迟突增
+    for name, stream in (("gw", gw), ("ext", ext)):
+        oks = [(s[1], s[2]) for s in stream if s[0] == "ok" and s[2] is not None]
+        if len(oks) < 10:
+            continue
+        baseline = _monitor_pct([v for _, v in oks[:30]], 0.5)
+        buckets = defaultdict(list)
+        for t, v in oks:
+            buckets[int(t // 10)].append(v)
+        spike_buckets = []
+        for b in sorted(buckets):
+            p95 = _monitor_pct(buckets[b], 0.95)
+            if p95 > max(3 * baseline, 200) and p95 > baseline + 50:
+                spike_buckets.append((b * 10, p95))
+        merged = []
+        for sb, peak in spike_buckets:
+            if merged and sb <= merged[-1][1] + 10:
+                merged[-1][1] = sb + 10
+                merged[-1][2] = max(merged[-1][2], peak)
+            else:
+                merged.append([sb, sb + 10, peak])
+        for s0, s1, peak in merged:
+            _add("latency_spike", name, s0, s1, False, "",
+                 f"基线 {baseline:.0f}ms → 峰值 {peak:.0f}ms",
+                 baseline=round(baseline, 1), peak=round(peak, 1))
+
+    events.sort(key=lambda e: e["start_ts"])
+    for i, ev in enumerate(events, 1):
+        ev["id"] = i
+        ev["start_disp"] = _disp(ev["start_ts"])
+        ev["end_disp"] = _disp(ev["end_ts"])
+    return events
+
+
+def _monitor_conclusion(events, stats, snap):
+    """结论矩阵 (判定优先级自上而下) → (verdict, conclusion_text, advice)。"""
+    def has(t, *cls):
+        return [e for e in events
+                if e["type"] == t and (not cls or e.get("cls") in cls)]
+
+    internal = has("outage", "internal", "both_down")
+    carrier = has("outage", "carrier")
+    if any(e.get("cls") == "no_data" for e in events):
+        return ("no_data", "监测未能采集到有效数据 (外网 ping 无输出)",
+                "检查 ping 命令可用性; 必要时以管理员身份运行; "
+                "更换 --monitor-target 后重试")
+    if has("outage", "target_unreachable"):
+        return ("target_unreachable",
+                f"外网目标全程无 ICMP 回复, 但 TCP/DNS 正常",
+                "目标可能禁 ping; 用 --monitor-target 119.29.29.29 等换目标复测")
+    text_bits, advice_bits = [], []
+
+    def _fmt_outages(lst, label):
+        n = len(lst)
+        total = sum(e["duration_s"] for e in lst)
+        longest = max(e["duration_s"] for e in lst)
+        open_mark = next((e for e in lst if e["open_at_end"]), None)
+        s = (f"{label}中断 {n} 次 (累计 {total:.0f}s, 最长 {longest:.0f}s")
+        s += ", 结束时仍未恢复)" if open_mark else ")"
+        return s
+
+    if internal or carrier:
+        if internal and carrier:
+            verdict = "mixed"
+        else:
+            verdict = "internal" if internal else "carrier"
+        if internal:
+            text_bits.append(_fmt_outages(internal, "本机到网关"))
+            advice_bits.append("内网侧问题: 依次查 ①WiFi 信号/干扰或网线水晶头 "
+                               "②路由器散热/重启路由器 ③光猫到路由器网线; "
+                               "若光猫即网关且 LOS 红灯, 拍照后报障")
+        if carrier:
+            text_bits.append(_fmt_outages(carrier, "外网"))
+            advice_bits.append("运营商侧问题: 检查光猫光衰/LOS 告警; 带上本 HTML 报告"
+                               "向运营商报障 — 报告含分钟级时间轴, 可对齐客服记录")
+    elif has("dns_fail", "dns"):
+        verdict = "dns"
+        n = len(has("dns_fail", "dns"))
+        text_bits.append(f"DNS 解析失败 {n} 次, 期间外网 ping 正常")
+        advice_bits.append("解析侧问题: 本机/路由器 DNS 改 223.5.5.5 与 "
+                           "119.29.29.29 复测; 仍失败带报告报障")
+    elif has("latency_spike"):
+        verdict = "degraded"
+        spikes = has("latency_spike")
+        peak = max(s.get("peak", 0) for s in spikes)
+        base = next((s.get("baseline", 0) for s in spikes), 0)
+        text_bits.append(f"无中断但延迟突增 {len(spikes)} 段 "
+                         f"(基线 {base:.0f}ms, 峰值 {peak:.0f}ms)")
+        gw_spike = any(s["stream"] == "gw" for s in spikes)
+        advice_bits.append(
+            "本地段质量差 (网关线突增): 查 WiFi 干扰/网线" if gw_spike
+            else "上行链路拥塞: 建议晚高峰复测对比, 结合 bufferbloat 模块")
+    else:
+        verdict = "stable"
+        gw_pct = stats["gw"]["loss_pct"] if stats["gw"] else 0
+        ext_pct = stats["ext"]["loss_pct"] if stats["ext"] else 0
+        text_bits.append(f"监测期内未复现掉线 (网关丢包 {gw_pct:.1f}% / "
+                         f"外网丢包 {ext_pct:.1f}%)")
+        advice_bits.append("本次未复现: 建议在故障高发时段再盯 (如 --monitor 1800), "
+                           "或请客户记录掉线时刻后与本报告时间轴对齐")
+    return verdict, "；".join(text_bits), "\n".join(advice_bits)
+
+
+class MonitorSession:
+    """盯障会话: 4 路采集 + 进度行 + 网关漂移复查。"""
+
+    PROBE_INTERVAL = 5.0      # TCP/DNS 探测周期
+    GAP_S = 10.0              # ping 流静默判定间隙 (全丢包时超时行 ~2s/行)
+    MIN_LOSS_BURST = 3        # 连续丢包 ≥3 (~3s) 判中断
+    MIN_DNS_FAIL = 2          # DNS 连续失败 ≥2 (~10s) 判事件
+    DNS_DOMAIN = "www.qq.com"
+
+    def __init__(self, duration_s, ext_target=None):
+        self.duration_s = duration_s
+        self.ext_target = ext_target or "223.5.5.5"
+        self._stop = threading.Event()
+        self._gw_monitors = []        # [(ip, LatencyMonitor)] 支持漂移后多段
+        self._ext_monitor = None
+        self._probe_thread = None
+        self._tcp_samples = []        # [(t, ms_or_None)]
+        self._dns_samples = []        # [(t, ms_or_None, ip)]
+        self._probe_lock = threading.Lock()
+        self._gw_ip = None
+        self._dns_server = None
+        self._t0 = None
+        self._notes = []
+        self._last_gw_check = 0.0
+
+    def note(self, text):
+        self._notes.append({"t": round(time.time() - self._t0, 1) if self._t0 else 0,
+                            "text": text})
+
+    def start(self):
+        self._t0 = time.time()
+        self._gw_ip = get_default_gateway()
+        self._dns_server = (get_dns_servers() or ["223.5.5.5"])[0]
+        # 域名目标先解析 (DNS 挂了也不至于 ping 不动)
+        target = self.ext_target
+        try:
+            socket.inet_aton(target)
+        except OSError:
+            try:
+                target = socket.getaddrinfo(target, 0, socket.AF_INET)[0][4][0]
+                self.note(f"外网目标 {self.ext_target} 解析为 {target}")
+            except Exception as e:
+                self.note(f"外网目标 {self.ext_target} 解析失败: {e}")
+        self._ext_ip_resolved = target
+        if self._gw_ip:
+            mon = LatencyMonitor(self._gw_ip)
+            if mon.start():
+                self._gw_monitors.append((self._gw_ip, mon))
+            else:
+                self.note(f"网关 ping 启动失败 ({self._gw_ip})")
+        else:
+            self.note("未取到默认网关, 网关路缺席")
+        self._ext_monitor = LatencyMonitor(target)
+        if not self._ext_monitor.start():
+            return False
+        self._probe_thread = threading.Thread(target=self._probe_loop, daemon=True)
+        self._probe_thread.start()
+        atexit.register(self.stop)          # 兜底: 进程被硬杀前尽量收 ping
+        return True
+
+    def _probe_loop(self):
+        first = True
+        while not self._stop.is_set():
+            t_iter = time.time()
+            try:
+                # 排空上一轮迟到的 DNS 应答 (线程本地 socket 复用的串轮防护)
+                s = _get_dns_socket(0.02)
+                if s is not None:
+                    try:
+                        s.settimeout(0.02)
+                        while True:
+                            s.recvfrom(2048)
+                    except Exception:
+                        pass
+                t = time.time()
+                ip, ms = _dns_query(self._dns_server, self.DNS_DOMAIN, timeout=2.5)
+                with self._probe_lock:
+                    self._dns_samples.append((t, ms, ip))
+                if self._stop.is_set():
+                    break
+                ms2 = _tcping_ms(f"{self._ext_ip_resolved}:53", timeout=3.0)
+                with self._probe_lock:
+                    self._tcp_samples.append((time.time(), ms2))
+            except Exception:
+                pass
+            if first:
+                first = False
+                continue                      # 首轮后立即进入节拍
+            self._stop.wait(max(0.0, self.PROBE_INTERVAL - (time.time() - t_iter)))
+
+    def maybe_recheck_gateway(self, elapsed):
+        """每 60s 复查网关 (用户切 WiFi/换路由时旧网关会永久假丢包)。"""
+        if elapsed - self._last_gw_check < 60:
+            return
+        self._last_gw_check = elapsed
+        try:
+            gw = get_default_gateway()
+        except Exception:
+            return
+        if gw and gw != self._gw_ip:
+            self.note(f"网关漂移: {self._gw_ip} → {gw}, 已切换监测")
+            for _ip, mon in self._gw_monitors:
+                mon.stop()
+            self._gw_ip = gw
+            mon = LatencyMonitor(gw)
+            if mon.start():
+                self._gw_monitors.append((gw, mon))
+
+    def snapshot(self):
+        gw_stream = []
+        for _ip, mon in self._gw_monitors:
+            gw_stream.extend(mon.stream_since())
+        gw_stream.sort(key=lambda s: s[1])
+        ext_stream = self._ext_monitor.stream_since() if self._ext_monitor else []
+        with self._probe_lock:
+            tcp = list(self._tcp_samples)
+            dns = list(self._dns_samples)
+        return {"gw_stream": gw_stream, "ext_stream": ext_stream,
+                "tcp": tcp, "dns": dns}
+
+    def progress_line(self, elapsed):
+        now = time.time()
+        gw_loss = sum(1 for _ip, m in self._gw_monitors
+                      for t in m.losses_since(now - 10))
+        ext_loss = len(self._ext_monitor.losses_since(now - 10)) \
+            if self._ext_monitor else 0
+        with self._probe_lock:
+            last_dns = self._dns_samples[-1] if self._dns_samples else None
+            last_tcp = self._tcp_samples[-1] if self._tcp_samples else None
+        # 无样本 (刚启动) 显示 …, 有样本才判 ✓/✗
+        dns_ok = last_dns is not None and last_dns[1] is not None
+        tcp_ok = last_tcp is not None and last_tcp[1] is not None
+        dns_disp = "…" if last_dns is None else ("✓" if dns_ok else "✗")
+        tcp_disp = "…" if last_tcp is None else ("✓" if tcp_ok else "✗")
+        gw_bad = gw_loss >= self.MIN_LOSS_BURST
+        ext_bad = ext_loss >= self.MIN_LOSS_BURST
+        # 轻量事件计数: 连续丢包段数 (与最终落盘口径一致)
+        snap = self.snapshot()
+        ev_n = (len(_merge_runs(_strip_gaps(snap["gw_stream"], self.GAP_S)[0],
+                                self.MIN_LOSS_BURST, now))
+                + len(_merge_runs(_strip_gaps(snap["ext_stream"], self.GAP_S)[0],
+                                  self.MIN_LOSS_BURST, now)))
+        return (f"  盯障中 {_c(f'{elapsed:.0f}', C_CYAN)}/{self.duration_s}s  "
+                f"网关 {_c('✗丢' + str(gw_loss), C_RED) if gw_bad else _c('✓', C_GREEN)}  "
+                f"外网 {_c('✗丢' + str(ext_loss), C_RED) if ext_bad else _c('✓', C_GREEN)}  "
+                f"DNS {_c(dns_disp, C_GREEN if dns_ok else C_GRAY if last_dns is None else C_RED)}  "
+                f"TCP {_c(tcp_disp, C_GREEN if tcp_ok else C_GRAY if last_tcp is None else C_RED)}  "
+                f"事件 {_c(str(ev_n), C_YELLOW) if ev_n else '0'} 起"
+                f"  {_c('(Ctrl+C 提前结束)', C_GRAY)}")
+
+    def stop(self):
+        if self._stop.is_set():           # 幂等
+            return
+        self._stop.set()
+        for _ip, mon in self._gw_monitors:
+            mon.stop()
+        if self._ext_monitor:
+            self._ext_monitor.stop()
+        if self._probe_thread:
+            self._probe_thread.join(timeout=2)
+
+    @staticmethod
+    def _stream_stats(stream):
+        ok_vals = [s[2] for s in stream if s[0] == "ok" and s[2] is not None]
+        loss_n = sum(1 for s in stream if s[0] == "loss")
+        total = ok_vals and len(ok_vals) + loss_n
+        if not total:
+            return {"ok": 0, "loss": 0, "loss_pct": 0.0, "avg_ms": None,
+                    "p50_ms": None, "p95_ms": None, "max_ms": None}
+        return {"ok": len(ok_vals), "loss": loss_n,
+                "loss_pct": round(loss_n / total * 100, 2),
+                "avg_ms": round(sum(ok_vals) / len(ok_vals), 1) if ok_vals else None,
+                "p50_ms": round(_monitor_pct(ok_vals, 0.5), 1) if ok_vals else None,
+                "p95_ms": round(_monitor_pct(ok_vals, 0.95), 1) if ok_vals else None,
+                "max_ms": round(max(ok_vals), 1) if ok_vals else None}
+
+    def build_result(self, early_terminated=False):
+        ended_at = time.time()
+        duration_actual = round(ended_at - self._t0)
+        snap = self.snapshot()
+
+        def _probe_stats(samples):
+            ok = [s[1] for s in samples if s[1] is not None]
+            fail = len(samples) - len(ok)
+            return {"ok": len(ok), "fail": fail,
+                    "ok_pct": round(len(ok) / len(samples) * 100, 1) if samples else 0.0,
+                    "avg_ms": round(sum(ok) / len(ok), 1) if ok else None}
+
+        stats = {"gw": self._stream_stats(snap["gw_stream"]),
+                 "ext": self._stream_stats(snap["ext_stream"]),
+                 "tcp": _probe_stats(snap["tcp"]),
+                 "dns": _probe_stats(snap["dns"])}
+        events = _detect_monitor_events(snap, self._t0, ended_at)
+        verdict, conclusion, advice = _monitor_conclusion(events, stats, snap)
+
+        t0 = self._t0
+        result = {
+            "mode": "monitor",
+            "timestamp": datetime.fromtimestamp(t0).isoformat(),
+            "started_at": datetime.fromtimestamp(t0).strftime("%Y-%m-%d %H:%M:%S"),
+            "ended_at": datetime.fromtimestamp(ended_at).strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_planned_s": self.duration_s,
+            "duration_actual_s": duration_actual,
+            "early_terminated": early_terminated,
+            "targets": {"gateway": self._gw_ip,
+                        "external": self.ext_target,
+                        "external_resolved": self._ext_ip_resolved,
+                        "tcp_target": f"{self._ext_ip_resolved}:53",
+                        "dns_server": self._dns_server,
+                        "dns_domain": self.DNS_DOMAIN},
+            "notes": self._notes,
+            "samples": {
+                "gw_rtt": [[round(s[1] - t0, 1), round(s[2], 1)]
+                           for s in snap["gw_stream"] if s[0] == "ok"],
+                "gw_loss": [round(s[1] - t0, 1)
+                            for s in snap["gw_stream"] if s[0] == "loss"],
+                "ext_rtt": [[round(s[1] - t0, 1), round(s[2], 1)]
+                            for s in snap["ext_stream"] if s[0] == "ok"],
+                "ext_loss": [round(s[1] - t0, 1)
+                             for s in snap["ext_stream"] if s[0] == "loss"],
+                "tcp": [[round(s[0] - t0, 1), round(s[1], 1) if s[1] is not None else None]
+                        for s in snap["tcp"]],
+                "dns": [[round(s[0] - t0, 1),
+                         round(s[1], 1) if s[1] is not None else None, s[2]]
+                        for s in snap["dns"]],
+            },
+            "stats": stats,
+            "events": events,
+            "verdict": verdict,
+            "conclusion_text": conclusion,
+            "advice": advice,
+            "local_ip": get_local_ip(),
+        }
+        # CSV 行 (绝对墙钟, Excel 直开)
+        rows = []
+        for probe, stream, note_fn in (
+                ("gw_ping", snap["gw_stream"],
+                 lambda s: "" if s[0] == "ok" else "timeout"),
+                ("ext_ping", snap["ext_stream"],
+                 lambda s: "" if s[0] == "ok" else "timeout"),
+                ("ext_tcp", snap["tcp"],
+                 lambda s: "" if s[1] is not None else "connect_fail"),
+                ("dns", snap["dns"],
+                 lambda s: s[2] or "resolve_fail")):
+            for i, s in enumerate(stream, 1):
+                ts = s[1] if probe.endswith("ping") else s[0]
+                val = (s[2] if probe.endswith("ping") else s[1])
+                rows.append([datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                             probe, i,
+                             round(val, 1) if isinstance(val, (int, float)) else "",
+                             1 if (val is not None) else 0, note_fn(s)])
+        result["_csv_rows"] = rows
+        outages = [e for e in events if e["type"] == "outage"]
+        result["summary"] = (
+            f"盯障 {duration_actual}s: 网关丢包 {stats['gw']['loss_pct']}%, "
+            f"外网丢包 {stats['ext']['loss_pct']}%, "
+            + (f"中断 {len(outages)} 起 (最长 "
+               f"{max(e['duration_s'] for e in outages):.0f}s), "
+               if outages else "无中断, ")
+            + f"DNS 失败 {stats['dns']['fail']} 次")
+        return result
+
+
+def save_monitor_report(res):
+    """盯障三件套: CSV (utf-8-sig, Excel 直开) + HTML + JSON。返回 (html, json) 或 None。"""
+    try:
+        day_dir = _report_dir()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(day_dir, f"monitor_{stamp}.csv")
+        json_path = os.path.join(day_dir, f"monitor_{stamp}.json")
+        html_path = os.path.join(day_dir, f"monitor_{stamp}.html")
+        rows = res.pop("_csv_rows", [])
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = _csv.writer(f)
+            w.writerow(["time", "probe", "seq", "value_ms", "ok", "note"])
+            w.writerows(rows)
+        snapshot = dict(res)
+        snapshot["report_html"] = html_path
+        snapshot["report_csv"] = csv_path
+        snapshot["report_json"] = json_path
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2, default=str)
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(_render_monitor_html(snapshot))
+        return html_path, json_path
+    except Exception:
+        return None
+
+
+def _render_monitor_html(res):
+    """盯障独立报告: 结论 banner (会诊核心) + 事件表 + 延迟时序双线 (中断色带) +
+    连通率图。完全离线 (canvas 手绘, 无外部依赖)。"""
+    stats = res.get("stats", {})
+    events = res.get("events", [])
+    tg = res.get("targets", {})
+    samples = res.get("samples", {})
+    early = " · <b>提前结束</b>" if res.get("early_terminated") else ""
+    dur = (f"{res.get('duration_actual_s')}s / 计划 {res.get('duration_planned_s')}s"
+           f"{early}")
+
+    def _downsample(series, cap=2000):
+        if len(series) <= cap:
+            return series
+        import math
+        bucket = math.ceil(len(series) / cap)
+        out = []
+        for i in range(0, len(series), bucket):
+            chunk = series[i:i + bucket]
+            out.append([chunk[0][0],
+                        round(sum(v for _, v in chunk) / len(chunk), 1)])
+        return out
+
+    def _bands(loss_offsets, merge_s=1.0):
+        if not loss_offsets:
+            return []
+        bands = []
+        s = p = loss_offsets[0]
+        for t in loss_offsets[1:]:
+            if t - p <= merge_s + 1.5:
+                p = t
+            else:
+                bands.append([s, p])
+                s = p = t
+        bands.append([s, p])
+        return bands
+
+    gw = _downsample(samples.get("gw_rtt") or [])
+    ext = _downsample(samples.get("ext_rtt") or [])
+
+    def _rate_series(probe_samples, bucket_s=30):
+        buckets = defaultdict(lambda: [0, 0])
+        for item in probe_samples:
+            b = int(item[0] // bucket_s)
+            buckets[b][0] += 1 if item[1] is not None else 0
+            buckets[b][1] += 1
+        return [[b * bucket_s, round(c / n * 100, 1)]
+                for b, (c, n) in sorted(buckets.items()) if n]
+
+    tcp_rate = _rate_series(samples.get("tcp") or [])
+    dns_rate = _rate_series(samples.get("dns") or [])
+    data_js = json.dumps({
+        "gw": gw, "ext": ext,
+        "gw_bands": _bands(samples.get("gw_loss") or []),
+        "ext_bands": _bands(samples.get("ext_loss") or []),
+        "tcp_rate": tcp_rate, "dns_rate": dns_rate,
+    }, ensure_ascii=False)
+
+    gw_pct = stats.get("gw", {}).get("loss_pct", 0)
+    ext_pct = stats.get("ext", {}).get("loss_pct", 0)
+    outages = [e for e in events if e["type"] == "outage"]
+    longest = max((e["duration_s"] for e in outages), default=0)
+    dns_ok = stats.get("dns", {}).get("ok_pct")
+
+    def _metric(label, value, level, note=""):
+        color = {"ok": "#0e8a4f", "warn": "#b26a00", "err": "#b42318"}[level]
+        note_html = f"<div class='note'>{_esc_html(note)}</div>" if note else ""
+        return (f"<div class='metric'><div class='lab'>{_esc_html(label)}</div>"
+                f"<div class='v' style='color:{color}'>{_esc_html(value)}</div>"
+                f"{note_html}</div>")
+
+    v_color = {"stable": "#0e8a4f", "no_data": "#64748b", "target_unreachable": "#b26a00",
+               "internal": "#b42318", "carrier": "#b42318", "dns": "#b26a00",
+               "degraded": "#b26a00", "mixed": "#b42318"}.get(res.get("verdict"), "#0e8a4f")
+    v_name = {"stable": "监测稳定", "no_data": "无有效数据", "target_unreachable": "目标不可达",
+              "internal": "内网侧问题", "carrier": "运营商侧问题", "dns": "解析侧问题",
+              "degraded": "质量劣化", "mixed": "混合问题"}.get(res.get("verdict"), "")
+
+    ev_rows = []
+    type_names = {"outage": "中断", "dns_fail": "DNS 故障", "tcp_fail": "TCP 失败",
+                  "latency_spike": "延迟突增", "monitor_gap": "采集间隙"}
+    cls_names = {"internal": "内网侧", "carrier": "运营商侧", "both_down": "内外同断",
+                 "dns": "解析侧", "with_outage": "随中断", "policy": "端口策略",
+                 "target_unreachable": "目标不可达", "unknown": "无法定位", "": ""}
+    for e in events:
+        if e["type"] == "monitor_gap":
+            continue
+        status = ("<span class='pill open'>结束时未恢复</span>" if e.get("open_at_end")
+                  else "<span class='pill ok'>已恢复</span>")
+        ev_rows.append(
+            f"<tr><td>{_esc_html(e['start_disp'])}–{_esc_html(e['end_disp'])}</td>"
+            f"<td>{e['duration_s']:.0f}s</td>"
+            f"<td>{type_names.get(e['type'], e['type'])}</td>"
+            f"<td>{_esc_html(cls_names.get(e.get('cls', ''), e.get('cls', '—')))}</td>"
+            f"<td>{_esc_html(e.get('detail', ''))}</td><td>{status}</td></tr>")
+    ev_table = ("<table><tr><th>时刻</th><th>持续</th><th>类型</th><th>定位</th>"
+                "<th>详情</th><th>状态</th></tr>"
+                + ("".join(ev_rows) if ev_rows
+                   else "<tr><td colspan=6 class='empty'>监测期内无异常事件</td></tr>")
+                + "</table>")
+
+    notes_html = "".join(f"<div class='note-line'>· [{n['t']}s] {_esc_html(n['text'])}</div>"
+                         for n in res.get("notes", []))
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>NetPulse 盯障监测报告</title>
+<style>
+body{{font-family:'Microsoft YaHei',sans-serif;background:#f2f5f9;margin:0;padding:24px;color:#1e293b}}
+.wrap{{max-width:900px;margin:0 auto}}
+h1{{font-size:22px;margin:0 0 4px}}
+.sub{{color:#64748b;font-size:13px;margin-bottom:18px}}
+.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:16px}}
+.metric{{background:#fff;border-radius:10px;padding:12px 16px;box-shadow:0 1px 3px rgba(0,0,0,.06)}}
+.metric .lab{{font-size:12px;color:#64748b}} .metric .v{{font-size:22px;font-weight:700;font-family:Consolas,monospace}}
+.metric .note{{font-size:11px;color:#94a3b8;margin-top:2px}}
+.banner{{background:#fff;border-left:5px solid {v_color};border-radius:8px;padding:14px 18px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.06)}}
+.banner .verdict{{font-size:16px;font-weight:700;color:{v_color};margin-bottom:6px}}
+.banner .text{{font-size:14px;line-height:1.7}} .banner .advice{{font-size:13px;color:#1e293b;background:#f0f9ff;border-left:3px solid #0284c7;padding:8px 12px;border-radius:0 6px 6px 0;margin-top:10px;white-space:pre-line}}
+.panel{{background:#fff;border-radius:10px;padding:14px 18px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.06)}}
+.panel h3{{margin:0 0 10px;font-size:15px}}
+table{{width:100%;border-collapse:collapse;font-size:12.5px}}
+th{{text-align:left;color:#64748b;font-weight:600;border-bottom:1px solid #e2e8f0;padding:6px 8px}}
+td{{border-bottom:1px solid #f1f5f9;padding:6px 8px;vertical-align:top}}
+.empty{{color:#94a3b8;text-align:center;padding:16px}}
+.pill{{font-size:11px;padding:2px 8px;border-radius:10px}} .pill.ok{{background:#ecfdf5;color:#0e8a4f}} .pill.open{{background:#fef2f2;color:#b42318}}
+canvas{{max-width:100%}}
+.note-line{{font-size:12px;color:#94a3b8}}
+.footer{{color:#94a3b8;font-size:12px;text-align:center;margin-top:8px}}
+</style></head><body><div class="wrap">
+<h1>NetPulse 盯障监测报告</h1>
+<div class="sub">开始 {_esc_html(res.get('started_at', ''))} · 时长 {_esc_html(dur)} ·
+本机 {_esc_html(res.get('local_ip') or '—')} · 网关 {_esc_html(str(tg.get('gateway') or '—'))} ·
+外网目标 {_esc_html(str(tg.get('external') or '—'))}</div>
+<div class="metrics">
+{_metric("网关丢包率", f"{gw_pct}%", "err" if gw_pct > 10 else "warn" if gw_pct > 2 else "ok")}
+{_metric("外网丢包率", f"{ext_pct}%", "err" if ext_pct > 10 else "warn" if ext_pct > 2 else "ok")}
+{_metric("最长中断", f"{longest:.0f}s", "err" if longest >= 30 else "warn" if longest else "ok")}
+{_metric("DNS 成功率", f"{dns_ok}%", "err" if (dns_ok or 100) < 90 else "ok", f"服务器 {tg.get('dns_server', '')}")}
+</div>
+<div class="banner">
+<div class="verdict">{_esc_html(v_name)}</div>
+<div class="text">{_esc_html(res.get('conclusion_text', ''))}</div>
+<div class="advice">💡 处置建议: {_esc_html(res.get('advice', ''))}</div>
+</div>
+<div class="panel"><h3>事件明细 ({len([e for e in events if e['type'] != 'monitor_gap'])} 起)</h3>{ev_table}</div>
+<div class="panel"><h3>延迟时序 (网关 / 外网, 红色区带 = 中断时段)</h3>
+<canvas id="latChart" width="840" height="240"></canvas></div>
+<div class="panel"><h3>连通率 (TCP 53 / DNS, 30 秒桶)</h3>
+<canvas id="reachChart" width="840" height="160"></canvas></div>
+<div class="panel"><h3>监测详情</h3>
+<table>
+<tr><th>项目</th><th>值</th></tr>
+<tr><td>采样规格</td><td>网关/外网 ping 1s × 2 路; TCP 53 / DNS 解析 5s</td></tr>
+<tr><td>探测目标</td><td>外网 {_esc_html(str(tg.get('external')))} → {_esc_html(str(tg.get('external_resolved')))} ·
+DNS {_esc_html(str(tg.get('dns_server')))} / {_esc_html(str(tg.get('dns_domain')))}</td></tr>
+<tr><td>样本数</td><td>网关 {stats.get('gw', {}).get('ok', 0)} 成功 / {stats.get('gw', {}).get('loss', 0)} 丢包 ·
+外网 {stats.get('ext', {}).get('ok', 0)} / {stats.get('ext', {}).get('loss', 0)}</td></tr>
+<tr><td>延迟分布</td><td>网关 p50 {stats.get('gw', {}).get('p50_ms', '—')}ms /
+p95 {stats.get('gw', {}).get('p95_ms', '—')}ms · 外网 p50 {stats.get('ext', {}).get('p50_ms', '—')}ms /
+p95 {stats.get('ext', {}).get('p95_ms', '—')}ms</td></tr>
+</table>{notes_html}</div>
+<div class="footer">由 NetPulse 生成 · 结论基于监测期内客观采样, 供装维与报障参考 ·
+原始数据见同名 .csv / .json</div>
+<script>
+var DATA = {data_js};
+function chart(id, datasets, bands, yLabel) {{
+  var c = document.getElementById(id), ctx = c.getContext('2d');
+  var W = c.width, H = c.height, padL = 44, padR = 10, padT = 10, padB = 22;
+  var xmax = 0, ymax = 0;
+  datasets.forEach(function(ds) {{
+    ds.data.forEach(function(p) {{ if (p[0] > xmax) xmax = p[0]; if (p[1] > ymax) ymax = p[1]; }});
+  }});
+  if (!xmax) {{ ctx.fillStyle = '#94a3b8'; ctx.font = '13px sans-serif';
+    ctx.fillText('无有效数据', W / 2 - 40, H / 2); return; }}
+  ymax = Math.max(ymax * 1.15, 10);
+  function X(t) {{ return padL + t / xmax * (W - padL - padR); }}
+  function Y(v) {{ return H - padB - v / ymax * (H - padT - padB); }}
+  (bands || []).forEach(function(b) {{
+    ctx.fillStyle = 'rgba(255,59,48,0.10)';
+    ctx.fillRect(X(b[0]), padT, Math.max(X(b[1]) - X(b[0]), 2), H - padT - padB);
+  }});
+  ctx.strokeStyle = '#e2e8f0'; ctx.fillStyle = '#94a3b8'; ctx.font = '10px sans-serif';
+  for (var i = 0; i <= 4; i++) {{
+    var v = ymax * i / 4, y = Y(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.fillText(Math.round(v), 6, y + 3);
+  }}
+  for (var i = 0; i <= 5; i++) {{
+    var t = xmax * i / 5;
+    ctx.fillText(Math.round(t) + 's', X(t) - 8, H - 6);
+  }}
+  datasets.forEach(function(ds) {{
+    if (ds.data.length < 2) return;
+    ctx.strokeStyle = ds.color; ctx.lineWidth = 1.4; ctx.beginPath();
+    ds.data.forEach(function(p, i) {{
+      i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1]));
+    }});
+    ctx.stroke();
+  }});
+  var lx = padL + 8;
+  datasets.forEach(function(ds) {{
+    ctx.fillStyle = ds.color; ctx.fillRect(lx, 4, 10, 3);
+    ctx.fillStyle = '#64748b'; ctx.fillText(ds.name, lx + 14, 9);
+    lx += 14 + ctx.measureText(ds.name).width + 18;
+  }});
+}}
+chart('latChart',
+  [{{name: '网关 ping', color: '#0e8a4f', data: DATA.gw}},
+   {{name: '外网 ping', color: '#0a84ff', data: DATA.ext}}],
+  DATA.gw_bands.concat(DATA.ext_bands));
+chart('reachChart',
+  [{{name: 'TCP 53', color: '#ea580c', data: DATA.tcp_rate}},
+   {{name: 'DNS', color: '#0891b2', data: DATA.dns_rate}}]);
+</script>
+</div></body></html>"""
+
+
+def run_monitor_mode(duration_s, ext_target=None):
+    """盯障模式入口 (CLI --monitor 与菜单 m 共用)。
+
+    全文件唯一在长循环外层捕获 KeyboardInterrupt 的地方: Ctrl+C 提前结束
+    也必须走统一的报告落盘路径 (装维随时可停, 数据不丢)。"""
+    duration_s = max(30, min(86400, int(duration_s or 600)))
+    session = MonitorSession(duration_s, ext_target)
+    if not session.start():
+        print(_c("  ✗ 外网 ping 启动失败, 无法开始监测 (检查 ping 命令可用性)", C_RED))
+        return None
+    tg = session  # noqa: F841 (保留引用便于将来扩展)
+    print(_c(f"  盯障开始: 时长 {duration_s}s · 网关 {session._gw_ip or '—'} · "
+             f"外网 {session._ext_ip_resolved} · DNS {session._dns_server}", C_CYAN))
+    print(_c("  期间可正常使用电脑; Ctrl+C 可提前结束并生成报告", C_GRAY))
+    early = False
+    tty = sys.stdout.isatty()
+    mono0 = time.monotonic()
+    last_heartbeat = -61
+    try:
+        while True:
+            elapsed = time.monotonic() - mono0
+            if elapsed >= duration_s:
+                break
+            line = session.progress_line(elapsed)
+            if tty:
+                sys.stdout.write("\r\033[K" + line)
+                sys.stdout.flush()
+            elif elapsed - last_heartbeat >= 60:
+                print(line)
+                last_heartbeat = elapsed
+            session.maybe_recheck_gateway(elapsed)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        early = True
+    finally:
+        if tty:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+        print(_c("  收到 Ctrl+C, 提前结束监测..." if early else "  监测完成, 汇总数据...",
+                 C_YELLOW if early else C_GREEN))
+        session.stop()
+    result = session.build_result(early_terminated=early)
+    paths = save_monitor_report(result)
+    print(_c(f"  {result['summary']}", C_GREEN))
+    if paths:
+        result["report_html"], result["report_json"] = paths[0], paths[1]
+        for p in paths:
+            print(_c(f"  ✓ {os.path.abspath(p)}", C_GREEN))
+        if tty:
+            try:
+                webbrowser.open("file:///" + paths[0].replace("\\", "/"))
+            except Exception:
+                pass
+    else:
+        print(_c("  ✗ 报告保存失败 (目录不可写?)", C_RED))
+    return result
+
+
+# ============================================================
 # SECTION 5: 模块注册与 CLI
 # ============================================================
 
@@ -5923,10 +8042,14 @@ MODULE_REGISTRY = [
     ("bufferbloat","Bufferbloat",   BufferbloatTester),
     # iperf3: 到指定服务器的点对点吞吐 (归类 b 宽带测速, 但测的是链路吞吐非互联网宽带)
     ("iperf3",     "iperf3 吞吐",   Iperf3Tester),
+    # tcpcc: 并发连接容量压测 (NAT 表上限), 与吞吐/延迟同属"容量性能"家族
+    ("tcpcc",      "TCP 并发",      TCPConcurrencyTester),
     # ── 故障诊断: 定位故障根源 ──
     ("gateway",    "网关检测",      GatewayTester),
     ("external",   "外网检测",      ExternalNetworkTester),
     ("dns",        "DNS 诊断",      DNSTester),
+    # web: L7 应用层体检, 紧随 DNS (域名解析完就看网页分层耗时)
+    ("web",        "网页体检",      WebPageTester),
     ("arp",        "ARP 分析",      ARPAnalyzer),
     ("loop",       "环路检测",      LoopDetector),
     ("tcp",        "TCP 连接",      TCPConnectionAnalyzer),
@@ -5934,6 +8057,10 @@ MODULE_REGISTRY = [
     ("route",      "路由表",        RouteTableAnalyzer),
     ("tcpstats",   "TCP 传输质量",  TCPStatsTester),
     ("mtu",        "MTU 检测",      MTUDetector),
+    # proxy: 代理/加速器残留清点 + 可用性探测 ("开着代理但代理没了"是断网高频根因)
+    ("proxy",      "代理检测",      ProxyDetector),
+    # nattype: STUN 双服务器对比判定锥形/对称型 + UDP 出网受阻检测 (游戏/P2P 排障)
+    ("nattype",    "NAT 类型",      NATTypeTester),
 ]
 MODULE_MAP = {k: (n, c) for k, n, c in MODULE_REGISTRY}
 
@@ -5942,10 +8069,10 @@ MODULE_MAP = {k: (n, c) for k, n, c in MODULE_REGISTRY}
 MODULE_CATEGORIES = [
     ("基础信息", ["linkspeed", "dhcp", "lan", "wifi", "ipv6", "egress"],
      "环境快照 · 看清网络状态"),
-    ("宽带测速", ["speedtest", "bufferbloat", "iperf3"],
+    ("宽带测速", ["speedtest", "bufferbloat", "iperf3", "tcpcc"],
      "带宽达标验证 · 装维核心高频"),
-    ("故障诊断", ["gateway", "external", "dns", "arp", "loop", "tcp",
-                  "port", "route", "tcpstats", "mtu"],
+    ("故障诊断", ["gateway", "external", "dns", "web", "arp", "loop", "tcp",
+                  "port", "route", "tcpstats", "mtu", "proxy", "nattype"],
      "定位故障根源"),
 ]
 # 分类速查: key -> 分类名
@@ -6438,6 +8565,10 @@ MODULE_TIMEOUTS = {
     "port":        180.0,  # 端口探测自带总时长上限, 这里只兜底
     "dhcp":        150.0,  # 可能等待 Npcap/scapy 抓包
     "lan":         150.0,
+    "nattype":     45.0,   # 2 台 STUN × 2 次重试 × 2s + 出口对照
+    "proxy":       30.0,   # 注册表/netsh 即时 + 探测 ≤3+8+8s
+    "web":         150.0,  # _module_timeout 有动态公式, 这里只兜底
+    "tcpcc":       120.0,  # 同上, 动态公式优先生效
 }
 
 
@@ -6454,8 +8585,16 @@ def _module_detect_kwargs(key):
             server=SPEEDTEST_CONFIG.get("iperf3_server"),
             port=SPEEDTEST_CONFIG.get("iperf3_port", 5201),
             duration=SPEEDTEST_CONFIG.get("iperf3_duration", 10),
+            udp=SPEEDTEST_CONFIG.get("iperf3_udp", False),
             save_report=True,
         )
+    if key == "nattype":
+        return dict(servers=NATTYPE_CONFIG.get("servers") or [])
+    if key == "web":
+        return dict(extra_targets=WEB_CONFIG.get("targets") or [])
+    if key == "tcpcc":
+        return dict(max_concurrency=TCPCC_CONFIG.get("max", 1600),
+                    target=TCPCC_CONFIG.get("target"))
     return {}
 
 
@@ -6465,6 +8604,15 @@ def _module_timeout(key):
         # + 定位/下载 iperf3.exe + 报告落盘。静态 120s 会让 duration≥50 必然超时。
         d = SPEEDTEST_CONFIG.get("iperf3_duration", 10)
         return 2 * (d + 15) + 90
+    if key == "web":
+        # 单目标总预算 60s / 3 并发 → 每批目标 60s + 余量
+        n = 3 + len(WEB_CONFIG.get("targets") or [])
+        return 30 + 60 * ((n + 2) // 3)
+    if key == "tcpcc":
+        # 时长随 --tcpcc-max 的级别数伸缩: 每级 (波 3~8s + 保持 1s) ×12s + 预检/回环/余量
+        mx = max(50, min(8000, int(TCPCC_CONFIG.get("max", 1600) or 1600)))
+        n_levels = len({l for l in TCPConcurrencyTester.LADDER_BASE if l <= mx} | {mx})
+        return 30 + 12 * n_levels + 10
     return MODULE_TIMEOUTS.get(key, DEFAULT_MODULE_TIMEOUT)
 
 
@@ -6654,6 +8802,14 @@ THRESHOLDS = {
     "tcpstats": {
         "retrans_rate_pct":{"warn": 1,  "err": 5,   "unit": "%", "label": "重传率",
                             "lower_better": True},
+    },
+    "web": {
+        "avg_ttfb_ms":  {"warn": 500,  "err": 2000, "unit": "ms", "label": "平均首字节",
+                         "lower_better": True},
+    },
+    "tcpcc": {
+        "max_sustained": {"warn": 1024, "err": 512, "label": "最大可持续并发",
+                          "lower_better": False},
     },
 }
 
@@ -6916,29 +9072,45 @@ def _metrics_speedtest(res):
 def _verdict_iperf3(res):
     if "error" in res:
         return res.get("error", "iperf3 测试失败")
-    if not res.get("download_mbps") and not res.get("upload_mbps"):
+    if res.get("udp"):
+        if (res.get("download_jitter_ms") is None
+                and res.get("upload_jitter_ms") is None):
+            return "iperf3 UDP 无有效结果"
+    elif not res.get("download_mbps") and not res.get("upload_mbps"):
         return "iperf3 无有效结果"
     return res.get("summary", "iperf3 链路吞吐")
 
 
 def _metrics_iperf3(res):
-    """iperf3 关键指标: 明确标注是到服务器的链路吞吐 (非宽带)。"""
+    """iperf3 关键指标: 明确标注是到服务器的链路吞吐 (非宽带); UDP 模式给抖动/丢包。"""
     out = []
     if "error" in res:
         return out
-    dl = res.get("download_mbps")
-    ul = res.get("upload_mbps")
-    if dl is not None:
-        out.append(("下载(到服务器)", f"{dl} Mbps", "ok"))
-    if ul is not None:
-        out.append(("上传(到服务器)", f"{ul} Mbps", "ok"))
-    if res.get("download_error"):
-        out.append(("下载", res["download_error"], "warn"))
-    if res.get("upload_error"):
-        out.append(("上传", res["upload_error"], "warn"))
+    if res.get("udp"):
+        for side, jit, loss in (("下载", res.get("download_jitter_ms"), res.get("download_loss_pct")),
+                                 ("上传", res.get("upload_jitter_ms"), res.get("upload_loss_pct"))):
+            if jit is None and loss is None:
+                if res.get(f"{side}_error"):
+                    out.append((side, res[f"{side}_error"], "warn"))
+                continue
+            out.append((f"{side}抖动", f"{jit} ms",
+                        "err" if (jit or 0) > 100 else "warn" if (jit or 0) > 30 else "ok"))
+            out.append((f"{side}UDP丢包", f"{loss}%",
+                        "err" if (loss or 0) > 5 else "warn" if (loss or 0) > 1 else "ok"))
+    else:
+        dl = res.get("download_mbps")
+        ul = res.get("upload_mbps")
+        if dl is not None:
+            out.append(("下载(到服务器)", f"{dl} Mbps", "ok"))
+        if ul is not None:
+            out.append(("上传(到服务器)", f"{ul} Mbps", "ok"))
+        if res.get("download_error"):
+            out.append(("下载", res["download_error"], "warn"))
+        if res.get("upload_error"):
+            out.append(("上传", res["upload_error"], "warn"))
     out.append(("链路", f"{res.get('server')}:{res.get('port')}", "ok"))
     out.append(("时长", f"{res.get('duration_s')} s", "ok"))
-    out.append(("说明", "链路吞吐非宽带", "ok"))
+    out.append(("说明", "UDP 抖动/丢包" if res.get("udp") else "链路吞吐非宽带", "ok"))
     return out
 
 
@@ -7026,6 +9198,11 @@ def _metrics_linkspeed(res):
         sig = wifi["signal_pct"]
         out.append(("WiFi 信号", f"{sig}%",
                     "ok" if sig >= 60 else "warn" if sig >= 30 else "err"))
+    nic = res.get("nic_errors") or {}
+    errs = nic.get("total_errors")
+    if errs:                                   # 0/None 都不展示 (统计不可用时打扰)
+        out.append(("网卡错误", f"{errs} (自开机)",
+                    "err" if errs > 100 else "warn"))
     return out
 
 
@@ -7033,11 +9210,14 @@ def _issues_linkspeed(res):
     out = []
     for issue in res.get("issues", []):
         if isinstance(issue, dict):
+            action = ("换网线/换端口后重跑对比 (错误清零需重启); 持续增长则网卡"
+                      "或对端端口硬件故障" if issue.get("type") == "nic_errors"
+                      else "检查物理连接或网卡驱动")
             out.append({
                 "severity": "警告" if issue.get("severity") == "warning" else "信息",
                 "text": issue.get("message", ""),
                 "impact": issue.get("detail", ""),
-                "action": "检查物理连接或网卡驱动"
+                "action": action
             })
     return out
 
@@ -7446,6 +9626,346 @@ def _issues_tcpstats(res):
     return out
 
 
+def _verdict_proxy(res):
+    if "error" in res:
+        return res.get("error", "代理检测失败")
+    return res.get("summary", "代理检测")
+
+
+def _metrics_proxy(res):
+    wininet = res.get("wininet", {})
+    probe = res.get("probe") or {}
+    ep = wininet.get("proxy_endpoint") if wininet.get("proxy_enable") else None
+    pac = wininet.get("auto_config_url")
+    if pac:
+        sys_val, sys_lvl = "PAC", "warn"
+    elif ep:
+        sys_val, sys_lvl = f"开 → {ep}", "warn"
+    else:
+        sys_val, sys_lvl = "关", "ok"
+    verdict = res.get("verdict")
+    avail = {"unreachable": ("不可达", "err"), "no_forward": ("拒绝转发", "err"),
+             "ok_both": ("可用", "ok"), "only_proxy": ("可用(唯一通道)", "warn"),
+             "both_fail": ("不可用", "warn"), "pac": ("PAC 模式", "warn"),
+             "none": ("未配置", "ok")}.get(verdict, ("—", "ok"))
+    if probe:
+        direct = ("通" if probe.get("direct_ok") else "不通") if "direct_status" in probe else "未测"
+    else:
+        direct = "未测"
+    vpns = res.get("vpn_adapters") or []
+    hosts = res.get("hosts_check") or {}
+    if hosts.get("hijacked"):
+        hosts_val, hosts_lvl = f"{len(hosts['hijacked'])} 条劫持", "err"
+    elif hosts.get("suspicious"):
+        hosts_val, hosts_lvl = f"{len(hosts['suspicious'])} 条可疑", "warn"
+    else:
+        hosts_val, hosts_lvl = "干净", "ok"
+    out = [
+        ("系统代理", sys_val, sys_lvl),
+        ("代理可用性", avail[0], avail[1]),
+        ("直连对照", direct, "ok" if direct == "通" else "warn" if direct == "不通" else "ok"),
+        ("VPN/虚拟网卡", f"{len(vpns)} 块" if vpns else "无", "warn" if vpns else "ok"),
+        ("hosts 文件", hosts_val, hosts_lvl),
+    ]
+    return out
+
+
+def _issues_proxy(res):
+    out = []
+    for issue in res.get("issues", []):
+        if not isinstance(issue, dict):
+            continue
+        sev = {"critical": "异常", "warning": "警告"}.get(issue.get("severity"), "信息")
+        # 断网根因类问题给可执行建议; 其余保持模块内 detail
+        action = "查看技术细节或联系网络管理员"
+        if issue.get("type") in ("proxy_unreachable", "proxy_no_forward"):
+            action = "关闭系统代理 (设置 → 网络 → 代理) 或修复代理客户端"
+        elif issue.get("type") == "proxy_only_path":
+            action = "排障时勿直接关代理; 先确认代理用途再处理"
+        elif issue.get("type") == "vpn_adapter":
+            action = "如非预期, 退出 VPN/加速器客户端后重测"
+        elif issue.get("type") == "hosts_hijack":
+            action = ("以管理员打开 hosts (C:\\Windows\\System32\\drivers\\etc\\hosts) "
+                      "删除对应行; 删完杀毒扫描复核")
+        elif issue.get("type") == "hosts_suspicious":
+            action = "确认非本人/合规软件所需后删除对应行"
+        elif issue.get("type") == "hosts_bulk":
+            action = "检查是哪个工具写入 (常见: 加速器/去广告/破解补丁), 按需清理"
+        out.append({"severity": sev, "text": issue.get("message", ""),
+                    "impact": issue.get("detail", ""), "action": action})
+    return out
+
+
+def _issues_external(res):
+    """外网检测: 之前只亮徽章不出问题条目, 装维看不到处置建议 — 按段位给建议。"""
+    out = []
+    if "error" in res:
+        return out
+    loss = res.get("avg_loss_pct", 0) or 0
+    rtt = res.get("avg_rtt_ms", 0) or 0
+    tcp_ok, tcp_total = res.get("tcp_ok", 0), res.get("tcp_total", 0)
+    unreachable = res.get("unreachable_count", 0) or 0
+    if tcp_total and tcp_ok == 0 and unreachable:
+        out.append({"severity": "异常", "text": "全部外网目标不可达",
+                    "impact": "出网链路中断或被防火墙整体拦截",
+                    "action": "先看网关检测与链路速率; 网关正常则查本机防火墙/代理 (跑 proxy 模块)"})
+    elif unreachable:
+        out.append({"severity": "警告", "text": f"{unreachable} 个外网目标不可达",
+                    "impact": "部分目标不通, 可能是目标站自身问题或链路单侧劣化",
+                    "action": "看技术细节里的路径追踪, 确定从哪一跳开始不通; 仅个别目标不通多为对端问题"})
+    if loss >= 5:
+        out.append({"severity": "异常", "text": f"外网平均丢包 {loss}%",
+                    "impact": "明显丢包: 网页卡顿、游戏掉线、视频花屏",
+                    "action": "网关正常而此处丢包 → 问题在运营商侧, 保留报告 (含逐跳路径) 带回报障"})
+    elif loss >= 1:
+        out.append({"severity": "警告", "text": f"外网平均丢包 {loss}%",
+                    "impact": "轻度丢包会影响游戏/通话体验",
+                    "action": "结合网关模块丢包判断段位: 网关也丢=内网问题; 网关不丢=外线问题"})
+    if rtt >= 150:
+        out.append({"severity": "警告", "text": f"外网平均延迟 {rtt:.0f}ms",
+                    "impact": "延迟偏高, 游戏类应用会明显感觉慢",
+                    "action": "看路径追踪逐跳延迟, 从哪一跳开始升高, 问题就在那一段"})
+    return out
+
+
+def _issues_speedtest(res):
+    """测速: 宽带不达标是装维核心场景, 必须给出建议条目而非只亮警告徽章。"""
+    out = []
+    if "error" in res:
+        return out
+    down, up = res.get("download_mbps"), res.get("upload_mbps")
+    if isinstance(down, (int, float)):
+        if down < 1:
+            out.append({"severity": "异常", "text": f"下载速率仅 {down} Mbps, 接近不可用",
+                        "impact": "基本无法正常上网",
+                        "action": "查链路速率是否只协商到低档位; 重启光猫; 仍低则携本报告报障"})
+        elif down < 10:
+            out.append({"severity": "警告", "text": f"下载速率仅 {down} Mbps, 远低于常见宽带档位",
+                        "impact": "网页/视频会明显卡顿",
+                        "action": "确认办理档位; 千兆环境查网线是否八芯、光猫口是否千兆口"})
+    if isinstance(up, (int, float)) and up < 1:
+        out.append({"severity": "警告", "text": f"上传速率仅 {up} Mbps",
+                    "impact": "视频通话上传卡、网盘备份慢",
+                    "action": "部分套餐上传本身限速, 对照办理档位判断是否达标"})
+    grade = res.get("bufferbloat_grade") or ""
+    if grade in ("D", "F"):
+        out.append({"severity": "警告", "text": f"缓冲膨胀评级 {grade}",
+                    "impact": "一边下载一边游戏/通话会明显变卡 (延迟暴涨)",
+                    "action": "开启路由器 QoS 限速或更换路由器; 光猫路由一体机可改桥接 + 自备路由器"})
+    return out
+
+
+def _issues_iperf3(res):
+    out = []
+    if "error" in res:
+        return out
+    dl_err, ul_err = res.get("download_error"), res.get("upload_error")
+    if dl_err or ul_err:
+        sides = "、".join(s for s, e in (("下载", dl_err), ("上传", ul_err)) if e)
+        out.append({"severity": "异常" if (dl_err and ul_err) else "警告",
+                    "text": f"iperf3 {sides}方向测试失败",
+                    "impact": "无法测得该方向的链路吞吐",
+                    "action": "确认服务器端已运行 iperf3 -s 且 5201 端口放行; 单方向失败多为服务器侧单向策略或中途防火墙"})
+    dl = res.get("download_mbps")
+    if isinstance(dl, (int, float)) and 0 < dl < 10:
+        out.append({"severity": "警告", "text": f"到服务器的下载吞吐仅 {dl} Mbps",
+                    "impact": "点对点链路吞吐远低于常见水平",
+                    "action": "对照 speedtest 宽带结果: 宽带正常而点对点低 → 瓶颈在中间链路或服务器侧, 保留数据带回分析"})
+    if res.get("udp"):
+        for side in ("download", "upload"):
+            side_name = "下载" if side == "download" else "上传"
+            loss = res.get(f"{side}_loss_pct")
+            jit = res.get(f"{side}_jitter_ms")
+            if isinstance(loss, (int, float)) and loss > 5:
+                out.append({"severity": "异常", "text": f"UDP {side_name}丢包 {loss}%",
+                            "impact": "语音通话/游戏会明显卡顿掉线; TCP 正常而 UDP 丢包高多为 QoS 限速或链路突发",
+                            "action": "检查中间设备/运营商是否对 UDP 限速; 结合 nattype (UDP 出网) 与盯障模式复测"})
+            elif isinstance(loss, (int, float)) and loss > 1:
+                out.append({"severity": "警告", "text": f"UDP {side_name}丢包 {loss}%",
+                            "impact": "语音质量可感知下降",
+                            "action": "结合盯障模式 (--monitor) 观察是否为间歇性"})
+            if isinstance(jit, (int, float)) and jit > 100:
+                out.append({"severity": "警告", "text": f"UDP {side_name}抖动 {jit} ms",
+                            "impact": "语音通话断续、游戏操作不跟手",
+                            "action": "排查链路拥塞 (bufferbloat 模块) 与中间设备缓存策略"})
+    return out
+
+
+def _issues_lan(res):
+    out = []
+    if "error" in res:
+        return out
+    devs = res.get("devices") or []
+    if res.get("device_count", 0) == 0 and not devs:
+        out.append({"severity": "警告", "text": "未扫描到任何局域网设备",
+                    "impact": "可能是权限不足、终端隔离或扫描窗口太短",
+                    "action": "以管理员身份重试; 无线网络开了 AP 隔离时看不到邻居属正常现象"})
+        return out
+    unknown = [d for d in devs if d.get("mac") and not d.get("vendor")]
+    if unknown and len(unknown) >= max(2, len(devs) // 2):
+        out.append({"severity": "信息", "text": f"{len(unknown)}/{len(devs)} 台设备厂商无法识别",
+                    "impact": "多为小众/贴牌设备 (智能家电常见), 不影响在线判断",
+                    "action": "无需处理; 需要时可用 MAC 地址在厂商库核对"})
+    return out
+
+
+def _verdict_nattype(res):
+    if "error" in res:
+        return res.get("error", "NAT 类型检测失败")
+    return res.get("summary", "NAT 类型")
+
+
+def _metrics_nattype(res):
+    beh = res.get("nat_behavior", "—")
+    blocked = bool(res.get("udp_blocked"))
+    ipm = res.get("ip_match")
+    if blocked:
+        beh_lvl = "err"
+    elif beh == "对称型":
+        beh_lvl = "warn"
+    else:
+        beh_lvl = "ok"
+    if ipm is False:
+        match_val, match_lvl = "不一致", "warn"
+    elif ipm:
+        match_val, match_lvl = "一致", "ok"
+    else:
+        match_val, match_lvl = "—", "ok"
+    out = [
+        ("映射行为", beh, beh_lvl),
+        ("UDP 出网", "受阻" if blocked else "正常", "err" if blocked else "ok"),
+        ("出口一致性", match_val, match_lvl),
+        ("本机内网IP", res.get("local_lan_ip") or "—", "ok"),
+    ]
+    cone = res.get("cone_type")
+    if cone and cone not in ("—",):
+        out.insert(1, ("锥形细分", cone, "ok"))
+    return out
+
+
+def _issues_nattype(res):
+    out = []
+    for issue in res.get("issues", []):
+        if not isinstance(issue, dict):
+            continue
+        sev = {"critical": "异常", "warning": "警告"}.get(issue.get("severity"), "信息")
+        action = {
+            "udp_blocked": "检查路由器 UDP 出站限制与本机防火墙; 对比 dns 模块 (TCP 53) 是否正常",
+            "symmetric": "对称型下 P2P 直连难属预期; 游戏/语音改用中继模式或联系运营商",
+            "egress_mismatch": "结合多出口 (egress) 与代理检测 (proxy) 判断哪个出口在分流量",
+        }.get(issue.get("type"), "查看技术细节")
+        out.append({"severity": sev, "text": issue.get("message", ""),
+                    "impact": issue.get("detail", ""), "action": action})
+    return out
+
+
+def _verdict_web(res):
+    if "error" in res:
+        return res.get("error", "网页体检失败")
+    return res.get("summary", "网页体检")
+
+
+def _metrics_web(res):
+    ok, total = res.get("ok_count", 0), res.get("total_count", 0)
+    ttfb, dns, tls = res.get("avg_ttfb_ms"), res.get("avg_dns_ms"), res.get("avg_tls_ms")
+    cert = res.get("min_cert_days")
+
+    def lvl(v, warn, err):
+        return ("err" if v >= err else "warn" if v >= warn else "ok") if v is not None else "ok"
+
+    return [
+        ("目标可达", f"{ok}/{total}", "err" if ok == 0 else "warn" if ok < total else "ok"),
+        ("平均首字节", f"{ttfb} ms" if ttfb is not None else "—", lvl(ttfb, 500, 2000)),
+        ("平均 DNS", f"{dns} ms" if dns is not None else "—", lvl(dns, 200, 10**9)),
+        ("平均 TLS", f"{tls} ms" if tls is not None else "—", lvl(tls, 500, 10**9)),
+        ("证书最短剩余", f"{cert} 天" if cert is not None else "—",
+         "err" if cert is not None and cert < 7 else
+         "warn" if cert is not None and cert < 30 else "ok"),
+    ]
+
+
+def _issues_web(res):
+    # 断层定位: 每类失败给指向既有模块的可执行建议
+    actions = {
+        "dns_fail": "运行 dns 模块定位解析链路",
+        "tcp_fail": "运行 port 模块探测 80/443, 检查防火墙出站",
+        "tls_cert_fail": "核对系统时间; 检查是否存在 HTTPS 中间盒/企业解密",
+        "tls_fail": "检查中间盒拦截或 TLS 版本兼容性",
+        "http_fail": "结合外网检测 (external) 判断链路, 或目标站点本身故障",
+        "ttfb_slow": "DNS/TCP/TLS 均正常时为服务端或链路慢, 结合测速与 route 判断",
+        "cert_expire": "联系站点管理员续期证书",
+        "cert_soon": "关注证书续期",
+    }
+    impacts = {
+        "tls_cert_fail": "疑似中间人/企业 HTTPS 解密或系统时间错误, 浏览器会报证书错误",
+        "dns_fail": "域名无法解析, 所有依赖该域名的服务不可用",
+        "tcp_fail": "传输层不通: 防火墙拦截或目标端口未开放",
+    }
+    out = []
+    for issue in res.get("issues", []):
+        if not isinstance(issue, dict):
+            continue
+        sev = {"critical": "异常", "warning": "警告"}.get(issue.get("severity"), "信息")
+        t = issue.get("type", "")
+        out.append({"severity": sev, "text": issue.get("message", ""),
+                    "impact": impacts.get(t, issue.get("detail", "")),
+                    "action": actions.get(t, "查看技术细节")})
+    return out
+
+
+def _verdict_tcpcc(res):
+    if "error" in res:
+        return res.get("error", "TCP 并发测试失败")
+    return res.get("summary", "TCP 并发")
+
+
+def _metrics_tcpcc(res):
+    n = res.get("max_sustained", 0)
+    capped = bool(res.get("capped")) and n
+    shown = f"≥{n}" if capped else str(n)
+    levels = res.get("levels") or []
+    last_ok = None
+    for r in levels:
+        if r.get("attempted") and r.get("success_rate", 0) >= 90 and r.get("p95_ms"):
+            last_ok = r
+    base = res.get("local_baseline") or {}
+    base_ok = bool(base) and base.get("success_rate", 0) >= 90
+    bottleneck = res.get("bottleneck")
+    # capped (全级别通过) = 容量至少 N, 不按 N 的大小判色
+    n_lvl = "ok" if capped else ("err" if n < 512 else "warn" if n < 1024 else "ok")
+    out = [
+        ("最大并发", shown, n_lvl),
+        ("建连 P50", f"{last_ok['p50_ms']} ms" if last_ok else "—", "ok"),
+        ("建连 P95", f"{last_ok['p95_ms']} ms" if last_ok else "—",
+         "warn" if last_ok and last_ok["p95_ms"] > 500 else "ok"),
+        ("峰值建连", f"{res.get('peak_cps', 0):.0f} /s", "ok"),
+        ("本机对照",
+         f"{base.get('level')} 并发{'通过' if base_ok else '受限' }" if base else "—",
+         "ok" if base_ok or not base else "warn"),
+    ]
+    if bottleneck in ("本机", "网络/NAT"):
+        out.append(("瓶颈位置", bottleneck, "warn" if bottleneck == "本机" else "ok"))
+    return out
+
+
+def _issues_tcpcc(res):
+    actions = {
+        "low_concurrency": "检查路由器/光猫 NAT 并发会话数规格; 对照本机回环结果区分本机/网络瓶颈",
+        "fail_mode": "超时为主→NAT 表满, 考虑升级设备或减少长连接设备; 拒绝为主→换 --tcpcc-target 复测",
+        "local_bottleneck": "排查安全软件/终端管控软件的连接数限制; 对照资源监视器确认",
+        "path_bottleneck": "重启网关; 核实设备 NAT 规格是否与办理带宽匹配",
+    }
+    out = []
+    for issue in res.get("issues", []):
+        if not isinstance(issue, dict):
+            continue
+        sev = {"critical": "异常", "warning": "警告"}.get(issue.get("severity"), "信息")
+        out.append({"severity": sev, "text": issue.get("message", ""),
+                    "impact": issue.get("detail", ""),
+                    "action": actions.get(issue.get("type"), "查看技术细节")})
+    return out
+
+
 # 通用兜底: 没专门配置的模块, 用 summary + 2-3 个简单指标
 def _generic_verdict(res):
     if "error" in res:
@@ -7474,19 +9994,21 @@ def _generic_issues(res):
         for issue in issues:
             if isinstance(issue, str):
                 out.append({"severity": "警告", "text": issue,
-                            "impact": "", "action": "关注后续诊断结果"})
+                            "impact": "",
+                            "action": "按结论提示现场排查; 无法定位时保留本报告 (HTML+JSON) 带回支撑分析"})
             elif isinstance(issue, dict):
                 sev = issue.get("severity", "")
                 out.append({
                     "severity": "异常" if sev == "critical" else "警告" if sev == "warning" else "信息",
                     "text": issue.get("message", ""),
                     "impact": issue.get("detail", ""),
-                    "action": "查看技术细节或联系网络管理员"
+                    "action": "查看该模块技术细节; 现场无法处理时保留本报告带回会诊"
                 })
     for w in res.get("warnings", []):
         if isinstance(w, str) and not any(i.get("text") == w for i in out):
             out.append({"severity": "警告", "text": w,
-                        "impact": "", "action": "关注后续诊断结果"})
+                        "impact": "",
+                        "action": "按结论提示现场排查; 无法定位时保留本报告 (HTML+JSON) 带回支撑分析"})
     return out
 
 
@@ -7501,7 +10023,7 @@ MODULE_PRESENTATION = {
                    "issues_fn": _issues_loop,
                    "tech_keys": ["arp_entries"]},
     "external":   {"verdict_fn": _verdict_external,   "metrics_fn": _metrics_external,
-                   "issues_fn": _generic_issues,
+                   "issues_fn": _issues_external,
                    "tech_keys": ["targets", "traceroute"]},
     "linkspeed":  {"verdict_fn": _verdict_linkspeed,  "metrics_fn": _metrics_linkspeed,
                    "issues_fn": _issues_linkspeed,
@@ -7536,16 +10058,128 @@ MODULE_PRESENTATION = {
                    "issues_fn": _issues_route,
                    "tech_keys": ["routes"]},
     "speedtest":  {"verdict_fn": _verdict_speedtest,  "metrics_fn": _metrics_speedtest,
-                   "issues_fn": _generic_issues,
+                   "issues_fn": _issues_speedtest,
                    "tech_keys": ["speedtest", "http"]},
     "iperf3":     {"verdict_fn": _verdict_iperf3,     "metrics_fn": _metrics_iperf3,
-                   "issues_fn": _generic_issues,
+                   "issues_fn": _issues_iperf3,
                    "tech_keys": ["download_intervals_mbps", "upload_intervals_mbps"]},
     "lan":        {"verdict_fn": _verdict_lan,        "metrics_fn": _metrics_lan,
-                   "issues_fn": _generic_issues,
+                   "issues_fn": _issues_lan,
                    "tech_keys": ["devices"]},
     "tcpstats":   {"verdict_fn": _verdict_tcpstats,   "metrics_fn": _metrics_tcpstats,
                    "issues_fn": _issues_tcpstats},
+    "proxy":      {"verdict_fn": _verdict_proxy,      "metrics_fn": _metrics_proxy,
+                   "issues_fn": _issues_proxy,
+                   "tech_keys": ["wininet", "winhttp", "env_proxies", "vpn_adapters",
+                                 "hosts_check", "probe"]},
+    "nattype":    {"verdict_fn": _verdict_nattype,    "metrics_fn": _metrics_nattype,
+                   "issues_fn": _issues_nattype,
+                   "tech_keys": ["servers"]},
+    "web":        {"verdict_fn": _verdict_web,        "metrics_fn": _metrics_web,
+                   "issues_fn": _issues_web,
+                   "tech_keys": ["targets", "redirect_chain"]},
+    "tcpcc":      {"verdict_fn": _verdict_tcpcc,      "metrics_fn": _metrics_tcpcc,
+                   "issues_fn": _issues_tcpcc,
+                   "tech_keys": ["levels", "target_candidates", "local_baseline",
+                                 "established_before", "established_after"]},
+}
+
+
+# ── 装维可读性: 模块说明 + 指标术语解释 ──
+# 报告受众是装维人员: 每个模块卡片配一句"这是测什么的、结果怎么看",
+# 行话指标 (TTFB/P95/CPS/NAT 类型…) 配通俗解释。集中两张表, 渲染层注入。
+MODULE_EXPLAINS = {
+    "linkspeed": "看电脑与网关之间的通道协商到了多高速率 (网线芯数/水晶头/WiFi 档位决定)。千兆宽带只协商到百兆是最常见的不达标原因。",
+    "dhcp": "检查 IP 地址由谁分配。内网出现多台 DHCP 服务器 (常见于私接的路由器) 会导致上网时好时坏、网段错乱。",
+    "lan": "清点当前局域网在线设备 (基于 ARP 表), 可发现陌生设备或私接的路由器/交换机。",
+    "wifi": "扫描周边 WiFi 的信道占用并推荐最空闲信道。信道拥挤 = WiFi 慢但宽带本身正常, 换信道即可改善。",
+    "ipv6": "检查新一代网络地址 (IPv6) 是否开通可用。部分运营商业务与测评依赖它, 缺失属资源配置问题非故障。",
+    "egress": "检查是否同时存在多条上网出口 (如网线+VPN/加速器并行)。流量走错出口会出现『测速正常但某个软件不通』。",
+    "speedtest": "实测下载/上传速率并推算宽带档位。实测明显低于办理档位 = 线路或设备有问题, 是装维核心验收项。",
+    "bufferbloat": "测『一边满速下载、一边游戏/通话』时延会不会暴涨。评级差说明路由器缓存策略差, 表现为下载时全家卡。",
+    "iperf3": "到指定服务器点对点测吞吐 (内网/专线验收用), 测的是链路吞吐, 与互联网宽带测速是两回事。UDP 模式 (--iperf3-udp) 改测抖动/丢包 — 语音/游戏质量的关键指标。",
+    "tcpcc": "压测整条通路同时能保持多少条 TCP 连接 (光猫/路由器的 NAT 会话表容量)。数值低 = 设备一连多就掉线、网页资源加载不全。",
+    "gateway": "Ping 网关 (光猫/路由器), 反映『本机 ↔ 网关』这一段的质量。这里丢包/高延迟说明问题在内网 (网线/WiFi/路由器), 无需找运营商。",
+    "external": "Ping 多个外网目标并逐跳追踪路径, 定位问题出在哪一段: 内网侧、运营商侧还是目标网站侧。",
+    "dns": "检查域名解析 (DNS) 的速度与结果正确性, 并识别 DNS 劫持。典型症状: 网页打不开但 QQ/微信正常。",
+    "web": "把『打开一个网页』拆成 域名解析→TCP 建连→加密握手→首字节 四段分别计时, 哪一段失败/慢一目了然, 不再靠猜。",
+    "arp": "排查 ARP 冲突与 ARP 欺骗 (内网攻击/设备故障), 表现为网速慢、频繁掉线、页面被插广告。",
+    "loop": "排查内网环路/广播风暴 (常见于路由器 LAN 口误接回环线), 表现为全网突然极慢甚至断网。",
+    "tcp": "统计本机当前 TCP 连接的数量、状态与占用程序。连接数爆表时新连接建立不上, 表现为『什么都打不开』。",
+    "port": "探测指定地址的端口是否可达、响应多快, 用于验证服务是否在线、防火墙是否放行。",
+    "route": "检查系统路由表有无环路/异常网关等会导致『网关能 ping 通但上不了网』的配置问题。",
+    "tcpstats": "看系统 TCP 层的累计质量统计: 重传率高 = 链路实际在丢包 (干扰/劣化), 即使 ping 看不出来。",
+    "mtu": "探测链路允许的最大包尺寸。不匹配的典型症状: 网页打得开但图片/验证码加载不出、VPN 连得上但传不了数据。",
+    "proxy": "清点系统里的代理/加速器设置、hosts 文件劫持并实测代理是否还能用。『开了代理但代理已失效』『hosts 被改』都是打不开网页的高频根因。",
+    "nattype": "判定出口 NAT 类型 (锥形/对称) 并检查 UDP 能否出网, 直接影响游戏联机、视频通话能否直连; 对称型属运营商侧网络结构, 现场无法改变。",
+}
+
+# 指标术语解释: {模块: {指标名: 通俗解释}}。present 层按 (key, label) 注入,
+# 模块自带 hint (如 ARP) 优先, 都没有才回落"超过阈值"。
+METRIC_HINTS = {
+    "gateway": {
+        "平均延迟": "本机到网关的往返时间, 反映内网段质量",
+        "丢包率": "内网丢包, 超过 1% 就会影响游戏/通话",
+        "抖动": "延迟的波动幅度, 越大越卡",
+    },
+    "external": {
+        "平均延迟": "到外网目标的往返时间",
+        "平均丢包": "外网方向丢包; 网关正常而这里丢 = 问题在运营商侧或对端",
+        "TCP 可达": "直接测目标端口连通性 (部分站点禁 ping 但 TCP 正常, 以此为准)",
+        "禁拼目标": "对方防火墙禁 ping, 不算故障",
+        "不可达目标": "ping 与 TCP 均不通的目标",
+    },
+    "speedtest": {
+        "下载": "实测下载速率, 与办理档位对比 (百兆宽带实测应 ≥ 90 Mbps)",
+        "上传": "实测上传速率",
+        "预估宽带": "按实测速率推算的宽带档位",
+        "缓冲膨胀": "满载时的延迟增加量, 大于 100ms 会让游戏/通话明显变卡",
+    },
+    "bufferbloat": {
+        "空闲延迟": "没人用网时的基础延迟",
+        "负载延迟": "满速下载时的延迟",
+        "延迟增加": "负载与空闲的差值, 越小越好",
+        "评级": "A 最好, F 最差",
+    },
+    "web": {
+        "平均 DNS": "把域名解析成 IP 的耗时",
+        "平均 TLS": "加密握手耗时, 走代理/加速器会明显变大",
+        "平均首字节": "发出请求到收到响应第一个字节的时间, 反映服务端+链路快慢",
+        "证书最短剩余": "网站数字证书的剩余有效期, 过期后浏览器会报『不安全』",
+        "重定向次数": "跳转几次才到最终页面",
+    },
+    "tcpcc": {
+        "最大并发": "同时保持的连接数上限; 低于 1024 的光猫/路由器容易设备一连多就掉线",
+        "建连 P50": "一半的连接在此时间内完成建立",
+        "建连 P95": "95% 的连接在此时间内完成, 数值大说明高并发下很吃力",
+        "峰值建连": "每秒能新建的连接数 (CPS)",
+        "本机对照": "同样并发在本机内部重测; 对照通过 = 瓶颈在网络侧而非这台电脑",
+    },
+    "nattype": {
+        "映射行为": "锥形 = 对外用同一端口 (P2P 直连友好); 对称型 = 每个目标不同端口 (打洞难, 多需中继)",
+        "UDP 出网": "游戏/语音常用的 UDP 包能否出去, 受阻则联机/通话不通",
+        "出口一致性": "UDP 出口与网页出口是否同一个 IP; 不一致 = 多出口或走了代理",
+        "映射地址": "运营商网络侧看到的本机地址",
+    },
+    "proxy": {
+        "系统代理": "浏览器等大多数软件共用的代理开关 (改它会全局生效)",
+        "代理可用性": "代理服务器是否还活着、能否转发",
+        "直连对照": "不走代理直接访问同样的网站是否正常",
+        "VPN/虚拟网卡": "ZeroTier/加速器等虚拟网卡; 存在时各模块测的是隧道链路而非物理宽带",
+    },
+    "tcpstats": {
+        "重传率": "丢包后重发的比例; 大于 1% 链路质量偏差, 大于 5% 明显影响网速",
+        "当前连接": "本机当前的 TCP 连接总数",
+    },
+    "iperf3": {
+        "下载抖动": "延迟波动幅度, 语音通话要求 <30ms",
+        "上传抖动": "延迟波动幅度, 语音通话要求 <30ms",
+        "下载UDP丢包": "语音/游戏包丢失率, 大于 1% 人耳可感知",
+        "上传UDP丢包": "语音/游戏包丢失率, 大于 1% 人耳可感知",
+    },
+    "linkspeed": {
+        "网卡错误": "自开机累计值, 重启清零; 换线后复测对比才有意义",
+    },
 }
 
 
@@ -7567,6 +10201,12 @@ def _present_module(key, raw_result, status):
             metrics.append({"label": m[0], "value": m[1], "level": m[2] or "ok", "hint": ""})
         else:
             metrics.append({"label": m[0], "value": m[1], "level": "ok", "hint": ""})
+
+    # 术语解释 (装维视角): 集中表按 (模块, 指标名) 注入; 已有 hint 不覆盖,
+    # 注入后仍为空的非 ok 指标才回落到"超过阈值"提示
+    for m in metrics:
+        if not m["hint"]:
+            m["hint"] = METRIC_HINTS.get(key, {}).get(m["label"], "")
 
     # 给关键指标补阈值提示
     for m in metrics:
@@ -8318,6 +10958,9 @@ HEADER_MAP = {
     "description": "描述", "media_type": "媒体类型",
     "is_wifi": "无线网卡", "link_speed_raw": "链路速率原始值",
     "speed_mbps": "速率(Mbps)",
+    "rx_errors": "收包错误", "tx_errors": "发包错误",
+    "rx_discarded": "收包丢弃", "tx_discarded": "发包丢弃",
+    "nic_errors": "网卡错误统计",
     # 端口探测
     "tcp_used_port": "实际端口", "rtt_min_ms": "最小 RTT(ms)", "rtt_max_ms": "最大 RTT(ms)",
     # MTU
@@ -8328,6 +10971,48 @@ HEADER_MAP = {
     "is_default": "是否默认",
     # IPv6
     "ipv6_global": "IPv6 全局", "ipv6_reachable": "IPv6 可达",
+    # 代理检测
+    "wininet": "WinINET 系统代理", "winhttp": "WinHTTP 代理",
+    "env_proxies": "环境变量代理", "proxy_enable": "系统代理开关",
+    "proxy_server_raw": "代理服务器(原始)", "proxy_server": "代理服务器(解析)",
+    "proxy_endpoint": "代理端点", "proxy_override": "代理例外列表",
+    "auto_config_url": "PAC 地址", "vpn_adapters": "VPN/虚拟网卡",
+    "bypass": "绕过列表",
+    "via_proxy_ok": "经代理可达", "via_proxy_status": "经代理状态码",
+    "via_proxy_ms": "经代理耗时(ms)", "via_proxy_error": "经代理错误",
+    "direct_ok": "直连可达", "direct_status": "直连状态码",
+    "direct_ms": "直连耗时(ms)", "direct_error": "直连错误",
+    "pac_reachable": "PAC 可达", "verdict": "探测结论",
+    "hosts_check": "hosts 检查", "hijacked": "劫持条目",
+    "suspicious": "可疑条目", "total_entries": "有效条目数",
+    # NAT 类型
+    "servers": "STUN 服务器", "server": "服务器",
+    "mapped_addr": "映射地址", "mapped_ip": "映射 IP", "mapped_port": "映射端口",
+    "nat_behavior": "映射行为", "cone_type": "锥形细分",
+    "udp_blocked": "UDP 受阻", "public_ip_tcp": "HTTP 出口 IP",
+    "ip_match": "出口一致性", "changed_addr": "支持变更地址",
+    "local_lan_ip": "本机内网 IP",
+    # 网页体检
+    "url": "URL", "final_url": "最终 URL", "redirects": "重定向次数",
+    "dns_ms": "DNS(ms)", "tcp_ms": "TCP 连接(ms)", "tls_ms": "TLS 握手(ms)",
+    "ttfb_ms": "首字节(ms)", "total_ms": "总耗时(ms)", "status_code": "状态码",
+    "tls_version": "TLS 版本", "cert_days_left": "证书剩余(天)",
+    "cert_issuer": "证书颁发者", "cert_not_after": "证书到期时间",
+    "fail_stage": "失败阶段", "avg_ttfb_ms": "平均首字节(ms)",
+    "ok_count": "成功目标数", "redirect_chain": "重定向链",
+    "fail_stages": "失败分布",
+    # TCP 并发
+    "levels": "分级明细", "level": "并发级别", "attempted": "发起数",
+    "fail": "失败数", "success_rate": "成功率(%)",
+    "p50_ms": "建连P50(ms)", "p95_ms": "建连P95(ms)",
+    "cps": "建连速率(次/秒)", "fail_timeout": "超时失败",
+    "fail_refused": "拒绝失败", "fail_other": "其他失败",
+    "max_sustained": "最大可持续并发", "capped": "达到上限",
+    "local_baseline": "本机回环对照", "local_baseline_level": "对照级别",
+    "peak_cps": "峰值建连速率", "target_candidates": "候选目标预检",
+    "established_before": "测试前连接数", "established_after": "测试后连接数",
+    "bottleneck": "瓶颈位置", "max_concurrency": "阶梯上限",
+    "wall_ms": "耗时(ms)",
 }
 
 
@@ -8553,6 +11238,16 @@ def render_report_html_customer(report):
   {f"<div class='action'>💡 建议: {_html_esc(action)}</div>" if action else ""}
 </div>""")
         extra_bits = []
+        # 会诊引导: 存在异常级问题时提示升级路径 (现场解决不了 → 带报告回去)
+        critical_cnt = sum(1 for i in need_attention
+                           if i.get("severity") in ("异常", "错误"))
+        if critical_cnt:
+            todo_blocks.append(f"""
+<div class="issue consult">
+  <h3><span class="sev">会诊</span>{critical_cnt} 项异常级问题的现场处置指引</h3>
+  <div class="impact">📌 影响: 异常级问题按上述建议现场处理后仍存在的, 多涉及线路质量、运营商侧或设备本身缺陷, 现场手段有限</div>
+  <div class="action">💡 建议: 保留本 HTML 报告与同名 <b>.json</b> 文件带回交专家会诊 — .json 内含完整原始测量数据 (逐跳路径、时序曲线、原始统计), 供后台深入分析; 客户处可先留存 HTML 版说明</div>
+</div>""")
         hidden_cnt = len(need_attention) - len(top_issues)
         if hidden_cnt > 0:
             extra_bits.append(f"顶部仅展示前 10 条, 另有 {hidden_cnt} 条见下方模块详情")
@@ -8676,6 +11371,9 @@ def render_report_html_customer(report):
 
         # 整个模块卡
         verdict = m.get("verdict", "")
+        explain = MODULE_EXPLAINS.get(m["key"], "")
+        explain_html = (f"<div class='explain'>📖 {_html_esc(explain)}</div>"
+                        if explain else "")
         mod_blocks.append(f"""
 <div class="mod {sk}" id="mod-{_html_esc(m["key"])}">
   <div class="mod-head">
@@ -8685,6 +11383,7 @@ def render_report_html_customer(report):
   </div>
   <div class="mod-body">
     <div class="verdict"><span class="tag">结论</span>{_html_esc(verdict)}</div>
+    {explain_html}
     {metrics_html}
     {issues_html}
     {empty_note_html}
@@ -8792,6 +11491,8 @@ body{background:#f6f8fa;color:#1e293b;font:14px/1.6 -apple-system,BlinkMacSystem
 .issue .impact{font-size:12.5px;color:#991b1b;margin:4px 0 6px;padding:6px 10px;background:rgba(255,255,255,.6);border-radius:6px}
 .issue.ok .impact{color:#166534}
 .issue .action{font-size:12.5px;color:#1e293b;padding:8px 12px;background:#fffbeb;border-left:3px solid #f59e0b;border-radius:0 6px 6px 0;line-height:1.7}
+.issue.consult{border:1px dashed #7c3aed;background:#faf5ff}
+.issue.consult .sev{background:#7c3aed}
 .overview{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:6px 0;margin-bottom:8px;box-shadow:0 1px 3px rgba(15,23,42,.05)}
 .overview ul{list-style:none}
 .overview li{padding:10px 22px;border-bottom:1px solid #f1f5f9;display:flex;align-items:center;gap:12px;font-size:13.5px;transition:background .1s}
@@ -8814,6 +11515,7 @@ body{background:#f6f8fa;color:#1e293b;font:14px/1.6 -apple-system,BlinkMacSystem
 .mod-head .badge{margin-left:auto;padding:3px 12px;border-radius:999px;font-size:11.5px;font-weight:700;letter-spacing:.5px}
 .mod-body{padding:16px 20px}
 .verdict{font-size:14px;line-height:1.7;color:#1e293b;margin-bottom:12px}
+.explain{font-size:12px;line-height:1.7;color:#64748b;background:#f8fafc;border-left:3px solid #cbd5e1;padding:7px 12px;border-radius:0 6px 6px 0;margin:-4px 0 12px 0}
 .verdict .tag{display:inline-block;padding:2px 9px;border-radius:5px;font-size:11px;font-weight:700;background:#e0e7ff;color:#4338ca;margin-right:8px;vertical-align:1px}
 .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-bottom:8px}
 .metric{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:9px 13px;display:flex;justify-content:space-between;align-items:center;gap:8px}
@@ -9323,6 +12025,13 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
                 f"<b>结论</b></font>　{_html_esc(verdict)}", concl))
             flow.append(Spacer(1, 3))
 
+        # 模块说明 (装维视角: 这是在测什么、结果怎么看)
+        explain = MODULE_EXPLAINS.get(m.get("key", ""), "")
+        if explain:
+            flow.append(Paragraph(
+                f"<font size=7.5 color='#64748b'>📖 {_html_esc(explain)}</font>", concl))
+            flow.append(Spacer(1, 3))
+
         # 关键指标 (流式 2 列键值表, 行可拆分, 不整体 KeepTogether)
         metrics = m.get("key_metrics", [])
         if metrics:
@@ -9730,9 +12439,10 @@ def interactive_menu(install=False, pip_mirror=None):
                 print("    " + line)
         print()
         print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发)', C_GRAY)}")
+        print(f"    {_c(' m', C_CYAN)}. 盯障模式 {_c('(长时间监测, 找偶发掉线)', C_GRAY)}")
         print(f"    {_c(' e', C_CYAN)}. 导出上次诊断报告")
         print(f"    {_c(' q', C_CYAN)}. 退出")
-        print(_c("  快捷: a/b/c=按分类运行; all/0/*=全部; e=导出报告。", C_GRAY))
+        print(_c("  快捷: a/b/c=按分类运行; all/0/*=全部; m=盯障; e=导出报告。", C_GRAY))
         print(_c("-" * 60, C_GRAY))
         try:
             choice = input(_c("  输入 > ", C_GREEN)).strip()
@@ -9741,6 +12451,28 @@ def interactive_menu(install=False, pip_mirror=None):
             break
         if choice.lower() in ("q", "quit", "exit"):
             break
+        # m / monitor: 盯障模式 (独立运行模式, 不进模块注册表)
+        if choice.lower() in ("m", "monitor", "盯障"):
+            sec = 600
+            if sys.stdout.isatty():
+                try:
+                    raw = input(_c("  监测时长(秒, 回车=600, 范围 30-86400): ",
+                                   C_GREEN)).strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    continue
+                if raw:
+                    try:
+                        sec = int(raw)
+                    except ValueError:
+                        print(_c("  无效时长, 使用默认 600 秒。", C_YELLOW))
+                        sec = 600
+            run_monitor_mode(sec)
+            try:
+                input(_c("  按 Enter 返回菜单...", C_GRAY))
+            except (EOFError, KeyboardInterrupt):
+                break
+            continue
         # e / export: 不跑诊断, 直接导出上次报告 (回车返回菜单后无需重新测试)
         if choice.lower() in ("e", "export", "导出"):
             if not LAST_RUN:
@@ -9866,6 +12598,9 @@ def main():
                              "例: 192.168.1.10 或 192.168.1.10:5201")
     parser.add_argument("--iperf3-duration", type=int, default=10, metavar="SEC",
                         help="iperf3 单方向测速时长 (秒, 默认 10)")
+    parser.add_argument("--iperf3-udp", action="store_true",
+                        help="iperf3 改用 UDP 模式测抖动/丢包 (1 Mbps 发包率, 语音/游戏"
+                             "质量口径): 抖动 >30ms 或丢包 >1% 给出告警; 默认 TCP 测吞吐")
     parser.add_argument("--speedtest-net", action="store_true",
                         help="启用 Speedtest.net 测速 (默认关闭: 国内网络下常选中"
                              "海外服务器, 结果严重偏低, 仅作参考)")
@@ -9873,6 +12608,25 @@ def main():
                         help="指定上行测速服务器 (可选): speedtest 服务器 ID 或 "
                              "host:port (如 3633 或 112.25.80.50:8080); "
                              "默认自动选择延迟最低的国内运营商节点")
+    parser.add_argument("--nattype-server", action="append", metavar="HOST[:PORT]",
+                        help="NAT 类型检测的 STUN 服务器 (可选, 可指定两次提供两台, "
+                             "缺省端口 3478); 默认用内置国内服务器自动回退")
+    parser.add_argument("--web-target", action="append", metavar="URL",
+                        help="网页体检追加目标 (可选, 追加到默认 3 个国内大站后, "
+                             "总数上限 8), 例: --web-target https://example.com")
+    parser.add_argument("--tcpcc-target", metavar="HOST:PORT",
+                        help="TCP 并发测试的自定义目标 (可选, 如自建服务器/内网设备); "
+                             "默认自动挑公网 anycast DNS 的 TCP 53 端点")
+    parser.add_argument("--tcpcc-max", type=int, default=1600, metavar="N",
+                        help="TCP 并发阶梯上限 (默认 1600, 硬上限 8000)。高上限会短时"
+                             "建立大量连接, 勿短时间重复运行; 并行模式下建议单跑本模块")
+    parser.add_argument("--monitor", metavar="SEC", type=int, nargs="?", const=600,
+                        help="盯障模式: 持续监测 SEC 秒找偶发掉线, 结束生成 CSV/HTML/JSON "
+                             "报告 (不带值 = 600 秒; 范围 30-86400; Ctrl+C 提前结束同样"
+                             "生成报告); 与其他模块互斥, 指定时忽略 modules 与 --export")
+    parser.add_argument("--monitor-target", metavar="HOST",
+                        help="盯障外网 ping 目标 (默认 223.5.5.5, 同时对该目标 TCP 53 "
+                             "建连; 可用域名)")
     args = parser.parse_args()
 
     # 禁用 scapy 二层抓包 (避免 Npcap 不稳定导致段错误)
@@ -9909,9 +12663,26 @@ def main():
     SPEEDTEST_CONFIG["use_speedtest_net"] = bool(args.speedtest_net)
     SPEEDTEST_CONFIG["node"] = getattr(args, "speedtest_node", None) or None
     SPEEDTEST_CONFIG["iperf3_duration"] = max(1, int(getattr(args, "iperf3_duration", 10)))
+    SPEEDTEST_CONFIG["iperf3_udp"] = bool(getattr(args, "iperf3_udp", False))
+
+    # NAT 类型参数 -> 全局配置 (runner -> NATTypeTester.detect 读取)
+    NATTYPE_CONFIG["servers"] = [s.strip() for s in (args.nattype_server or [])
+                                 if s and s.strip()]
+
+    # 网页体检参数 -> 全局配置 (runner -> WebPageTester.detect 读取)
+    WEB_CONFIG["targets"] = [u.strip() for u in (args.web_target or [])
+                             if u and u.strip()]
+
+    # TCP 并发参数 -> 全局配置 (runner -> TCPConcurrencyTester.detect 读取)
+    TCPCC_CONFIG["max"] = max(50, min(8000, int(getattr(args, "tcpcc_max", 1600) or 1600)))
+    TCPCC_CONFIG["target"] = (getattr(args, "tcpcc_target", None) or "").strip() or None
 
     if args.list:
         _print_module_list()
+        return
+    # 盯障模式: 独立顶层运行模式 (与模块诊断互斥)
+    if args.monitor:
+        run_monitor_mode(args.monitor, ext_target=args.monitor_target)
         return
     if args.modules:
         is_all_only = (args.modules == ["all"])

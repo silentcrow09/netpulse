@@ -1,13 +1,16 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 19 项诊断模块 · v1.0.0
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.0.0
 
 NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `netpulse.py` 文件即可运行**（核心功能仅依赖 Python 标准库），覆盖局域网、网关、DNS、外网、WiFi、测速、TCP、路由等常见排障场景，并可将结果导出为 HTML / PDF / TXT 报告。
 
 ## ✨ 特性
 
 - **零依赖即可运行**：核心诊断只用 Python 标准库，无需安装任何第三方包。
-- **19 个诊断模块**：从局域网设备扫描到 TCP 传输质量，覆盖端到端排障链路。
+- **23 个诊断模块**：从局域网设备扫描、TCP 并发压测、网页分层体检到 NAT 类型与代理检测，覆盖端到端排障链路。
+- **TCP 并发能力压测**：阶梯并发连接测试（累计保持），判定网络路径（光猫/路由器 NAT）最大可持续并发；同跑本机回环对照，自动区分「本机瓶颈 vs 网络/NAT 瓶颈」，零依赖、无需自建服务器。
+- **盯障模式 `--monitor`**：分钟级持续监测网关/外网 ping + TCP + DNS，抓偶发掉线（普通模块全是快照抓不到）；自动事件检测 + 分段定位（内网侧/运营商侧/解析侧），输出带时间轴的 HTML 报告 + Excel 直开的 CSV + 完整 JSON。
+- **iperf3 UDP 模式**：`--iperf3-udp` 以 1 Mbps 发包率测点对点抖动/丢包 —— 语音/游戏质量的关键指标。
 - **宽带测速 = 带宽体检**：上下行测速 + 预估宽带 + Bufferbloat 评级一体化；
   上行用内置国内运营商节点（电信/联通/移动官方测速服务器），零第三方依赖。
 - **iperf3 链路吞吐（独立模块）**：`iperf3` 模块测量到指定服务器的点对点上下行吞吐
@@ -40,9 +43,9 @@ python netpulse.py --list
 # 运行全部模块
 python netpulse.py all
 
-# 指定模块运行 (支持 key 或序号, 空格分隔)
+# 指定模块运行 (支持 key 或序号, 空格分隔; 序号以 --list 实时输出为准)
 python netpulse.py gateway dns external
-python netpulse.py 2 10 4
+python netpulse.py dhcp gateway dns
 
 # 按分类运行 (a=基础信息  b=宽带测速  c=故障诊断, 可组合)
 python netpulse.py a
@@ -80,6 +83,31 @@ python netpulse.py iperf3 --iperf3-server 192.168.1.10:5201
 python netpulse.py iperf3 --iperf3-server 10.0.0.1 --iperf3-duration 15   # 单方向 15s
 # 缺 iperf3.exe 时会询问自动下载; 服务器不可达时明确报"双向均失败"并给出排查提示
 
+# TCP 并发能力压测: 阶梯 50→1600 累计保持连接, 找 NAT 并发上限 + 本机回环对照
+python netpulse.py tcpcc
+python netpulse.py tcpcc --tcpcc-max 3200                          # 提高阶梯上限
+python netpulse.py tcpcc --tcpcc-target 192.168.1.10:5201          # 指向自建服务器复测
+
+# 网页体检: DNS/TCP/TLS/TTFB 分段计时 + 证书 + 重定向 (默认 qq/baidu/aliyun)
+python netpulse.py web
+python netpulse.py web --web-target https://example.com            # 追加目标
+
+# NAT 类型: STUN 双服务器对比判定锥形/对称型, 检测 UDP 出网受阻 (游戏/P2P 排障)
+python netpulse.py nattype
+python netpulse.py nattype --nattype-server stun.chat.bilibili.com  # 自定义服务器
+
+# 代理检测: WinINET/WinHTTP/环境变量/VPN 网卡全清点 + 代理可用性探测
+python netpulse.py proxy
+
+# iperf3 UDP 模式: 测抖动/丢包 (语音/游戏质量口径, 1 Mbps 发包率)
+python netpulse.py iperf3 --iperf3-server 192.168.1.10 --iperf3-udp
+
+# 盯障模式 (独立运行, 不属于 23 个模块): 长时间监测找偶发掉线
+python netpulse.py --monitor              # 默认 600 秒 (10 分钟)
+python netpulse.py --monitor 1800         # 30 分钟
+python netpulse.py --monitor 600 --monitor-target www.baidu.com
+# 交互菜单里也有 m=盯障模式 入口; Ctrl+C 提前结束同样生成报告
+
 # 禁用 scapy 二层抓包 (Npcap 不稳定导致崩溃时使用, DHCP 降级)
 python netpulse.py dhcp --no-scapy
 
@@ -106,11 +134,18 @@ python netpulse.py --install
 | `--port-force` | 强制执行端口探测（即使展开后目标数超过 1000 上限） |
 | `--iperf3-server` | iperf3 服务器地址 (iperf3 独立模块必填): 测到该服务器的上下行吞吐 (iperf3.exe 缺失时会交互式询问自动下载)。例: `192.168.1.10` 或 `192.168.1.10:5201` |
 | `--iperf3-duration` | iperf3 单方向测速时长秒数 (默认 10) |
+| `--tcpcc-target` | TCP 并发测试自定义目标 `HOST:PORT` (可选): 默认自动挑公网 anycast DNS 的 TCP 53 端点 (预检并发友好度) |
+| `--tcpcc-max` | TCP 并发阶梯上限 (默认 1600, 硬上限 8000)。高上限会短时建立大量连接, 勿短时间重复运行 |
+| `--web-target` | 网页体检追加目标 URL (可选, 可多次; 追加到默认 3 个国内大站后, 总数上限 8) |
+| `--nattype-server` | NAT 类型检测的 STUN 服务器 `HOST[:PORT]` (可选, 可指定两次提供两台; 缺省端口 3478); 默认内置国内服务器自动回退 |
+| `--iperf3-udp` | iperf3 改用 UDP 模式测抖动/丢包 (1 Mbps 发包率, 语音/游戏质量口径); 默认 TCP 测吞吐 |
+| `--monitor` | 盯障模式: 持续监测 `SEC` 秒找偶发掉线, 结束生成 CSV/HTML/JSON 报告 (不带值 = 600 秒; 范围 30-86400; Ctrl+C 提前结束同样生成报告); 与其他模块互斥 |
+| `--monitor-target` | 盯障外网 ping 目标 (默认 223.5.5.5, 同时对该目标 TCP 53 建连; 可用域名) |
 | `--speedtest-node` | 指定上行测速服务器 (可选): speedtest 服务器 host:port (如 112.25.80.50:8080); 默认自动选延迟最低的国内运营商节点 |
 | `--speedtest-net` | 启用 Speedtest.net 参考测速 (默认关闭: 国内网络下常选中海外服务器, 结果严重偏低) |
 | `--export` | 诊断后导出报告，逗号分隔多格式（`report.pdf,report.html`） |
 
-## 📋 诊断模块（19 项）
+## 📋 诊断模块（23 项）
 
 > 按装维工作流分三大类，序号与交互菜单 / `--list` 输出一致；菜单 / CLI 均可用分类字母快捷运行：**a=基础信息、b=宽带测速、c=故障诊断**。
 
@@ -125,16 +160,20 @@ python netpulse.py --install
 | 7 | `speedtest` | 测速 | 带宽体检: 上下行测速 + 预估宽带 + Bufferbloat 评级 (上行用内置国内运营商节点, 零依赖) |
 | 8 | `bufferbloat` | Bufferbloat | 负载下延迟测试，评级 A–F |
 | 9 | `iperf3` | iperf3 吞吐 | 到指定 iperf3 服务器的点对点上下行吞吐 (链路吞吐非宽带, 需 `--iperf3-server`) |
-| 10 | `gateway` | 网关检测 | Ping 默认网关，统计延迟、丢包率、抖动 |
-| 11 | `external` | 外网检测 | 多目标 Ping + Traceroute，逐跳延迟、丢包与路径可视化 |
-| 12 | `dns` | DNS 诊断 | 多 DNS 服务器原生 UDP 对比，延迟 / 异常 / **DNS 劫持检测** |
-| 13 | `arp` | ARP 分析 | ARP 冲突检测、网关 MAC 验证、ARP 欺骗排查 |
-| 14 | `loop` | 环路检测 | ARP 表 / TTL / 丢包模式分析内网环路 |
-| 15 | `tcp` | TCP 连接 | 按状态 / 进程统计 TCP 连接，检测连接数超限 |
-| 16 | `port` | 端口探测 | TCP / UDP 端口可达性与响应时延 |
-| 17 | `route` | 路由表 | 路由环路检测、异常路由、网关子网验证 |
-| 18 | `tcpstats` | TCP 传输质量 | 解析 `netstat -s` 重传率、错误段、连接失败数 |
-| 19 | `mtu` | MTU 检测 | 二分法发现路径 MTU，识别分片风险 |
+| 10 | `tcpcc` | TCP 并发 | 阶梯并发连接压测, 判定最大可持续并发 (NAT 表上限), 本机回环对照区分瓶颈位置 |
+| 11 | `gateway` | 网关检测 | Ping 默认网关，统计延迟、丢包率、抖动 |
+| 12 | `external` | 外网检测 | 多目标 Ping + Traceroute，逐跳延迟、丢包与路径可视化 |
+| 13 | `dns` | DNS 诊断 | 多 DNS 服务器原生 UDP 对比，延迟 / 异常 / **DNS 劫持检测** |
+| 14 | `web` | 网页体检 | DNS/TCP/TLS/TTFB 分段计时, 证书检查, 重定向跟踪, 断层定位 |
+| 15 | `arp` | ARP 分析 | ARP 冲突检测、网关 MAC 验证、ARP 欺骗排查 |
+| 16 | `loop` | 环路检测 | ARP 表 / TTL / 丢包模式分析内网环路 |
+| 17 | `tcp` | TCP 连接 | 按状态 / 进程统计 TCP 连接，检测连接数超限 |
+| 18 | `port` | 端口探测 | TCP / UDP 端口可达性与响应时延 |
+| 19 | `route` | 路由表 | 路由环路检测、异常路由、网关子网验证 |
+| 20 | `tcpstats` | TCP 传输质量 | 解析 `netstat -s` 重传率、错误段、连接失败数 |
+| 21 | `mtu` | MTU 检测 | 二分法发现路径 MTU，识别分片风险 |
+| 22 | `proxy` | 代理检测 | WinINET/WinHTTP/环境变量/VPN 网卡代理清点 + 可用性探测 (疑似断网根因) |
+| 23 | `nattype` | NAT 类型 | STUN 双服务器对比判定锥形/对称型, UDP 出网受阻检测 (游戏/P2P 排障) |
 
 ## 🔌 端口探测 `--port-target` 语法
 
@@ -194,8 +233,19 @@ python netpulse.py all --port-target 223.5.5.5:53 --export report.html,report.pd
 
 - **健康分（0-100）**：异常 -20 / 错误 -30 / 警告 -5 / 未检测 -2。等级 A/B/C/D/F。
 - **待办问题清单**：按严重度排序，每条带"影响 + 建议"（如"网关延迟高 → 检查网线/WiFi 信号/路由 CPU"）。
+- **装维可读**：每个模块卡片带一句"这是测什么的、结果怎么看"的说明；行话指标（首字节/P95/并发/CPS、NAT 锥形对称等）附通俗解释；存在异常级问题时清单尾部出现**会诊指引**——现场处置无效的，提示保留 HTML+JSON 报告带回专家分析（.json 含逐跳路径、时序等完整原始数据）。
 - **关键指标**：每个模块 3-5 个，颜色按阈值（绿/黄/红）。
 - **技术细节**：HTML 默认折叠；PDF 弱化为浅灰小表；完整数据见 `.json`。
+
+### 盯障模式报告（偶发掉线取证单）
+
+`--monitor N`（或交互菜单 `m`）持续监测 N 秒：网关/外网 ping（1s×2 路）+ 外网 TCP 53 + DNS 解析（各 5s），结束后自动保存 **`reports/YYYY-MM-DD/monitor_时间戳.{csv,html,json}`**：
+
+- **事件检测 + 分段定位**：连续丢包 ≥3s 判中断；外网中断且网关正常 → **运营商侧**（带 HTML 报告报障，分钟级时间轴可对齐客服记录）；与网关中断同时 → 内外同断；网关单独中断 → 内网侧；DNS 连续失败而 ping 正常 → 解析侧；另有延迟突增段检测（10s 桶 p95 对比基线）。
+- **HTML 报告**：结论 banner（含处置建议，服务"现场解决不了带回落诊"流程）+ 事件表（时刻/持续/定位/是否已恢复）+ 延迟时序双线图（红色区带标中断时段）+ TCP/DNS 连通率图。
+- **CSV 用 Excel 直接打开**（utf-8-sig），一列时间戳可精确对齐客户口述的掉线时刻；JSON 含全部原始样本。
+- **Ctrl+C 随时可停**：提前结束同样生成报告；网关漂移（切 WiFi/换路由）自动切换监测目标。
+- 提示：监测期间常驻两个 ping 进程 + 周期外联，部分杀软/EDR 可能告警，装维机建议加白。
 
 ### 独立测速报告（带宽体检单）
 
