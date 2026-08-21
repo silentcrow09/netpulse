@@ -1792,10 +1792,20 @@ def parse_ping_output(output):
     return result
 
 
-def ping_host(host, count=20, packet_size=64, timeout=30):
-    """Ping 指定主机"""
-    cmd = f"ping -n {count} -l {packet_size} -w {timeout*1000//count} {host}"
-    code, out, _ = run_cmd(cmd, timeout=timeout + 10)
+def ping_host(host, count=20, packet_size=64, timeout=30, wait_ms=3000):
+    """Ping 指定主机。
+
+    timeout: 进程总超时 (秒) — 留足 count × wait + 启动开销, 避免 ping
+             被外部 kill 导致 parse_ping_output 拿不到完整统计行。
+    wait_ms: 单包超时 (毫秒) — 默认 3000 接近系统默认值 (-w 4000), 不要
+             压得太低否则偶发 >1.5s 的回复会被 ping 判为"超时丢包",
+             与手动 ping 结果对不上 (老版曾用 timeout*1000//count 推算
+             wait, count=10 时仅 1500ms, 是误判丢包的根因)。
+    """
+    # 进程超时比理论最大值稍宽, 防 stdout 被截断造成 parse 失真
+    proc_timeout = max(timeout, (count * wait_ms // 1000) + 10)
+    cmd = f"ping -n {count} -l {packet_size} -w {wait_ms} {host}"
+    code, out, _ = run_cmd(cmd, timeout=proc_timeout)
     return parse_ping_output(out)
 
 
@@ -11824,20 +11834,19 @@ def render_report_html_customer(report):
                     continue
                 level = me.get("level", "ok")
                 hint = me.get("hint", "")
-                # 统计卡保持清爽: 正常指标的说明只进悬停提示, 不占卡面;
-                # 只有 warn/err (需要用户注意) 的指标才把说明显示在卡面上
-                hint_html = (f"<span class='hint'>{_html_esc(hint)}</span>"
-                             if hint and level in ("warn", "err") else "")
-                # title 提示完整名/值/说明, 防止窄屏 ellipsis 截断后看不到原值
+                # 指标卡保持清爽: 数字为主, 名称在下, 任何说明文字都不进卡面
+                # (包括 warn/err 也不再 inline 显示), 全部进悬停提示 —
+                # 卡面只靠颜色传达"这条需要关注", 点数超过 5 个时长说明挤
+                # 变形, 移到 title 是更可读的方案
+                # title 包含完整名/值/说明, 窄屏 ellipsis 截断后仍能看到
                 full_title = f"{me.get('label','')}: {me.get('value','')}"
                 if hint:
-                    full_title += f"\n{hint}"
+                    full_title += f"\n💡 {hint}"
                 # 数值在上、名称在下 (flex-column), 长名称可换行不再截断
                 metric_html.append(
                     f"<div class='metric' title='{_html_esc(full_title)}'>"
                     f"<span class='v {level}'>{_html_esc(me['value'])}</span>"
                     f"<span class='lab'>{_html_esc(me['label'])}</span>"
-                    f"{hint_html}"
                     f"</div>"
                 )
             metrics_html = f"<div class='metrics'>{''.join(metric_html)}</div>"
