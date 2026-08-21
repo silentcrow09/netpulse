@@ -11157,9 +11157,18 @@ def render_report_html_customer(report):
     输入: build_report() 的输出 (双视图)
     输出: 完整可独立打开的 HTML 字符串
     """
-    # 评分卡配色: A/B=good(绿), C=warn(橙), D/F=bad(红)
-    def _score_class(grade):
-        return {"A": "good", "B": "good", "C": "warn"}.get(grade, "bad")
+    # 评分卡配色: 90+=绿, 70-89=橙, <70=红
+    def _score_class(score):
+        if score >= 90:
+            return "score-90"
+        elif score >= 80:
+            return "score-80"
+        elif score >= 70:
+            return "score-70"
+        elif score >= 60:
+            return "score-60"
+        else:
+            return "score-50"
 
     if not report:
         return "<p>尚无诊断数据，请先运行诊断</p>"
@@ -11201,10 +11210,9 @@ def render_report_html_customer(report):
     {geo_line}
     {ipv6_line}
   </div>
-  <div class="score {_html_esc(_score_class(health["grade"]))}">
+  <div class="score {_html_esc(_score_class(health["score"]))}">
     <div class="score-num">{health['score']}</div>
-    <div class="score-grade">{_html_esc(health['grade'])}</div>
-    <div class="score-text">{_html_esc(health['verdict'])}</div>
+    <div class="score-label">{_html_esc(health['verdict'])}</div>
   </div>
 </header>"""
 
@@ -11281,6 +11289,20 @@ def render_report_html_customer(report):
   <div class="todo-head">✓ 网络状态良好</div>
   <div class="impact">所有 18 项检测均正常, 无需特别处理。</div>
 </div>"""
+
+    # ── 统计卡片 ──
+    stats_order = ["完成", "警告", "异常", "错误", "未检测"]
+    stat_items = [(k, counts.get(k, 0)) for k in stats_order if counts.get(k, 0)]
+    if not stat_items:
+        stat_items = [("未检测", 0)]
+    stat_cards = "".join(
+        f"<div class='stat-card {SKEY.get(k, 'idle').replace('fatal', 'err')}'>"
+        f"<div class='count'>{v}</div>"
+        f"<div class='label'>{k}</div></div>"
+        for k, v in stat_items
+    )
+    stats_section = f"""
+<div class="stats-grid">{stat_cards}</div>"""
 
     # ── 检测结果一览 ──
     overview_items = []
@@ -11382,11 +11404,19 @@ def render_report_html_customer(report):
         explain = MODULE_EXPLAINS.get(m["key"], "")
         explain_html = (f"<div class='explain'>📖 {_html_esc(explain)}</div>"
                         if explain else "")
+        # 模块图标
+        mod_icons = {
+            "ok": "✓",
+            "warn": "⚠",
+            "err": "✕",
+            "idle": "○"
+        }
+        mod_icon = mod_icons.get(sk, "○")
         mod_blocks.append(f"""
 <div class="mod {sk}" id="mod-{_html_esc(m["key"])}">
   <div class="mod-head">
-    <span class="dot {sk}"></span>
-    <span class="name">{_html_esc(m['name'])}<a class="anchor" href="#mod-{_html_esc(m["key"])}" title="复制此模块链接">🔗</a></span>
+    <div class="mod-icon {sk}">{mod_icon}</div>
+    <div class="name">{_html_esc(m['name'])}<a class="anchor" href="#mod-{_html_esc(m["key"])}" title="复制此模块链接">🔗</a></div>
     <span class="badge {sk}">{_html_esc(st)}</span>
   </div>
   <div class="mod-body">
@@ -11469,21 +11499,30 @@ def render_report_html_customer(report):
     # ── CSS ──
     CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#f6f8fa;color:#1e293b;font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding:32px 16px 80px}
-.wrap{max-width:920px;margin:0 auto}
-.hero{background:linear-gradient(135deg,#1e3a8a 0%,#2563eb 100%);color:#fff;padding:28px 32px;border-radius:16px;display:grid;grid-template-columns:1fr auto;gap:24px;align-items:center;box-shadow:0 4px 12px rgba(37,99,235,.2);margin-bottom:8px}
-.hero h1{font-size:24px;font-weight:800;margin-bottom:6px}
-.hero .sub{font-size:13px;opacity:.9}
-.hero .host{margin-top:10px;font-size:12px;opacity:.85;font-family:Cascadia Mono,Consolas,monospace}
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+body{background:linear-gradient(180deg,#f8fafc 0%,#e2e8f0 100%);color:#1e293b;font:14px/1.6 'Noto Sans SC',-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding:32px 16px 80px}
+.wrap{max-width:900px;margin:0 auto}
+.hero{background:linear-gradient(135deg,#0a1628 0%,#1e3a5f 50%,#1e40af 100%);color:#fff;padding:48px;display:grid;grid-template-columns:1fr auto;gap:32px;align-items:center;border-radius:28px;box-shadow:0 25px 50px -12px rgba(0,0,0,.35);margin-bottom:32px;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;top:-50%;right:-20%;width:400px;height:400px;background:radial-gradient(circle,rgba(59,130,246,.3) 0%,transparent 70%);pointer-events:none}
+.hero::after{content:'';position:absolute;bottom:-30%;left:-10%;width:300px;height:300px;background:radial-gradient(circle,rgba(16,185,129,.2) 0%,transparent 70%);pointer-events:none}
+.hero h1{font-size:32px;font-weight:900;letter-spacing:-0.5px;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.hero .sub{font-size:15px;opacity:.85;margin-bottom:24px}
+.hero .host{margin-top:12px;font-size:13px;opacity:.8;font-family:'JetBrains Mono',Cascadia Mono,Consolas,monospace}
 .hero .geo{margin-top:4px;font-size:12px;opacity:.85}
-.score{background:rgba(255,255,255,.15);border-radius:14px;padding:16px 26px;text-align:center;min-width:150px;backdrop-filter:blur(8px)}.score.good{background:rgba(34,197,94,.25)}.score.warn{background:rgba(234,88,12,.25)}.score.bad{background:rgba(220,38,38,.3)}
-.score-num{font-size:48px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
-.score-grade{font-size:20px;font-weight:700;margin-top:4px;letter-spacing:2px}
-.score-text{font-size:11.5px;opacity:.9;margin-top:6px;line-height:1.4}
+.score{background:rgba(255,255,255,.12);backdrop-filter:blur(20px);border-radius:20px;padding:24px 32px;text-align:center;min-width:160px;border:1px solid rgba(255,255,255,.2);position:relative;z-index:1}.score.score-90{background:linear-gradient(135deg,rgba(16,185,129,.3),rgba(5,150,105,.4))}.score.score-80{background:linear-gradient(135deg,rgba(16,185,129,.25),rgba(5,150,105,.35))}.score.score-70{background:linear-gradient(135deg,rgba(245,158,11,.3),rgba(217,119,6,.4))}.score.score-60,.score.score-50{background:linear-gradient(135deg,rgba(239,68,68,.35),rgba(220,38,38,.45))}
+.score-num{font-size:56px;font-weight:900;line-height:1;font-variant-numeric:tabular-nums}
+.score.score-90 .score-num{color:#34d399}.score.score-80 .score-num{color:#6ee7b7}.score.score-70 .score-num{color:#fbbf24}.score.score-60 .score-num,.score.score-50 .score-num{color:#f87171}
+.score-label{font-size:13px;opacity:.9;margin-top:4px}
 .sec{margin:32px 0 12px}
-.sec h2{font-size:17px;font-weight:700;display:flex;align-items:center;gap:10px;color:#0f172a}
-.sec h2 .icon{width:26px;height:26px;border-radius:7px;background:#e0e7ff;color:#4338ca;display:inline-flex;align-items:center;justify-content:center;font-size:14px}.sec h2 .extra-count{font-size:12px;font-weight:400;color:#64748b;margin-left:6px}
-.todo{background:linear-gradient(180deg,#fef2f2 0%,#fff5f5 100%);border:1px solid #fecaca;border-radius:14px;padding:18px 22px;margin-bottom:8px}
+.sec h2{font-size:18px;font-weight:700;display:flex;align-items:center;gap:8px;color:#111827}
+.sec h2 .icon{width:28px;height:28px;border-radius:8px;background:#e0e7ff;color:#4338ca;display:inline-flex;align-items:center;justify-content:center;font-size:14px}.sec h2 .extra-count{font-size:12px;font-weight:400;color:#64748b;margin-left:6px}
+.stats-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin-bottom:32px}
+.stat-card{background:#fff;border-radius:12px;padding:16px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.08);border:1px solid #e5e7eb;transition:transform .2s,box-shadow .2s}
+.stat-card:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.12)}
+.stat-card .count{font-size:32px;font-weight:800}
+.stat-card.ok .count{color:#10b981}.stat-card.warn .count{color:#f59e0b}.stat-card.err .count,.stat-card.danger .count{color:#ef4444}.stat-card.info .count{color:#6b7280}
+.stat-card .label{font-size:12px;color:#9ca3af;margin-top:2px}
+.todo{background:#fff;border-radius:20px;padding:24px;margin-bottom:32px;box-shadow:0 1px 3px rgba(0,0,0,.08);border:1px solid #e5e7eb}
 .todo.ok{background:linear-gradient(180deg,#f0fdf4 0%,#f7fee7 100%);border-color:#bbf7d0}
 .todo-head{font-size:15px;font-weight:700;color:#991b1b;margin-bottom:12px}
 .todo.ok .todo-head{color:#166534}
@@ -11515,12 +11554,15 @@ body{background:#f6f8fa;color:#1e293b;font:14px/1.6 -apple-system,BlinkMacSystem
 .badge.idle{background:#e2e8f0;color:#475569}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
 .dot.ok{background:#16a34a}.dot.warn{background:#ea580c}.dot.err{background:#dc2626}.dot.fatal{background:#7f1d1d}.dot.idle{background:#94a3b8}
-.mod{background:#fff;border:1px solid #e2e8f0;border-radius:14px;margin-bottom:12px;box-shadow:0 1px 3px rgba(15,23,42,.05);overflow:hidden}
-/* 状态色靠头部 .dot 小圆点 + 右侧徽章传递, 不再用左边框 (像中括号的视觉) */
-.mod-head{padding:14px 20px;display:flex;align-items:center;gap:10px;border-bottom:1px solid #f1f5f9}
-.mod-head .name{font-size:15px;font-weight:700;color:#0f172a}.mod-head a.anchor{color:#94a3b8;font-size:13px;text-decoration:none;margin-left:6px}.mod-head a.anchor:hover{color:#2563eb}.mod{scroll-margin-top:80px}
-.mod-head .badge{margin-left:auto;padding:3px 12px;border-radius:999px;font-size:11.5px;font-weight:700;letter-spacing:.5px}
-.mod-body{padding:16px 20px}
+.mod{background:#fff;border:1px solid #e2e8f0;border-radius:20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08);border:1px solid #e5e7eb;overflow:hidden;transition:box-shadow .2s}
+.mod:hover{box-shadow:0 4px 12px rgba(0,0,0,.1)}
+.mod-head{padding:16px 24px;display:flex;align-items:center;gap:16px;border-bottom:1px solid #f3f4f6;background:#fafbfc}
+.mod-icon{width:40px;height:40px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px}
+.mod-icon.ok{background:#d1fae5}.mod-icon.warn{background:#fef3c7}.mod-icon.err{background:#fee2e2}.mod-icon.info{background:#f3f4f6}
+.mod-head .name{font-size:16px;font-weight:700;color:#111827;flex:1}.mod-head .subtitle{font-size:12px;color:#9ca3af}
+.mod-head a.anchor{color:#94a3b8;font-size:13px;text-decoration:none;margin-left:6px}.mod-head a.anchor:hover{color:#2563eb}.mod{scroll-margin-top:80px}
+.mod-head .badge{margin-left:auto;padding:4px 14px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:.5px}
+.mod-body{padding:24px}
 .verdict{font-size:14px;line-height:1.7;color:#1e293b;margin-bottom:12px}
 .explain{font-size:12px;line-height:1.7;color:#64748b;background:#f8fafc;border-left:3px solid #cbd5e1;padding:7px 12px;border-radius:0 6px 6px 0;margin:-4px 0 12px 0}
 .verdict .tag{display:inline-block;padding:2px 9px;border-radius:5px;font-size:11px;font-weight:700;background:#e0e7ff;color:#4338ca;margin-right:8px;vertical-align:1px}
@@ -11541,10 +11583,11 @@ details.collapse[open] summary::before{transform:rotate(90deg)}
 details.collapse .cnt{background:#e2e8f0;color:#475569;border-radius:999px;font-size:10.5px;padding:1px 8px;margin-left:6px;font-weight:600}
 details.collapse .body{padding:4px 14px 12px;font-size:12px;color:#475569;line-height:1.7}
 details.collapse .subcap{font-size:12px;font-weight:700;color:#475569;margin:10px 0 4px}
-details.collapse table{width:100%;border-collapse:collapse;margin-top:4px}
-details.collapse th{background:#e2e8f0;color:#334155;text-align:left;padding:5px 8px;font-weight:600;font-size:11.5px}
-details.collapse td{padding:4px 8px;border-top:1px solid #e2e8f0;font-family:Cascadia Mono,Consolas,monospace;font-size:11.5px}
-details.collapse td.k{width:35%;color:#64748b;background:#f8fafc}
+details.collapse table{width:100%;border-collapse:collapse;margin-top:4px;display:block;overflow-x:auto;white-space:nowrap}
+details.collapse th{background:#e2e8f0;color:#334155;text-align:left;padding:5px 8px;font-weight:600;font-size:11.5px;white-space:nowrap}
+details.collapse td{padding:4px 8px;border-top:1px solid #e2e8f0;font-family:Cascadia Mono,Consolas,monospace;font-size:11.5px;white-space:nowrap;max-width:300px;overflow:hidden;text-overflow:ellipsis}
+details.collapse td.k{width:35%;color:#64748b;background:#f8fafc;white-space:normal}
+details.collapse td:hover{white-space:normal;overflow:visible}
 details.collapse p.mono{font-family:Cascadia Mono,Consolas,monospace;background:#f1f5f9;padding:6px 10px;border-radius:4px;word-break:break-all}
 details.collapse p.muted{color:#94a3b8;font-size:11.5px;margin-top:6px}
 .host-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
@@ -11561,7 +11604,7 @@ details.collapse p.muted{color:#94a3b8;font-size:11.5px;margin-top:6px}
 .kw.warn{background:#fed7aa;color:#9a3412}
 .kw.err{background:#fecaca;color:#991b1b}
 details.collapse .subcap code{background:#fff;padding:1px 6px;border-radius:3px;border:1px solid #cbd5e1;font-size:11.5px;color:#475569}
-@media(max-width:600px){.hero{grid-template-columns:1fr;text-align:center}.score{justify-self:center}}
+@media(max-width:768px){.hero{grid-template-columns:1fr;text-align:center;padding:32px}.score{justify-self:center}.stats-grid{grid-template-columns:repeat(3,1fr)}.speed-stats{grid-template-columns:repeat(2,1fr)}.hero .meta{justify-content:center}}
 @media print{body{background:#fff;padding:0;font-size:12px}.hero{background:#1e3a8a !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.mod,.host-card,.todo{box-shadow:none;break-inside:avoid}.mod-head{break-after:avoid}details.collapse .body{display:block !important}details.collapse>summary::before{display:none}details.collapse{border-style:solid}.score{background:rgba(255,255,255,.2) !important}}
 footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-top:20px;border-top:1px solid #e2e8f0}
 """
@@ -11578,6 +11621,7 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 <div class="wrap">
 {hero}
 {todo_section}
+{stats_section}
 {overview_section}
 {modules_section}
 {host_section}
