@@ -9307,7 +9307,9 @@ def _verdict_linkspeed(res):
                 worst = lvl
         # 拼接 verdict
         if issues:
-            return f"检测到 {n} 个适配器, {len(issues)} 个问题; 最差速率档位: {worst}"
+            # 内部等级 (ok/warn/err) 映射为中文, 不把代码标识泄漏给客户
+            worst_cn = {"ok": "正常", "warn": "偏低", "err": "异常"}[worst]
+            return f"检测到 {n} 个适配器, {len(issues)} 个问题; 最差速率档位: {worst_cn}"
         if worst == "err":
             # 标注最低的适配器
             slow = [w for w in worst_kinds if w[3] == "err"]
@@ -10013,8 +10015,10 @@ def _verdict_nattype(res):
         servers = res.get("servers") or []
         mappings = []
         for s in servers:
-            if isinstance(s, dict) and s.get("success") and s.get("mapping"):
-                m = s["mapping"]
+            # 服务器记录的真实字段是 ok / mapped_addr (见 NATTypeTester.detect),
+            # 此前误写成 success / mapping 导致本修复从未生效
+            if isinstance(s, dict) and s.get("ok") and s.get("mapped_addr"):
+                m = s["mapped_addr"]
                 if m not in mappings:
                     mappings.append(m)
         if len(mappings) >= 2:
