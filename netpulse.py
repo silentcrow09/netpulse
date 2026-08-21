@@ -3656,6 +3656,7 @@ def _render_speedtest_html(res):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NetPulse 宽带测速报告</title>
 <style>
+  {_BRAND_HEADER_CSS}
   body {{ font-family: "Microsoft YaHei", "Segoe UI", sans-serif; margin: 0; background: #eef2f6; color: #1c2430; }}
   .wrap {{ max-width: 880px; margin: 0 auto; padding: 28px 20px 48px; }}
   h1 {{ font-size: 23px; margin: 0; font-weight: 600; letter-spacing: .3px; }}
@@ -3832,36 +3833,39 @@ def _render_brand_header(title, sub_text, gradient=("#0b1f3a", "#153e6b", "#1d4e
     """通用页眉 — 测速/盯障/iperf3 三种独立报告统一品牌风格,
     与主报告 (render_report_html_customer) 视觉一致。
 
-    返回页眉 HTML 字符串。
+    返回页眉 HTML 字符串。样式类名带 brand- 前缀, 由 _BRAND_HEADER_CSS
+    提供 (调用方渲染器在自己的 <head> 里输出, 避免在 body 中插 <style>)。
     """
-    g1, g2, g3 = gradient
     return f"""<header class="brand-banner">
   <span class="logo"></span>
   <div class="brand-text">
-    <div class="brand-row"><span class="brand-name">NetPulse</span><span class="brand-ver">v1.0.0</span></div>
+    <div class="brand-row"><span class="brand-name">{_esc_html(APP_NAME)}</span><span class="brand-ver">v{_esc_html(APP_VERSION)}</span></div>
     <h1>{title}</h1>
     <div class="brand-sub">{sub_text}</div>
   </div>
-</header>
-<style>
-.brand-banner{{background:linear-gradient(135deg,{g1} 0%,{g2} 55%,{g3} 100%);
+</header>"""
+
+
+# 页眉样式: 放 <head>, 三种报告各注入一次即可
+_BRAND_HEADER_CSS = """
+.brand-banner{background:linear-gradient(135deg,#0b1f3a 0%,#153e6b 55%,#1d4e89 100%);
   color:#fff;padding:24px 28px;display:flex;align-items:center;gap:16px;
   border-radius:14px;box-shadow:0 8px 24px -10px rgba(11,31,58,.45);margin-bottom:24px;
-  position:relative;overflow:hidden}}
-.brand-banner::before{{content:'';position:absolute;top:-40%;right:-15%;width:340px;height:340px;
-  background:radial-gradient(circle,rgba(96,165,250,.18) 0%,transparent 70%);pointer-events:none}}
-.brand-banner .logo{{width:36px;height:36px;border-radius:9px;
-  background:linear-gradient(135deg,#7ab3f5,#3b82f6);position:relative;flex:none}}
-.brand-banner .logo::after{{content:'';position:absolute;inset:8px;
-  border:2px solid rgba(255,255,255,.92);border-radius:3px}}
-.brand-text{{flex:1;min-width:0}}
-.brand-row{{display:flex;align-items:center;gap:8px;margin-bottom:2px}}
-.brand-name{{font-size:14px;font-weight:700;color:#dbeafe;letter-spacing:.3px}}
-.brand-ver{{font-size:11px;font-weight:600;color:#bfdbfe;
-  background:rgba(255,255,255,.14);padding:1px 9px;border-radius:999px}}
-.brand-banner h1{{font-size:22px;font-weight:800;letter-spacing:.5px;margin:4px 0 2px;color:#fff}}
-.brand-sub{{font-size:12.5px;color:#9db8dd}}
-</style>"""
+  position:relative;overflow:hidden}
+.brand-banner::before{content:'';position:absolute;top:-40%;right:-15%;width:340px;height:340px;
+  background:radial-gradient(circle,rgba(96,165,250,.18) 0%,transparent 70%);pointer-events:none}
+.brand-banner .logo{width:36px;height:36px;border-radius:9px;
+  background:linear-gradient(135deg,#7ab3f5,#3b82f6);position:relative;flex:none}
+.brand-banner .logo::after{content:'';position:absolute;inset:8px;
+  border:2px solid rgba(255,255,255,.92);border-radius:3px}
+.brand-text{flex:1;min-width:0}
+.brand-row{display:flex;align-items:center;gap:8px;margin-bottom:2px}
+.brand-name{font-size:14px;font-weight:700;color:#dbeafe;letter-spacing:.3px}
+.brand-ver{font-size:11px;font-weight:600;color:#bfdbfe;
+  background:rgba(255,255,255,.14);padding:1px 9px;border-radius:999px}
+.brand-banner h1{font-size:22px;font-weight:800;letter-spacing:.5px;margin:4px 0 2px;color:#fff}
+.brand-sub{font-size:12.5px;color:#9db8dd}
+"""
 
 
 def save_speedtest_report(res):
@@ -3934,6 +3938,7 @@ def _render_iperf3_html(res):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NetPulse iperf3 链路吞吐报告</title>
 <style>
+  {_BRAND_HEADER_CSS}
   body {{ font-family: "Microsoft YaHei", "Segoe UI", sans-serif; margin: 0; background: #eef2f6; color: #1c2430; }}
   .wrap {{ max-width: 880px; margin: 0 auto; padding: 28px 20px 48px; }}
   h1 {{ font-size: 23px; margin: 0; font-weight: 600; }}
@@ -7952,10 +7957,12 @@ def _render_monitor_html(res):
     dns_ok = stats.get("dns", {}).get("ok_pct")
 
     def _metric(label, value, level, note=""):
+        # 与主报告指标卡同向: 数值在上、名称在下
         color = {"ok": "#0e8a4f", "warn": "#b26a00", "err": "#b42318"}[level]
         note_html = f"<div class='note'>{_esc_html(note)}</div>" if note else ""
-        return (f"<div class='metric'><div class='lab'>{_esc_html(label)}</div>"
+        return (f"<div class='metric'>"
                 f"<div class='v' style='color:{color}'>{_esc_html(value)}</div>"
+                f"<div class='lab'>{_esc_html(label)}</div>"
                 f"{note_html}</div>")
 
     v_color = {"stable": "#0e8a4f", "no_data": "#64748b", "target_unreachable": "#b26a00",
@@ -7994,6 +8001,7 @@ def _render_monitor_html(res):
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>NetPulse 盯障监测报告</title>
 <style>
+{_BRAND_HEADER_CSS}
 body{{font-family:'Microsoft YaHei',sans-serif;background:#f2f5f9;margin:0;padding:24px;color:#1e293b}}
 .wrap{{max-width:900px;margin:0 auto}}
 h1{{font-size:22px;margin:0 0 4px}}
@@ -10616,56 +10624,29 @@ HEALTH_GRADE_TABLE = [
     (0,  "F", "严重"),
 ]
 
-def compute_health_score(counts, issues_count=None,
-                          err_issue_count=None, fatal_issue_count=None,
-                          warn_issue_count=None,
-                          score_counts=None):
-    """根据状态计数算健康分和等级。
+def compute_health_score(counts, text_counts=None):
+    """根据模块状态计数算健康分和等级。
 
-    counts: {"完成": 14, "警告": 3, "异常": 1, ...}
-    issues_count: 各模块实际 issue 总数 (含警告/异常/错误)。
-                 若提供, verdict 文案会精确显示此项数。
-    err_issue_count / fatal_issue_count / warn_issue_count:
-                     真实各级 issue 数 (按实际 issue 统计)。
-                     这些用于文案 (与 todo 列表一致), 默认含豁免模块。
-    score_counts: 用于 score 实际扣分的 counts。默认 = counts (不含豁免)。
-                  传入时可让豁免模块也参与扣分 (严) 或相反 (宽)。
+    counts: 扣分口径的 {"完成": N, "警告": N, "异常": N, "错误": N, ...}。
+            调用方应先排除评分豁免模块 (iperf3/ipv6/proxy/nattype)。
+    text_counts: 文案口径的计数 (默认 = counts)。传含豁免模块的全量计数时,
+            verdict 文案与"检测结果一览"徽章/统计卡数字保持一致 —
+            豁免模块不扣分, 但客户看得到它的红色徽章, 文案少报会自相矛盾。
 
-    混合策略: 文案口径与扣分口径分离 — 让用户看到完整的异常数 (含豁免),
-    同时 score 只反映用户能/应采取行动的问题 (不含豁免), 避免 ipv6 可选异常
-    等被夸大。
+    评分口径: 异常 -20 / 错误 -30 (硬故障), 警告 -2 (仅提示, 不压垮总分),
+    未检测不扣分 (环境缺测如无 WiFi 网卡不应被记过)。
+    verdict 口径: 按模块状态计数 — 按实际 issue 条目计数会把同一模块的
+    多条 issue 算成多项异常, 与一览徽章数对不上。
     """
-    # 评分口径:
-    #   - 异常 -20, 错误 -30: 硬故障, 一票否决
-    #   - 警告 -2: 仅提示, 不应压垮整体分数 (旧版 -5 偏重,
-    #              1 异常 + 6 警告 = 50 分, 给人"网络不能用"的错觉)
-    #   - 未检测不扣分: 环境缺测 (如无 WiFi 网卡) 不应被记过
-    #   - 特殊豁免: 调用方可在 score_counts 里排除 iperf3/ipv6/proxy/nattype
-    if err_issue_count is None:
-        err_issue_count = counts.get("异常", 0)
-    if fatal_issue_count is None:
-        fatal_issue_count = counts.get("错误", 0)
-    if warn_issue_count is None:
-        warn_issue_count = counts.get("警告", 0)
-
-    sc = score_counts if score_counts is not None else counts
     score = 100
-    score -= sc.get("异常", 0) * 20
-    score -= sc.get("错误", 0) * 30
-    score -= sc.get("警告", 0) * 2
+    score -= counts.get("异常", 0) * 20
+    score -= counts.get("错误", 0) * 30
+    score -= counts.get("警告", 0) * 2
     score = max(0, min(100, score))
 
-    # 文案所需的"异常/警告"计数一律基于真实 issue (而不是模块状态)
-    err_cnt = err_issue_count + fatal_issue_count
-    warn_cnt = warn_issue_count
-    if issues_count is None:
-        issues_count = err_cnt + warn_cnt
-
-    # verdict 口径: 按模块状态计数 (与"检测结果一览"和统计卡一致)。
-    # 之前按 issue 条目计数, 同一模块多条 issue 会被算成多项异常,
-    # 导致"3 项异常"而一览里只有 1 个异常模块, 数字对不上。
-    err_mod = counts.get("异常", 0) + counts.get("错误", 0)
-    warn_mod = counts.get("警告", 0)
+    tc = text_counts if text_counts is not None else counts
+    err_mod = tc.get("异常", 0) + tc.get("错误", 0)
+    warn_mod = tc.get("警告", 0)
     for threshold, grade, label in HEALTH_GRADE_TABLE:
         if score >= threshold:
             if err_mod == 0 and warn_mod == 0:
@@ -10712,9 +10693,11 @@ def build_report():
     # 状态计数 (按模块状态)
     # 豁免模块不参与扣分: iperf3(未配置不是故障), ipv6(可选), proxy/VPN(环境特性), nattype(运营商侧)
     EXEMPT_MODULES = {"iperf3", "ipv6", "proxy", "nattype"}
-    counts = {}
+    counts = {}          # 扣分口径: 不含豁免模块
+    all_counts = {}      # 文案口径: 全部模块 (与"检测结果一览"的徽章一致)
     exempt_count = 0
     for key, st in run["status"].items():
+        all_counts[st] = all_counts.get(st, 0) + 1
         if key in EXEMPT_MODULES:
             exempt_count += 1
             continue  # 豁免模块不计入扣分
@@ -10733,40 +10716,11 @@ def build_report():
             status = "未检测"
         modules.append(_present_module(key, res, status))
 
-    # 汇总真实 issue 数 (按严重级别拆分, 用于 health.verdict 精确文案 + 分数)
-    # 关键: 用真实 issue 计数, 不用 counts。counts 不含豁免模块, 但豁免模块里的
-    # 真异常 issue (ipv6 不可达、外网丢包) 应该反映到 score/verdict。
-    # 模块状态异常但没有任何非 info issue 时 (如 IPv6 状态异常 但 issues 全是 info)
-    # 才补计 1 条模块级异常, 避免与 issue 条目重复计数。
-    issue_total = 0
-    err_issue_count = 0
-    fatal_issue_count = 0
-    warn_issue_count = 0
-    for m in modules:
-        for issue in m.get("issues", []) or []:
-            sev = issue.get("severity", "信息")
-            if sev == "异常":
-                err_issue_count += 1
-                issue_total += 1
-            elif sev == "错误":
-                fatal_issue_count += 1
-                issue_total += 1
-            elif sev == "警告":
-                warn_issue_count += 1
-                issue_total += 1
-        # 模块状态异常但无对应 issue 条目, 补计 1 条 (但豁免模块跳过)
-        # 否则 iperf3 未配置会算成 "1 项异常" 但用户看不到任何 issue, 自相矛盾
-        if (m.get("key") not in EXEMPT_MODULES
-                and not any(i.get("severity", "信息") in ("异常", "错误", "警告")
-                            for i in (m.get("issues") or []))
-                and m.get("status", "") in ("异常", "错误")):
-            issue_total += 1
-            err_issue_count += 1
+    # 健康分: 扣分只用 counts (不含豁免, 可选/环境/运营商问题不压总分);
+    # verdict 文案用 all_counts (含豁免, 与一览徽章、统计卡的数字一致 —
+    # 豁免模块的异常客户同样看得到, 文案少报会造成"一览 2 个红而这里说 1 个"的矛盾)。
     health = compute_health_score(
-        counts, issues_count=issue_total,
-        err_issue_count=err_issue_count,
-        fatal_issue_count=fatal_issue_count,
-        warn_issue_count=warn_issue_count,
+        counts, text_counts=all_counts,
     )
 
     return {
@@ -11602,10 +11556,12 @@ def _render_web_targets_table(targets):
             cells.append("—" if v is None else _html_esc(str(v)))
         body_rows.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
     body = "".join(body_rows)
+    more = (f"<p class='muted'>… 还有 {len(targets) - 20} 条 (如需完整数据, "
+            f"导出 JSON 报告 {len(targets)} 条)</p>" if len(targets) > 20 else "")
     return (f"<div class='subcap'>探测目标 ({len(targets)} 条, 仅展示关键列; "
             f"证书/重定向等完整字段见 JSON 报告)</div>"
             f"<div class='tbl-wrap'><table class='tbl'><thead><tr>{head}</tr></thead>"
-            f"<tbody>{body}</tbody></table></div>")
+            f"<tbody>{body}</tbody></table></div>{more}")
 
 
 def _render_linkspeed_adapters_table(adapters):
@@ -12114,7 +12070,6 @@ body{background:linear-gradient(180deg,#f8fafc 0%,#e2e8f0 100%);color:#1e293b;fo
 .overview li a{padding:10px 22px;display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none;transition:background .1s}
 .overview li a:hover{background:#f8fafc}
 .overview li a:hover .name{color:#2563eb}
-.overview li:last-child{border-bottom:none}
 .overview .name{font-weight:600;min-width:130px;color:#0f172a}
 .overview .verdict{color:#475569;flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .overview .badge{padding:2px 11px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.5px;flex:none}
