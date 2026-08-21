@@ -2532,6 +2532,46 @@ class ExternalNetworkTester:
             assessment = f"外网部分不可达 ({unreachable_count}/{len(results)}), " \
                          f"{tcp_ok_count} 个 TCP 可达"
 
+        # 同步写 issues 到 self.results (与 _issues_external 口径一致),
+        # determine_status 才能拿到 critical/warning, 状态徽章与卡片对得上
+        # (此前 issue 仅在展示层生成, 导致徽章'完成'与卡片红色'异常'割裂)
+        issues = []
+        if tcp_total and tcp_ok == 0 and unreachable_count:
+            issues.append({
+                "type": "external_all_unreachable", "severity": "critical",
+                "message": "全部外网目标不可达",
+                "detail": "出网链路中断或被防火墙整体拦截",
+                "action": ("先看网关检测与链路速率; 网关正常则查本机防火墙/代理 (跑 proxy 模块)"),
+            })
+        elif unreachable_count:
+            issues.append({
+                "type": "external_some_unreachable", "severity": "warning",
+                "message": f"{unreachable_count} 个外网目标不可达",
+                "detail": "部分目标不通, 可能是目标站自身问题或链路单侧劣化",
+                "action": "看技术细节里的路径追踪, 确定从哪一跳开始不通; 仅个别目标不通多为对端问题",
+            })
+        if avg_loss >= 5:
+            issues.append({
+                "type": "external_high_loss", "severity": "critical",
+                "message": f"外网平均丢包 {avg_loss:.1f}%",
+                "detail": "明显丢包: 网页卡顿、游戏掉线、视频花屏",
+                "action": "网关正常而此处丢包 → 问题在运营商侧, 保留报告 (含逐跳路径) 带回报障",
+            })
+        elif avg_loss >= 1:
+            issues.append({
+                "type": "external_loss", "severity": "warning",
+                "message": f"外网平均丢包 {avg_loss:.1f}%",
+                "detail": "轻度丢包会影响游戏/通话体验",
+                "action": "结合网关模块丢包判断段位: 网关也丢=内网问题; 网关不丢=外线问题",
+            })
+        if avg_rtt >= 150:
+            issues.append({
+                "type": "external_high_rtt", "severity": "warning",
+                "message": f"外网平均延迟 {avg_rtt:.0f}ms",
+                "detail": "延迟偏高, 游戏类应用会明显感觉慢",
+                "action": "看路径追踪逐跳延迟, 从哪一跳开始升高, 问题就在那一段",
+            })
+
         # 拼接 summary 包含禁拼提示
         summary_parts = [f"外网检测: 平均延迟 {avg_rtt:.0f}ms, 平均丢包 {avg_loss:.1f}%"]
         if unreachable_count > 0:
@@ -2550,6 +2590,7 @@ class ExternalNetworkTester:
             "avg_loss_pct": round(avg_loss, 1),
             "avg_rtt_ms": round(avg_rtt, 1),
             "assessment": assessment,
+            "issues": issues,         # 同步 issues, 让 determine_status 与展示层口径一致
             "timestamp": datetime.now().isoformat(),
             "summary": summary,
         }
@@ -4164,9 +4205,21 @@ class MultiEgressDetector:
             })
         elif fake_default:
             # 唯一真默认路由 + 假网关 -> 不报警, 改报 info
-            fake_str = ", ".join(
-                f"{r['gateway']}(metric={r.get('metric','?')})"
-                for r in fake_default)
+            # 关键: 优先显示接口名 (如 "ZeroTier One [xxx]" / "Default"),
+            # 而非 gateway IP (VPN 虚拟接口的占位 gateway IP 可能恰好与真网关 IP
+            # 相同, 把真网关 IP 标为假网关会让用户误以为真网关是假的)。
+            def _fake_desc(r):
+                iface = r.get('interface', '') or ''
+                gw = r.get('gateway', '')
+                metric = r.get('metric') or '?'
+                if iface and iface != gw:
+                    # 接口名 ≠ gateway IP, 用接口名 (如 "ZeroTier One [9f77...]")
+                    return f"{_short_iface(iface, 36)} (gateway={gw}, metric={metric})"
+                if iface:
+                    # 接口名 == gateway IP, 退回到只显示 IP (避免重复)
+                    return f"{gw}(metric={metric})"
+                return f"{gw}(metric={metric})"
+            fake_str = ", ".join(_fake_desc(r) for r in fake_default)
             # 识别常见 ZeroTier 25.255.255.254 情况, 提示更准确
             is_zerotier_fake = any(
                 r["gateway"] == "25.255.255.254" for r in fake_default)
@@ -4176,8 +4229,8 @@ class MultiEgressDetector:
                           f"而插入的占位默认路由, 25.0.0.0/8 是英国国防部历史保留段, "
                           f"公网上不可能真实存在, 不影响真实流量。")
             else:
-                msg = f"检测到 {len(fake_default)} 条 VPN 占位/虚拟接口默认路由"
-                detail = (f"{fake_str}。可能是 VPN 客户端 (Tailscale/WireGuard 等) "
+                msg = f"检测到 {len(fake_default)} 条 VPN 占位/虚拟接口默认路由 ({fake_str})"
+                detail = (f"可能是 VPN 客户端 (Tailscale/WireGuard 等) "
                           f"为触发 Windows 网络分类或自身转发而插入的占位默认路由, "
                           f"不可达或走 VPN 隧道, 不影响真实流量。")
             detail += " 如需关闭可在对应 VPN 客户端关闭 'Allow Default Route' / 'Allow Global IPs' 等选项。"
@@ -5080,9 +5133,15 @@ class RouteTableAnalyzer:
             detail = "可能导致流量路径不确定"
             if fake_default_routes:
                 # 提示用户: 这些不是真问题, 是 VPN 客户端的占位
-                fake_str = ", ".join(
-                    f"{r['gateway']}(metric={r.get('metric','?')})"
-                    for r in fake_default_routes)
+                # 关键: 优先显示接口名, 避免把真网关 IP 误标为假网关
+                def _fake_desc(r):
+                    iface = r.get('interface', '') or ''
+                    gw = r.get('gateway', '')
+                    metric = r.get('metric') or '?'
+                    if iface and iface != gw:
+                        return f"{_short_iface(iface, 36)} (gateway={gw}, metric={metric})"
+                    return f"{gw}(metric={metric})"
+                fake_str = ", ".join(_fake_desc(r) for r in fake_default_routes)
                 detail += f"。另有 {len(fake_default_routes)} 条 VPN 占位/虚拟接口已忽略: {fake_str}"
             issues.append({
                 "type": "multiple_default",
@@ -5092,9 +5151,14 @@ class RouteTableAnalyzer:
             })
         elif len(default_routes) > 1 and fake_default_routes:
             # 唯一真默认路由 + 一条或多条假网关 -> 不报警, 改报 info 提示
-            fake_str = ", ".join(
-                f"{r['gateway']}(metric={r.get('metric','?')})"
-                for r in fake_default_routes)
+            def _fake_desc(r):
+                iface = r.get('interface', '') or ''
+                gw = r.get('gateway', '')
+                metric = r.get('metric') or '?'
+                if iface and iface != gw:
+                    return f"{_short_iface(iface, 36)} (gateway={gw}, metric={metric})"
+                return f"{gw}(metric={metric})"
+            fake_str = ", ".join(_fake_desc(r) for r in fake_default_routes)
             # 识别常见 ZeroTier 25.255.255.254 情况, 提示更准确
             is_zerotier_fake = any(
                 r["gateway"] == "25.255.255.254" for r in fake_default_routes)
@@ -5104,8 +5168,8 @@ class RouteTableAnalyzer:
                           f"而插入的占位默认路由, 25.0.0.0/8 是英国国防部历史保留段, "
                           f"公网上不可能真实存在, 不影响真实流量。")
             else:
-                msg = f"检测到 {len(fake_default_routes)} 条 VPN 占位/虚拟接口默认路由"
-                detail = (f"{fake_str}。可能是 VPN 客户端 (Tailscale/WireGuard 等) "
+                msg = f"检测到 {len(fake_default_routes)} 条 VPN 占位/虚拟接口默认路由 ({fake_str})"
+                detail = (f"可能是 VPN 客户端 (Tailscale/WireGuard 等) "
                           f"为触发 Windows 网络分类或自身转发而插入的占位默认路由, "
                           f"不可达或走 VPN 隧道, 不影响真实流量。")
             detail += " 如需关闭可在对应 VPN 客户端关闭 'Allow Default Route' / 'Allow Global IPs' 等选项。"
@@ -7174,6 +7238,20 @@ class TCPConcurrencyTester:
                                "message": f"失败以拒绝对主 ({fr}/{failed_level['fail']}) — "
                                           "目标服务器限流或本机安全软件拦截",
                                "detail": "可换 --tcpcc-target 自建服务器复测排除目标侧因素"})
+        # 高并发 P95 异常: 即使并发级别通过, 延迟 P95 > 500ms 也说明高并发吃力
+        # (典型: 800/1600 级 P95 经常 2000-4000ms, 用户打开多网页会感觉卡)
+        for lv in level_records:
+            if (lv.get("success_rate", 0) >= 90
+                    and isinstance(lv.get("p95_ms"), (int, float))
+                    and lv["p95_ms"] > 500):
+                issues.append({
+                    "type": "high_p95",
+                    "severity": "warning",
+                    "message": f"高并发下建连 P95 偏高 ({lv['level']} 级: P95 {lv['p95_ms']:.0f}ms > 500ms)",
+                    "detail": (f"虽然 {lv['level']} 并发能全部建立, 但 95% 的连接需要 {lv['p95_ms']:.0f}ms 才能完成, "
+                               f"浏览器多 tab / 多线程下载 / P2P 会感觉卡顿, 通常是 NAT 表小或中间盒转发慢导致"),
+                })
+                break  # 只报最高级那条
         if bottleneck == "本机":
             issues.append({"type": "local_bottleneck", "severity": "warning",
                            "message": f"本机回环对照在 {base_level} 并发同样受限 — "
@@ -8868,11 +8946,22 @@ def _issues_gateway(res):
     for issue in res.get("issues", []) or []:
         if isinstance(issue, dict):
             sev = issue.get("severity", "")
+            # 把 ping 原始数据塞进 raw_summary, 让顶部 todo 块能直接显示
+            # "20 发 / 19 收 / 1 丢" (不必展开技术细节也能看到依据)
+            raw_summary = None
+            if issue.get("type") in ("gateway_packet_loss",):
+                p = res.get("ping", {}) or {}
+                sent = p.get("sent")
+                recv = p.get("received")
+                if sent is not None and recv is not None:
+                    raw_summary = f"{sent} 发 / {recv} 收 / {sent - recv} 丢"
             out.append({
                 "severity": "异常" if sev == "critical" else "警告" if sev == "warning" else "信息",
                 "text": issue.get("message", ""),
                 "impact": issue.get("detail", ""),
                 "action": issue.get("action", ""),
+                "type": issue.get("type", ""),
+                "raw_summary": raw_summary,
             })
     return out
 
@@ -8920,7 +9009,9 @@ def _metrics_external(res):
     if res.get("unreachable_count", 0):
         out.append(("不可达目标", f"{res['unreachable_count']} 个", "err"))
     elif res.get("icmp_blocked_count", 0):
-        out.append(("禁拼目标", f"{res['icmp_blocked_count']} 个", "warn"))
+        # "禁拼目标" 不是故障 (对方防火墙策略, 不影响 TCP), 用 info 灰色而非 warn 橙色
+        # 与 explain 文本 "不算故障" 一致
+        out.append(("禁拼目标", f"{res['icmp_blocked_count']} 个", "info", "对方防火墙禁 ping, TCP 实测可达, 不算故障"))
     return out
 
 
@@ -9176,11 +9267,60 @@ def _issues_bufferbloat(res):
 
 
 def _verdict_linkspeed(res):
-    n = len(res.get("adapters", []))
+    """链路速率结论。
+    旧版只看 issues 数量, 即便所有网卡都协商到百兆也报"速率正常"。
+    现版基于 metrics 等级 (err/warn/ok) 综合判定: 优先反馈最严重的网卡档位。
+    """
+    adapters = res.get("adapters", [])
+    n = len(adapters)
     issues = res.get("issues", [])
+    up_adapters = [a for a in adapters if a.get("status") in ("Up", "已启用")]
+    # 统计每个网卡的协商速率档位
+    if up_adapters:
+        # 按 is_wifi 分档: 有线 ≥1000 ok / ≥100 warn / <100 err; WiFi ≥150 ok / ≥54 warn / <54 err
+        # VPN/虚拟接口单独识别, 不当作"有线"评估档位 (VPN 隧道速率不代表物理链路)
+        worst = "ok"
+        worst_kinds = []  # [(kind, name, speed, level)]
+        for a in up_adapters:
+            sp = a.get("speed_mbps", 0) or 0
+            is_wifi = bool(a.get("is_wifi"))
+            desc = (a.get("description") or "").lower()
+            name_lower = (a.get("name") or "").lower()
+            is_virt = any(kw in desc or kw in name_lower
+                          for kw in ("zerotier", "tailscale", "wireguard",
+                                     "tap-windows", "vpn-adapter", "cisco anyconnect",
+                                     "forticl", "globalprotect", "openvpn",
+                                     "nordvpn", "expressvpn", "hamachi"))
+            if is_wifi:
+                lvl = "ok" if sp >= 150 else "warn" if sp >= 54 else "err"
+                kind = "WiFi"
+            elif is_virt:
+                lvl = "ok"  # VPN 虚拟接口档位不扣分
+                kind = "虚拟"
+            else:
+                lvl = "ok" if sp >= 1000 else "warn" if sp >= 100 else "err"
+                kind = "有线"
+            worst_kinds.append((kind, a.get("name", "?"), sp, lvl))
+            # 计算最差等级 (err > warn > ok)
+            rank = {"ok": 0, "warn": 1, "err": 2}
+            if rank[lvl] > rank[worst]:
+                worst = lvl
+        # 拼接 verdict
+        if issues:
+            return f"检测到 {n} 个适配器, {len(issues)} 个问题; 最差速率档位: {worst}"
+        if worst == "err":
+            # 标注最低的适配器
+            slow = [w for w in worst_kinds if w[3] == "err"]
+            slow_str = ", ".join(f"{w[0]}·{w[1]} {w[2]} Mbps" for w in slow)
+            return f"检测到 {n} 个适配器, 速率档位异常: {slow_str}"
+        if worst == "warn":
+            slow = [w for w in worst_kinds if w[3] == "warn"]
+            slow_str = ", ".join(f"{w[0]}·{w[1]} {w[2]} Mbps" for w in slow)
+            return f"检测到 {n} 个适配器, 部分档位偏低 (千兆期望下百兆): {slow_str}"
+        return f"检测到 {n} 个适配器, 速率档位正常"
     if issues:
         return f"检测到 {n} 个适配器, {len(issues)} 个问题"
-    return f"检测到 {n} 个网络适配器, 速率正常"
+    return f"检测到 {n} 个适配器, 无在线网卡"
 
 
 def _metrics_linkspeed(res):
@@ -9189,14 +9329,39 @@ def _metrics_linkspeed(res):
         if a.get("status") not in ("Up", "已启用"):
             continue
         speed = a.get("speed_mbps", 0)
-        kind = "WiFi" if a.get("is_wifi") else "有线"
-        # 阈值
+        # 接口分类: VPN 虚拟接口单独标识 (避免被误以为是物理网线速率)
+        desc = (a.get("description") or "").lower()
+        name_lower = (a.get("name") or "").lower()
+        # 关键字选具体的 VPN/隧道产品名, 避免误伤正常网卡
+        # (不要写 "virtual", 太宽, 会把 VirtualBox Host-Only 这种本地桥接网误判)
+        is_virt = any(kw in desc or kw in name_lower
+                      for kw in ("zerotier", "tailscale", "wireguard",
+                                 "tap-windows", "vpn-adapter", "cisco anyconnect",
+                                 "forticlient", "globalprotect", "openvpn",
+                                 "nordvpn", "expressvpn", "hamachi"))
         if a.get("is_wifi"):
+            kind = "WiFi"
+            hint = ""
             level = "ok" if speed >= 150 else "warn" if speed >= 54 else "err"
+            if level == "warn":
+                hint = "档位偏低 (54-150 Mbps, 千兆环境期望更高)"
+            elif level == "err":
+                hint = "档位过低 (<54 Mbps, 远低于预期)"
+        elif is_virt:
+            kind = "虚拟"
+            hint = "VPN/虚拟网卡速率, 不代表物理链路"
+            level = "ok"  # 虚拟网卡档位不扣分
         else:
+            kind = "有线"
+            hint = ""
             level = "ok" if speed >= 1000 else "warn" if speed >= 100 else "err"
+            if level == "warn":
+                hint = "协商到百兆, 千兆环境应达 1000 Mbps"
+            elif level == "err":
+                hint = "协商速率过低 (<100 Mbps), 检查网线/水晶头"
+        # 有 hint 时占位, 避免 _present_module 用通用 "略超阈值" 覆盖
         out.append((f"{kind} · {_short_iface(a.get('name', '?'))}",
-                    f"{speed} Mbps", level))
+                    f"{speed} Mbps", level, hint))
     wifi = res.get("wifi_details", {})
     if wifi.get("signal_pct") is not None:
         sig = wifi["signal_pct"]
@@ -9404,15 +9569,32 @@ def _metrics_egress(res):
 
 
 def _issues_egress(res):
+    """多出口 issue。
+    旧版无论何种 issue 一律塞 "联系网络管理员确认多出口配置" 作为 action,
+    即便是 "ZeroTier 假网关" 这种 info 级无害提示也强行弹出, 让 verdict "正常"
+    的模块显得自相矛盾 (verdict 说正常, action 说联系网管)。
+    现版按 type 给具体 action; info 级 (fake_gateway/vpn_adapter) 不给 action,
+    让卡片只显示 "[信息]" 不附带 "建议" 行。
+    """
     out = []
+    type_actions = {
+        "multiple_default_routes": "检查路由表, 找出非预期的多默认路由, 必要时手动指定 metric 让一条为主",
+        "multiple_default": "检查路由表, 找出非预期的多默认路由, 必要时手动指定 metric 让一条为主",
+        "fake_gateway_present": "",   # info 级, VPN/虚拟接口占位无需处理
+        "vpn_adapter": "如非预期, 退出 VPN/加速器客户端后重测",
+    }
     for issue in res.get("issues", []):
         if isinstance(issue, dict):
             sev = issue.get("severity", "")
+            itype = issue.get("type", "")
+            # info 级 issue 默认不给 action; 真问题才给具体建议
+            default_action = "" if sev == "info" else "联系网络管理员确认多出口配置"
+            action = type_actions.get(itype, default_action)
             out.append({
                 "severity": "异常" if sev == "critical" else "警告" if sev == "warning" else "信息",
                 "text": issue.get("message", ""),
                 "impact": issue.get("detail", ""),
-                "action": "联系网络管理员确认多出口配置"
+                "action": action,
             })
     return out
 
@@ -9611,8 +9793,10 @@ def _metrics_tcpstats(res):
     out = [
         ("重传率", f"{res.get('retrans_rate_pct', 0)}%",
          "err" if res.get("retrans_rate_pct", 0) >= 5 else
-         "warn" if res.get("retrans_rate_pct", 0) >= 1 else "ok"),
-        ("当前连接", cur_str),
+         "warn" if res.get("retrans_rate_pct", 0) >= 1 else "ok",
+         "丢包后重发的比例; 大于 1% 链路质量偏差, 大于 5% 明显影响网速"),
+        ("当前连接", cur_str, "ok",
+         "本机当前的 TCP 连接总数 (实时快照, 与 TCP 连接模块采样时刻略有差异属正常)"),
     ]
     return out
 
@@ -9814,9 +9998,28 @@ def _issues_lan(res):
 
 
 def _verdict_nattype(res):
+    """NAT 类型 verdict。
+    旧版只看 summary, 对称型时只显示第一个映射地址, 与 todo issue 块描述
+    (\"42396 vs 42397\") 对不上, 用户从 overview 看 verdict 只有一个 IP, 但
+    从 todo 看到两个, 会以为有数据问题。
+    现版: 对称型时拼接多个映射地址 (与 _issues_nattype 口径一致)。
+    """
     if "error" in res:
         return res.get("error", "NAT 类型检测失败")
-    return res.get("summary", "NAT 类型")
+    base = res.get("summary", "NAT 类型")
+    beh = res.get("nat_behavior", "")
+    if beh == "对称型":
+        # 收集 STUN 服务器实际映射地址 (按检测顺序)
+        servers = res.get("servers") or []
+        mappings = []
+        for s in servers:
+            if isinstance(s, dict) and s.get("success") and s.get("mapping"):
+                m = s["mapping"]
+                if m not in mappings:
+                    mappings.append(m)
+        if len(mappings) >= 2:
+            return f"{base} ({mappings[0]} vs {mappings[1]})"
+    return base
 
 
 def _metrics_nattype(res):
@@ -9918,9 +10121,25 @@ def _issues_web(res):
 
 
 def _verdict_tcpcc(res):
+    """TCP 并发 verdict。
+    原版只用 summary, 不反映高并发下的 P95 延迟恶化 (800/1600 级常见)
+    现版: 在 summary 基础上追加 P95 异常提示, 让装维一眼看到高并发吃力
+    """
     if "error" in res:
         return res.get("error", "TCP 并发测试失败")
-    return res.get("summary", "TCP 并发")
+    base = res.get("summary", "TCP 并发")
+    # 检查各级别 P95: 凡是最后通过的级别 P95 > 500ms 视为"高并发吃力"
+    levels = res.get("levels") or []
+    high_p95_levels = []
+    for r in levels:
+        if (r.get("success_rate", 0) >= 90
+                and isinstance(r.get("p95_ms"), (int, float))
+                and r["p95_ms"] > 500):
+            high_p95_levels.append((r["level"], r["p95_ms"]))
+    if high_p95_levels:
+        max_lvl, max_p95 = max(high_p95_levels, key=lambda x: x[0])
+        return f"{base}; 高并发 P95 偏高 (≥{max_lvl} 级 P95 {max_p95:.0f}ms > 500ms)"
+    return base
 
 
 def _metrics_tcpcc(res):
@@ -9958,6 +10177,7 @@ def _issues_tcpcc(res):
         "fail_mode": "超时为主→NAT 表满, 考虑升级设备或减少长连接设备; 拒绝为主→换 --tcpcc-target 复测",
         "local_bottleneck": "排查安全软件/终端管控软件的连接数限制; 对照资源监视器确认",
         "path_bottleneck": "重启网关; 核实设备 NAT 规格是否与办理带宽匹配",
+        "high_p95": "升级路由器 NAT 规格/换更高速设备; 检查运营商侧是否有连接数/QoS 限制",
     }
     out = []
     for issue in res.get("issues", []):
@@ -10134,8 +10354,8 @@ METRIC_HINTS = {
         "不可达目标": "ping 与 TCP 均不通的目标",
     },
     "speedtest": {
-        "下载": "实测下载速率, 与办理档位对比 (百兆宽带实测应 ≥ 90 Mbps)",
-        "上传": "实测上传速率",
+        "下载": "实测下载速率; < 10 Mbps 警告, < 1 Mbps 异常 (千兆期望下应达 800+ Mbps, 百兆期望下应达 80+ Mbps)",
+        "上传": "实测上传速率; < 5 Mbps 警告, < 1 Mbps 异常",
         "预估宽带": "按实测速率推算的宽带档位",
         "缓冲膨胀": "满载时的延迟增加量, 大于 100ms 会让游戏/通话明显变卡",
     },
@@ -10197,11 +10417,13 @@ def _present_module(key, raw_result, status):
     name = MODULE_MAP.get(key, (key, key))[0]
     verdict = verdict_fn(raw_result) if raw_result else "未检测"
 
-    # 指标: 兼容老格式 (label, value) 和新格式 (label, value, level)
+    # 指标: 兼容老格式 (label, value) 和新格式 (label, value, level) / (label, value, level, hint)
     raw_metrics = metrics_fn(raw_result) if raw_result else []
     metrics = []
     for m in raw_metrics:
-        if len(m) == 3:
+        if len(m) == 4:
+            metrics.append({"label": m[0], "value": m[1], "level": m[2] or "ok", "hint": m[3] or ""})
+        elif len(m) == 3:
             metrics.append({"label": m[0], "value": m[1], "level": m[2] or "ok", "hint": ""})
         else:
             metrics.append({"label": m[0], "value": m[1], "level": "ok", "hint": ""})
@@ -10263,6 +10485,22 @@ def _present_module(key, raw_result, status):
         # 插到列表首位, 让这条解释最先被看到
         issues = [arp_auto_inject] + list(issues)
 
+    # 检查是否有实际的技术细节数据（而非仅检查配置）
+    has_tech = False
+    if pres.get("tech_keys") and raw_result:
+        for k in pres["tech_keys"]:
+            v = raw_result.get(k)
+            if v:
+                if isinstance(v, list) and v:
+                    has_tech = True
+                    break
+                elif isinstance(v, dict) and v:
+                    has_tech = True
+                    break
+                elif isinstance(v, str) and v:
+                    has_tech = True
+                    break
+
     return {
         "key": key,
         "name": name,
@@ -10270,7 +10508,7 @@ def _present_module(key, raw_result, status):
         "verdict": verdict,
         "key_metrics": metrics,
         "issues": issues,
-        "has_tech_details": bool(pres.get("tech_keys")),
+        "has_tech_details": has_tech,
         "raw": raw_result or {},   # 客户报告不展示, JSON 报告用
     }
 
@@ -10285,28 +10523,48 @@ HEALTH_GRADE_TABLE = [
     (0,  "F", "严重"),
 ]
 
-def compute_health_score(counts, issues_count=None):
+def compute_health_score(counts, issues_count=None,
+                          err_issue_count=None, fatal_issue_count=None,
+                          warn_issue_count=None,
+                          score_counts=None):
     """根据状态计数算健康分和等级。
 
     counts: {"完成": 14, "警告": 3, "异常": 1, ...}
     issues_count: 各模块实际 issue 总数 (含警告/异常/错误)。
                  若提供, verdict 文案会精确显示此项数。
+    err_issue_count / fatal_issue_count / warn_issue_count:
+                     真实各级 issue 数 (按实际 issue 统计)。
+                     这些用于文案 (与 todo 列表一致), 默认含豁免模块。
+    score_counts: 用于 score 实际扣分的 counts。默认 = counts (不含豁免)。
+                  传入时可让豁免模块也参与扣分 (严) 或相反 (宽)。
+
+    混合策略: 文案口径与扣分口径分离 — 让用户看到完整的异常数 (含豁免),
+    同时 score 只反映用户能/应采取行动的问题 (不含豁免), 避免 ipv6 可选异常
+    等被夸大。
     """
     # 评分口径:
     #   - 异常 -20, 错误 -30: 硬故障, 一票否决
     #   - 警告 -2: 仅提示, 不应压垮整体分数 (旧版 -5 偏重,
     #              1 异常 + 6 警告 = 50 分, 给人"网络不能用"的错觉)
     #   - 未检测不扣分: 环境缺测 (如无 WiFi 网卡) 不应被记过
-    #   - 特殊豁免: 调用方已在 counts 计算时排除了 iperf3/ipv6/proxy/nattype
+    #   - 特殊豁免: 调用方可在 score_counts 里排除 iperf3/ipv6/proxy/nattype
+    if err_issue_count is None:
+        err_issue_count = counts.get("异常", 0)
+    if fatal_issue_count is None:
+        fatal_issue_count = counts.get("错误", 0)
+    if warn_issue_count is None:
+        warn_issue_count = counts.get("警告", 0)
+
+    sc = score_counts if score_counts is not None else counts
     score = 100
-    score -= counts.get("异常", 0) * 20
-    score -= counts.get("错误", 0) * 30
-    score -= counts.get("警告", 0) * 2
+    score -= sc.get("异常", 0) * 20
+    score -= sc.get("错误", 0) * 30
+    score -= sc.get("警告", 0) * 2
     score = max(0, min(100, score))
 
-    # 计算真实需关注的条目数 (异常+错误, 警告; 不计"信息")
-    err_cnt = counts.get("异常", 0) + counts.get("错误", 0)
-    warn_cnt = counts.get("警告", 0)
+    # 文案所需的"异常/警告"计数一律基于真实 issue (而不是模块状态)
+    err_cnt = err_issue_count + fatal_issue_count
+    warn_cnt = warn_issue_count
     if issues_count is None:
         issues_count = err_cnt + warn_cnt
 
@@ -10364,8 +10622,10 @@ def build_report():
     # 豁免模块不参与扣分: iperf3(未配置不是故障), ipv6(可选), proxy/VPN(环境特性), nattype(运营商侧)
     EXEMPT_MODULES = {"iperf3", "ipv6", "proxy", "nattype"}
     counts = {}
+    exempt_count = 0
     for key, st in run["status"].items():
         if key in EXEMPT_MODULES:
+            exempt_count += 1
             continue  # 豁免模块不计入扣分
         counts[st] = counts.get(st, 0) + 1
 
@@ -10377,17 +10637,41 @@ def build_report():
         status = run["status"].get(key, "未检测")
         modules.append(_present_module(key, res, status))
 
-    # 汇总真实 issue 数 (用于 health.verdict 精确文案, 避免分数/verdict/问题数三者打架)
-    # 统计各模块非 info 级 issue; 模块状态异常但没有任何非 info issue 时 (如 IPv6 状态异常
-    # 但 issues 全是 info) 才补计 1 条模块级异常, 避免与 issue 条目重复计数
+    # 汇总真实 issue 数 (按严重级别拆分, 用于 health.verdict 精确文案 + 分数)
+    # 关键: 用真实 issue 计数, 不用 counts。counts 不含豁免模块, 但豁免模块里的
+    # 真异常 issue (ipv6 不可达、外网丢包) 应该反映到 score/verdict。
+    # 模块状态异常但没有任何非 info issue 时 (如 IPv6 状态异常 但 issues 全是 info)
+    # 才补计 1 条模块级异常, 避免与 issue 条目重复计数。
     issue_total = 0
+    err_issue_count = 0
+    fatal_issue_count = 0
+    warn_issue_count = 0
     for m in modules:
-        n_noninfo = sum(1 for issue in m.get("issues", []) or []
-                        if issue.get("severity", "信息") in ("异常", "错误", "警告"))
-        issue_total += n_noninfo
-        if n_noninfo == 0 and m.get("status", "") in ("异常", "错误"):
-            issue_total += 1  # 模块级异常但无对应 issue 条目
-    health = compute_health_score(counts, issues_count=issue_total)
+        for issue in m.get("issues", []) or []:
+            sev = issue.get("severity", "信息")
+            if sev == "异常":
+                err_issue_count += 1
+                issue_total += 1
+            elif sev == "错误":
+                fatal_issue_count += 1
+                issue_total += 1
+            elif sev == "警告":
+                warn_issue_count += 1
+                issue_total += 1
+        # 模块状态异常但无对应 issue 条目, 补计 1 条 (但豁免模块跳过)
+        # 否则 iperf3 未配置会算成 "1 项异常" 但用户看不到任何 issue, 自相矛盾
+        if (m.get("key") not in EXEMPT_MODULES
+                and not any(i.get("severity", "信息") in ("异常", "错误", "警告")
+                            for i in (m.get("issues") or []))
+                and m.get("status", "") in ("异常", "错误")):
+            issue_total += 1
+            err_issue_count += 1
+    health = compute_health_score(
+        counts, issues_count=issue_total,
+        err_issue_count=err_issue_count,
+        fatal_issue_count=fatal_issue_count,
+        warn_issue_count=warn_issue_count,
+    )
 
     return {
         "app": run["app"],
@@ -10396,6 +10680,7 @@ def build_report():
         "system": run["system"],
         "health": health,
         "counts": counts,
+        "exempt_count": exempt_count,        # 评分豁免的模块数 (iperf3/ipv6/proxy/nattype)
         "summary": {m["key"]: m["status"] for m in modules},
         "modules": modules,
         "tech": {
@@ -11113,6 +11398,10 @@ def _render_html_tech_block(key, raw_result, tech_keys, auto_open=True):
         if v is None:
             continue
         if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+            # 链路速率: 自定义精简列, 避免 12 列全展示导致表格溢出
+            if key == "linkspeed" and k == "adapters":
+                out.append(_render_linkspeed_adapters_table(v))
+                continue
             # 同构字典列表 → 真正的多列表格
             rt = _record_table(v)
             if rt:
@@ -11149,6 +11438,46 @@ def _render_html_tech_block(key, raw_result, tech_keys, auto_open=True):
             out.append(f"<p class='mono'>{_html_esc(str(v))}</p>")
     out.append("</div></details>")
     return "".join(out)
+
+
+def _render_linkspeed_adapters_table(adapters):
+    """链路速率专用: 只展示真正有用的 5 列。
+
+    原 _record_table 把 adapters dict 的全部 12 个 key 都展开, 导致:
+      - 重复列 (链路速率原始值 / 速率 Mbps / 综合判定 含相同信息)
+      - 冗余列 (4 个收发包错误列几乎都是 0/N/A)
+      - 难懂列 (无线网卡 True/False、媒体类型 802.3/Native 802.11)
+      - 长名 (ZeroTier One [9f77fc393e225015] + Realtek 8822CE ...) 把表格撑爆
+    客户关心的是: 名字 + 描述 + 状态 + 是否WiFi + 速率(Mbps) + 档位判定。其他进 JSON。
+    """
+    # 选定的展示列 + 中文化表头
+    column_map = [
+        ("name", "名称"),
+        ("description", "描述"),
+        ("status", "状态"),
+        ("speed_mbps", "速率 (Mbps)"),
+        ("assessment", "档位判定"),
+    ]
+    head = "".join(f"<th>{_html_esc(label)}</th>" for _, label in column_map)
+    body_rows = []
+    for a in adapters[:20]:  # 折叠里最多 20 条
+        cells = []
+        for key, _ in column_map:
+            v = a.get(key)
+            if v is None:
+                cells.append("—")
+            elif key == "speed_mbps":
+                cells.append(_html_esc(str(v)))
+            elif key == "name":
+                cells.append(_html_esc(_short_iface(str(v), 36)))
+            else:
+                cells.append(_html_esc(str(v)))
+        body_rows.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+    body = "".join(body_rows)
+    return (f"<div class='subcap'>adapters ({len(adapters)} 条, 仅展示关键列; "
+            f"完整 12 列字段见 JSON 报告)</div>"
+            f"<table class='tbl'><thead><tr>{head}</tr></thead>"
+            f"<tbody>{body}</tbody></table>")
 
 
 def render_report_html_customer(report):
@@ -11246,10 +11575,16 @@ def render_report_html_customer(report):
             action = issue.get("action", "")
             text = issue.get("text", "")
             module = issue.get("_module", "")
+            raw_summary = issue.get("raw_summary", "")
+            # 把 raw_summary 也加到来源 meta 行, 让装维一眼看到原始数据
+            # (例如网关丢包: 立即看到 "20 发 / 19 收 / 1 丢", 不必展开技术细节)
+            meta_line = f"📍 来源: {_html_esc(module)}"
+            if raw_summary:
+                meta_line += f" · 📊 {_html_esc(raw_summary)}"
             todo_blocks.append(f"""
 <div class="issue {sev_class}">
   <h3><span class="sev">{_html_esc(sev)}</span>{_html_esc(text)}</h3>
-  <div class="meta">📍 来源: {_html_esc(module)}</div>
+  <div class="meta">{meta_line}</div>
   {f"<div class='impact'>📌 影响: {_html_esc(impact)}</div>" if impact else ""}
   {f"<div class='action'>💡 建议: {_html_esc(action)}</div>" if action else ""}
 </div>""")
@@ -11301,8 +11636,17 @@ def render_report_html_customer(report):
         f"<div class='label'>{k}</div></div>"
         for k, v in stat_items
     )
+    # 模块总数 + 豁免模块数 (避免 stats-grid 只显示 17+1 误导用户以为只剩 18 个模块)
+    total_modules = len(modules)
+    exempt_count = report.get("exempt_count", 0) or 0
+    stats_caption = ""
+    if total_modules:
+        if exempt_count:
+            stats_caption = f"<div class='stats-caption'>共 {total_modules} 个模块 (含 {exempt_count} 个评分豁免: iperf3/ipv6/proxy/nattype, 不参与扣分)</div>"
+        else:
+            stats_caption = f"<div class='stats-caption'>共 {total_modules} 个模块</div>"
     stats_section = f"""
-<div class="stats-grid">{stat_cards}</div>"""
+<div class="stats-grid">{stat_cards}</div>{stats_caption}"""
 
     # ── 检测结果一览 ──
     overview_items = []
@@ -11416,7 +11760,7 @@ def render_report_html_customer(report):
 <div class="mod {sk}" id="mod-{_html_esc(m["key"])}">
   <div class="mod-head">
     <div class="mod-icon {sk}">{mod_icon}</div>
-    <div class="name">{_html_esc(m['name'])}<a class="anchor" href="#mod-{_html_esc(m["key"])}" title="复制此模块链接">🔗</a></div>
+    <div class="name">{_html_esc(m['name'])}<a class="anchor" href="#mod-{_html_esc(m["key"])}" title="复制此模块链接" aria-label="复制 {_html_esc(m['name'])} 模块链接">🔗</a></div>
     <span class="badge {sk}">{_html_esc(st)}</span>
   </div>
   <div class="mod-body">
@@ -11498,7 +11842,12 @@ def render_report_html_customer(report):
 
     # ── CSS ──
     CSS = """
-*{box-sizing:border-box;margin:0;padding:0}
+*{box-sizing:border-box;margin:0;padding:0;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+.skip-link{position:absolute;left:-9999px;top:0;z-index:9999;background:#0a1628;color:#fff;padding:8px 16px;text-decoration:none;border-radius:0 0 8px 0}
+.skip-link:focus{left:0}
+@media (prefers-reduced-motion: reduce){
+*{animation:none!important;transition:none!important}
+}
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
 body{background:linear-gradient(180deg,#f8fafc 0%,#e2e8f0 100%);color:#1e293b;font:14px/1.6 'Noto Sans SC',-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding:32px 16px 80px}
 .wrap{max-width:900px;margin:0 auto}
@@ -11516,7 +11865,8 @@ body{background:linear-gradient(180deg,#f8fafc 0%,#e2e8f0 100%);color:#1e293b;fo
 .sec{margin:32px 0 12px}
 .sec h2{font-size:18px;font-weight:700;display:flex;align-items:center;gap:8px;color:#111827}
 .sec h2 .icon{width:28px;height:28px;border-radius:8px;background:#e0e7ff;color:#4338ca;display:inline-flex;align-items:center;justify-content:center;font-size:14px}.sec h2 .extra-count{font-size:12px;font-weight:400;color:#64748b;margin-left:6px}
-.stats-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin-bottom:32px}
+.stats-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin-bottom:8px}
+.stats-caption{text-align:center;font-size:11.5px;color:#94a3b8;margin-bottom:24px}
 .stat-card{background:#fff;border-radius:12px;padding:16px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.08);border:1px solid #e5e7eb;transition:transform .2s,box-shadow .2s}
 .stat-card:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.12)}
 .stat-card .count{font-size:32px;font-weight:800}
@@ -11570,7 +11920,7 @@ body{background:linear-gradient(180deg,#f8fafc 0%,#e2e8f0 100%);color:#1e293b;fo
 .metric{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:9px 13px;display:flex;justify-content:space-between;align-items:center;gap:8px}
 .metric .lab{font-size:12px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
 .metric .v{font-size:14px;font-weight:700;font-family:Cascadia Mono,Consolas,monospace;text-align:right}
-.metric .v.ok{color:#15803d}.metric .v.warn{color:#c2410c}.metric .v.err{color:#b91c1c}.metric .v.idle{color:#94a3b8}
+.metric .v.ok{color:#15803d}.metric .v.warn{color:#c2410c}.metric .v.err{color:#b91c1c}.metric .v.info{color:#64748b}.metric .v.idle{color:#94a3b8}
 .metric .hint{font-size:11px;color:#94a3b8;margin-left:4px;font-weight:400}
 .impact-line{background:#fef2f2;border-left:3px solid #dc2626;padding:6px 12px;border-radius:0 6px 6px 0;font-size:12.5px;color:#7f1d1d;margin:8px 0}
 .impact-line.warn{background:#fffbeb;border-left-color:#f59e0b;color:#78350f}.impact-line.info{background:#f1f5f9;border-left-color:#94a3b8;color:#475569;font-size:12px}
@@ -11583,9 +11933,10 @@ details.collapse[open] summary::before{transform:rotate(90deg)}
 details.collapse .cnt{background:#e2e8f0;color:#475569;border-radius:999px;font-size:10.5px;padding:1px 8px;margin-left:6px;font-weight:600}
 details.collapse .body{padding:4px 14px 12px;font-size:12px;color:#475569;line-height:1.7}
 details.collapse .subcap{font-size:12px;font-weight:700;color:#475569;margin:10px 0 4px}
-details.collapse table{width:100%;border-collapse:collapse;margin-top:4px;display:block;overflow-x:auto;white-space:nowrap}
+details.collapse table{width:100%;border-collapse:collapse;margin-top:4px;display:table;overflow-x:auto;white-space:nowrap}
+details.collapse table.tbl{width:100%;min-width:100%}
 details.collapse th{background:#e2e8f0;color:#334155;text-align:left;padding:5px 8px;font-weight:600;font-size:11.5px;white-space:nowrap}
-details.collapse td{padding:4px 8px;border-top:1px solid #e2e8f0;font-family:Cascadia Mono,Consolas,monospace;font-size:11.5px;white-space:nowrap;max-width:300px;overflow:hidden;text-overflow:ellipsis}
+details.collapse td{padding:4px 8px;border-top:1px solid #e2e8f0;font-family:Cascadia Mono,Consolas,monospace;font-size:11.5px;white-space:nowrap;min-width:50px;max-width:none;width:auto;overflow:hidden;text-overflow:ellipsis}
 details.collapse td.k{width:35%;color:#64748b;background:#f8fafc;white-space:normal}
 details.collapse td:hover{white-space:normal;overflow:visible}
 details.collapse p.mono{font-family:Cascadia Mono,Consolas,monospace;background:#f1f5f9;padding:6px 10px;border-radius:4px;word-break:break-all}
@@ -11614,11 +11965,14 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0a1628">
 <title>{_html_esc(report['app'])} 诊断报告</title>
 <style>{CSS}</style>
 </head>
 <body>
+<a href="#main-content" class="skip-link">跳到主要内容</a>
 <div class="wrap">
+<main id="main-content">
 {hero}
 {todo_section}
 {stats_section}
@@ -11626,6 +11980,7 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 {modules_section}
 {host_section}
 {standards_section}
+</main>
 <footer>由 {_html_esc(report['app'])} v{_html_esc(report['version'])} 自动生成 · {_html_esc(g)}</footer>
 </div>
 <script>
