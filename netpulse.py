@@ -2177,7 +2177,9 @@ class GatewayTester:
         if callback:
             callback(f"Ping 网关 {gateway} ({count} 次)...")
 
-        ping_result = ping_host(gateway, count=count, timeout=count + 10)
+        # 内网网关正常回复 <10ms, wait 1500 足够; 不可达时也能更快收敛
+        ping_result = ping_host(gateway, count=count, timeout=count + 10,
+                                wait_ms=1500)
 
         # 评估: 分级阈值, 避免 53ms 0% 丢包被误报"延迟严重"
         # 阈值依据: 国内普通宽带/企业网到局域网网关一般 < 10ms;
@@ -2319,7 +2321,7 @@ class LoopDetector:
         if callback:
             callback("TTL 分析...")
         if gateway:
-            ping_result = ping_host(gateway, count=10, timeout=15)
+            ping_result = ping_host(gateway, count=10, timeout=15, wait_ms=1500)
             # 正常内网网关 TTL 通常为 64 (Linux) 或 128 (Windows)
             # 如果 TTL 远低于预期，可能存在环路
             code, ping_out, _ = run_cmd(f"ping -n 1 {gateway}")
@@ -2356,7 +2358,7 @@ class LoopDetector:
 
         # 4. 检查网关丢包模式 (环路常导致间歇性丢包)
         if gateway:
-            ping_result = ping_host(gateway, count=15, timeout=20)
+            ping_result = ping_host(gateway, count=15, timeout=20, wait_ms=1500)
             if ping_result["loss_pct"] > 0 and ping_result["loss_pct"] < 50:
                 # 间歇性丢包可能是环路的征兆
                 if ping_result["jitter_ms"] > ping_result["avg_ms"]:
@@ -4429,7 +4431,7 @@ class MultiEgressDetector:
                     "status": reason,
                     "_critical": False,
                 }
-            ping_result = ping_host(gw, count=10, timeout=15)
+            ping_result = ping_host(gw, count=10, timeout=15, wait_ms=1500)
             status = ("正常" if ping_result["loss_pct"] == 0 else
                       f"丢包 {ping_result['loss_pct']}%"
                       if ping_result["loss_pct"] < 50 else "故障")
@@ -11843,8 +11845,10 @@ def render_report_html_customer(report):
                 if hint:
                     full_title += f"\n💡 {hint}"
                 # 数值在上、名称在下 (flex-column), 长名称可换行不再截断
+                # data-hint 供触摸设备点击展开 (桌面 hover 走 title)
                 metric_html.append(
-                    f"<div class='metric' title='{_html_esc(full_title)}'>"
+                    f"<div class='metric' title='{_html_esc(full_title)}'"
+                    f"{' data-hint=\'' + _html_esc(hint) + '\'' if hint else ''}>"
                     f"<span class='v {level}'>{_html_esc(me['value'])}</span>"
                     f"<span class='lab'>{_html_esc(me['label'])}</span>"
                     f"</div>"
@@ -12106,6 +12110,8 @@ body{background:linear-gradient(180deg,#f8fafc 0%,#e2e8f0 100%);color:#1e293b;fo
 .metric .v{font-size:15px;font-weight:700;font-family:Cascadia Mono,Consolas,monospace;text-align:left;max-width:100%;overflow-wrap:break-word}
 .metric .lab{font-size:11.5px;color:#64748b;overflow-wrap:break-word;white-space:normal;line-height:1.45;max-width:100%}
 .metric .v.ok{color:#15803d}.metric .v.warn{color:#c2410c}.metric .v.err{color:#b91c1c}.metric .v.info{color:#64748b}.metric .v.idle{color:#94a3b8}
+.metric[data-hint]{cursor:pointer}
+.metric.show-hint::after{content:attr(data-hint);display:block;font-size:11px;color:#475569;background:#eef2ff;border-radius:4px;padding:4px 8px;margin-top:4px;line-height:1.5}
 .metric .hint{font-size:11px;color:#b45309;font-weight:400;display:block;margin-top:2px;line-height:1.45}
 .impact-line{background:#fef2f2;border-left:3px solid #dc2626;padding:6px 12px;border-radius:0 6px 6px 0;font-size:12.5px;color:#7f1d1d;margin:8px 0}
 .impact-line.warn{background:#fffbeb;border-left-color:#f59e0b;color:#78350f}.impact-line.info{background:#f1f5f9;border-left-color:#94a3b8;color:#475569;font-size:12px}
@@ -12172,6 +12178,14 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 <footer>由 {_html_esc(report['app'])} v{_html_esc(report['version'])} 自动生成 · {_html_esc(g)}</footer>
 </div>
 <script>
+// 指标卡点击展开说明 (触摸设备无 hover; 桌面点击也可用)
+(function(){{
+  document.querySelectorAll('.metric[data-hint]').forEach(function(el){{
+    el.addEventListener('click', function(){{
+      el.classList.toggle('show-hint');
+    }});
+  }});
+}})();
 // IP/MAC 值点击复制
 (function(){{
   document.querySelectorAll('.host-card .val').forEach(function(el){{
@@ -12638,9 +12652,10 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
                 vstyle = metric_val_map.get(lvl, metric_val_ok)
                 hint = me.get("hint", "")
                 vtext = me.get("value", "")
-                # 与 HTML 口径一致: 正常指标不加说明文字, 保持卡片清爽
-                if hint and lvl in ("warn", "err"):
-                    vtext += (f"  <font size=7 color='#b45309'>"
+                # PDF 是静态文档无悬停: 所有 hint 全部内联 (自包含),
+                # 换小号浅色字与数值区分, 不影响主体可读性
+                if hint:
+                    vtext += (f"  <font size=7 color='#64748b'>"
                               f"{_html_esc(hint)}</font>")
                 mrows.append([
                     Paragraph(_html_esc(me.get("label", "")), metric_lbl),
