@@ -2536,7 +2536,7 @@ class ExternalNetworkTester:
         # determine_status 才能拿到 critical/warning, 状态徽章与卡片对得上
         # (此前 issue 仅在展示层生成, 导致徽章'完成'与卡片红色'异常'割裂)
         issues = []
-        if tcp_total and tcp_ok == 0 and unreachable_count:
+        if results and tcp_ok_count == 0 and unreachable_count:
             issues.append({
                 "type": "external_all_unreachable", "severity": "critical",
                 "message": "全部外网目标不可达",
@@ -3592,10 +3592,17 @@ def _render_speedtest_html(res):
     面向装维人员留档/给客户看: 三大指标仪表盘 + 速率曲线 + 延迟曲线
     (bufferbloat) + 预估带宽 + 测试参数, 不含"达标判定"的结论, 只给客观数据。
     """
+    # 通用页眉: 与主报告/盯障/iperf3 报告统一品牌风格 (品牌徽标 + 版本 + 时间)
     download = res.get("download_mbps") or 0
     upload = res.get("upload_mbps")
     est = res.get("estimated_bandwidth") or {}
     grade = str(res.get("bufferbloat_grade") or "—")
+    # 把 "A (优秀, 无缓冲膨胀)" 拆成简短字母 + 评语 (与主报告 metric 卡策略一致,
+    # 避免卡片被长字符串撑大)
+    g0 = grade.split(" ", 1)[0] if grade and grade != "—" else "—"
+    g_rest = grade[len(g0):].strip(" ()") if g0 != "—" else ""
+    grade_letter = g0
+    grade_note = g_rest or ""
     idle_rtt = res.get("idle_rtt_ms")
     loaded_rtt = res.get("loaded_rtt_ms")
     bloat_ms = res.get("bufferbloat_ms")
@@ -3672,7 +3679,10 @@ def _render_speedtest_html(res):
   .info .note {{ color: #98a2af; font-size: 11.5px; margin-top: 2px; }}
   .panel {{ background: #fff; border-radius: 14px; padding: 18px 20px; margin-bottom: 18px;
             box-shadow: 0 1px 3px rgba(16,42,67,.08); }}
-  .panel h3 {{ margin: 0 0 14px; font-size: 15px; color: #1c2430; font-weight: 500; }}
+  .panel h3 {{ margin: 0 0 14px; font-size: 15px; color: #1c2430; font-weight: 500;
+               display:flex;align-items:center;gap:8px; }}
+  .tag-tp {{ display:inline-block; padding:2px 9px; border-radius:5px;
+    font-size:11px; font-weight:600; background:#e0e7ff; color:#4338ca; letter-spacing:.2px; }}
   canvas {{ width: 100%; height: auto; }}
   table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
   td {{ padding: 8px 10px; border-bottom: 1px solid #f0f2f5; }}
@@ -3686,24 +3696,25 @@ def _render_speedtest_html(res):
 </head>
 <body>
 <div class="wrap">
-  <h1><span class="dot">●</span>NetPulse 宽带测速报告</h1>
-  <div class="sub">测试时间: {ts_disp} &nbsp;·&nbsp; 本机 IP: {local_ip} &nbsp;·&nbsp; 网关: {gateway}</div>
+  {_render_brand_header("宽带测速报告",
+                        f"测试时间: {ts_disp} &nbsp;·&nbsp; 本机 IP: {local_ip} &nbsp;·&nbsp; 网关: {gateway}")}
+  <div class="sub">客观速率/延迟实测数据, 不含达标判定</div>
 
   <div class="metric-row">
     <div class="metric down">
-      <div class="label">下载速率 Download</div>
+      <div class="label">下载</div>
       <div class="big">{download:.1f}<span class="unit"> Mbps</span></div>
       <div class="note">{down_note}</div>
     </div>
     <div class="metric up">
-      <div class="label">上传速率 Upload</div>
+      <div class="label">上传</div>
       <div class="big">{up_big}<span class="unit"> Mbps</span></div>
       <div class="note">{upload_server} · {up_threads} 连接</div>
     </div>
     <div class="metric ping">
-      <div class="label">延迟 Ping</div>
+      <div class="label">延迟 (网关)</div>
       <div class="big">{ping_big}<span class="unit"> ms</span></div>
-      <div class="note">对网关 {gateway} 的 ICMP 延迟 (空闲基线)</div>
+      <div class="note">空闲基线 · 下行/上行负载下还会测一次算缓冲膨胀</div>
     </div>
   </div>
 
@@ -3715,13 +3726,13 @@ def _render_speedtest_html(res):
     </div>
     <div class="info">
       <div class="label">缓冲膨胀 Bufferbloat</div>
-      <div class="value">{grade}</div>
-      <div class="note">空闲 {idle_str} → 负载 {loaded_str} ({bloat_str})</div>
+      <div class="value">{grade_letter}</div>
+      <div class="note">空闲 {idle_str} → 负载 {loaded_str} ({bloat_str}) · {grade_note}</div>
     </div>
   </div>
 
   <div class="panel">
-    <h3>速率曲线 <span class="tag">Mbps</span></h3>
+    <h3>速率曲线 <span class="tag-mbps">Mbps · 每秒采样</span></h3>
     <canvas id="speedChart" width="840" height="280"></canvas>
     <div class="legend">
       <span class="sw" style="background:#0a84ff"></span>下行 · {down_note}
@@ -3730,7 +3741,7 @@ def _render_speedtest_html(res):
   </div>
 
   <div class="panel">
-    <h3>延迟变化 <span class="tag">ms · 负载期间延迟上升越多, 缓冲膨胀越严重</span></h3>
+    <h3>延迟变化 <span class="tag-ms">ms · 负载期间延迟上升越多, 缓冲膨胀越严重</span></h3>
     <canvas id="latChart" width="840" height="200"></canvas>
   </div>
 
@@ -3741,9 +3752,7 @@ def _render_speedtest_html(res):
       <tr><td>上行测速方式</td><td>{upload_method} ({upload_server}) · {up_threads} 连接</td></tr>
       <tr><td>延迟采样目标</td><td>{res.get("latency_target", "—")} (空闲/负载延迟均对它测)</td></tr>
       <tr><td>测速节点延迟</td><td>{server_lat_str}</td></tr>
-      <tr><td>空闲延迟 / 负载延迟</td><td>{idle_str} / {loaded_str} ({res.get("loaded_phase") or "—"} 阶段)</td></tr>
       <tr><td>延迟采样阶段</td><td>空闲基线 → 下行 → 上行 (全程并行采样)</td></tr>
-      <tr><td>缓冲膨胀增量</td><td>{bloat_str}</td></tr>
     </table>
   </div>
 
@@ -3817,6 +3826,42 @@ multiLineChart("latChart", [{{data: DATA.lat, color: "#34c759", fill: true, fill
 </script>
 </body>
 </html>"""
+
+
+def _render_brand_header(title, sub_text, gradient=("#0b1f3a", "#153e6b", "#1d4e89")):
+    """通用页眉 — 测速/盯障/iperf3 三种独立报告统一品牌风格,
+    与主报告 (render_report_html_customer) 视觉一致。
+
+    返回页眉 HTML 字符串。
+    """
+    g1, g2, g3 = gradient
+    return f"""<header class="brand-banner">
+  <span class="logo"></span>
+  <div class="brand-text">
+    <div class="brand-row"><span class="brand-name">NetPulse</span><span class="brand-ver">v1.0.0</span></div>
+    <h1>{title}</h1>
+    <div class="brand-sub">{sub_text}</div>
+  </div>
+</header>
+<style>
+.brand-banner{{background:linear-gradient(135deg,{g1} 0%,{g2} 55%,{g3} 100%);
+  color:#fff;padding:24px 28px;display:flex;align-items:center;gap:16px;
+  border-radius:14px;box-shadow:0 8px 24px -10px rgba(11,31,58,.45);margin-bottom:24px;
+  position:relative;overflow:hidden}}
+.brand-banner::before{{content:'';position:absolute;top:-40%;right:-15%;width:340px;height:340px;
+  background:radial-gradient(circle,rgba(96,165,250,.18) 0%,transparent 70%);pointer-events:none}}
+.brand-banner .logo{{width:36px;height:36px;border-radius:9px;
+  background:linear-gradient(135deg,#7ab3f5,#3b82f6);position:relative;flex:none}}
+.brand-banner .logo::after{{content:'';position:absolute;inset:8px;
+  border:2px solid rgba(255,255,255,.92);border-radius:3px}}
+.brand-text{{flex:1;min-width:0}}
+.brand-row{{display:flex;align-items:center;gap:8px;margin-bottom:2px}}
+.brand-name{{font-size:14px;font-weight:700;color:#dbeafe;letter-spacing:.3px}}
+.brand-ver{{font-size:11px;font-weight:600;color:#bfdbfe;
+  background:rgba(255,255,255,.14);padding:1px 9px;border-radius:999px}}
+.brand-banner h1{{font-size:22px;font-weight:800;letter-spacing:.5px;margin:4px 0 2px;color:#fff}}
+.brand-sub{{font-size:12.5px;color:#9db8dd}}
+</style>"""
 
 
 def save_speedtest_report(res):
@@ -3906,7 +3951,10 @@ def _render_iperf3_html(res):
   .metric.up {{ border-top-color: #ff9500; }} .metric.up .big {{ color: #ff9500; }}
   .panel {{ background: #fff; border-radius: 14px; padding: 18px 20px; margin-bottom: 18px;
             box-shadow: 0 1px 3px rgba(16,42,67,.08); }}
-  .panel h3 {{ margin: 0 0 14px; font-size: 15px; color: #1c2430; font-weight: 500; }}
+  .panel h3 {{ margin: 0 0 14px; font-size: 15px; color: #1c2430; font-weight: 500;
+               display:flex;align-items:center;gap:8px; }}
+  .tag-tp {{ display:inline-block; padding:2px 9px; border-radius:5px;
+    font-size:11px; font-weight:600; background:#e0e7ff; color:#4338ca; letter-spacing:.2px; }}
   canvas {{ width: 100%; height: auto; }}
   table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
   td {{ padding: 8px 10px; border-bottom: 1px solid #f0f2f5; }}
@@ -3920,8 +3968,9 @@ def _render_iperf3_html(res):
 </head>
 <body>
 <div class="wrap">
-  <h1><span class="dot">●</span>NetPulse iperf3 链路吞吐报告</h1>
-  <div class="sub">测试时间: {ts_disp} &nbsp;·&nbsp; 到服务器 {server_html}:{port}</div>
+  {_render_brand_header("iperf3 链路吞吐报告",
+                        f"测试时间: {ts_disp} &nbsp;·&nbsp; 到服务器 {server_html}:{port}")}
+  <div class="sub">链路吞吐实测 (TCP/UDP), 不含达标判定</div>
 
   <div class="banner">⚠️ iperf3 测量的是<b>到指定服务器 {server_html} 的链路吞吐</b>,
     不代表互联网宽带速率。服务器在内网时数值会远高于出口宽带, 属正常现象。</div>
@@ -3940,7 +3989,7 @@ def _render_iperf3_html(res):
   </div>
 
   <div class="panel">
-    <h3>吞吐速率曲线 <span class="tag">Mbps · 每秒采样</span></h3>
+    <h3>吞吐速率曲线 <span class="tag-tp">Mbps · 每秒采样</span></h3>
     <canvas id="tpChart" width="840" height="280"></canvas>
     <div class="legend">
       <span class="sw" style="background:#0a84ff"></span>下载
@@ -5048,9 +5097,8 @@ class IPv6Tester:
             if has_ipv6_route:
                 issues.append("有 IPv6 路由但无法建立 IPv6 连接，可能是防火墙/MTU 问题")
             else:
-                issues.append("未检测到默认 IPv6 路由（可能是 ISATAP/6to4 隧道，"
-                              "Windows `route print` 不显示），如需 IPv6 外网请检查 "
-                              "隧道适配器或路由器 IPv6 转发")
+                issues.append("有 IPv6 地址但当前无法通过 IPv6 上外网 "
+                              "(本机配置了隧道方式的 IPv6, 系统命令查不到它的路由)。")
         if has_global_ipv6 and not ipv6_dns:
             issues.append("IPv6 DNS 解析失败")
 
@@ -6724,7 +6772,15 @@ class WebPageTester:
                         seg["cert_not_after"] = cert["notAfter"]
                         issuer = cert.get("issuer") or ()
                         if issuer:
-                            seg["cert_issuer"] = str(issuer[-1][-1])
+                            # issuer 是形如 (('commonName', 'DigiCert ...'),) 的
+                            # 嵌套元组, 逐层取最后一个元素直到得到字符串 (颁发者名)
+                            node = issuer[-1]
+                            for _ in range(4):
+                                if isinstance(node, (tuple, list)) and node:
+                                    node = node[-1]
+                                else:
+                                    break
+                            seg["cert_issuer"] = str(node) if node else "N/A"
                     except Exception:
                         pass
 
@@ -7247,7 +7303,9 @@ class TCPConcurrencyTester:
                 issues.append({
                     "type": "high_p95",
                     "severity": "warning",
-                    "message": f"高并发下建连 P95 偏高 ({lv['level']} 级: P95 {lv['p95_ms']:.0f}ms > 500ms)",
+                    "message": (f"高并发时新建连接明显变慢 "
+                 f"(并发 {lv['level']} 时, 95% 的连接需 {lv['p95_ms']:.0f}ms 才建立, "
+                 f"参考值 500ms 内)"),
                     "detail": (f"虽然 {lv['level']} 并发能全部建立, 但 95% 的连接需要 {lv['p95_ms']:.0f}ms 才能完成, "
                                f"浏览器多 tab / 多线程下载 / P2P 会感觉卡顿, 通常是 NAT 表小或中间盒转发慢导致"),
                 })
@@ -7941,9 +7999,11 @@ body{{font-family:'Microsoft YaHei',sans-serif;background:#f2f5f9;margin:0;paddi
 h1{{font-size:22px;margin:0 0 4px}}
 .sub{{color:#64748b;font-size:13px;margin-bottom:18px}}
 .metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:16px}}
-.metric{{background:#fff;border-radius:10px;padding:12px 16px;box-shadow:0 1px 3px rgba(0,0,0,.06)}}
-.metric .lab{{font-size:12px;color:#64748b}} .metric .v{{font-size:22px;font-weight:700;font-family:Consolas,monospace}}
-.metric .note{{font-size:11px;color:#94a3b8;margin-top:2px}}
+.metric{{background:#fff;border-radius:10px;padding:12px 14px 10px;box-shadow:0 1px 3px rgba(0,0,0,.06);
+        display:flex;flex-direction:column;gap:2px}}
+.metric .lab{{font-size:11.5px;color:#64748b;line-height:1.45}}
+.metric .v{{font-size:22px;font-weight:700;font-family:Consolas,monospace;line-height:1.2}}
+.metric .note{{font-size:11px;color:#94a3b8;margin-top:2px;line-height:1.4}}
 .banner{{background:#fff;border-left:5px solid {v_color};border-radius:8px;padding:14px 18px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.06)}}
 .banner .verdict{{font-size:16px;font-weight:700;color:{v_color};margin-bottom:6px}}
 .banner .text{{font-size:14px;line-height:1.7}} .banner .advice{{font-size:13px;color:#1e293b;background:#f0f9ff;border-left:3px solid #0284c7;padding:8px 12px;border-radius:0 6px 6px 0;margin-top:10px;white-space:pre-line}}
@@ -7958,10 +8018,12 @@ canvas{{max-width:100%}}
 .note-line{{font-size:12px;color:#94a3b8}}
 .footer{{color:#94a3b8;font-size:12px;text-align:center;margin-top:8px}}
 </style></head><body><div class="wrap">
-<h1>NetPulse 盯障监测报告</h1>
-<div class="sub">开始 {_esc_html(res.get('started_at', ''))} · 时长 {_esc_html(dur)} ·
-本机 {_esc_html(res.get('local_ip') or '—')} · 网关 {_esc_html(str(tg.get('gateway') or '—'))} ·
-外网目标 {_esc_html(str(tg.get('external') or '—'))}</div>
+{_render_brand_header("盯障监测报告",
+                        f"开始 {_esc_html(res.get('started_at', ''))} &nbsp;·&nbsp; 时长 {_esc_html(dur)} &nbsp;·&nbsp; "
+                        f"本机 {_esc_html(res.get('local_ip') or '—')} &nbsp;·&nbsp; "
+                        f"网关 {_esc_html(str(tg.get('gateway') or '—'))} &nbsp;·&nbsp; "
+                        f"外网目标 {_esc_html(str(tg.get('external') or '—'))}")}
+<div class="sub">长时间监测客观采样, 用于查找偶发掉线; 现场处理后仍异常时请保留 .csv/.json 一起带回会诊</div>
 <div class="metrics">
 {_metric("网关丢包率", f"{gw_pct}%", "err" if gw_pct > 10 else "warn" if gw_pct > 2 else "ok")}
 {_metric("外网丢包率", f"{ext_pct}%", "err" if ext_pct > 10 else "warn" if ext_pct > 2 else "ok")}
@@ -9102,6 +9164,10 @@ def _metrics_wifi(res):
     cur = res.get("current_channel")
     best = res.get("best_2g_channel") or {}
     best_ch = best.get("channel") if isinstance(best, dict) else None
+    # 未连接 WiFi 时没有扫描数据, "邻居数 0"是误导 — 不出指标卡,
+    # 由卡片里的提示行说明 "未连接属正常现象"
+    if not cur and not n:
+        return []
     out = [
         ("当前信道", f"{cur}" if cur else "未连接"),
         ("邻居数", f"{n} 个",
@@ -9160,12 +9226,20 @@ def _metrics_speedtest(res):
                     "ok" if idle < 30 else "warn"))
     if grade:
         lv = "ok" if grade.startswith(("A", "B")) else "warn"
-        out.append(("缓冲膨胀", grade, lv))
+        # 卡片只放等级字母 (A/B/...), 括号里的完整评语放 hint, 卡面更清爽
+        g0 = grade.split(" ", 1)[0]
+        g_rest = grade[len(g0):].strip(" ()")
+        out.append(("缓冲膨胀", g0, lv, g_rest or "负载时延迟增加量"))
     return out
 
 
 def _verdict_iperf3(res):
     if "error" in res:
+        err = str(res.get("error", ""))
+        # 未配置服务器不是故障: 给客户能看懂的一句话, CLI 用法放括号里弱化
+        if "未指定" in err:
+            return ("本次未测试 — 需要指定一台 iperf3 服务器 "
+                    "(内网/专线验收时配置)")
         return res.get("error", "iperf3 测试失败")
     if res.get("udp"):
         if (res.get("download_jitter_ms") is None
@@ -9403,9 +9477,9 @@ def _verdict_loop(res):
 
 
 def _metrics_loop(res):
+    # ARP 条目数与结论无关 (ARP 模块已展示), 正常时不指标卡;
+    # 只有发现环路才出状态卡
     out = []
-    n = len(res.get("arp_entries", []))
-    out.append(("ARP 条目", f"{n} 条"))
     if res.get("loop_detected"):
         out.append(("环路状态", "发现疑似环路", "err"))
     return out
@@ -9440,8 +9514,12 @@ def _verdict_dhcp(res):
 
 
 def _metrics_dhcp(res):
+    # 结论里已有服务器数说明, 正常情况不再单独出指标卡 (省空间);
+    # 只有发现干扰/多服务器异常时才展示卡片
     n = len(res.get("servers", []))
-    out = [("服务器数", f"{n} 个", "err" if n > 1 else "ok")]
+    out = []
+    if n > 1:
+        out.append(("DHCP 服务器", f"{n} 个", "err"))
     if res.get("interference"):
         out.append(("干扰", "存在", "err"))
     return out
@@ -9615,10 +9693,11 @@ def _metrics_mtu(res):
     paths = res.get("path_mtus", [])
     for p in paths:
         if p.get("error"):
-            out.append((f"→ {p.get('target', '?')}", "测量失败", "warn"))
+            out.append((f"到 {p.get('target', '?')}", "测量失败", "warn"))
         else:
-            out.append((f"→ {p.get('target', '?')}", f"MTU {p.get('path_mtu', '?')}",
+            out.append((f"到 {p.get('target', '?')}", f"MTU {p.get('path_mtu', '?')}",
                         "ok" if not p.get("fragmentation_risk") else "warn"))
+
     local = res.get("local_mtus", [])
     if local:
         m = local[0]
@@ -9685,7 +9764,8 @@ def _issues_arp(res):
 def _verdict_ipv6(res):
     if "error" in res:
         return res.get("error", "检测失败")
-    return f"IPv6: {res.get('assessment', '?')}"
+    # 模块名已含 "IPv6", 结论里不再重复前缀
+    return res.get("assessment", "检测结果未知")
 
 
 def _metrics_ipv6(res):
@@ -9775,11 +9855,12 @@ def _verdict_lan(res):
 
 
 def _metrics_lan(res):
-    out = [("设备数", f"{res.get('device_count', 0)} 台")]
+    # 设备数结论里已有, 不再单独出指标卡; 只在异常时展示
+    out = []
     devs = res.get("devices", [])
     unknown = sum(1 for d in devs if not d.get("vendor") and d.get("mac"))
     if unknown:
-        out.append(("未知厂商", f"{unknown} 台", "warn"))
+        out.append(("未知厂商设备", f"{unknown} 台", "warn"))
     return out
 
 
@@ -9819,7 +9900,10 @@ def _issues_tcpstats(res):
 def _verdict_proxy(res):
     if "error" in res:
         return res.get("error", "代理检测失败")
-    return res.get("summary", "代理检测")
+    s = res.get("summary", "代理检测")
+    # 状态码行话转人话: "经代理 200 / 直连 200" → "经代理正常 / 直连正常"
+    s = s.replace("经代理 200", "经代理正常").replace("直连 200", "直连正常")
+    return s
 
 
 def _metrics_proxy(res):
@@ -10142,7 +10226,9 @@ def _verdict_tcpcc(res):
             high_p95_levels.append((r["level"], r["p95_ms"]))
     if high_p95_levels:
         max_lvl, max_p95 = max(high_p95_levels, key=lambda x: x[0])
-        return f"{base}; 高并发 P95 偏高 (≥{max_lvl} 级 P95 {max_p95:.0f}ms > 500ms)"
+        return (f"{base}; 高并发时新建连接明显变慢 "
+                f"(并发 ≥{max_lvl} 时, 95% 的连接需 {max_p95:.0f}ms 才建立, "
+                f"理想应在 500ms 内)")
     return base
 
 
@@ -10162,9 +10248,11 @@ def _metrics_tcpcc(res):
     n_lvl = "ok" if capped else ("err" if n < 512 else "warn" if n < 1024 else "ok")
     out = [
         ("最大并发", shown, n_lvl),
-        ("建连 P50", f"{last_ok['p50_ms']} ms" if last_ok else "—", "ok"),
-        ("建连 P95", f"{last_ok['p95_ms']} ms" if last_ok else "—",
-         "warn" if last_ok and last_ok["p95_ms"] > 500 else "ok"),
+        ("半数建连耗时", f"{last_ok['p50_ms']} ms" if last_ok else "—", "ok",
+         "一半连接在此耗时内完成"),
+        ("95%建连耗时", f"{last_ok['p95_ms']} ms" if last_ok else "—",
+         "warn" if last_ok and last_ok["p95_ms"] > 500 else "ok",
+         "95% 的连接慢于此值即偏慢"),
         ("峰值建连", f"{res.get('peak_cps', 0):.0f} /s", "ok"),
         ("本机对照",
          f"{base.get('level')} 并发{'通过' if base_ok else '受限' }" if base else "—",
@@ -10442,7 +10530,8 @@ def _present_module(key, raw_result, status):
     for m in metrics:
         # 已经显式给了 level 的不覆盖 hint
         if m["level"] != "ok" and not m["hint"]:
-            m["hint"] = "超过阈值" if m["level"] == "err" else "略超阈值"
+            m["hint"] = ("未达到正常标准" if m["level"] == "err"
+                          else "轻微超出正常范围")
 
     # ARP 模块专用: 给"ARP 条目"和"MAC 数"加 hint, 让用户一眼看出
     # MAC 数 < ARP 条目 是因为过滤了广播/组播/协议保留 MAC (避免
@@ -10572,21 +10661,19 @@ def compute_health_score(counts, issues_count=None,
     if issues_count is None:
         issues_count = err_cnt + warn_cnt
 
+    # verdict 口径: 按模块状态计数 (与"检测结果一览"和统计卡一致)。
+    # 之前按 issue 条目计数, 同一模块多条 issue 会被算成多项异常,
+    # 导致"3 项异常"而一览里只有 1 个异常模块, 数字对不上。
+    err_mod = counts.get("异常", 0) + counts.get("错误", 0)
+    warn_mod = counts.get("警告", 0)
     for threshold, grade, label in HEALTH_GRADE_TABLE:
         if score >= threshold:
-            # 一句话结论: 精确反映真实问题数 (而非模块数), 避免分数/verdict/问题数三者打架
-            if err_cnt == 0 and warn_cnt == 0:
+            if err_mod == 0 and warn_mod == 0:
                 verdict = "网络良好, 无问题"
-            elif err_cnt > 0:
-                if issues_count == 0:
-                    verdict = "存在异常模块"
-                else:
-                    verdict = f"{issues_count} 项需关注 (含 {err_cnt} 项异常)"
+            elif err_mod > 0:
+                verdict = f"{err_mod + warn_mod} 个模块需关注 (含 {err_mod} 个异常)"
             else:
-                if issues_count == 0:
-                    verdict = f"{warn_cnt} 个模块提示警告"
-                else:
-                    verdict = f"{issues_count} 项需关注"
+                verdict = f"{warn_mod} 个模块提示警告"
             return {
                 "score": score,
                 "grade": grade,
@@ -10639,6 +10726,11 @@ def build_report():
         name = MODULE_MAP.get(key, (key, key))[0]
         res = run["results"].get(key, {})
         status = run["status"].get(key, "未检测")
+        # iperf3 未配置服务器不是故障: 显示"未检测"而非"错误",
+        # 避免客户看到红色错误误以为网络有问题
+        if (key == "iperf3" and "error" in res
+                and "未指定" in str(res.get("error", ""))):
+            status = "未检测"
         modules.append(_present_module(key, res, status))
 
     # 汇总真实 issue 数 (按严重级别拆分, 用于 health.verdict 精确文案 + 分数)
@@ -11301,7 +11393,7 @@ HEADER_MAP = {
     # TCP 并发
     "levels": "分级明细", "level": "并发级别", "attempted": "发起数",
     "fail": "失败数", "success_rate": "成功率(%)",
-    "p50_ms": "建连P50(ms)", "p95_ms": "建连P95(ms)",
+    "p50_ms": "半数建连耗时(ms)", "p95_ms": "95%建连耗时(ms)",
     "cps": "建连速率(次/秒)", "fail_timeout": "超时失败",
     "fail_refused": "拒绝失败", "fail_other": "其他失败",
     "max_sustained": "最大可持续并发", "capped": "达到上限",
@@ -11406,6 +11498,10 @@ def _render_html_tech_block(key, raw_result, tech_keys, auto_open=True):
             if key == "linkspeed" and k == "adapters":
                 out.append(_render_linkspeed_adapters_table(v))
                 continue
+            # 网页体检: 14 列全展示必溢出, 只保留用户关心的分段耗时列
+            if key == "web" and k == "targets":
+                out.append(_render_web_targets_table(v))
+                continue
             # 同构字典列表 → 真正的多列表格
             rt = _record_table(v)
             if rt:
@@ -11416,32 +11512,100 @@ def _render_html_tech_block(key, raw_result, tech_keys, auto_open=True):
                     "<tr>" + "".join(f"<td>{_html_esc(x or '—')}</td>" for x in r) + "</tr>"
                     for r in rows[:20]   # 折叠里最多展示 20 条, 防止 HTML 巨大
                 )
-                out.append(f"<table class='tbl'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
+                out.append(f"<div class='tbl-wrap'><table class='tbl'><thead><tr>{head}</tr></thead>"
+                           f"<tbody>{body}</tbody></table></div>")
                 if len(rows) > 20:
                     out.append(f"<p class='muted'>… 还有 {len(rows) - 20} 条 (如需完整数据, 导出 JSON 报告 {len(rows)} 条)</p>")
         elif isinstance(v, dict):
-            # 嵌套字典 → KV 表格
+            # 嵌套字典 → KV 表格 (跳过纯流程字段; 布尔值中文化)
             rows = []
             for kk, vv in v.items():
+                if kk in ("summary", "method", "performed", "timestamp"):
+                    continue
                 if vv is None or vv == "" or vv == []:
                     continue
-                if isinstance(vv, (dict, list)):
+                if isinstance(vv, bool):
+                    rows.append((_html_esc(HEADER_MAP.get(kk, kk)), "是" if vv else "否"))
+                elif kk == "proxy_enable" and str(vv) in ("0", "1"):
+                    rows.append((_html_esc(HEADER_MAP.get(kk, kk)), "开" if int(vv) else "关"))
+                elif isinstance(vv, dict):
+                    rows.append((_html_esc(HEADER_MAP.get(kk, kk)),
+                                 _html_esc(_pretty_dict(vv))))
+                elif isinstance(vv, list):
                     rows.append((_html_esc(HEADER_MAP.get(kk, kk)),
                                  _html_esc(json.dumps(vv, ensure_ascii=False)[:200])))
                 else:
-                    rows.append((_html_esc(HEADER_MAP.get(kk, kk)), _html_esc(str(vv))))
+                    rows.append((_html_esc(HEADER_MAP.get(kk, kk)),
+                                 _html_esc(_humanize_en(str(vv)))))
             if rows:
                 out.append(f"<div class='subcap'>{_html_esc(HEADER_MAP.get(k, k))}</div>")
                 body = "".join(
                     f"<tr><td class='k'>{k_}</td><td class='v'>{v_}</td></tr>"
                     for k_, v_ in rows)
-                out.append(f"<table class='tbl kv'><thead><tr><th>指标</th><th>值</th></tr></thead>"
-                           f"<tbody>{body}</tbody></table>")
+                out.append(f"<div class='tbl-wrap'><table class='tbl kv'>"
+                           f"<thead><tr><th>指标</th><th>值</th></tr></thead>"
+                           f"<tbody>{body}</tbody></table></div>")
         else:
             out.append(f"<div class='subcap'>{_html_esc(HEADER_MAP.get(k, k))}</div>")
-            out.append(f"<p class='mono'>{_html_esc(str(v))}</p>")
+            out.append(f"<p class='mono'>{_html_esc(_humanize_en(str(v)))}</p>")
     out.append("</div></details>")
     return "".join(out)
+
+
+# 常见英文工具原句 → 中文 (代理检测的 netsh/注册表输出等)
+_EN_ZH_MAP = {
+    "direct access (no proxy server).": "直连 (未配置代理)",
+    "direct access (no proxy server)": "直连 (未配置代理)",
+    "proxy is set": "已配置代理服务器",
+}
+
+
+def _humanize_en(s):
+    """把常见英文工具原句翻成中文, 其余原样返回 (只做展示层美化)。"""
+    if not isinstance(s, str):
+        return s
+    return _EN_ZH_MAP.get(s.strip().lower(), s)
+
+
+def _pretty_dict(d, max_len=160):
+    """把 dict 值内联成人话: "http: 1.2.3.4:8080, https: ...", 避免裸 JSON。"""
+    try:
+        parts = []
+        for k, v in d.items():
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v, ensure_ascii=False)
+            parts.append(f"{k}: {v}")
+        s = ", ".join(parts)
+        return s if len(s) <= max_len else s[:max_len - 1] + "…"
+    except Exception:
+        return json.dumps(d, ensure_ascii=False)[:max_len]
+
+
+def _render_web_targets_table(targets):
+    """网页体检专用: 只展示 8 个关键列, 避免 14 列全展示导致表格溢出。
+
+    砍掉的列 (TLS 版本/证书剩余/颁发者/到期时间/解析 IP/重定向次数/最终 URL)
+    属证书与重定向细节, 完整数据在 JSON 报告; 表格宽了必溢出。
+    """
+    column_map = [
+        ("url", "URL"), ("status_code", "状态码"),
+        ("dns_ms", "DNS(ms)"), ("tcp_ms", "TCP 连接(ms)"),
+        ("tls_ms", "TLS 握手(ms)"), ("ttfb_ms", "首字节(ms)"),
+        ("total_ms", "总耗时(ms)"), ("fail_stage", "失败阶段"),
+    ]
+    head = "".join(f"<th>{_html_esc(l)}</th>" for _, l in column_map)
+    body_rows = []
+    for t in targets[:20]:
+        cells = []
+        for key, _ in column_map:
+            v = t.get(key)
+            cells.append("—" if v is None else _html_esc(str(v)))
+        body_rows.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+    body = "".join(body_rows)
+    return (f"<div class='subcap'>探测目标 ({len(targets)} 条, 仅展示关键列; "
+            f"证书/重定向等完整字段见 JSON 报告)</div>"
+            f"<div class='tbl-wrap'><table class='tbl'><thead><tr>{head}</tr></thead>"
+            f"<tbody>{body}</tbody></table></div>")
 
 
 def _render_linkspeed_adapters_table(adapters):
@@ -11480,8 +11644,8 @@ def _render_linkspeed_adapters_table(adapters):
     body = "".join(body_rows)
     return (f"<div class='subcap'>adapters ({len(adapters)} 条, 仅展示关键列; "
             f"完整 12 列字段见 JSON 报告)</div>"
-            f"<table class='tbl'><thead><tr>{head}</tr></thead>"
-            f"<tbody>{body}</tbody></table>")
+            f"<div class='tbl-wrap'><table class='tbl'><thead><tr>{head}</tr></thead>"
+            f"<tbody>{body}</tbody></table></div>")
 
 
 def render_report_html_customer(report):
@@ -11525,10 +11689,11 @@ def render_report_html_customer(report):
             geo_bits.append(sys_i["geo"])
         if sys_i.get("asn"):
             geo_bits.append(sys_i["asn"])
-        geo_line = f"<div class='geo'>📍 {' / '.join(geo_bits)}</div>"
+        geo_line = f"<div class='chips'><span class='chip'>📍 {' / '.join(geo_bits)}</span></div>"
     ipv6_line = ""
     if sys_i.get("ipv6_public_ip"):
-        ipv6_line = f"<div class='geo'>IPv6: {_html_esc(sys_i['ipv6_public_ip'])}</div>"
+        ipv6_line = (f"<div class='chips'><span class='chip'>"
+                     f"IPv6: {_html_esc(sys_i['ipv6_public_ip'])}</span></div>")
 
     host_line = f"本机 {_html_esc(sys_i.get('local_ip', '?'))} · 公网 {_html_esc(sys_i.get('public_ip', '?'))}"
     if sys_i.get("dns"):
@@ -11536,10 +11701,13 @@ def render_report_html_customer(report):
 
     hero = f"""
 <header class="hero">
-  <div>
-    <h1>📡 {_html_esc(report['app'])} 诊断报告</h1>
-    <div class="sub">网络健康度检测 · {_html_esc(g)}</div>
-    <div class="host">{host_line}</div>
+  <div class="hero-left">
+    <div class="brand"><span class="logo"></span>
+      <span class="brand-name">{_html_esc(report['app'])}</span>
+      <span class="ver">v{_html_esc(report['version'])}</span></div>
+    <h1>网络诊断报告</h1>
+    <div class="sub">生成于 {_html_esc(g)}</div>
+    <div class="chips"><span class="chip">{host_line}</span></div>
     {geo_line}
     {ipv6_line}
   </div>
@@ -11571,13 +11739,25 @@ def render_report_html_customer(report):
     top_issues = need_attention[:10]
 
     if top_issues:
-        todo_blocks = []
+        # 合并"同来源 + 同影响 + 同建议"的条目为一张卡 (如 IPv6 的两条异常):
+        # 标题用「；」连接多条问题, 卡片数更少、建议不重复刷屏
+        merged = []
+        merge_index = {}
         for issue in top_issues:
+            gkey = (issue.get("_module", ""), issue.get("impact", ""),
+                    issue.get("action", ""), issue.get("severity", "信息"))
+            if gkey in merge_index:
+                merged[merge_index[gkey]]["_texts"].append(issue.get("text", ""))
+            else:
+                merge_index[gkey] = len(merged)
+                merged.append({**issue, "_texts": [issue.get("text", "")]})
+        todo_blocks = []
+        for issue in merged:
             sev = issue.get("severity", "信息")
             sev_class = "err" if sev in ("异常", "错误") else "warn"
             impact = issue.get("impact", "")
             action = issue.get("action", "")
-            text = issue.get("text", "")
+            text = "；".join(t for t in issue["_texts"] if t)
             module = issue.get("_module", "")
             raw_summary = issue.get("raw_summary", "")
             # 把 raw_summary 也加到来源 meta 行, 让装维一眼看到原始数据
@@ -11622,11 +11802,11 @@ def render_report_html_customer(report):
   <div class="impact">所有核心检测均正常, 部分提示项可在下方模块详情查看。</div>
 </div>"""
     else:
-        todo_section = """
+        todo_section = f"""
 <div class="sec"><h2><span class="icon">✓</span>所有检测通过</h2></div>
 <div class="todo ok">
   <div class="todo-head">✓ 网络状态良好</div>
-  <div class="impact">所有 18 项检测均正常, 无需特别处理。</div>
+  <div class="impact">全部 {len(modules)} 项检测均正常, 无需特别处理。</div>
 </div>"""
 
     # ── 统计卡片 ──
@@ -11661,10 +11841,12 @@ def render_report_html_customer(report):
         verdict_short = m["verdict"][:60] + ("…" if len(m["verdict"]) > 60 else "")
         overview_items.append(
             f"<li>"
+            f"<a href='#mod-{_html_esc(m['key'])}' title='跳转到 {_html_esc(m['name'])} 详细结果'>"
             f"<span class='dot {sk}'></span>"
             f"<span class='name'>{_html_esc(m['name'])}</span>"
             f"<span class='verdict'>{_html_esc(verdict_short)}</span>"
             f"<span class='badge {sk}'>{_html_esc(st)}</span>"
+            f"</a>"
             f"</li>"
         )
     overview_section = f"""
@@ -11681,15 +11863,25 @@ def render_report_html_customer(report):
         if metrics:
             metric_html = []
             for me in metrics:
+                # 空值指标 (—/N/A/无) 没有信息量, 不占卡片格
+                if str(me.get("value", "")).strip() in ("—", "N/A", "无", ""):
+                    continue
                 level = me.get("level", "ok")
                 hint = me.get("hint", "")
-                hint_html = f"<span class='hint'>{_html_esc(hint)}</span>" if hint else ""
-                # title 提示完整名/值, 防止窄屏 ellipsis 截断后看不到原值
+                # 统计卡保持清爽: 正常指标的说明只进悬停提示, 不占卡面;
+                # 只有 warn/err (需要用户注意) 的指标才把说明显示在卡面上
+                hint_html = (f"<span class='hint'>{_html_esc(hint)}</span>"
+                             if hint and level in ("warn", "err") else "")
+                # title 提示完整名/值/说明, 防止窄屏 ellipsis 截断后看不到原值
                 full_title = f"{me.get('label','')}: {me.get('value','')}"
+                if hint:
+                    full_title += f"\n{hint}"
+                # 数值在上、名称在下 (flex-column), 长名称可换行不再截断
                 metric_html.append(
                     f"<div class='metric' title='{_html_esc(full_title)}'>"
+                    f"<span class='v {level}'>{_html_esc(me['value'])}</span>"
                     f"<span class='lab'>{_html_esc(me['label'])}</span>"
-                    f"<span><span class='v {level}'>{_html_esc(me['value'])}</span>{hint_html}</span>"
+                    f"{hint_html}"
                     f"</div>"
                 )
             metrics_html = f"<div class='metrics'>{''.join(metric_html)}</div>"
@@ -11703,26 +11895,43 @@ def render_report_html_customer(report):
         # 与卡片内容对不上。
         issues = m.get("issues", []) or []
         if issues:
-            issue_html = []
+            # 先按 (severity, text) 去重 (与顶部计数口径一致), 再把
+            # "同一条建议"的多条问题合并到一组: 问题列表只出现一次建议,
+            # 避免同一模块里 💡 建议重复刷屏 (如 IPv6 的两条异常共享同一建议)
+            deduped = []
             seen_issue_keys = set()
             for issue in issues:
                 sev = issue.get("severity", "信息")
-                sev_class = "err" if sev in ("异常", "错误") else "warn" if sev == "警告" else ""
-                text = issue.get("text", "") or ""
-                action = issue.get("action", "") or ""
-                act_key = (sev, text.strip())
-                if act_key in seen_issue_keys:
+                text = (issue.get("text", "") or "").strip()
+                action = (issue.get("action", "") or "").strip()
+                act_key = (sev, text)
+                if not text or act_key in seen_issue_keys:
                     continue
                 seen_issue_keys.add(act_key)
-                # 始终显示 info 级别条目 (info 也加灰色 impact-line), 让用户知道为什么
-                if text.strip():
+                deduped.append((sev, text, action))
+            # 按建议分组 (保持出现顺序): {action: [(sev, text), ...]}
+            groups = []
+            group_index = {}
+            for sev, text, action in deduped:
+                if action and action in group_index:
+                    groups[group_index[action]][1].append((sev, text))
+                else:
+                    group_index[action] = len(groups)
+                    groups.append((action, [(sev, text)]))
+            issue_html = []
+            for action, items in groups:
+                for sev, text in items:
+                    sev_class = ("err" if sev in ("异常", "错误")
+                                 else "warn" if sev == "警告" else "")
                     info_cls = sev_class if sev_class else "info"
                     issue_html.append(
                         f"<div class='impact-line {info_cls}'>"
                         f"<b>[{_html_esc(sev)}]</b> {_html_esc(text)}"
                         f"</div>"
                     )
-                if action.strip():
+                # 纯信息级的条目不带建议 (如 "假网关属设计行为" 却跟一条
+                # "联系网络管理员" 的建议, 自相矛盾且徒增噪音)
+                if action and any(s in ("异常", "错误", "警告") for s, _ in items):
                     issue_html.append(
                         f"<div class='action-line'>💡 {_html_esc(action)}</div>"
                     )
@@ -11757,6 +11966,7 @@ def render_report_html_customer(report):
             "ok": "✓",
             "warn": "⚠",
             "err": "✕",
+            "fatal": "✕",
             "idle": "○"
         }
         mod_icon = mod_icons.get(sk, "○")
@@ -11852,17 +12062,21 @@ def render_report_html_customer(report):
 @media (prefers-reduced-motion: reduce){
 *{animation:none!important;transition:none!important}
 }
-@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
-body{background:linear-gradient(180deg,#f8fafc 0%,#e2e8f0 100%);color:#1e293b;font:14px/1.6 'Noto Sans SC',-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding:32px 16px 80px}
+/* 报告需可离线打开: 全部使用系统字体, 不引入任何在线资源 */
+body{background:linear-gradient(180deg,#f8fafc 0%,#e2e8f0 100%);color:#1e293b;font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding:32px 16px 80px}
 .wrap{max-width:900px;margin:0 auto}
-.hero{background:linear-gradient(135deg,#0a1628 0%,#1e3a5f 50%,#1e40af 100%);color:#fff;padding:48px;display:grid;grid-template-columns:1fr auto;gap:32px;align-items:center;border-radius:28px;box-shadow:0 25px 50px -12px rgba(0,0,0,.35);margin-bottom:32px;position:relative;overflow:hidden}
-.hero::before{content:'';position:absolute;top:-50%;right:-20%;width:400px;height:400px;background:radial-gradient(circle,rgba(59,130,246,.3) 0%,transparent 70%);pointer-events:none}
-.hero::after{content:'';position:absolute;bottom:-30%;left:-10%;width:300px;height:300px;background:radial-gradient(circle,rgba(16,185,129,.2) 0%,transparent 70%);pointer-events:none}
-.hero h1{font-size:32px;font-weight:900;letter-spacing:-0.5px;margin-bottom:8px;display:flex;align-items:center;gap:8px}
-.hero .sub{font-size:15px;opacity:.85;margin-bottom:24px}
-.hero .host{margin-top:12px;font-size:13px;opacity:.8;font-family:'JetBrains Mono',Cascadia Mono,Consolas,monospace}
-.hero .geo{margin-top:4px;font-size:12px;opacity:.85}
-.score{background:rgba(255,255,255,.12);backdrop-filter:blur(20px);border-radius:20px;padding:24px 32px;text-align:center;min-width:160px;border:1px solid rgba(255,255,255,.2);position:relative;z-index:1}.score.score-90{background:linear-gradient(135deg,rgba(16,185,129,.3),rgba(5,150,105,.4))}.score.score-80{background:linear-gradient(135deg,rgba(16,185,129,.25),rgba(5,150,105,.35))}.score.score-70{background:linear-gradient(135deg,rgba(245,158,11,.3),rgba(217,119,6,.4))}.score.score-60,.score.score-50{background:linear-gradient(135deg,rgba(239,68,68,.35),rgba(220,38,38,.45))}
+.hero{background:linear-gradient(135deg,#0b1f3a 0%,#153e6b 55%,#1d4e89 100%);color:#fff;padding:36px 40px;display:grid;grid-template-columns:1fr auto;gap:32px;align-items:center;border-radius:20px;box-shadow:0 12px 32px -12px rgba(11,31,58,.45);margin-bottom:28px;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;top:-50%;right:-15%;width:420px;height:420px;background:radial-gradient(circle,rgba(96,165,250,.22) 0%,transparent 70%);pointer-events:none}
+.hero h1{font-size:26px;font-weight:800;letter-spacing:.5px;margin:10px 0 4px}
+.hero .brand{display:flex;align-items:center;gap:9px}
+.hero .logo{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#7ab3f5,#3b82f6);display:inline-block;position:relative;flex:none}
+.hero .logo::after{content:'';position:absolute;inset:6px;border:2px solid rgba(255,255,255,.92);border-radius:3px}
+.hero .brand-name{font-size:15px;font-weight:700;color:#dbeafe;letter-spacing:.3px}
+.hero .ver{font-size:11px;font-weight:600;color:#bfdbfe;background:rgba(255,255,255,.14);padding:1px 9px;border-radius:999px}
+.hero .sub{font-size:13px;color:#9db8dd;margin-bottom:14px}
+.hero .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.hero .chip{font-size:12px;color:#cfe0f5;background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.14);border-radius:999px;padding:3px 12px;font-family:'JetBrains Mono',Cascadia Mono,Consolas,monospace}
+.score{background:rgba(255,255,255,.1);backdrop-filter:blur(20px);border-radius:16px;padding:22px 30px;text-align:center;min-width:150px;border:1px solid rgba(255,255,255,.22);position:relative;z-index:1}.score.score-90{background:linear-gradient(135deg,rgba(16,185,129,.3),rgba(5,150,105,.4))}.score.score-80{background:linear-gradient(135deg,rgba(16,185,129,.25),rgba(5,150,105,.35))}.score.score-70{background:linear-gradient(135deg,rgba(245,158,11,.3),rgba(217,119,6,.4))}.score.score-60,.score.score-50{background:linear-gradient(135deg,rgba(239,68,68,.35),rgba(220,38,38,.45))}
 .score-num{font-size:56px;font-weight:900;line-height:1;font-variant-numeric:tabular-nums}
 .score.score-90 .score-num{color:#34d399}.score.score-80 .score-num{color:#6ee7b7}.score.score-70 .score-num{color:#fbbf24}.score.score-60 .score-num,.score.score-50 .score-num{color:#f87171}
 .score-label{font-size:13px;opacity:.9;margin-top:4px}
@@ -11895,8 +12109,11 @@ body{background:linear-gradient(180deg,#f8fafc 0%,#e2e8f0 100%);color:#1e293b;fo
 .issue.consult{border-top:1px dashed #fecaca}
 .overview{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:6px 0;margin-bottom:8px;box-shadow:0 1px 3px rgba(15,23,42,.05)}
 .overview ul{list-style:none}
-.overview li{padding:10px 22px;border-bottom:1px solid #f1f5f9;display:flex;align-items:center;gap:12px;font-size:13.5px;transition:background .1s}
-.overview li:hover{background:#f8fafc}
+.overview li{padding:0;border-bottom:1px solid #f1f5f9;font-size:13.5px}
+.overview li:last-child{border-bottom:none}
+.overview li a{padding:10px 22px;display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none;transition:background .1s}
+.overview li a:hover{background:#f8fafc}
+.overview li a:hover .name{color:#2563eb}
 .overview li:last-child{border-bottom:none}
 .overview .name{font-weight:600;min-width:130px;color:#0f172a}
 .overview .verdict{color:#475569;flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -11920,12 +12137,12 @@ body{background:linear-gradient(180deg,#f8fafc 0%,#e2e8f0 100%);color:#1e293b;fo
 .verdict{font-size:14px;line-height:1.7;color:#1e293b;margin-bottom:12px}
 .explain{font-size:12px;line-height:1.7;color:#64748b;background:#f8fafc;border-left:3px solid #cbd5e1;padding:7px 12px;border-radius:0 6px 6px 0;margin:-4px 0 12px 0}
 .verdict .tag{display:inline-block;padding:2px 9px;border-radius:5px;font-size:11px;font-weight:700;background:#e0e7ff;color:#4338ca;margin-right:8px;vertical-align:1px}
-.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-bottom:8px}
-.metric{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:9px 13px;display:flex;justify-content:space-between;align-items:center;gap:8px}
-.metric .lab{font-size:12px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
-.metric .v{font-size:14px;font-weight:700;font-family:Cascadia Mono,Consolas,monospace;text-align:right}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:8px}
+.metric{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 13px;display:flex;flex-direction:column;align-items:flex-start;gap:3px;min-width:0}
+.metric .v{font-size:15px;font-weight:700;font-family:Cascadia Mono,Consolas,monospace;text-align:left;max-width:100%;overflow-wrap:break-word}
+.metric .lab{font-size:11.5px;color:#64748b;overflow-wrap:break-word;white-space:normal;line-height:1.45;max-width:100%}
 .metric .v.ok{color:#15803d}.metric .v.warn{color:#c2410c}.metric .v.err{color:#b91c1c}.metric .v.info{color:#64748b}.metric .v.idle{color:#94a3b8}
-.metric .hint{font-size:11px;color:#94a3b8;margin-left:4px;font-weight:400}
+.metric .hint{font-size:11px;color:#b45309;font-weight:400;display:block;margin-top:2px;line-height:1.45}
 .impact-line{background:#fef2f2;border-left:3px solid #dc2626;padding:6px 12px;border-radius:0 6px 6px 0;font-size:12.5px;color:#7f1d1d;margin:8px 0}
 .impact-line.warn{background:#fffbeb;border-left-color:#f59e0b;color:#78350f}.impact-line.info{background:#f1f5f9;border-left-color:#94a3b8;color:#475569;font-size:12px}
 .action-line{background:#f0f9ff;border-left:3px solid #0284c7;padding:6px 12px;border-radius:0 6px 6px 0;font-size:12.5px;color:#0c4a6e;margin:4px 0 8px;line-height:1.6}
@@ -11937,12 +12154,15 @@ details.collapse[open] summary::before{transform:rotate(90deg)}
 details.collapse .cnt{background:#e2e8f0;color:#475569;border-radius:999px;font-size:10.5px;padding:1px 8px;margin-left:6px;font-weight:600}
 details.collapse .body{padding:4px 14px 12px;font-size:12px;color:#475569;line-height:1.7}
 details.collapse .subcap{font-size:12px;font-weight:700;color:#475569;margin:10px 0 4px}
-details.collapse table{width:100%;border-collapse:collapse;margin-top:4px;display:table;overflow-x:auto;white-space:nowrap}
-details.collapse table.tbl{width:100%;min-width:100%}
-details.collapse th{background:#e2e8f0;color:#334155;text-align:left;padding:5px 8px;font-weight:600;font-size:11.5px;white-space:nowrap}
-details.collapse td{padding:4px 8px;border-top:1px solid #e2e8f0;font-family:Cascadia Mono,Consolas,monospace;font-size:11.5px;white-space:nowrap;min-width:50px;max-width:none;width:auto;overflow:hidden;text-overflow:ellipsis}
+.tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin-top:4px;border-radius:4px}
+.tbl-wrap::-webkit-scrollbar{height:6px}
+.tbl-wrap::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
+details.collapse table{width:100%;border-collapse:collapse}
+details.collapse table.tbl{min-width:520px}
+details.collapse table.tbl.kv{min-width:0}
+details.collapse th{background:#e2e8f0;color:#334155;text-align:left;padding:5px 10px;font-weight:600;font-size:11.5px;white-space:nowrap}
+details.collapse td{padding:4px 10px;border-top:1px solid #e2e8f0;font-family:Cascadia Mono,Consolas,monospace;font-size:11.5px;white-space:normal;word-break:break-word;vertical-align:top}
 details.collapse td.k{width:35%;color:#64748b;background:#f8fafc;white-space:normal}
-details.collapse td:hover{white-space:normal;overflow:visible}
 details.collapse p.mono{font-family:Cascadia Mono,Consolas,monospace;background:#f1f5f9;padding:6px 10px;border-radius:4px;word-break:break-all}
 details.collapse p.muted{color:#94a3b8;font-size:11.5px;margin-top:6px}
 .host-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
@@ -12447,12 +12667,16 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
         if metrics:
             mrows = []
             for me in metrics:
+                # 与 HTML 口径一致: 空值指标 (—/N/A/无) 不占行
+                if str(me.get("value", "")).strip() in ("—", "N/A", "无", ""):
+                    continue
                 lvl = me.get("level", "ok")
                 vstyle = metric_val_map.get(lvl, metric_val_ok)
                 hint = me.get("hint", "")
                 vtext = me.get("value", "")
-                if hint:
-                    vtext += (f"  <font size=7 color='#94a3b8'>"
+                # 与 HTML 口径一致: 正常指标不加说明文字, 保持卡片清爽
+                if hint and lvl in ("warn", "err"):
+                    vtext += (f"  <font size=7 color='#b45309'>"
                               f"{_html_esc(hint)}</font>")
                 mrows.append([
                     Paragraph(_html_esc(me.get("label", "")), metric_lbl),
