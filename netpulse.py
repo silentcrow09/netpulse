@@ -15,6 +15,10 @@ NetPulse - Windows 网络诊断工具
 # SECTION 1: IMPORTS
 # ============================================================
 
+# 抑制 scapy 导入时的 cryptography DH 弃用警告 (scapy 内部问题，不影响功能)
+import warnings
+warnings.filterwarnings("ignore", message=".*Diffie-Hellman over finite fields.*deprecated.*")
+
 import subprocess
 import threading
 import ctypes
@@ -10293,11 +10297,11 @@ def compute_health_score(counts, issues_count=None):
     #   - 警告 -2: 仅提示, 不应压垮整体分数 (旧版 -5 偏重,
     #              1 异常 + 6 警告 = 50 分, 给人"网络不能用"的错觉)
     #   - 未检测不扣分: 环境缺测 (如无 WiFi 网卡) 不应被记过
+    #   - 特殊豁免: 调用方已在 counts 计算时排除了 iperf3/ipv6/proxy/nattype
     score = 100
     score -= counts.get("异常", 0) * 20
     score -= counts.get("错误", 0) * 30
     score -= counts.get("警告", 0) * 2
-    # counts.get("未检测", 0) * 0  # 环境原因不扣分
     score = max(0, min(100, score))
 
     # 计算真实需关注的条目数 (异常+错误, 警告; 不计"信息")
@@ -10357,8 +10361,12 @@ def build_report():
     run = LAST_RUN
 
     # 状态计数 (按模块状态)
+    # 豁免模块不参与扣分: iperf3(未配置不是故障), ipv6(可选), proxy/VPN(环境特性), nattype(运营商侧)
+    EXEMPT_MODULES = {"iperf3", "ipv6", "proxy", "nattype"}
     counts = {}
-    for st in run["status"].values():
+    for key, st in run["status"].items():
+        if key in EXEMPT_MODULES:
+            continue  # 豁免模块不计入扣分
         counts[st] = counts.get(st, 0) + 1
 
     # 客户视图模块列表
@@ -11454,7 +11462,7 @@ def render_report_html_customer(report):
     <thead><tr><th>模块</th><th>指标</th><th>警告阈值</th><th>异常阈值</th><th>单位</th><th>判定方向</th></tr></thead>
     <tbody>{std_body}</tbody>
   </table>
-  <div class='subcap' style='margin-top:12px'>评分规则 (本次已调整): 起始 100 分, 异常 -20/项, 错误 -30/项, 警告 -2/项, 未检测不扣分。等级: A≥90 优秀, B≥75 良好, C≥60 一般, D≥40 欠佳, F&lt;40 严重。</div>
+  <div class='subcap' style='margin-top:12px'>评分规则: 起始 100 分, 异常 -20/项, 错误 -30/项, 警告 -2/项, 未检测不扣分。<br>豁免模块 (不参与扣分): iperf3(未配置非故障), IPv6(可选), VPN/虚拟网卡(环境特性), NAT类型(运营商侧)。等级: A≥90 优秀, B≥75 良好, C≥60 一般, D≥40 欠佳, F&lt;40 严重。</div>
 </div>
 </details>"""
 
@@ -11491,8 +11499,7 @@ body{background:#f6f8fa;color:#1e293b;font:14px/1.6 -apple-system,BlinkMacSystem
 .issue .impact{font-size:12.5px;color:#991b1b;margin:4px 0 6px;padding:6px 10px;background:rgba(255,255,255,.6);border-radius:6px}
 .issue.ok .impact{color:#166534}
 .issue .action{font-size:12.5px;color:#1e293b;padding:8px 12px;background:#fffbeb;border-left:3px solid #f59e0b;border-radius:0 6px 6px 0;line-height:1.7}
-.issue.consult{border:1px dashed #7c3aed;background:#faf5ff}
-.issue.consult .sev{background:#7c3aed}
+.issue.consult{border-top:1px dashed #fecaca}
 .overview{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:6px 0;margin-bottom:8px;box-shadow:0 1px 3px rgba(15,23,42,.05)}
 .overview ul{list-style:none}
 .overview li{padding:10px 22px;border-bottom:1px solid #f1f5f9;display:flex;align-items:center;gap:12px;font-size:13.5px;transition:background .1s}
