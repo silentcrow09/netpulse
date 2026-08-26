@@ -91,14 +91,20 @@ PORT_PROBE_CONFIG = {"targets": [], "proto": "tcp", "count": 2,
 # 测速 / iperf3 模块的运行参数 (由 CLI 写入, runner 读取)
 # - iperf3_server / iperf3_port / iperf3_duration: iperf3 独立模块用, 由 --iperf3-server 提供;
 #   提供后 iperf3 模块测到该服务器的上下行吞吐 (iperf3 是最准的链路吞吐测量)
-# - use_speedtest_net: 默认关闭 — 启用 Ookla Speedtest CLI 官方测速作为对照参考;
-#   国内自动选点可能偏海外 (结果偏低), 可用 --speedtest-node <数字ID> 指定国内服务器
+# - use_speedtest_net: 默认启用 — Ookla Speedtest CLI 官方测速作为对照参考;
+#   交互菜单模式下自动启用 (无需 --speedtest-net), CLI 模式需显式加 --speedtest-net
+# - ookla_server_id: 默认 3633 (上海电信 Ookla 服务器), 避免自动选点偏海外;
+#   --speedtest-node <数字ID> 可覆盖; 传 host:port 则只影响国内上行节点
 # - node: 手动指定测速服务器 — 数字 ID (Ookla 服务器, 配合 --speedtest-net) 或
 #   host:port (国内上行节点); 默认自动选国内运营商节点
 # - duration_down / duration_up: 上下行测速时长 (秒)
 # - live_ui: 单独运行测速模块时启用终端实时可视化 (由 run_diagnostics 写入)
+# Ookla 上海电信服务器 ID 3633 来源: speedtest.net 官方服务器列表
+# (https://www.speedtest.net/server/3633), 长期稳定; 如失效可 --speedtest-node 覆盖
+OOKLA_DEFAULT_SERVER_ID = 3633  # 上海电信
 SPEEDTEST_CONFIG = {"iperf3_server": None, "iperf3_port": 5201, "iperf3_duration": 10,
                     "use_speedtest_net": False,
+                    "ookla_server_id": OOKLA_DEFAULT_SERVER_ID,
                     "node": None, "duration_down": 8.0, "duration_up": 8.0,
                     "live_ui": False}
 
@@ -701,11 +707,13 @@ APP_VERSION = "1.0.0"
 #   tcp_port 用于 TCP 可达性预检 (应对 ICMP 被防火墙过滤的场景:
 #   很多企业网禁 ping 到 8.8.8.8 / 114.114.114.114 等公共 DNS 或国际
 #   站点, 但这些目标的 TCP 服务端口通常是开的, 不应该判为不可达)
+# 目标选择: 以 Web 类目标为主 (TCP 80/443 更稳定), DNS 类为辅
+# (DNS 服务器 ICMP 优先级低, 忙时会丢 ping, 不适合作为"外网丢包"的评估目标)
 EXTERNAL_TARGETS = [
-    ("223.5.5.5", "AliDNS", 53),
-    ("114.114.114.114", "114DNS", 53),
-    ("119.29.29.29", "DNSPod", 53),
     ("www.baidu.com", "Baidu", 80),
+    ("www.qq.com", "QQ", 80),
+    ("223.5.5.5", "AliDNS", 53),
+    ("www.taobao.com", "Taobao", 443),
 ]
 
 # 常用 DNS 服务器 (国内网络环境)
@@ -2572,15 +2580,25 @@ class ExternalNetworkTester:
         blocked_count = sum(1 for r in results
                            if r["reachability"] == "icmp_blocked")
 
-        # 平均延迟只在 ping 通的目标上算 (禁拼目标不参与)
+        # 平均延迟: 优先用 TCP RTT (更真实), TCP 不可用时用 ping 延迟
+        tcp_rtts = [r["tcp_rtt_ms"] for r in results
+                    if r["tcp_reachable"] and r["tcp_rtt_ms"] and r["tcp_rtt_ms"] > 0]
         ping_rtts = [r["ping_avg_ms"] for r in results
-                    if r["ping_avg_ms"] > 0]
-        avg_rtt = sum(ping_rtts) / len(ping_rtts) if ping_rtts else 0
+                     if r["ping_avg_ms"] > 0]
+        # 延迟优先用 TCP RTT (TCP 握手时间反映真实网络延迟), ping 延迟作回退
+        avg_rtt = (sum(tcp_rtts) / len(tcp_rtts) if tcp_rtts
+                   else sum(ping_rtts) / len(ping_rtts) if ping_rtts else 0)
 
-        # 平均丢包只在 ping 通的目标上算 (禁拼目标不参与, 避免 100% 拖累)
-        ping_losses = [r["ping_loss_pct"] for r in results
-                      if r["reachability"] in ("ok", "tcp_blocked")]
-        avg_loss = sum(ping_losses) / len(ping_losses) if ping_losses else 100
+        # 平均丢包: 只统计 TCP 不可达的目标 (TCP 通但 ping 丢 = ICMP 被限速/降级, 不是真丢包)
+        # 旧逻辑: 在 ok/tcp_blocked 目标上也统计 ping 丢包, 导致 DNS 服务器 ICMP 限速被误报为"外网丢包"
+        # 新逻辑: TCP 可达的目标 ping 丢包不算外网丢包 (ICMP 优先级低, DNS/Web 服务器会降级 ICMP)
+        real_losses = [r["ping_loss_pct"] for r in results
+                       if r["reachability"] == "unreachable"]
+        avg_loss = sum(real_losses) / len(real_losses) if real_losses else 0
+        # ICMP 丢包率 (仅作参考, 不影响告警): 在 TCP 可达但 ping 有丢包的目标上统计
+        icmp_losses = [r["ping_loss_pct"] for r in results
+                       if r["reachability"] in ("ok", "tcp_blocked")
+                       and r["ping_loss_pct"] > 0]
 
         # 路径追踪记录表 (每跳一行, 供报告渲染成多列表 + 状态着色)
         traceroute = []
@@ -2593,13 +2611,13 @@ class ExternalNetworkTester:
                     "target": r["name"], "hop": h["hop"],
                     "node": h["ip"], "avg_ms": avg, "status": status})
 
-        # 评估: TCP 可达性优先
+        # 评估: TCP 可达性优先 (ping 丢包在 TCP 可达时不视为故障)
         if tcp_ok_count == len(results) and avg_loss == 0 and avg_rtt < 50:
             assessment = "外网连通正常"
         elif tcp_ok_count == len(results) and avg_loss < 5:
             assessment = "外网连通性良好"
         elif tcp_ok_count == len(results):
-            assessment = "外网存在一定丢包"
+            assessment = "外网 TCP 全部可达, 存在部分丢包"
         elif unreachable_count == 0:
             # 全部 TCP 通, 但部分被禁拼 -> 实际网络正常, ICMP 被防火墙挡
             assessment = f"外网 TCP 可达 ({tcp_ok_count}/{len(results)}), " \
@@ -2628,6 +2646,7 @@ class ExternalNetworkTester:
                 "detail": "部分目标不通, 可能是目标站自身问题或链路单侧劣化",
                 "action": "看技术细节里的路径追踪, 确定从哪一跳开始不通; 仅个别目标不通多为对端问题",
             })
+        # 丢包告警: 只在 TCP 不可达时触发 (TCP 可达但 ping 丢 = ICMP 限速, 不是真丢包)
         if avg_loss >= 5:
             issues.append({
                 "type": "external_high_loss", "severity": "critical",
@@ -2642,6 +2661,18 @@ class ExternalNetworkTester:
                 "detail": "轻度丢包会影响游戏/通话体验",
                 "action": "结合网关模块丢包判断段位: 网关也丢=内网问题; 网关不丢=外线问题",
             })
+        # TCP RTT 异常告警 (TCP 握手 >500ms 说明 SYN 队列堆积或链路严重劣化)
+        high_tcp_rtts = [r for r in results
+                         if r["tcp_reachable"] and r["tcp_rtt_ms"]
+                         and r["tcp_rtt_ms"] > 500]
+        if high_tcp_rtts:
+            names = ", ".join(f"{r['name']}({r['tcp_rtt_ms']:.0f}ms)" for r in high_tcp_rtts)
+            issues.append({
+                "type": "external_high_tcp_rtt", "severity": "warning",
+                "message": f"TCP 握手延迟异常: {names}",
+                "detail": "TCP 建连超过 500ms, 可能是中间设备 SYN 限速或链路拥塞",
+                "action": "看路径追踪逐跳延迟; 换目标重测确认是否单点问题",
+            })
         if avg_rtt >= 150:
             issues.append({
                 "type": "external_high_rtt", "severity": "warning",
@@ -2651,11 +2682,15 @@ class ExternalNetworkTester:
             })
 
         # 拼接 summary 包含禁拼提示
-        summary_parts = [f"外网检测: 平均延迟 {avg_rtt:.0f}ms, 平均丢包 {avg_loss:.1f}%"]
+        summary_parts = [f"外网检测: 平均延迟 {avg_rtt:.0f}ms, 丢包 {avg_loss:.1f}%"]
         if unreachable_count > 0:
             summary_parts.append(f"{unreachable_count} 个不可达")
         if blocked_count > 0:
             summary_parts.append(f"{blocked_count} 个禁拼")
+        # TCP 全可达但 ICMP 有丢包时, 附注 ICMP 丢包率 (仅参考, 不影响告警)
+        if icmp_losses and tcp_ok_count == len(results):
+            avg_icmp_loss = sum(icmp_losses) / len(icmp_losses)
+            summary_parts.append(f"ICMP 丢包 {avg_icmp_loss:.0f}% (参考, TCP 正常)")
         summary = ", ".join(summary_parts)
 
         self.results = {
@@ -3362,7 +3397,7 @@ class SpeedTester:
                 "sponsor": node, "cc": "CN", "country": "手动指定"}
 
     def detect(self, use_speedtest_net=False, node=None, live_ui=False,
-               save_report=True, callback=None):
+               ookla_server_id=None, save_report=True, callback=None):
         """完整测速 (带宽体检) — 纯互联网宽带测速, 不含 iperf3 (iperf3 已是独立模块)。
 
         流程: ① 空闲延迟基线 → ② 下行测速 (国内镜像多连接, 并行采样负载延迟)
@@ -3371,6 +3406,9 @@ class SpeedTester:
 
         live_ui: 单独运行本模块时终端实时动画 (由 run_diagnostics 置位)。
         save_report: 结束后保存独立测速报告到 reports/YYYY-MM-DD/。
+
+        use_speedtest_net: 启用 Ookla 官方测速 (交互菜单默认启用, CLI 需 --speedtest-net)。
+        ookla_server_id: Ookla 服务器 ID (默认 3633=上海电信, 避免 auto-select 偏海外)。
         """
         # live_ui 时抑制阶段文本 callback, 避免与终端实时动画 (\r 刷新) 互相覆盖
         def _cb(msg):
@@ -3463,16 +3501,17 @@ class SpeedTester:
         # 延迟时间序列 (空闲 + 下行 + 上行 全段)
         lat_series = monitor.series_since(t_start) if monitor_ok else []
 
-        # Ookla Speedtest 官方测速 (可选, --speedtest-net 启用)
-        # --speedtest-node 传数字 ID 时, 作为 Ookla 服务器 ID (speedtest.exe -s <id>)
+        # Ookla Speedtest 官方测速 (交互菜单默认启用, CLI 需 --speedtest-net)
+        # 服务器选择优先级: --speedtest-node <数字ID> > ookla_server_id (默认 3633 上海电信)
+        # --speedtest-node 传 host:port 时只影响国内上行节点, 不影响 Ookla 选点
         speedtest_result = None
         if use_speedtest_net:
-            ookla_server_id = None
+            final_ookla_id = ookla_server_id  # 默认 3633 (上海电信)
             if node:
                 resolved = self._resolve_node(node)
                 if resolved and resolved.get("type") == "ookla_id":
-                    ookla_server_id = resolved.get("server_id")
-            speedtest_result = self.test_ookla(_cb, server_id=ookla_server_id)
+                    final_ookla_id = resolved.get("server_id")
+            speedtest_result = self.test_ookla(_cb, server_id=final_ookla_id)
 
         results = {
             "download_mbps": round(download, 2),
@@ -5626,14 +5665,15 @@ def _parse_target(spec):
 def _prompt_for_port_targets():
     """交互式询问端口探测目标。返回 (targets_list, proto, count) 或 None (用户取消)。
 
+    优化: 一行输入目标, 协议和次数用默认值 (tcp/4), 不再逐项询问;
+    需要改时在目标后加 /udp 或 /次数, 如 192.168.1.1:443/8。
+
     用法: 交互菜单选 port, 或 CLI `port` 不带 --port-target 时调用。
     非 TTY 场景不应调用本函数 (调用方需先 sys.stdout.isatty() 判断)。
     """
-    print(_c("  端口探测必须指定目标 (host:port), 不再内置默认值。", C_YELLOW))
-    print(_c("  格式: HOST:PORT (例: 192.168.1.1:443)", C_GRAY))
-    print(_c("  范围: HOST:port1-port2 (例: 10.0.0.1:1-1024) 或混合 HOST:80,443,8000-8100", C_GRAY))
-    print(_c("  协议: tcp / udp / both (默认 tcp)。采样次数默认 4。", C_GRAY))
-    print(_c("  上限: 单次探测目标数不超过 1000 (防探测风暴), 强制请用 --port-force", C_GRAY))
+    print(_c("  端口探测 (格式: HOST:PORT, 例: 192.168.1.1:443)", C_YELLOW))
+    print(_c("  可选后缀: /udp 改 UDP, /N 改采样次数, 例: 8.8.8.8:53/udp/8", C_GRAY))
+    print(_c("  默认: TCP 协议, 采样 4 次", C_GRAY))
     try:
         spec = input(_c("  目标 > ", C_GREEN)).strip()
     except (EOFError, KeyboardInterrupt):
@@ -5641,8 +5681,19 @@ def _prompt_for_port_targets():
         return None
     if not spec:
         return None
-    # 解析目标列表 (逗号分隔, 空白容错)
-    parts = [p.strip() for p in spec.replace("，", ",").split(",") if p.strip()]
+    # 解析可选后缀: /udp, /N (次数), /udp/N
+    proto = "tcp"
+    cnt = 4
+    parts = spec.replace("，", ",").split("/")
+    spec = parts[0].strip()
+    for suffix in parts[1:]:
+        suffix = suffix.strip().lower()
+        if suffix in ("tcp", "udp", "both"):
+            proto = suffix
+        elif suffix.isdigit():
+            cnt = max(1, int(suffix))
+    # 解析目标列表 (逗号分隔)
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
     valid = []
     expanded_count = 0
     for p in parts:
@@ -5656,30 +5707,14 @@ def _prompt_for_port_targets():
         print(_c("  没有合法目标, 已取消端口探测。", C_YELLOW))
         return None
     if expanded_count > 1:
-        print(_c(f"  → 共展开 {expanded_count} 个探测目标 (含端口范围)", C_GRAY))
-    # 协议
-    try:
-        proto = input(_c("  协议 [tcp/udp/both] (默认 tcp) > ", C_GREEN)).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        proto = "tcp"
-    if proto not in ("tcp", "udp", "both"):
-        proto = "tcp"
-    # 采样次数
-    try:
-        cnt_raw = input(_c("  采样次数 (默认 4) > ", C_GREEN)).strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        cnt_raw = ""
-    try:
-        cnt = max(1, int(cnt_raw)) if cnt_raw else 4
-    except ValueError:
-        cnt = 4
+        print(_c(f"  → 共 {expanded_count} 个目标, {proto.upper()}, 采样 {cnt} 次", C_GRAY))
     return valid, proto, cnt
 
 
 def _prompt_for_iperf3():
     """交互式询问 iperf3 服务器地址。返回 (host, port) 或 None。
+
+    优化: 直接问地址, 回车=跳过 (不再先问是否配置)。
 
     iperf3 是独立模块: 测到指定服务器的链路吞吐 (非互联网宽带), 需要部署
     iperf3 服务器 (通常在出口网关/IDC/内网)。不提供服务器则模块明确报缺服务器,
@@ -5688,18 +5723,11 @@ def _prompt_for_iperf3():
     用法: 交互菜单选 iperf3 模块, 且 CLI 未传 --iperf3-server 时调用。
     非 TTY 场景不应调用 (调用方需先 sys.stdout.isatty() 判断)。
     """
-    print(_c("  iperf3 链路吞吐测试: 需 iperf3 服务器 (通常部署在出口/IDC)", C_YELLOW))
-    print(_c("  提示: 没 iperf3 服务器直接回车, 该模块将提示缺少服务器", C_GRAY))
+    print(_c("  iperf3 链路吞吐测试 (需自备服务器, 通常在出口/IDC)", C_YELLOW))
+    print(_c("  直接回车=跳过 (该模块将提示缺少服务器)", C_GRAY))
     try:
-        ans = input(_c("  是否配置 iperf3 服务器? [y/N] > ", C_GREEN)).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return None
-    if ans not in ('y', 'yes'):
-        return None
-    # 询问 server 地址
-    try:
-        spec = input(_c("  iperf3 server (HOST 或 HOST:PORT, 缺省 :5201) > ", C_GREEN)).strip()
+        spec = input(_c("  iperf3 server (HOST 或 HOST:PORT, 缺省 :5201) > ",
+                        C_GREEN)).strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return None
@@ -8967,6 +8995,7 @@ def _module_detect_kwargs(key):
         return dict(
             use_speedtest_net=SPEEDTEST_CONFIG.get("use_speedtest_net", False),
             node=SPEEDTEST_CONFIG.get("node"),
+            ookla_server_id=SPEEDTEST_CONFIG.get("ookla_server_id"),
             live_ui=SPEEDTEST_CONFIG.get("live_ui", False),
         )
     if key == "iperf3":
@@ -9313,6 +9342,14 @@ def _metrics_external(res):
     out.append(("TCP 可达", f"{tcp_ok}/{tcp_total}",
                 "ok" if tcp_ok == tcp_total else
                 "warn" if tcp_ok > 0 else "err"))
+    # TCP RTT 异常目标数 (TCP 握手 >500ms 说明 SYN 队列堆积或链路劣化)
+    targets = res.get("targets") or []
+    high_tcp_rtt_count = sum(1 for t in targets
+                             if t.get("tcp_reachable") and t.get("tcp_rtt_ms")
+                             and t["tcp_rtt_ms"] > 500)
+    if high_tcp_rtt_count:
+        out.append(("TCP延迟异常", f"{high_tcp_rtt_count} 个",
+                    "warn", "TCP 握手 >500ms, 可能 SYN 限速或链路拥塞"))
     if res.get("unreachable_count", 0):
         out.append(("不可达目标", f"{res['unreachable_count']} 个", "err"))
     elif res.get("icmp_blocked_count", 0):
@@ -9447,7 +9484,16 @@ def _verdict_speedtest(res):
             if "error" in sub:
                 return f"测速失败 ({k}): {sub['error']}"
         return res.get("error", "测速失败")
-    return res.get("summary", "测速")
+    base = res.get("summary", "测速")
+    # Ookla 官方测速未启用时, 在结论里提示用户可加 --speedtest-net 启用对照参考
+    ookla = res.get("speedtest")
+    if ookla is None:
+        base += " (未启用 Ookla 官方测速, 加 --speedtest-net 可对照参考)"
+    elif isinstance(ookla, dict) and "error" in ookla:
+        base += f" (Ookla 测速失败: {ookla['error']})"
+    elif isinstance(ookla, dict) and ookla.get("valid") is False:
+        base += f" (Ookla 选点海外 {ookla.get('server_cc', '?')}, 结果仅供参考)"
+    return base
 
 
 def _metrics_speedtest(res):
@@ -10216,7 +10262,11 @@ def _issues_proxy(res):
 
 
 def _issues_external(res):
-    """外网检测: 之前只亮徽章不出问题条目, 装维看不到处置建议 — 按段位给建议。"""
+    """外网检测: 之前只亮徽章不出问题条目, 装维看不到处置建议 — 按段位给建议。
+
+    丢包告警口径: 只在 TCP 不可达时触发 (TCP 可达但 ping 丢 = ICMP 限速, 不是真丢包)。
+    TCP RTT 异常 (>500ms) 单独告警 (SYN 队列堆积或链路拥塞)。
+    """
     out = []
     if "error" in res:
         return out
@@ -10232,6 +10282,7 @@ def _issues_external(res):
         out.append({"severity": "警告", "text": f"{unreachable} 个外网目标不可达",
                     "impact": "部分目标不通, 可能是目标站自身问题或链路单侧劣化",
                     "action": "看技术细节里的路径追踪, 确定从哪一跳开始不通; 仅个别目标不通多为对端问题"})
+    # 丢包告警: 只在 TCP 不可达时触发 (TCP 可达但 ping 丢 = ICMP 限速, 不是真丢包)
     if loss >= 5:
         out.append({"severity": "异常", "text": f"外网平均丢包 {loss}%",
                     "impact": "明显丢包: 网页卡顿、游戏掉线、视频花屏",
@@ -10240,6 +10291,16 @@ def _issues_external(res):
         out.append({"severity": "警告", "text": f"外网平均丢包 {loss}%",
                     "impact": "轻度丢包会影响游戏/通话体验",
                     "action": "结合网关模块丢包判断段位: 网关也丢=内网问题; 网关不丢=外线问题"})
+    # TCP RTT 异常告警 (TCP 握手 >500ms 说明 SYN 队列堆积或链路严重劣化)
+    targets = res.get("targets") or []
+    high_tcp_rtts = [t for t in targets
+                     if t.get("tcp_reachable") and t.get("tcp_rtt_ms")
+                     and t["tcp_rtt_ms"] > 500]
+    if high_tcp_rtts:
+        names = ", ".join(f"{t.get('name', '?')}({t['tcp_rtt_ms']:.0f}ms)" for t in high_tcp_rtts)
+        out.append({"severity": "警告", "text": f"TCP 握手延迟异常: {names}",
+                    "impact": "TCP 建连超过 500ms, 可能是中间设备 SYN 限速或链路拥塞",
+                    "action": "看路径追踪逐跳延迟; 换目标重测确认是否单点问题"})
     if rtt >= 150:
         out.append({"severity": "警告", "text": f"外网平均延迟 {rtt:.0f}ms",
                     "impact": "延迟偏高, 游戏类应用会明显感觉慢",
@@ -10620,7 +10681,7 @@ MODULE_PRESENTATION = {
                    "tech_keys": ["routes"]},
     "speedtest":  {"verdict_fn": _verdict_speedtest,  "metrics_fn": _metrics_speedtest,
                    "issues_fn": _issues_speedtest,
-                   "tech_keys": ["speedtest", "http"]},
+                   "tech_keys": ["speedtest", "http", "up_result"]},
     "iperf3":     {"verdict_fn": _verdict_iperf3,     "metrics_fn": _metrics_iperf3,
                    "issues_fn": _issues_iperf3,
                    "tech_keys": ["download_intervals_mbps", "upload_intervals_mbps"]},
@@ -11593,6 +11654,24 @@ HEADER_MAP = {
     "established_before": "测试前连接数", "established_after": "测试后连接数",
     "bottleneck": "瓶颈位置", "max_concurrency": "阶梯上限",
     "wall_ms": "耗时(ms)",
+    # 测速模块 (http / up_result / speedtest 子表)
+    "http": "HTTP 下载测速", "up_result": "国内上行测速", "speedtest": "Ookla 官方测速",
+    "download_mbps": "下载速率(Mbps)", "upload_mbps": "上传速率(Mbps)",
+    "downloaded_bytes": "下载字节", "downloaded_mb": "下载量(MB)",
+    "uploaded_bytes": "上传字节", "uploaded_mb": "上传量(MB)",
+    "elapsed_s": "耗时(秒)", "threads": "连接数",
+    "method": "测速方式", "sponsor": "测速节点", "server_host": "服务器地址",
+    "server_latency_ms": "服务器延迟(ms)",
+    "server_country": "服务器国家", "server_cc": "国家码",
+    "server_id": "服务器ID", "jitter_ms": "抖动(ms)",
+    "packet_loss_pct": "丢包率(%)", "result_url": "结果链接",
+    "isp": "运营商", "valid": "结果有效",
+    "note": "备注", "download_method": "下载方式", "upload_method": "上传方式",
+    "upload_server": "上传服务器", "estimated_bandwidth": "预估宽带",
+    "idle_rtt_ms": "空闲延迟(ms)", "loaded_rtt_ms": "负载延迟(ms)",
+    "bufferbloat_grade": "缓冲膨胀等级", "bufferbloat_ms": "缓冲膨胀(ms)",
+    "down_series": "下行采样", "up_series": "上行采样", "lat_series": "延迟采样",
+    "latency_target": "延迟目标",
 }
 
 
@@ -13257,6 +13336,9 @@ def export_report(path, auto_install=False, pip_mirror=None):
 def prompt_export_report(auto_install=False, pip_mirror=None):
     """交互菜单跑完后, 询问是否将本次诊断导出为报告文件。
 
+    优化: 默认直接生成 HTML (最常用格式), 一次回车即可;
+    输入 p 改 PDF, t 改 TXT, 其他输入均按默认 HTML 处理。
+
     auto_install: True 时 PDF 导出允许自动安装 reportlab
     (例如 CLI 加了 --install, 在交互菜单中也保持一致行为)。
     pip_mirror: 透传给 export_report。
@@ -13264,26 +13346,22 @@ def prompt_export_report(auto_install=False, pip_mirror=None):
     if not LAST_RUN:
         return
     try:
-        ans = input(_c("  是否生成诊断报告? [y/N] ", C_GREEN)).strip().lower()
+        ans = input(_c("  生成诊断报告? [Enter=HTML / p=PDF / t=TXT / N=不导出] ",
+                       C_GREEN)).strip().lower()
     except (EOFError, KeyboardInterrupt):
         return
-    if ans not in ("y", "yes"):
+    if ans in ("n", "no", "q", "quit"):
         return
-    try:
-        fmt = input(_c("  选择格式 (1=TXT  2=HTML  3=PDF, 默认3): ", C_GREEN)).strip()
-    except (EOFError, KeyboardInterrupt):
-        fmt = "3"
-    ext = {"1": ".txt", "2": ".html", "3": ".pdf"}.get(fmt, ".pdf")
+    # 默认 HTML, p=PDF, t=TXT
+    ext = ".html"
+    if ans in ("p", "pdf"):
+        ext = ".pdf"
+    elif ans in ("t", "txt"):
+        ext = ".txt"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     default_name = f"netdiag_report_{ts}{ext}"
-    try:
-        name = input(_c(f"  保存文件名 [{default_name}]: ", C_GREEN)).strip()
-    except (EOFError, KeyboardInterrupt):
-        name = ""
-    if not name:
-        name = default_name
-    if not os.path.splitext(name)[1]:
-        name += ext
+    # 直接用默认文件名, 不再问 (减少一轮输入; 文件名带时间戳不会重名)
+    name = default_name
     err = export_report(name, auto_install=auto_install, pip_mirror=pip_mirror)
     if err:
         print(_c(f"  ✗ {err}", C_RED))
@@ -13317,7 +13395,16 @@ def interactive_menu(install=False, pip_mirror=None):
         选全部时绝大多数用户想要快而不是看实时进度)
       - 选单模块 -> 走顺序, 让 TTY 实时进度行 (\\r\\033[K 刷新) 正常显示
       - run_diagnostics 内部 `parallel and len(keys) > 1` 会自动归一化
+
+    测速模块: 交互菜单默认启用 Ookla 官方测速 (上海电信节点 3633),
+    无需 --speedtest-net; CLI 模式仍需显式加 --speedtest-net。
     """
+    # 交互菜单: 默认启用 Ookla 官方测速 (上海电信节点, 避免自动选点偏海外)
+    # CLI 模式不受影响 (CLI 需显式 --speedtest-net)
+    SPEEDTEST_CONFIG["use_speedtest_net"] = True
+    if not SPEEDTEST_CONFIG.get("ookla_server_id"):
+        SPEEDTEST_CONFIG["ookla_server_id"] = OOKLA_DEFAULT_SERVER_ID
+
     while True:
         # 清屏: 用 ANSI 转义 (VT 已在 _cli_enable_vt 启用) 替代 os.system('cls'),
         # 避免 cmd.exe 解析 + 子进程阻塞。VT 未启用时退回到 subprocess 直调 cls。
@@ -13374,11 +13461,11 @@ def interactive_menu(install=False, pip_mirror=None):
             for line in _columnize(cells, columns=2, gap=4):
                 print("    " + line)
         print()
-        print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发)', C_GRAY)}")
-        print(f"    {_c(' m', C_CYAN)}. 盯障模式 {_c('(长时间监测, 找偶发掉线)', C_GRAY)}")
+        print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发, 含Ookla官方测速)', C_GRAY)}")
+        print(f"    {_c(' m', C_CYAN)}. 盯障模式 {_c('(600秒找偶发掉线, Ctrl+C可提前停)', C_GRAY)}")
         print(f"    {_c(' e', C_CYAN)}. 导出上次诊断报告")
         print(f"    {_c(' q', C_CYAN)}. 退出")
-        print(_c("  快捷: a/b/c=按分类运行; all/0/*=全部; m=盯障; e=导出报告。", C_GRAY))
+        print(_c("  快捷: 0=全部 a/b/c=按分类 m=盯障 e=导出 q=退出", C_GRAY))
         print(_c("-" * 60, C_GRAY))
         try:
             choice = input(_c("  输入 > ", C_GREEN)).strip()
@@ -13388,22 +13475,9 @@ def interactive_menu(install=False, pip_mirror=None):
         if choice.lower() in ("q", "quit", "exit"):
             break
         # m / monitor: 盯障模式 (独立运行模式, 不进模块注册表)
+        # 默认 600 秒直接跑, 不再询问时长 (减少输入; Ctrl+C 可提前结束)
         if choice.lower() in ("m", "monitor", "盯障"):
-            sec = 600
-            if sys.stdout.isatty():
-                try:
-                    raw = input(_c("  监测时长(秒, 回车=600, 范围 30-86400): ",
-                                   C_GREEN)).strip()
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    continue
-                if raw:
-                    try:
-                        sec = int(raw)
-                    except ValueError:
-                        print(_c("  无效时长, 使用默认 600 秒。", C_YELLOW))
-                        sec = 600
-            run_monitor_mode(sec)
+            run_monitor_mode(600)
             try:
                 input(_c("  按 Enter 返回菜单...", C_GRAY))
             except (EOFError, KeyboardInterrupt):
@@ -13428,39 +13502,50 @@ def interactive_menu(install=False, pip_mirror=None):
             except (EOFError, KeyboardInterrupt):
                 break
             continue
-        # 端口探测: 不管是单选 port 还是 0/all, 跑之前都要求用户输入目标
-        # (用户偏好: 端口探测必须有显式目标, 不再有隐式默认)
+        # 端口探测: 单选 port 时才询问目标; 选 0/全部时自动跳过 (避免打断全流程)
+        # (用户偏好: 端口探测必须有显式目标, 全量诊断时没目标就跳过不测)
+        is_all = (len(keys) == len(MODULE_REGISTRY))
         if "port" in keys and not PORT_PROBE_CONFIG.get("targets"):
-            prompted = _prompt_for_port_targets()
-            if prompted is None:
-                # 用户取消: 跳过 port, 跑其余模块
-                print(_c("  已取消端口探测, 其余模块继续。", C_YELLOW))
+            if is_all:
+                # 全量诊断: 没目标就跳过端口探测, 不打断流程
+                print(_c("  → 端口探测无目标, 自动跳过 (单独选 port 可指定目标)", C_GRAY))
                 keys = [k for k in keys if k != "port"]
-                if not keys:
-                    try:
-                        input(_c("  按 Enter 返回菜单...", C_GRAY))
-                    except (EOFError, KeyboardInterrupt):
-                        break
-                    continue
+            elif sys.stdout.isatty():
+                prompted = _prompt_for_port_targets()
+                if prompted is None:
+                    print(_c("  已取消端口探测, 其余模块继续。", C_YELLOW))
+                    keys = [k for k in keys if k != "port"]
+                    if not keys:
+                        try:
+                            input(_c("  按 Enter 返回菜单...", C_GRAY))
+                        except (EOFError, KeyboardInterrupt):
+                            break
+                        continue
+                else:
+                    tgt, proto, cnt = prompted
+                    PORT_PROBE_CONFIG["targets"] = tgt
+                    PORT_PROBE_CONFIG["proto"] = proto
+                    PORT_PROBE_CONFIG["count"] = cnt
             else:
-                tgt, proto, cnt = prompted
-                PORT_PROBE_CONFIG["targets"] = tgt
-                PORT_PROBE_CONFIG["proto"] = proto
-                PORT_PROBE_CONFIG["count"] = cnt
-        # iperf3 模块: 菜单模式运行 iperf3 时询问服务器 (默认不测, 缺服务器会明确报错)
-        # 已被 CLI --iperf3-server 预设过就不重复问; 非 TTY 不问 (否则会吃掉管道输入)
-        if ("iperf3" in keys and not SPEEDTEST_CONFIG.get("iperf3_server")
-                and sys.stdout.isatty()):
-            iperf3 = _prompt_for_iperf3()
-            if iperf3 is not None:
-                host, port = iperf3
-                SPEEDTEST_CONFIG["iperf3_server"] = host
-                SPEEDTEST_CONFIG["iperf3_port"] = port
-                print(_c(f"  → iperf3 server: {host}:{port}", C_GRAY))
-                # 提前确保 iperf3.exe 就位 (避免测速进度被 input("未找到 iperf3.exe") 打断)
-                Iperf3Tester()._find_iperf3(auto_download=True)
+                keys = [k for k in keys if k != "port"]
+        # iperf3 模块: 单选 iperf3 时才询问服务器; 选 0/全部时自动跳过
+        # (iperf3 需要用户自备服务器, 全量诊断时没服务器就跳过不测)
+        if ("iperf3" in keys and not SPEEDTEST_CONFIG.get("iperf3_server")):
+            if is_all:
+                print(_c("  → iperf3 无服务器, 自动跳过 (单独选 iperf3 可配置)", C_GRAY))
+                keys = [k for k in keys if k != "iperf3"]
+            elif sys.stdout.isatty():
+                iperf3 = _prompt_for_iperf3()
+                if iperf3 is not None:
+                    host, port = iperf3
+                    SPEEDTEST_CONFIG["iperf3_server"] = host
+                    SPEEDTEST_CONFIG["iperf3_port"] = port
+                    print(_c(f"  → iperf3 server: {host}:{port}", C_GRAY))
+                    Iperf3Tester()._find_iperf3(auto_download=True)
+                else:
+                    print(_c("  → 未提供 iperf3 服务器, 该模块运行时会提示缺少服务器", C_GRAY))
             else:
-                print(_c("  → 未提供 iperf3 服务器, 该模块运行时会提示缺少服务器", C_GRAY))
+                keys = [k for k in keys if k != "iperf3"]
         # 菜单模式: 多模块默认并发 (与 CLI `all --parallel` 对齐)。
         # run_diagnostics 内部 `parallel and len(keys) > 1` 会自动避免
         # 单模块走并发 (无意义且会浪费线程开销)。
@@ -13538,13 +13623,14 @@ def main():
                         help="iperf3 改用 UDP 模式测抖动/丢包 (1 Mbps 发包率, 语音/游戏"
                              "质量口径): 抖动 >30ms 或丢包 >1% 给出告警; 默认 TCP 测吞吐")
     parser.add_argument("--speedtest-net", action="store_true",
-                        help="启用 Ookla Speedtest 官方测速 (默认关闭: 国内自动选点"
-                             "可能偏海外, 结果仅作对照参考; 用 --speedtest-node <ID> "
-                             "可指定国内服务器)")
+                        help="启用 Ookla Speedtest 官方测速 (CLI 默认关闭; "
+                             "交互菜单默认启用, 上海电信节点 3633)。"
+                             "用 --speedtest-node <ID> 可指定其他服务器")
     parser.add_argument("--speedtest-node", metavar="ID|HOST:PORT",
                         help="指定测速服务器 (可选): 数字 ID = Ookla 服务器 ID "
-                             "(需配合 --speedtest-net, 如 3633); host:port = 国内上行"
-                             "节点 (如 112.25.80.50:8080); 默认自动选择国内运营商节点")
+                             "(覆盖默认 3633 上海电信, 如 5396 北京联通); "
+                             "host:port = 国内上行节点 (如 112.25.80.50:8080); "
+                             "默认自动选择国内运营商节点")
     parser.add_argument("--nattype-server", action="append", metavar="HOST[:PORT]",
                         help="NAT 类型检测的 STUN 服务器 (可选, 可指定两次提供两台, "
                              "缺省端口 3478); 默认用内置国内服务器自动回退")
@@ -13599,6 +13685,10 @@ def main():
             SPEEDTEST_CONFIG["iperf3_server"] = spec
     SPEEDTEST_CONFIG["use_speedtest_net"] = bool(args.speedtest_net)
     SPEEDTEST_CONFIG["node"] = getattr(args, "speedtest_node", None) or None
+    # --speedtest-node 传数字 ID 时, 同时设为 Ookla 服务器 ID (覆盖默认 3633)
+    sn = getattr(args, "speedtest_node", None)
+    if sn and str(sn).strip().isdigit():
+        SPEEDTEST_CONFIG["ookla_server_id"] = int(str(sn).strip())
     SPEEDTEST_CONFIG["iperf3_duration"] = max(1, int(getattr(args, "iperf3_duration", 10)))
     SPEEDTEST_CONFIG["iperf3_udp"] = bool(getattr(args, "iperf3_udp", False))
 
