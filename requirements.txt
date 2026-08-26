@@ -9,8 +9,8 @@ scapy>=2.5.0
 # cryptography: 修 scapy.modules.krack 的 ImportError (scapy 可选依赖)
 cryptography>=3.4
 
-# speedtest: Speedtest.net 测速
-speedtest-cli>=2.1.3
+# Ookla Speedtest CLI (speedtest.exe) 随发行版打包, 无需 Python 依赖
+# 旧版用 speedtest-cli Python 库, 已替换为 Ookla 官方 CLI (支持 -s <id> 指定国内服务器)
 
 # reportlab: PDF 报告导出 (可选, 缺失时自动降级导出 HTML)
 reportlab>=4.0.0

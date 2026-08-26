@@ -58,11 +58,12 @@ except Exception:
 # 强制禁用 scapy 二层抓包 (某些机器 Npcap 不稳定会段错误): 置 True 后 DHCP 走 ipconfig 降级
 FORCE_NO_SCAPY = False
 
-try:
-    import speedtest
-    SPEEDTEST_LIB_AVAILABLE = True
-except Exception:
-    SPEEDTEST_LIB_AVAILABLE = False
+# Ookla Speedtest CLI (speedtest.exe) 可用性 — 运行时按需探测 (见 _find_ookla_speedtest)。
+# 旧版用 speedtest-cli Python 库 (import speedtest), 但国内常选海外服务器结果严重偏低,
+# 已替换为 Ookla 官方 CLI (支持 -s <id> 指定国内服务器, 输出含丢包/jitter/result_url)。
+# 兼容: 保留 SPEEDTEST_LIB_AVAILABLE 别名 (旧代码引用), 实际指向 OOKLA_AVAILABLE。
+OOKLA_AVAILABLE = None  # None=未探测, True/False=已探测
+SPEEDTEST_LIB_AVAILABLE = OOKLA_AVAILABLE  # 别名 (向后兼容)
 
 # ============================================================
 # SECTION 1b: 可选依赖自动安装 (scapy / Npcap)
@@ -90,9 +91,10 @@ PORT_PROBE_CONFIG = {"targets": [], "proto": "tcp", "count": 2,
 # 测速 / iperf3 模块的运行参数 (由 CLI 写入, runner 读取)
 # - iperf3_server / iperf3_port / iperf3_duration: iperf3 独立模块用, 由 --iperf3-server 提供;
 #   提供后 iperf3 模块测到该服务器的上下行吞吐 (iperf3 是最准的链路吞吐测量)
-# - use_speedtest_net: 默认关闭 — 国内网络下 speedtest-cli 常选中海外服务器,
-#   结果严重偏低 (本机实测 100M 宽带测出 5 Mbps), 仅作参考
-# - node: 手动指定上行测速服务器 (speedtest 服务器 ID 或 host:port); 默认自动选国内运营商节点
+# - use_speedtest_net: 默认关闭 — 启用 Ookla Speedtest CLI 官方测速作为对照参考;
+#   国内自动选点可能偏海外 (结果偏低), 可用 --speedtest-node <数字ID> 指定国内服务器
+# - node: 手动指定测速服务器 — 数字 ID (Ookla 服务器, 配合 --speedtest-net) 或
+#   host:port (国内上行节点); 默认自动选国内运营商节点
 # - duration_down / duration_up: 上下行测速时长 (秒)
 # - live_ui: 单独运行测速模块时启用终端实时可视化 (由 run_diagnostics 写入)
 SPEEDTEST_CONFIG = {"iperf3_server": None, "iperf3_port": 5201, "iperf3_duration": 10,
@@ -530,6 +532,62 @@ def _download_iperf3(target_dir=None):
     if not os.path.exists(dst) or os.path.getsize(dst) < 1000:
         return False, f"解压后 iperf3.exe 不存在或过小: {dst}"
     return True, dst
+
+
+# ── Ookla Speedtest CLI (speedtest.exe) 定位 ──
+# 查找顺序: ./speedtest/speedtest.exe → 程序目录/speedtest/ → %LOCALAPPDATA%\NetPulse\speedtest\
+#           → PATH (where speedtest)
+# 打包模式 (frozen) 下 speedtest/ 子目录会被 PyInstaller --add-data 打入, 解压到临时目录
+# _MEIPASS/speedtest/speedtest.exe, 需优先查 sys._MEIPASS。
+def _find_ookla_speedtest():
+    """查找 speedtest.exe (Ookla 官方 CLI)。返回 exe 绝对路径或 None。
+
+    不交互式下载 (Ookla EULA 要求用户主动接受, 不适合自动下载; 缺失时返回 None,
+    调用方降级跳过 Ookla 测速)。
+    """
+    global OOKLA_AVAILABLE
+    exe_name = "speedtest.exe"
+
+    # 1. PyInstaller 打包模式: 优先查 sys._MEIPASS (临时解压目录)
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        p = os.path.join(meipass, "speedtest", exe_name)
+        if os.path.exists(p) and os.path.getsize(p) > 1000:
+            OOKLA_AVAILABLE = True
+            return p
+
+    # 2. 当前工作目录的 speedtest/ 子目录
+    p = os.path.join("speedtest", exe_name)
+    if os.path.exists(p) and os.path.getsize(p) > 1000:
+        OOKLA_AVAILABLE = True
+        return os.path.abspath(p)
+
+    # 3. 程序目录 (netpulse.py 或 EXE 所在目录) 的 speedtest/ 子目录
+    app_dir = os.path.dirname(os.path.abspath(
+        sys.argv[0] if getattr(sys, "frozen", False) else __file__))
+    p = os.path.join(app_dir, "speedtest", exe_name)
+    if os.path.exists(p) and os.path.getsize(p) > 1000:
+        OOKLA_AVAILABLE = True
+        return p
+
+    # 4. %LOCALAPPDATA%\NetPulse\speedtest\ (用户手动放置的回退落点)
+    fallback = os.path.join(
+        os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
+        "NetPulse", "speedtest", exe_name)
+    if os.path.exists(fallback) and os.path.getsize(fallback) > 1000:
+        OOKLA_AVAILABLE = True
+        return fallback
+
+    # 5. PATH 里的 speedtest (用户全局安装的情况)
+    code, out, _ = run_cmd("where speedtest", timeout=5)
+    if code == 0 and out.strip():
+        candidate = out.strip().split("\n")[0].strip()
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 1000:
+            OOKLA_AVAILABLE = True
+            return candidate
+
+    OOKLA_AVAILABLE = False
+    return None
 
 
 def _reload_scapy():
@@ -3063,55 +3121,124 @@ class SpeedTester:
         self.name = "网络测速"
         self.results = {}
 
-    def test_speedtest(self, callback=None):
-        """speedtest-cli 测速 (可选, 默认关闭; 国内网络下结果仅作参考)。
+    def test_ookla(self, callback=None, server_id=None):
+        """Ookla Speedtest CLI 官方测速 (可选, --speedtest-net 启用)。
 
-        国内现状: speedtest-cli 的服务器选点常指向海外服务器 (本机实测选中
-        美国亚利桑那州服务器, 100M 宽带测出 5 Mbps, 而国内镜像实测 64.6
-        Mbps)。因此:
-          - 只在 use_speedtest_net=True 时运行 (默认不跑, 避免输出误导数字)
-          - 选中服务器非中国大陆/港澳台时, 结果标记 valid=False 并附 note
+        用 speedtest.exe (Ookla 官方 CLI) 替代旧版 speedtest-cli Python 库:
+          - 输出 --format=json 结构化 JSON, 含 download/upload/ping/packetLoss/result_url
+          - 支持 -s <id> 指定服务器 (解决国内选点偏海外的问题, --speedtest-node 传数字 ID)
+          - 首次运行需 --accept-license --accept-gdpr (已内置, 用户无感)
+          - 零 Python 依赖 (exe 随发行版打包)
+
+        服务器国家判断保留: 选中海外服务器时标记 valid=False 并附 note。
         """
         if callback:
-            callback("Speedtest.net 测速中 (可选, 结果仅供参考)...")
-        if not SPEEDTEST_LIB_AVAILABLE:
-            return {"error": "speedtest 库未安装", "method": "speedtest_lib"}
+            callback("Ookla Speedtest 官方测速中 (可选, 结果仅供参考)...")
+        exe = _find_ookla_speedtest()
+        if not exe:
+            return {"error": "未找到 speedtest.exe (Ookla CLI), 无法运行官方测速; "
+                             "可从 speedtest.net 下载放入 speedtest/ 子目录",
+                    "method": "ookla"}
 
+        # 构造命令: --format=json 输出纯 JSON (含 log + result 两种 type)
+        # --accept-license --accept-gdpr 首次运行自动接受 (项目非商用, 已确认合规)
+        cmd_parts = [f'"{exe}"', "--format=json", "--accept-license", "--accept-gdpr"]
+        if server_id:
+            cmd_parts += ["-s", str(server_id)]
+        cmd = " ".join(cmd_parts)
+
+        if callback:
+            if server_id:
+                callback(f"  指定服务器 ID: {server_id}")
+            else:
+                callback("  自动选择最近服务器 (国内可能选到海外, 结果仅供参考)...")
+
+        # Ookla 测速通常 30-60s (下载 + 上传各 ~15s + 选服 + ping)
+        code, out, err = run_cmd(cmd, timeout=120, shell=True, use_cache=False)
+        if code != 0 and not out:
+            return {"error": f"speedtest.exe 执行失败 (code={code}): {err}",
+                    "method": "ookla"}
+
+        # 解析 JSON 输出: Ookla CLI 会输出多行 JSON (log + result), 取 type=="result" 的那行
+        result_data = None
+        for line in out.strip().splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+                if obj.get("type") == "result":
+                    result_data = obj
+                    break
+            except json.JSONDecodeError:
+                continue
+        if not result_data:
+            return {"error": f"speedtest.exe 输出无 result 行: {out[:200]}",
+                    "method": "ookla"}
+
+        # 提取字段 (Ookla JSON 结构):
+        #   download.bandwidth: bytes/s  → Mbps (×8 / 1e6)
+        #   upload.bandwidth: bytes/s
+        #   ping.latency / ping.jitter: ms
+        #   packetLoss: 0.0-1.0 (小数)
+        #   server.id / name / location / country / cc
+        #   result.url: speedtest.net 结果页链接
+        #   isp: 用户运营商
         try:
-            st = speedtest.Speedtest(secure=True)
-            if callback:
-                callback("选择最优服务器...")
-            st.get_best_server()
-            server = st.best
-            country = str(server.get("country", "") or "")
-            cc = str(server.get("cc", "") or "").upper()
+            dl_bw = result_data.get("download", {}).get("bandwidth", 0) or 0
+            ul_bw = result_data.get("upload", {}).get("bandwidth", 0) or 0
+            ping_obj = result_data.get("ping", {}) or {}
+            latency = ping_obj.get("latency", 0) or 0
+            jitter = ping_obj.get("jitter", 0) or 0
+            packet_loss = result_data.get("packetLoss", 0) or 0
+            server_obj = result_data.get("server", {}) or {}
+            result_url = (result_data.get("result", {}) or {}).get("url", "")
+            isp = result_data.get("isp", "")
+
+            download_mbps = round(dl_bw * 8 / 1e6, 2)  # bytes/s → Mbps
+            upload_mbps = round(ul_bw * 8 / 1e6, 2)
+            country = str(server_obj.get("country", "") or "")
+            cc = str(server_obj.get("cc", "") or "").upper()
+            server_name = str(server_obj.get("name", "") or "")
+            server_loc = str(server_obj.get("location", "") or "")
+            sponsor = str(server_obj.get("sponsor", "") or server_obj.get("name", "") or "")
+
             # 中国大陆 + 港澳台视为"国内可达", 其它 (海外) 标记结果无效
             valid = (cc in ("CN", "HK", "MO", "TW")
                      or "中国" in country or "Hong Kong" in country
                      or "Macao" in country or "Macau" in country
                      or "Taiwan" in country)
-            if callback:
-                callback("下载测速中...")
-            download_speed = st.download() / 1e6  # Mbps
-            if callback:
-                callback("上传测速中...")
-            upload_speed = st.upload() / 1e6
+
             result = {
-                "method": "speedtest.net",
-                "server": f"{server.get('sponsor', '')} ({server.get('name', '')}, {country})",
+                "method": "ookla",
+                "server": f"{sponsor} ({server_name}, {country})".strip(),
                 "server_country": country,
                 "server_cc": cc,
-                "server_latency_ms": round(server.get('latency', 0), 1),
-                "download_mbps": round(download_speed, 2),
-                "upload_mbps": round(upload_speed, 2),
+                "server_id": server_obj.get("id", ""),
+                "server_latency_ms": round(latency, 1),
+                "download_mbps": download_mbps,
+                "upload_mbps": upload_mbps,
+                "jitter_ms": round(jitter, 2),
+                "packet_loss_pct": round(packet_loss * 100, 2),
+                "result_url": result_url,
+                "isp": isp,
                 "valid": valid,
             }
             if not valid:
-                result["note"] = (f"Speedtest.net 选中服务器位于海外 ({country}), "
-                                  "跨境链路测速结果不代表本地宽带速率, 仅供参考")
+                result["note"] = (f"Ookla 选中服务器位于海外 ({country}), "
+                                  "跨境链路测速结果不代表本地宽带速率, 仅供参考; "
+                                  "可用 --speedtest-node <国内服务器ID> 指定国内节点")
+            if callback:
+                callback(f"  Ookla 完成: ↓{download_mbps} Mbps ↑{upload_mbps} Mbps "
+                         f"({sponsor}, {country})")
             return result
         except Exception as e:
-            return {"error": str(e), "method": "speedtest_lib"}
+            return {"error": f"解析 Ookla 结果失败: {e}", "method": "ookla",
+                    "raw_output": out[:500]}
+
+    # 旧版兼容别名 (外部如有调用 test_speedtest 仍可用, 内部转发到 test_ookla)
+    def test_speedtest(self, callback=None, **kw):
+        return self.test_ookla(callback=callback, server_id=kw.get("server_id"))
 
     def test_http(self, callback=None, on_sample=None, series=None):
         """HTTP 多连接下载测速 (默认主测速路径)。
@@ -3181,8 +3308,14 @@ class SpeedTester:
             if node:
                 server = self._resolve_node(node)
                 if not server:
-                    return {"error": f"无法解析测速节点: {node} (支持 host:port, "
-                                     "如 112.25.80.50:8080)", "method": "upload_cn"}
+                    return {"error": f"无法解析测速节点: {node} (支持数字 ID 或 "
+                                     "host:port, 如 3633 或 112.25.80.50:8080)",
+                            "method": "upload_cn"}
+                # 数字 ID 是 Ookla 服务器, 不走国内上行节点逻辑 (由 test_ookla 处理)
+                if server.get("type") == "ookla_id":
+                    return {"error": "数字 ID 仅用于 Ookla 官方测速 (--speedtest-net), "
+                                     "国内上行节点请用 host:port 格式",
+                            "method": "upload_cn"}
             else:
                 server, err = _select_domestic_speedtest_server(callback)
                 if not server:
@@ -3209,13 +3342,24 @@ class SpeedTester:
             return {"error": str(e), "method": "upload_cn"}
 
     def _resolve_node(self, node):
-        """解析 --speedtest-node: host:port → 手工构造 server dict; 数字 ID 不支持。"""
+        """解析 --speedtest-node: 支持两种格式。
+
+        - 数字 ID (如 3633): Ookla Speedtest 服务器 ID, 传给 speedtest.exe -s <id>
+        - host:port (如 112.25.80.50:8080): 国内运营商上行节点 (speedtest 协议)
+
+        返回 dict: {"type": "ookla_id", "server_id": 3633} 或
+                   {"type": "host_port", "host": "...", "sponsor": "...", ...}
+        """
         node = str(node).strip()
+        # 纯数字 → Ookla 服务器 ID
+        if node.isdigit():
+            return {"type": "ookla_id", "server_id": int(node)}
+        # host:port → 国内上行节点
         host, _, port = node.rpartition(":")
         if not host or not port.isdigit():
             return None
-        return {"host": f"{host}:{port}", "sponsor": node, "cc": "CN",
-                "country": "手动指定"}
+        return {"type": "host_port", "host": f"{host}:{port}",
+                "sponsor": node, "cc": "CN", "country": "手动指定"}
 
     def detect(self, use_speedtest_net=False, node=None, live_ui=False,
                save_report=True, callback=None):
@@ -3319,10 +3463,16 @@ class SpeedTester:
         # 延迟时间序列 (空闲 + 下行 + 上行 全段)
         lat_series = monitor.series_since(t_start) if monitor_ok else []
 
-        # Speedtest.net 参考 (可选)
+        # Ookla Speedtest 官方测速 (可选, --speedtest-net 启用)
+        # --speedtest-node 传数字 ID 时, 作为 Ookla 服务器 ID (speedtest.exe -s <id>)
         speedtest_result = None
         if use_speedtest_net:
-            speedtest_result = self.test_speedtest(_cb)
+            ookla_server_id = None
+            if node:
+                resolved = self._resolve_node(node)
+                if resolved and resolved.get("type") == "ookla_id":
+                    ookla_server_id = resolved.get("server_id")
+            speedtest_result = self.test_ookla(_cb, server_id=ookla_server_id)
 
         results = {
             "download_mbps": round(download, 2),
@@ -3658,6 +3808,52 @@ def _render_speedtest_html(res):
     server_lat = up_res.get("server_latency_ms")
     server_lat_str = (f"{server_lat:.0f} ms (TCP 握手)" if server_lat is not None else "—")
 
+    # Ookla Speedtest 官方测速结果 (可选, --speedtest-net 启用)
+    ookla = res.get("speedtest") or {}
+    ookla_html = ""
+    if ookla and "error" not in ookla:
+        ookla_dl = ookla.get("download_mbps", 0)
+        ookla_ul = ookla.get("upload_mbps", 0)
+        ookla_lat = ookla.get("server_latency_ms", 0)
+        ookla_jit = ookla.get("jitter_ms", 0)
+        ookla_loss = ookla.get("packet_loss_pct", 0)
+        ookla_server = ookla.get("server", "—")
+        ookla_url = ookla.get("result_url", "")
+        ookla_isp = ookla.get("isp", "")
+        ookla_valid = ookla.get("valid", True)
+        ookla_note = ookla.get("note", "")
+        # 结果页链接 (有 URL 时可点击)
+        url_html = (f'<a href="{_esc_html(ookla_url)}" target="_blank">{_esc_html(ookla_url)}</a>'
+                    if ookla_url else "—")
+        # 海外服务器警告
+        warn_html = (f'<tr><td colspan="2" style="color:#e67e22;font-size:12px;">'
+                     f'⚠ {_esc_html(ookla_note)}</td></tr>' if not ookla_valid and ookla_note else "")
+        ookla_html = f"""
+  <div class="panel">
+    <h3>Ookla Speedtest 官方测速 <span class="tag-tp">对照参考</span></h3>
+    <table>
+      <tr><td>服务器</td><td>{_esc_html(str(ookla_server))}</td></tr>
+      <tr><td>运营商 (ISP)</td><td>{_esc_html(str(ookla_isp)) or "—"}</td></tr>
+      <tr><td>下载速率</td><td>{ookla_dl:.1f} Mbps</td></tr>
+      <tr><td>上传速率</td><td>{ookla_ul:.1f} Mbps</td></tr>
+      <tr><td>服务器延迟</td><td>{ookla_lat:.0f} ms</td></tr>
+      <tr><td>抖动 (Jitter)</td><td>{ookla_jit:.2f} ms</td></tr>
+      <tr><td>丢包率</td><td>{ookla_loss:.2f}%</td></tr>
+      <tr><td>结果页链接</td><td>{url_html}</td></tr>
+      {warn_html}
+    </table>
+  </div>
+"""
+    elif ookla and "error" in ookla:
+        ookla_html = f"""
+  <div class="panel">
+    <h3>Ookla Speedtest 官方测速 <span class="tag-tp">对照参考</span></h3>
+    <table>
+      <tr><td>状态</td><td style="color:#e74c3c;">失败: {_esc_html(str(ookla.get("error", "")))}</td></tr>
+    </table>
+  </div>
+"""
+
     # 速率曲线: 下行段 (蓝) + 上行段 (橙, 时间轴偏移到下行之后)
     down_data = [[round(t, 2), v] for t, v in down_series]
     base_t = down_series[-1][0] if down_series else 0.0
@@ -3776,6 +3972,7 @@ def _render_speedtest_html(res):
       <tr><td>延迟采样阶段</td><td>空闲基线 → 下行 → 上行 (全程并行采样)</td></tr>
     </table>
   </div>
+  {ookla_html}
 
   <div class="footer">由 NetPulse 生成 · 报告仅为客观测速数据, 不包含达标判定</div>
 </div>
@@ -8752,7 +8949,7 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
 # "超时"并继续, 不再互相拖累; daemon 线程也不会阻塞进程退出。
 DEFAULT_MODULE_TIMEOUT = 120.0  # 秒
 MODULE_TIMEOUTS = {
-    "speedtest":   180.0,  # 国内HTTP(多源×多连接) + 可选 speedtest-cli + iperf3
+    "speedtest":   180.0,  # 国内HTTP(多源×多连接) + 国内上行 + 可选 Ookla CLI (~60s)
     "bufferbloat": 120.0,
     "port":        180.0,  # 端口探测自带总时长上限, 这里只兜底
     "dhcp":        150.0,  # 可能等待 Npcap/scapy 抓包
@@ -13341,12 +13538,13 @@ def main():
                         help="iperf3 改用 UDP 模式测抖动/丢包 (1 Mbps 发包率, 语音/游戏"
                              "质量口径): 抖动 >30ms 或丢包 >1% 给出告警; 默认 TCP 测吞吐")
     parser.add_argument("--speedtest-net", action="store_true",
-                        help="启用 Speedtest.net 测速 (默认关闭: 国内网络下常选中"
-                             "海外服务器, 结果严重偏低, 仅作参考)")
+                        help="启用 Ookla Speedtest 官方测速 (默认关闭: 国内自动选点"
+                             "可能偏海外, 结果仅作对照参考; 用 --speedtest-node <ID> "
+                             "可指定国内服务器)")
     parser.add_argument("--speedtest-node", metavar="ID|HOST:PORT",
-                        help="指定上行测速服务器 (可选): speedtest 服务器 ID 或 "
-                             "host:port (如 3633 或 112.25.80.50:8080); "
-                             "默认自动选择延迟最低的国内运营商节点")
+                        help="指定测速服务器 (可选): 数字 ID = Ookla 服务器 ID "
+                             "(需配合 --speedtest-net, 如 3633); host:port = 国内上行"
+                             "节点 (如 112.25.80.50:8080); 默认自动选择国内运营商节点")
     parser.add_argument("--nattype-server", action="append", metavar="HOST[:PORT]",
                         help="NAT 类型检测的 STUN 服务器 (可选, 可指定两次提供两台, "
                              "缺省端口 3478); 默认用内置国内服务器自动回退")

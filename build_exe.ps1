@@ -98,13 +98,11 @@ if (-not $pip) {
 $pipDisplay = if ($pip.ExtraArgs.Count -gt 0) { "$($pip.Cmd) $($pip.ExtraArgs -join ' ')" } else { $pip.Cmd }
 
 # 用 import 测试代替 pip show
-# key = pip 安装名, value = import 测试名 (两者不同的: speedtest-cli 的 import 名是
-# speedtest; pyinstaller 的 import 名是 PyInstaller)。注意 PyPI 上的 'speedtest'
-# 是 2020 年的 1.3 kB 占位空包, 绝不能直接 pip install speedtest
+# key = pip 安装名, value = import 测试名 (两者不同的: pyinstaller 的 import 名是 PyInstaller)
+# 注: speedtest-cli 已移除, 改用 Ookla CLI (speedtest.exe 随包打包, 无 Python 依赖)
 $required = @{
     'scapy'         = 'scapy'
     'cryptography'  = 'cryptography'
-    'speedtest-cli' = 'speedtest'
     'reportlab'     = 'reportlab'
     'pyinstaller'   = 'PyInstaller'
 }
@@ -134,7 +132,7 @@ if ($missing.Count -gt 0) {
     }
     Write-Host " 完成" -ForegroundColor Green
 } else {
-    Step-Ok "(scapy, cryptography, speedtest-cli, reportlab, pyinstaller 全部就位)"
+    Step-Ok "(scapy, cryptography, reportlab, pyinstaller 全部就位)"
 }
 
 # ---- 3/6: 清理旧构建 ----
@@ -158,6 +156,7 @@ $piArgs = @(
     '--onefile', '--console', '--noconfirm',
     '--name', 'NetPulse',
     '--add-data', 'netpulse.py;.',
+    '--add-data', 'speedtest/speedtest.exe;speedtest',
     '--hidden-import', 'tkinter',
     '--hidden-import', 'scapy.all',
     '--collect-all', 'scapy',
@@ -303,5 +302,7 @@ Write-Host "    - DHCP 完整检测: 首次跑需管理员权限 (会触发 UAC 
 Write-Host "      无管理员时自动降级 ipconfig 简化检测, 仍可用" -ForegroundColor Yellow
 Write-Host "    - iperf3 测速: 首次跑会询问是否自动下载 (默认 Y, ~2MB)" -ForegroundColor Yellow
 Write-Host "      也可手动下载 https://iperf.fr/iperf-download.php 放 EXE 同目录" -ForegroundColor Yellow
+Write-Host "    - Ookla Speedtest: speedtest.exe 已打包进 EXE, --speedtest-net 启用" -ForegroundColor Yellow
+Write-Host "      (国内自动选点可能偏海外, 用 --speedtest-node <ID> 指定国内服务器)" -ForegroundColor Yellow
 Write-Host ""
 Read-Host "  按 Enter 退出"
