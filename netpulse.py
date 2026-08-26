@@ -1741,8 +1741,10 @@ def parse_ping_output(output):
     解析统计行前先把 \\n 折成空格, 行为一致。
     """
     result = {"sent": 0, "received": 0, "loss_pct": 100.0,
-              "min_ms": 0, "avg_ms": 0, "max_ms": 0, "rtts": [], "jitter_ms": 0}
+              "min_ms": 0, "avg_ms": 0, "max_ms": 0, "rtts": [], "jitter_ms": 0,
+              "ttl": None}
     # 解析回复行 - 匹配 "时间=2ms" / "time=2ms" / "时间<1ms" / "time<1ms"
+    # 同时提取首个 TTL (Windows ping 每个回复行都带 TTL=xx)
     for line in output.split("\n"):
         # 先检查 <1ms 模式
         if re.search(r"(?:[Tt]ime|时间)<\s*1?\s*ms", line):
@@ -1751,6 +1753,11 @@ def parse_ping_output(output):
             m = re.search(r"(?:[Tt]ime|时间)[=<]\s*(\d+)\s*ms", line)
             if m:
                 result["rtts"].append(int(m.group(1)))
+        # 提取首个 TTL (用于环路检测, 避免单独再 ping 一次)
+        if result["ttl"] is None:
+            tm = re.search(r"TTL[=:]\s*(\d+)", line, re.IGNORECASE)
+            if tm:
+                result["ttl"] = int(tm.group(1))
     # 把 "统计" 段折成单行, 兼容老 Windows 把字段拆到多行
     flat = re.sub(r"\s*\n\s*", " ", output)
     # 解析统计行
@@ -2177,9 +2184,12 @@ class GatewayTester:
         if callback:
             callback(f"Ping 网关 {gateway} ({count} 次)...")
 
-        # 内网网关正常回复 <10ms, wait 1500 足够; 不可达时也能更快收敛
-        ping_result = ping_host(gateway, count=count, timeout=count + 10,
-                                wait_ms=1500)
+        # 内网网关正常回复 <10ms, 但 WiFi 网关在忙时偶发 >1.5s 响应,
+        # wait_ms=1500 会把这些慢回复误判为"超时丢包" (与用户手动 ping -t
+        # 默认 4000ms 结果对不上)。改为 3000ms 与系统默认接近, 避免误报。
+        # 进程总超时留足 count × wait + 启动开销, 防 stdout 被截断。
+        ping_result = ping_host(gateway, count=count, timeout=count + 15,
+                                wait_ms=3000)
 
         # 评估: 分级阈值, 避免 53ms 0% 丢包被误报"延迟严重"
         # 阈值依据: 国内普通宽带/企业网到局域网网关一般 < 10ms;
@@ -2317,17 +2327,30 @@ class LoopDetector:
                     "detail": "同一单播 MAC 对应多个 IP, 可能是网关多接口/代理 ARP, 也可能是环路/ARP 欺骗"
                 })
 
-        # 2. TTL 分析 — 检测异常 TTL
-        if callback:
-            callback("TTL 分析...")
+        # 3. 检查重复 ARP 响应 (网关 MAC 是否被其他 IP 共用)
+        if gateway and gateway in ip_to_mac:
+            gw_mac = ip_to_mac[gateway]
+            same_mac_ips = [ip for ip in mac_to_ips.get(gw_mac, []) if ip != gateway]
+            if same_mac_ips:
+                issues.append({
+                    "type": "gateway_mac_shared",
+                    "severity": "info",
+                    "message": f"网关 MAC {gw_mac} 也被以下 IP 使用: {', '.join(same_mac_ips[:3])}",
+                    "detail": "可能是同一设备有多个接口，也可能需要进一步排查"
+                })
+
+        # 2 & 4. TTL 分析 + 丢包模式分析 — 合并为一次 ping (避免重复探测)
+        # 旧版分三次 ping (count=10 取 TTL 未用 + ping -n 1 取 TTL + count=15 丢包),
+        # 浪费 3-5 秒且 wait_ms=1500 会误判丢包。现合并为一次 count=15, wait_ms=3000,
+        # 从同一结果提取 TTL / 丢包 / 抖动。
         if gateway:
-            ping_result = ping_host(gateway, count=10, timeout=15, wait_ms=1500)
+            if callback:
+                callback("TTL 与丢包模式分析...")
+            ping_result = ping_host(gateway, count=15, timeout=30, wait_ms=3000)
+            ttl = ping_result.get("ttl")
             # 正常内网网关 TTL 通常为 64 (Linux) 或 128 (Windows)
             # 如果 TTL 远低于预期，可能存在环路
-            code, ping_out, _ = run_cmd(f"ping -n 1 {gateway}")
-            ttl_match = re.search(r"TTL=(\d+)|TTL=\s*(\d+)", ping_out, re.IGNORECASE)
-            if ttl_match:
-                ttl = int(ttl_match.group(1) or ttl_match.group(2))
+            if ttl is not None:
                 if ttl < 30:
                     issues.append({
                         "type": "low_ttl",
@@ -2343,23 +2366,8 @@ class LoopDetector:
                         "detail": "TTL 偏低，可能存在多余的网络跳转"
                     })
 
-        # 3. 检查重复 ARP 响应
-        if gateway and gateway in ip_to_mac:
-            gw_mac = ip_to_mac[gateway]
-            # 检查是否有其他 IP 使用相同 MAC 作为网关
-            same_mac_ips = [ip for ip in mac_to_ips.get(gw_mac, []) if ip != gateway]
-            if same_mac_ips:
-                issues.append({
-                    "type": "gateway_mac_shared",
-                    "severity": "info",
-                    "message": f"网关 MAC {gw_mac} 也被以下 IP 使用: {', '.join(same_mac_ips[:3])}",
-                    "detail": "可能是同一设备有多个接口，也可能需要进一步排查"
-                })
-
-        # 4. 检查网关丢包模式 (环路常导致间歇性丢包)
-        if gateway:
-            ping_result = ping_host(gateway, count=15, timeout=20, wait_ms=1500)
-            if ping_result["loss_pct"] > 0 and ping_result["loss_pct"] < 50:
+            # 丢包模式分析 (环路常导致间歇性丢包)
+            if 0 < ping_result["loss_pct"] < 50:
                 # 间歇性丢包可能是环路的征兆
                 if ping_result["jitter_ms"] > ping_result["avg_ms"]:
                     # WiFi 链路抖动天然偏高 (2.4G 干扰/信道拥塞/距离), 环路
@@ -4431,10 +4439,30 @@ class MultiEgressDetector:
                     "status": reason,
                     "_critical": False,
                 }
-            ping_result = ping_host(gw, count=10, timeout=15, wait_ms=1500)
-            status = ("正常" if ping_result["loss_pct"] == 0 else
-                      f"丢包 {ping_result['loss_pct']}%"
-                      if ping_result["loss_pct"] < 50 else "故障")
+            # wait_ms=3000 与系统默认接近, 避免 WiFi 网关忙时偶发 >1.5s 响应
+            # 被误判为丢包 (旧版 wait_ms=1500 是误报根因)
+            ping_result = ping_host(gw, count=10, timeout=25, wait_ms=3000)
+            loss = ping_result["loss_pct"]
+            # 三态判定 (参考 ExternalNetworkTester): ping 100% 丢包时用 TCP 兜底,
+            # 区分"网关禁 ping"(实际可达) 与"网关不可达"(真故障), 避免误报
+            if loss >= 100:
+                tcp_ok, _, _ = _tcp_probe_multi(
+                    gw, ports=(53, 80, 443, 8080), timeout=2.0)
+                if tcp_ok:
+                    status = "可达 (禁 ping, TCP 正常)"
+                    critical = False
+                else:
+                    status = "故障"
+                    critical = True
+            elif loss == 0:
+                status = "正常"
+                critical = False
+            elif loss < 50:
+                status = f"丢包 {loss}%"
+                critical = False
+            else:
+                status = "故障"
+                critical = True
             return {
                 "gateway": gw,
                 "interface": route["interface"],
@@ -4442,7 +4470,7 @@ class MultiEgressDetector:
                 "ping_loss_pct": ping_result["loss_pct"],
                 "ping_avg_ms": ping_result["avg_ms"],
                 "status": status,
-                "_critical": ping_result["loss_pct"] >= 50,
+                "_critical": critical,
             }
 
         with ThreadPoolExecutor(max_workers=min(4, len(default_routes))) as ex:
@@ -11393,6 +11421,9 @@ def _record_table(v):
         return None
     headers = [HEADER_MAP.get(k, k) for k in keys]
     def _cell(v):
+        # 嵌套 list/dict 用 _humanize_cell 摘要, 避免裸 JSON / Python repr
+        if isinstance(v, (list, dict)):
+            return _humanize_cell(v)
         if v is None:
             return "N/A"  # None 明确显示 N/A, 而不是空字符串让用户误以为缺数据
         s = str(v)
@@ -11468,6 +11499,10 @@ def _render_html_tech_block(key, raw_result, tech_keys, auto_open=True):
             if key == "web" and k == "targets":
                 out.append(_render_web_targets_table(v))
                 continue
+            # WiFi 信道分析: networks 嵌套列表需摘要, 避免裸 JSON
+            if key == "wifi" and k == "channel_analysis":
+                out.append(_render_wifi_channel_table(v))
+                continue
             # 同构字典列表 → 真正的多列表格
             rt = _record_table(v)
             if rt:
@@ -11498,8 +11533,9 @@ def _render_html_tech_block(key, raw_result, tech_keys, auto_open=True):
                     rows.append((_html_esc(HEADER_MAP.get(kk, kk)),
                                  _html_esc(_pretty_dict(vv))))
                 elif isinstance(vv, list):
+                    # 嵌套 list 用 _humanize_cell 摘要, 避免裸 JSON
                     rows.append((_html_esc(HEADER_MAP.get(kk, kk)),
-                                 _html_esc(json.dumps(vv, ensure_ascii=False)[:200])))
+                                 _html_esc(_humanize_cell(vv))))
                 else:
                     rows.append((_html_esc(HEADER_MAP.get(kk, kk)),
                                  _html_esc(_humanize_en(str(vv)))))
@@ -11539,12 +11575,61 @@ def _pretty_dict(d, max_len=160):
         parts = []
         for k, v in d.items():
             if isinstance(v, (dict, list)):
-                v = json.dumps(v, ensure_ascii=False)
+                v = _humanize_cell(v)
             parts.append(f"{k}: {v}")
         s = ", ".join(parts)
         return s if len(s) <= max_len else s[:max_len - 1] + "…"
     except Exception:
         return json.dumps(d, ensure_ascii=False)[:max_len]
+
+
+def _humanize_cell(v, max_len=120):
+    """把表格单元格中的嵌套 list/dict 值摘要成人话, 避免裸 JSON / Python repr。
+
+    - list of dict (如 WiFi channel_analysis.networks): "3 个: SSID1(-65dBm), SSID2(-72dBm)"
+    - list of scalar: "a, b, c"
+    - dict: "k1: v1, k2: v2" (调用 _pretty_dict)
+    - 空 list/dict: "—"
+    - 其他: str(v)
+
+    max_len: 摘要最大长度, 超出截断 (表格单元格不宜过长)。
+    """
+    if v is None:
+        return "—"
+    if isinstance(v, list):
+        if not v:
+            return "—"
+        # list of dict: 提取每个 dict 的核心字段做摘要
+        if all(isinstance(x, dict) for x in v):
+            # WiFi networks 列表: 优先用 ssid + signal
+            if all("ssid" in x or "bssid" in x for x in v):
+                bits = []
+                for x in v[:8]:
+                    ssid = x.get("ssid") or x.get("bssid") or "?"
+                    sig = x.get("signal")
+                    bits.append(f"{ssid}({sig}dBm)" if sig is not None else str(ssid))
+                head = ", ".join(bits)
+                suffix = f" 等 {len(v)} 个" if len(v) > 8 else f" ({len(v)} 个)"
+                s = head + suffix
+            else:
+                # 通用 list of dict: 每个取前 2 个字段
+                bits = []
+                for x in v[:5]:
+                    items = list(x.items())[:2]
+                    bits.append(", ".join(f"{k}: {val}" for k, val in items))
+                s = "; ".join(bits)
+                if len(v) > 5:
+                    s += f" 等 {len(v)} 项"
+            return s if len(s) <= max_len else s[:max_len - 1] + "…"
+        # list of scalar
+        s = ", ".join("" if x is None else str(x) for x in v)
+        return s if len(s) <= max_len else s[:max_len - 1] + "…"
+    if isinstance(v, dict):
+        if not v:
+            return "—"
+        return _pretty_dict(v, max_len=max_len)
+    s = str(v)
+    return s if s else "—"
 
 
 def _render_web_targets_table(targets):
@@ -11614,6 +11699,46 @@ def _render_linkspeed_adapters_table(adapters):
             f"完整 12 列字段见 JSON 报告)</div>"
             f"<div class='tbl-wrap'><table class='tbl'><thead><tr>{head}</tr></thead>"
             f"<tbody>{body}</tbody></table></div>")
+
+
+def _render_wifi_channel_table(channel_analysis):
+    """WiFi 信道分析专用: 只展示用户关心的 6 列, networks 嵌套列表转摘要。
+
+    原 _record_table 把 networks 列直接 str(list) 显示成 Python repr,
+    一列塞几十个网络的完整 dict, 行高爆炸且用户看不懂。现改为:
+      - 只展示: 信道 / 频段 / 网络数 / 干扰分 / 干扰等级 / 网络摘要
+      - networks 列用 _humanize_cell 摘要为 "3 个: SSID1(-65dBm), SSID2(-72dBm)"
+    """
+    column_map = [
+        ("channel", "信道"),
+        ("band", "频段"),
+        ("network_count", "网络数"),
+        ("interference_score", "干扰分"),
+        ("interference_level", "干扰等级"),
+        ("networks", "网络列表"),
+    ]
+    head = "".join(f"<th>{_html_esc(label)}</th>" for _, label in column_map)
+    body_rows = []
+    for ca in channel_analysis[:20]:
+        cells = []
+        for key, _ in column_map:
+            v = ca.get(key)
+            if key == "networks":
+                # 嵌套 list of dict → 摘要
+                cells.append(_html_esc(_humanize_cell(v)))
+            elif v is None:
+                cells.append("—")
+            else:
+                cells.append(_html_esc(str(v)))
+        body_rows.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+    body = "".join(body_rows)
+    more = (f"<p class='muted'>… 还有 {len(channel_analysis) - 20} 条 (如需完整数据, "
+            f"导出 JSON 报告 {len(channel_analysis)} 条)</p>"
+            if len(channel_analysis) > 20 else "")
+    return (f"<div class='subcap'>信道分析 ({len(channel_analysis)} 条, "
+            f"网络列表为摘要; 完整 BSSID/信号/认证等见 JSON 报告)</div>"
+            f"<div class='tbl-wrap'><table class='tbl'><thead><tr>{head}</tr></thead>"
+            f"<tbody>{body}</tbody></table></div>{more}")
 
 
 def render_report_html_customer(report):
@@ -12409,10 +12534,11 @@ def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
 
     def _fmt_val(vv, max_len=80):
         """把原始值格式化为适合 PDF 的简短字符串, 避免 Python repr。"""
-        if isinstance(vv, (list, tuple)):
+        # 嵌套 list/dict 用 _humanize_cell 摘要, 避免裸 JSON / repr
+        if isinstance(vv, (list, dict)):
+            s = _humanize_cell(vv, max_len=max_len)
+        elif isinstance(vv, tuple):
             s = ", ".join(str(x) for x in vv)
-        elif isinstance(vv, dict):
-            s = "; ".join(f"{k}={v}" for k, v in vv.items())
         else:
             s = str(vv)
         return s[:max_len]
