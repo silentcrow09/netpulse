@@ -3239,8 +3239,10 @@ class SpeedTester:
             sponsor = str(server_obj.get("sponsor", "") or server_obj.get("name", "") or "")
 
             # 中国大陆 + 港澳台视为"国内可达", 其它 (海外) 标记结果无效
+            # 注意: Ookla JSON 中 country 可能是英文 "China"/"Hong Kong" 或中文 "中国"
             valid = (cc in ("CN", "HK", "MO", "TW")
-                     or "中国" in country or "Hong Kong" in country
+                     or "中国" in country or "China" in country
+                     or "Hong Kong" in country
                      or "Macao" in country or "Macau" in country
                      or "Taiwan" in country)
 
@@ -3802,8 +3804,42 @@ def _render_speedtest_html(res):
     (bufferbloat) + 预估带宽 + 测试参数, 不含"达标判定"的结论, 只给客观数据。
     """
     # 通用页眉: 与主报告/盯障/iperf3 报告统一品牌风格 (品牌徽标 + 版本 + 时间)
-    download = res.get("download_mbps") or 0
-    upload = res.get("upload_mbps")
+    # 顶部三大指标优先用 Ookla 官方测速结果 (更具权威性), 回退到 HTTP/国内上行
+    ookla = res.get("speedtest") or {}
+    use_ookla = (isinstance(ookla, dict) and "error" not in ookla
+                 and ookla.get("download_mbps"))
+
+    if use_ookla:
+        download = ookla.get("download_mbps", 0)
+        upload = ookla.get("upload_mbps")
+        idle_rtt = ookla.get("server_latency_ms")
+        primary_label = "Ookla 官方测速"
+        down_note = f"Ookla · {ookla.get('server', '—')}"
+        up_big = f"{upload:.1f}" if upload is not None else "未测"
+        ping_big = f"{idle_rtt:.0f}" if idle_rtt is not None else "—"
+        up_threads = 0  # Ookla 内部管理连接数, 不显示
+        upload_server = ookla.get("server", "—")
+        upload_method = "Ookla 官方"
+        server_lat_str = f"{idle_rtt:.0f} ms (Ookla 服务器)" if idle_rtt is not None else "—"
+    else:
+        download = res.get("download_mbps") or 0
+        upload = res.get("upload_mbps")
+        idle_rtt = res.get("idle_rtt_ms")
+        primary_label = "国内测速"
+        # 测速源信息: 下行 (国内镜像多连接) / 上行 (国内运营商节点)
+        src_url = (res.get("http") or {}).get("url", "")
+        src_domain = src_url.split("/")[2] if src_url.startswith("http") else "国内镜像"
+        down_threads = (res.get("http") or {}).get("threads", 4)
+        up_threads = (res.get("up_result") or {}).get("threads", 4)
+        down_note = f"{down_threads} 连接 × {src_domain}"
+        up_big = f"{upload:.1f}" if upload is not None else "未测"
+        ping_big = f"{idle_rtt:.0f}" if idle_rtt is not None else "—"
+        upload_server = res.get("upload_server") or "未测"
+        upload_method = res.get("upload_method") or "未测"
+        up_res = res.get("up_result") or {}
+        server_lat = up_res.get("server_latency_ms")
+        server_lat_str = (f"{server_lat:.0f} ms (TCP 握手)" if server_lat is not None else "—")
+
     est = res.get("estimated_bandwidth") or {}
     grade = str(res.get("bufferbloat_grade") or "—")
     # 把 "A (优秀, 无缓冲膨胀)" 拆成简短字母 + 评语 (与主报告 metric 卡策略一致,
@@ -3812,7 +3848,7 @@ def _render_speedtest_html(res):
     g_rest = grade[len(g0):].strip(" ()") if g0 != "—" else ""
     grade_letter = g0
     grade_note = g_rest or ""
-    idle_rtt = res.get("idle_rtt_ms")
+    # idle_rtt 已在上方 Ookla/回退分支中赋值 (Ookla 用 server_latency_ms, 回退用网关延迟)
     loaded_rtt = res.get("loaded_rtt_ms")
     bloat_ms = res.get("bufferbloat_ms")
     down_series = res.get("down_series") or []
@@ -3828,27 +3864,14 @@ def _render_speedtest_html(res):
     up_mbps = upload if upload is not None else "未测"
     est_text = est.get("text", "—") if est else "—"
     est_note = est.get("note", "") if est else ""
-    upload_server = res.get("upload_server") or "未测"
-    upload_method = res.get("upload_method") or "未测"
+    # upload_server / upload_method / server_lat_str 已在上方分支赋值
     idle_str = f"{idle_rtt:.0f} ms" if idle_rtt is not None else "—"
     loaded_str = f"{loaded_rtt:.0f} ms" if loaded_rtt is not None else "—"
     bloat_str = f"{bloat_ms:+.0f} ms" if bloat_ms is not None else "—"
-    # 测速源信息: 下行 (国内镜像多连接) / 上行 (国内运营商节点)
-    src_url = (res.get("http") or {}).get("url", "")
-    src_domain = src_url.split("/")[2] if src_url.startswith("http") else "国内镜像"
-    down_threads = (res.get("http") or {}).get("threads", 4)
-    up_threads = (res.get("up_result") or {}).get("threads", 4)
-    down_note = f"{down_threads} 连接 × {src_domain}"
-    # 大数字指标 (主流测速报告风格: 下行/上行/延迟)
-    up_big = f"{upload:.1f}" if upload is not None else "未测"
-    ping_big = f"{idle_rtt:.0f}" if idle_rtt is not None else "—"
-    # 测速节点延迟 (TCP 握手, 与报告"延迟 Ping"的 ICMP 网关延迟区分)
-    up_res = res.get("up_result") or {}
-    server_lat = up_res.get("server_latency_ms")
-    server_lat_str = (f"{server_lat:.0f} ms (TCP 握手)" if server_lat is not None else "—")
+    # down_note / up_threads / up_big / ping_big 已在上方分支赋值
 
     # Ookla Speedtest 官方测速结果 (可选, --speedtest-net 启用)
-    ookla = res.get("speedtest") or {}
+    # 注意: ookla 变量已在上方赋值 (用于判断 use_ookla), 这里复用
     ookla_html = ""
     if ookla and "error" not in ookla:
         ookla_dl = ookla.get("download_mbps", 0)
@@ -3954,7 +3977,7 @@ def _render_speedtest_html(res):
 <div class="wrap">
   {_render_brand_header("宽带测速报告",
                         f"测试时间: {ts_disp} &nbsp;·&nbsp; 本机 IP: {local_ip} &nbsp;·&nbsp; 网关: {gateway}")}
-  <div class="sub">客观速率/延迟实测数据, 不含达标判定</div>
+  <div class="sub">客观速率/延迟实测数据, 不含达标判定 · 数据来源: {primary_label}</div>
 
   <div class="metric-row">
     <div class="metric down">
@@ -3965,12 +3988,12 @@ def _render_speedtest_html(res):
     <div class="metric up">
       <div class="label">上传</div>
       <div class="big">{up_big}<span class="unit"> Mbps</span></div>
-      <div class="note">{upload_server} · {up_threads} 连接</div>
+      <div class="note">{upload_server}{' · ' + str(up_threads) + ' 连接' if up_threads else ''}</div>
     </div>
     <div class="metric ping">
-      <div class="label">延迟 (网关)</div>
+      <div class="label">延迟{' (Ookla服务器)' if use_ookla else ' (网关)'}</div>
       <div class="big">{ping_big}<span class="unit"> ms</span></div>
-      <div class="note">空闲基线 · 下行/上行负载下还会测一次算缓冲膨胀</div>
+      <div class="note">{'Ookla 服务器延迟' if use_ookla else '空闲基线 · 负载下还会测一次算缓冲膨胀'}</div>
     </div>
   </div>
 
@@ -4004,14 +4027,17 @@ def _render_speedtest_html(res):
   <div class="panel">
     <h3>测试详情</h3>
     <table>
-      <tr><td>下行测速方式</td><td>国内镜像多连接 HTTP 下载 ({down_threads} 连接 × {src_domain})</td></tr>
-      <tr><td>上行测速方式</td><td>{upload_method} ({upload_server}) · {up_threads} 连接</td></tr>
-      <tr><td>延迟采样目标</td><td>{res.get("latency_target", "—")} (空闲/负载延迟均对它测)</td></tr>
+      <tr><td>主测速方式</td><td>{'Ookla Speedtest 官方 CLI (speedtest.exe)' if use_ookla else '国内 HTTP 多连接 + 国内运营商上行'}</td></tr>
+      <tr><td>下行测速</td><td>{f'Ookla 官方测速 ({ookla.get("server", "—")})' if use_ookla else f'国内镜像多连接 HTTP 下载 ({down_threads} 连接 × {src_domain})'}</td></tr>
+      <tr><td>上行测速</td><td>{f'Ookla 官方测速 ({ookla.get("server", "—")})' if use_ookla else f'{upload_method} ({upload_server}) · {up_threads} 连接'}</td></tr>
+      <tr><td>延迟来源</td><td>{f'Ookla 服务器延迟 {server_lat_str}' if use_ookla else f'网关 {res.get("latency_target", "—")} (空闲/负载延迟均对它测)'}</td></tr>
       <tr><td>测速节点延迟</td><td>{server_lat_str}</td></tr>
-      <tr><td>延迟采样阶段</td><td>空闲基线 → 下行 → 上行 (全程并行采样)</td></tr>
+      {'<tr><td>抖动</td><td>' + f'{ookla.get("jitter_ms", 0):.2f} ms' + '</td></tr>' if use_ookla else ''}
+      {'<tr><td>丢包率</td><td>' + f'{ookla.get("packet_loss_pct", 0):.2f}%' + '</td></tr>' if use_ookla else ''}
+      {'<tr><td>结果链接</td><td><a href="' + _esc_html(str(ookla.get("result_url", ""))) + '" target="_blank">' + _esc_html(str(ookla.get("result_url", "—"))) + '</a></td></tr>' if use_ookla and ookla.get("result_url") else ''}
     </table>
   </div>
-  {ookla_html}
+  {ookla_html if not use_ookla else ''}  <!-- Ookla 已作为主测速显示, 不再重复 panel -->
 
   <div class="footer">由 NetPulse 生成 · 报告仅为客观测速数据, 不包含达标判定</div>
 </div>
@@ -9478,49 +9504,83 @@ def _issues_wifi(res):
 
 def _verdict_speedtest(res):
     if "error" in res:
-        # 顶层 error 时, 子模块里也可能有 error
         for k in ("speedtest", "http"):
             sub = res.get(k, {})
             if "error" in sub:
                 return f"测速失败 ({k}): {sub['error']}"
         return res.get("error", "测速失败")
-    base = res.get("summary", "测速")
-    # Ookla 官方测速未启用时, 在结论里提示用户可加 --speedtest-net 启用对照参考
+    # 优先用 Ookla 结果作为结论 (更具权威性)
     ookla = res.get("speedtest")
+    if isinstance(ookla, dict) and "error" not in ookla and ookla.get("download_mbps"):
+        dl = ookla.get("download_mbps", 0)
+        ul = ookla.get("upload_mbps", 0)
+        lat = ookla.get("server_latency_ms", 0)
+        server = ookla.get("server", "—")
+        base = f"Ookla 官方测速: ↓{dl:.1f} Mbps ↑{ul:.1f} Mbps ({lat:.0f}ms, {server})"
+        if ookla.get("valid") is False:
+            base += f" (选点海外 {ookla.get('server_cc', '?')}, 结果仅供参考)"
+        return base
+    # 回退: HTTP + 国内上行
+    base = res.get("summary", "测速")
     if ookla is None:
         base += " (未启用 Ookla 官方测速, 加 --speedtest-net 可对照参考)"
     elif isinstance(ookla, dict) and "error" in ookla:
         base += f" (Ookla 测速失败: {ookla['error']})"
-    elif isinstance(ookla, dict) and ookla.get("valid") is False:
-        base += f" (Ookla 选点海外 {ookla.get('server_cc', '?')}, 结果仅供参考)"
     return base
 
 
 def _metrics_speedtest(res):
-    """测速关键指标 (新结构: 顶层 download/upload/预估带宽/bufferbloat)"""
+    """测速关键指标 — 优先用 Ookla 官方测速结果, 回退到 HTTP/国内上行。
+
+    Ookla 是官方标准测速 (交互菜单默认启用), 结果更具权威性;
+    HTTP/国内上行作为回退 (CLI 未加 --speedtest-net 或 Ookla 失败时)。
+    """
     out = []
     if "error" in res:
         return out
-    down = res.get("download_mbps")
-    up = res.get("upload_mbps")
+    # 判断 Ookla 结果是否可用 (有数据且无 error)
+    ookla = res.get("speedtest")
+    use_ookla = (isinstance(ookla, dict) and "error" not in ookla
+                 and ookla.get("download_mbps"))
+
+    if use_ookla:
+        down = ookla.get("download_mbps")
+        up = ookla.get("upload_mbps")
+        lat = ookla.get("server_latency_ms")
+        jit = ookla.get("jitter_ms")
+        if down:
+            out.append(("下载", f"{down} Mbps", "ok" if down >= 10 else "warn"))
+        if up is not None:
+            out.append(("上传", f"{up} Mbps", "ok" if up >= 5 else "warn"))
+        if lat is not None:
+            out.append(("延迟", f"{lat:.0f} ms", "ok" if lat < 30 else "warn"))
+        if jit is not None:
+            out.append(("抖动", f"{jit:.1f} ms", "ok" if jit < 5 else "warn"))
+        out.append(("测速方式", "Ookla 官方", "ok"))
+    else:
+        # 回退: HTTP 下载 + 国内上行
+        down = res.get("download_mbps")
+        up = res.get("upload_mbps")
+        idle = res.get("idle_rtt_ms")
+        grade = res.get("bufferbloat_grade") or ""
+        if down:
+            out.append(("下载", f"{down} Mbps", "ok" if down >= 10 else "warn"))
+        if up is not None:
+            out.append(("上传", f"{up} Mbps", "ok" if up >= 5 else "warn"))
+        if idle is not None:
+            out.append(("延迟(网关)", f"{idle:.0f} ms",
+                        "ok" if idle < 30 else "warn"))
+        if grade:
+            lv = "ok" if grade.startswith(("A", "B")) else "warn"
+            g0 = grade.split(" ", 1)[0]
+            g_rest = grade[len(g0):].strip(" ()")
+            out.append(("缓冲膨胀", g0, lv, g_rest or "负载时延迟增加量"))
+        out.append(("测速方式", "国内HTTP+上行", "ok"))
+
+    # 预估宽带 (两种方式都显示)
     est = res.get("estimated_bandwidth") or {}
-    grade = res.get("bufferbloat_grade") or ""
-    idle = res.get("idle_rtt_ms")
-    if down:
-        out.append(("下载", f"{down} Mbps", "ok" if down >= 10 else "warn"))
-    if up is not None:
-        out.append(("上传", f"{up} Mbps", "ok" if up >= 5 else "warn"))
     if est.get("text"):
         out.append(("预估宽带", est["text"], "ok"))
-    if idle is not None:
-        out.append(("延迟(网关)", f"{idle:.0f} ms",
-                    "ok" if idle < 30 else "warn"))
-    if grade:
-        lv = "ok" if grade.startswith(("A", "B")) else "warn"
-        # 卡片只放等级字母 (A/B/...), 括号里的完整评语放 hint, 卡面更清爽
-        g0 = grade.split(" ", 1)[0]
-        g_rest = grade[len(g0):].strip(" ()")
-        out.append(("缓冲膨胀", g0, lv, g_rest or "负载时延迟增加量"))
     return out
 
 
@@ -12179,10 +12239,9 @@ def render_report_html_customer(report):
 </div>"""
 
     # ── 统计卡片 ──
+    # 始终显示全部 5 个卡片 (含 0 值), 与 stats-grid 的 5 列布局对齐
     stats_order = ["完成", "警告", "异常", "错误", "未检测"]
-    stat_items = [(k, counts.get(k, 0)) for k in stats_order if counts.get(k, 0)]
-    if not stat_items:
-        stat_items = [("未检测", 0)]
+    stat_items = [(k, counts.get(k, 0)) for k in stats_order]
     stat_cards = "".join(
         f"<div class='stat-card {SKEY.get(k, 'idle').replace('fatal', 'err')}'>"
         f"<div class='count'>{v}</div>"
@@ -12481,12 +12540,12 @@ body{background:linear-gradient(180deg,#f8fafc 0%,#e2e8f0 100%);color:#1e293b;fo
 .overview ul{list-style:none}
 .overview li{padding:0;border-bottom:1px solid #f1f5f9;font-size:13.5px}
 .overview li:last-child{border-bottom:none}
-.overview li a{padding:10px 22px;display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none;transition:background .1s}
+.overview li a{padding:10px 22px;display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none;transition:background .1s;line-height:1.4}
 .overview li a:hover{background:#f8fafc}
 .overview li a:hover .name{color:#2563eb}
-.overview .name{font-weight:600;min-width:130px;color:#0f172a}
-.overview .verdict{color:#475569;flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.overview .badge{padding:2px 11px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.5px;flex:none}
+.overview .name{font-weight:600;min-width:130px;color:#0f172a;line-height:1.4}
+.overview .verdict{color:#475569;flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.4}
+.overview .badge{padding:2px 11px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.5px;flex:none;line-height:1.4}
 .badge.ok{background:#dcfce7;color:#15803d}
 .badge.warn{background:#fed7aa;color:#9a3412}
 .badge.err{background:#fecaca;color:#991b1b}
