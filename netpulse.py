@@ -11990,17 +11990,22 @@ def _svg_status_bar(all_counts):
         if v <= 0:
             continue
         w = v / total * 1000
-        rects.append(f'<rect x="{x:.1f}" y="0" width="{w - 0.6:.1f}" '
-                     f'height="34" rx="6" fill="{_html_status_color(st)}"/>')
+        rects.append(f'<rect x="{x:.1f}" y="0" width="{w:.1f}" '
+                     f'height="34" fill="{_html_status_color(st)}"/>')
         x += w
     rest = total - sum(all_counts.get(st, 0) for st in STATUS_BAR_ORDER)
     if rest > 0:
         w = rest / total * 1000
-        rects.append(f'<rect x="{x:.1f}" y="0" width="{w - 0.6:.1f}" '
-                     f'height="34" rx="6" fill="#cbd5e1"/>')
+        rects.append(f'<rect x="{x:.1f}" y="0" width="{w:.1f}" height="34" fill="#cbd5e1"/>')
         x += w
+    # 段间零缝隙直角拼接, 整条用同一圆角矩形裁剪 — 每段各自 rx 会在衔接处
+    # 出现圆弧缺口+缩宽细缝, 视觉上像断开的几截
     return (f'<svg width="100%" height="46" viewBox="0 0 1000 46" '
-            f'preserveAspectRatio="none">{"".join(rects)}</svg>')
+            f'preserveAspectRatio="none">'
+            f'<defs><clipPath id="np-bar-clip">'
+            f'<rect x="0" y="0" width="1000" height="34" rx="7"/>'
+            f'</clipPath></defs>'
+            f'<g clip-path="url(#np-bar-clip)">{"".join(rects)}</g></svg>')
 
 
 def _build_report_nav(modules):
