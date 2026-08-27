@@ -8638,7 +8638,7 @@ def determine_status(result):
             _raise("异常")
 
     # 2. issues 列表: 任一 critical -> 异常; 存在 warning 或字符串 issue -> 警告;
-    #    纯 info 级 issue 不改变状态 (与 HTML/PDF 卡片及顶部"需关注"口径一致,
+    #    纯 info 级 issue 不改变状态 (与 HTML 卡片及顶部"需关注"口径一致,
     #    避免"徽章标警告、卡片里却只有灰色[信息]"的割裂观感)。
     #    字符串 issue 视为真实问题 (MTU/Bufferbloat/IPv6/LAN/TCPQuality 用字符串)。
     issues = result.get("issues")
@@ -11690,7 +11690,7 @@ HEADER_MAP = {
 def _record_table(v):
     """若 v 是同构字典列表(记录表), 返回 (headers, rows); 否则返回 None。
 
-    headers/rows 均为已中文化/字符串化的列表, 可直接交给 PDF/HTML 渲染。
+    headers/rows 均为已中文化/字符串化的列表, 可直接交给 HTML 渲染。
     """
     if not isinstance(v, list) or len(v) < 1:
         return None
@@ -12676,7 +12676,7 @@ def render_report_json(report, indent=2):
 
 
 # 老的 render_report_text 保留, 但 export_report 默认不再导出
-# (客户报告走 HTML/PDF/JSON, TXT 是 legacy 模式; 仍可手工调用)
+# (客户报告走 HTML/JSON, TXT 是 legacy 模式; 仍可手工调用)
 # 已存在的 render_report_text / render_report_html 保留代码, 不再被 export_report 调用
 
 

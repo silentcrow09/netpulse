@@ -14,6 +14,10 @@ reports/
 
 # ── 本地项目数据 (WorkBuddy, 含记忆/配置, 不入库) ──
 .workbuddy/
+.codefree/
+
+# ── Ookla speedtest.exe 二进制 (运行时按需探测, 不入库) ──
+speedtest/
 
 # ── 操作系统 / 编辑器 ──
 Thumbs.db
@@ -28,6 +32,7 @@ ehthumbs.db
 /_verify_*.py
 /_smoke_*.py
 /_perf_test*.py
+/nul
 
 # ── 报告优化改动留档 (一次性, 升级完就过期) ──
 # 实际改动已合入 netpulse.py, 这些文件不入仓
