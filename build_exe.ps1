@@ -103,7 +103,6 @@ $pipDisplay = if ($pip.ExtraArgs.Count -gt 0) { "$($pip.Cmd) $($pip.ExtraArgs -j
 $required = @{
     'scapy'         = 'scapy'
     'cryptography'  = 'cryptography'
-    'reportlab'     = 'reportlab'
     'pyinstaller'   = 'PyInstaller'
 }
 $missing = @()
@@ -132,7 +131,7 @@ if ($missing.Count -gt 0) {
     }
     Write-Host " 完成" -ForegroundColor Green
 } else {
-    Step-Ok "(scapy, cryptography, reportlab, pyinstaller 全部就位)"
+    Step-Ok "(scapy, cryptography, pyinstaller 全部就位)"
 }
 
 # ---- 3/6: 清理旧构建 ----
@@ -160,8 +159,6 @@ $piArgs = @(
     '--hidden-import', 'tkinter',
     '--hidden-import', 'scapy.all',
     '--collect-all', 'scapy',
-    '--hidden-import', 'reportlab',
-    '--collect-all', 'reportlab',
     '--log-level', 'WARN',
     'netpulse.py'
 )

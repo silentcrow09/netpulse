@@ -12,8 +12,5 @@ cryptography>=3.4
 # Ookla Speedtest CLI (speedtest.exe) 随发行版打包, 无需 Python 依赖
 # 旧版用 speedtest-cli Python 库, 已替换为 Ookla 官方 CLI (支持 -s <id> 指定国内服务器)
 
-# reportlab: PDF 报告导出 (可选, 缺失时自动降级导出 HTML)
-reportlab>=4.0.0
-
 # PyInstaller: 打包为单文件 exe
 pyinstaller>=6.0.0

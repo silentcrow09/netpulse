@@ -2,7 +2,7 @@
 
 > 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.0.0
 
-NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `netpulse.py` 文件即可运行**（核心功能仅依赖 Python 标准库），覆盖局域网、网关、DNS、外网、WiFi、测速、TCP、路由等常见排障场景，并可将结果导出为 HTML / PDF / TXT 报告。
+NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `netpulse.py` 文件即可运行**（核心功能仅依赖 Python 标准库），覆盖局域网、网关、DNS、外网、WiFi、测速、TCP、路由等常见排障场景，并可将结果导出为 HTML / JSON 报告（HTML 支持浏览器打印/另存为 PDF）。
 
 ## ✨ 特性
 
@@ -18,7 +18,7 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 - **测速实时可视化**：单独测速时终端实时刷新速率/进度，结束自动生成独立测速报告。
 - **原生 UDP DNS 探测**：自构造 DNS 报文，并行查询多家国内 DNS，速度快、无需 `nslookup` 进程。
 - **双运行模式**：交互式菜单（适合新手）+ 命令行参数（适合脚本/自动化）。
-- **专业报告**：导出 HTML（工程风可视化）/ PDF / TXT，按日期自动归档到 `reports/YYYY-MM-DD/`。
+- **专业报告**：导出 HTML（工程风可视化）/ JSON，按日期自动归档到 `reports/YYYY-MM-DD/`。
 - **国内网络优化**：默认检测国内 DNS（AliDNS / DNSPod / 114）与公网 IP 服务，不探测国外站点。
 - **优雅降级**：可选依赖（scapy / speedtest-cli）缺失时自动降级，不会报错退出。
 
@@ -49,13 +49,13 @@ python netpulse.py dhcp gateway dns
 
 # 按分类运行 (a=基础信息  b=宽带测速  c=故障诊断, 可组合)
 python netpulse.py a
-python netpulse.py a c --export report.pdf
+python netpulse.py a c --export report.html
 
 # 以 JSON 输出完整结果 (便于脚本解析)
 python netpulse.py all --json
 
-# 导出报告 (支持 txt / html / pdf, 逗号分隔多种格式)
-python netpulse.py all --export report.pdf,report.html,report.txt
+# 导出报告 (支持 html / json, 逗号分隔多种格式)
+python netpulse.py all --export report.html,report.json
 
 # 端口探测: 指定目标与协议
 python netpulse.py port --port-target 223.5.5.5:53,119.29.29.29:53 --port-proto both --port-count 4
@@ -143,7 +143,7 @@ python netpulse.py --install
 | `--monitor-target` | 盯障外网 ping 目标 (默认 223.5.5.5, 同时对该目标 TCP 53 建连; 可用域名) |
 | `--speedtest-node` | 指定上行测速服务器 (可选): speedtest 服务器 host:port (如 112.25.80.50:8080); 默认自动选延迟最低的国内运营商节点 |
 | `--speedtest-net` | 启用 Speedtest.net 参考测速 (默认关闭: 国内网络下常选中海外服务器, 结果严重偏低) |
-| `--export` | 诊断后导出报告，逗号分隔多格式（`report.pdf,report.html`） |
+| `--export` | 诊断后导出报告，逗号分隔多格式（`report.html,report.json`） |
 
 ## 📋 诊断模块（23 项）
 
@@ -212,10 +212,10 @@ python netpulse.py --install
 报告是给客户看的，技术细节放 JSON 单独存。**`reports/YYYY-MM-DD/`** 按日期归档。
 
 - **`--export report.html`**：客户版 HTML，含健康分、待办问题清单、关键指标、可折叠技术细节。
-- **`--export report.pdf`**：客户版 PDF，浅色主题、模块卡片化、适合打印/留档。依赖 `reportlab`；缺失或 EXE 未内置时**自动降级导出同名 HTML** 并提示原因。
+- **纸质留档**：PDF 直接导出已移除。用浏览器打开 HTML 后 `Ctrl+P` 打印或另存为 PDF（内置打印样式：技术细节全部展开、去阴影）。
 - **`--export report.json`**：技术员 / 脚本用。含完整 raw 原始数据（30 个 RTT 序列、ARP 表、路由表等）+ 阈值定义 + 健康分计算依据。
-- 多个格式可同时导：`--export report.html,report.pdf,report.json`。
-- 旧版拍平所有字段的 `.txt` 已废弃，导出 `.txt` 会提示改用 HTML/PDF/JSON。
+- 多个格式可同时导：`--export report.html,report.json`。
+- 旧版拍平所有字段的 `.txt` 已废弃，导出 `.txt` 会提示改用 HTML/JSON。
 
 示例：
 ```bash
@@ -225,8 +225,8 @@ python netpulse.py all --port-target 223.5.5.5:53 --export report.html
 # 客户版 + 技术员 JSON
 python netpulse.py all --port-target 223.5.5.5:53 --export report.html,report.json
 
-# 三种都导 (HTML + PDF + JSON)
-python netpulse.py all --port-target 223.5.5.5:53 --export report.html,report.pdf,report.json --install
+# 两种都导 (HTML + JSON)
+python netpulse.py all --port-target 223.5.5.5:53 --export report.html,report.json --install
 ```
 
 ### 报告设计要点
@@ -235,7 +235,7 @@ python netpulse.py all --port-target 223.5.5.5:53 --export report.html,report.pd
 - **待办问题清单**：按严重度排序，每条带"影响 + 建议"（如"网关延迟高 → 检查网线/WiFi 信号/路由 CPU"）。
 - **装维可读**：每个模块卡片带一句"这是测什么的、结果怎么看"的说明；行话指标（首字节/P95/并发/CPS、NAT 锥形对称等）附通俗解释；存在异常级问题时清单尾部出现**会诊指引**——现场处置无效的，提示保留 HTML+JSON 报告带回专家分析（.json 含逐跳路径、时序等完整原始数据）。
 - **关键指标**：每个模块 3-5 个，颜色按阈值（绿/黄/红）。
-- **技术细节**：HTML 默认折叠；PDF 弱化为浅灰小表；完整数据见 `.json`。
+- **技术细节**：HTML 默认折叠；完整数据见 `.json`。
 
 ### 盯障模式报告（偶发掉线取证单）
 
@@ -367,7 +367,6 @@ irm https://<bucket>.oss-cn-hangzhou.aliyuncs.com/netpulse/v1-beta/install.ps1 |
 |------|------|--------|
 | `scapy` | DHCP 完整检测（发送 Discover） | DHCP 降级为仅读取当前 DHCP 服务器 |
 | `speedtest-cli` | Speedtest.net 参考测速（可选，`--speedtest-net`） | 不启用；上行仍用内置国内节点，不受影响 |
-| `reportlab` | PDF 报告导出 | 导出 PDF 自动降级为同名 HTML（打包 EXE 内置，无需单独安装） |
 | `pyinstaller` | 打包为单文件 EXE | 不影响直接运行 |
 
 ## 💻 系统要求

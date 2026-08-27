@@ -351,7 +351,7 @@ def _pip_install_scapy(mirror=None):
 # ============================================================
 #
 # 国内网络环境下, pypi.org 经常卡到超时 (TCP RST / 极慢 / 间歇性失败),
-# 装 scapy / reportlab 等依赖会卡 5-10 分钟。自动探测并切到国内镜像:
+# 装 scapy 等依赖会卡 5-10 分钟。自动探测并切到国内镜像:
 #   1. --pip-mirror CLI 显式指定 (优先级最高)
 #   2. PIP_INDEX_URL 环境变量
 #   3. 探测国内镜像候选, 选第一个可达的
@@ -9185,7 +9185,7 @@ def _run_diagnostics_parallel(keys, max_workers, total):
 
 
 # ============================================================
-# SECTION: 诊断报告生成与导出 (TXT / HTML / PDF)
+# SECTION: 诊断报告生成与导出 (HTML / JSON)
 # ============================================================
 
 # ============================================================
@@ -11026,7 +11026,7 @@ def compute_health_score(counts, text_counts=None):
 def build_report():
     """基于最近一次诊断运行 (LAST_RUN) 构造完整报告数据结构 (双视图)。
 
-    返回结构 (供 render_report_html_customer / render_report_pdf_customer / render_report_json 使用):
+    返回结构 (供 render_report_html_customer / render_report_json 使用):
       {
         "app": ..., "version": ..., "generated_at": ...,
         "system": {local_ip, gateway, dns, public_ip, asn, geo, ipv6_public_ip},
@@ -11497,56 +11497,8 @@ footer{margin-top:32px;text-align:center;color:var(--faint);font-size:12px;
 </div></body></html>"""
 
 
-def ensure_reportlab(auto_yes=False, mirror=None):
-    """确保 reportlab 可用 (PDF 导出依赖)。缺失时提示/自动安装。
-
-    镜像选择: 走 _resolve_pip_mirror() 自动选源, 显式参数 mirror 仍可用作覆盖。
-
-    frozen (PyInstaller EXE) 场景: 无法用 sys.executable -m pip 安装
-    (sys.executable 是 EXE 本身, -m pip 无效且装到系统 Python 对 EXE 也不生效),
-    直接返回 False 并给出明确提示, 由调用方降级 (如自动导出 HTML)。
-    """
-    try:
-        import reportlab  # noqa
-        return True
-    except Exception:
-        pass
-    if getattr(sys, "frozen", False):
-        print(_c("  ⚠ 当前 EXE 版未内置 PDF 导出依赖 (reportlab)，无法导出 PDF。", C_YELLOW))
-        print(_c("    将自动降级导出 HTML 报告；如需 PDF 请用内置 reportlab 的打包版。", C_YELLOW))
-        return False
-    is_tty = sys.stdout.isatty()
-    if not is_tty and not auto_yes:
-        print(_c("  ⚠ 未安装 reportlab，无法导出 PDF。可先运行一次交互模式安装，"
-                 "或改用 --export report.html / report.txt。", C_YELLOW))
-        return False
-    print(_c("  正在准备 PDF 导出依赖 reportlab ...", C_GRAY))
-    if mirror is None:
-        mirror, source = _resolve_pip_mirror()
-        if mirror:
-            print(_c(f"  自动选源: {mirror} ({source})", C_GRAY))
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "reportlab"]
-    if mirror:
-        cmd += ["-i", mirror]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              env=os.environ.copy(), timeout=300)
-    except subprocess.TimeoutExpired:
-        print(_c("  ✗ reportlab 安装超时", C_RED)); return False
-    except Exception as e:
-        print(_c(f"  ✗ reportlab 安装异常: {e}", C_RED)); return False
-    if proc.returncode != 0:
-        print(_c("  ✗ reportlab 安装失败:", C_RED))
-        for line in (proc.stdout + proc.stderr).strip().split("\n")[-10:]:
-            if line.strip():
-                print(_c("    " + line.strip(), C_GRAY))
-        return False
-    print(_c("  ✓ reportlab 安装成功", C_GREEN))
-    return True
-
-
 def _flatten_kv(v, prefix=""):
-    """将嵌套 dict/list 扁平化为 (key, value) 列表，便于 PDF/HTML 表格展示。
+    """将嵌套 dict/list 扁平化为 (key, value) 列表，便于表格展示。
 
     - 标量值: 直接成一行。
     - 基本值列表 (如 system_dns): 在父键下一行逗号分隔。
@@ -12682,588 +12634,6 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 </html>"""
 
 
-def _register_pdf_cjk_font():
-    """注册 PDF 中文字体: 优先微软雅黑 (TTF 内嵌, 无阅读器字体依赖),
-    缺失/失败时回退 STSong-Light (CID 宋体, 不内嵌)。
-
-    返回 (font_name, has_bold):
-      - font_name: 报告正文/标题统一使用的字体名
-      - has_bold: 是否注册了独立粗体 (True 时 <b> 会真正加粗)
-    """
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-
-    windir = os.environ.get("WINDIR") or r"C:\Windows"
-    fonts_dir = os.path.join(windir, "Fonts")
-    regular = os.path.join(fonts_dir, "msyh.ttc")
-    bold = os.path.join(fonts_dir, "msyhbd.ttc")
-    try:
-        if os.path.exists(regular):
-            pdfmetrics.registerFont(TTFont("MSYaHei", regular, subfontIndex=0))
-            if os.path.exists(bold):
-                pdfmetrics.registerFont(
-                    TTFont("MSYaHei-Bold", bold, subfontIndex=0))
-                pdfmetrics.registerFontFamily(
-                    "MSYaHei", normal="MSYaHei", bold="MSYaHei-Bold",
-                    italic="MSYaHei", boldItalic="MSYaHei-Bold")
-                return "MSYaHei", True
-            # 无粗体文件: 常规字重同时充当粗体 (保证中文正常渲染)
-            pdfmetrics.registerFontFamily(
-                "MSYaHei", normal="MSYaHei", bold="MSYaHei",
-                italic="MSYaHei", boldItalic="MSYaHei")
-            return "MSYaHei", False
-    except Exception:
-        pass
-    # 回退: 宋体 CID 字体 (不内嵌, 依赖阅读器内置字体)
-    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
-    return "STSong-Light", False
-
-
-def render_report_pdf(report, path, auto_install=False, pip_mirror=None):
-    """客户版 PDF 报告 (浅色主题 + 模块卡片, 内置中文字体微软雅黑)。
-
-    与老版的差异:
-      - 用 build_report 的双视图 (customer_view + tech_view), 不再吃 raw result
-      - 每模块: 状态徽章 + 结论 + 3-5 个关键指标 + 问题/建议
-      - PDF 不能折叠, 技术细节弱化为浅灰小表 (工程师看 JSON 拿完整数据)
-      - 顶部加健康分大字, 待办问题单独成块
-
-    auto_install: True 时 reportlab 缺失会自动 pip install
-    pip_mirror: 显式指定 pip 镜像 URL
-    """
-    if not ensure_reportlab(auto_yes=auto_install, mirror=pip_mirror):
-        return False
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import mm
-    from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame,
-                                    Paragraph, Spacer, Table, TableStyle,
-                                    KeepTogether, HRFlowable, CondPageBreak)
-
-    FONT, _has_bold = _register_pdf_cjk_font()
-
-    # ── 配色 (与 HTML 客户版一致) ──
-    C_INK = colors.HexColor("#1e293b")
-    C_SUB = colors.HexColor("#64748b")
-    C_FAINT = colors.HexColor("#94a3b8")
-    C_LINE = colors.HexColor("#e2e8f0")
-    C_CARD = colors.HexColor("#f6f8fa")
-    C_BAND = colors.HexColor("#1e3a8a")
-    C_PRI = colors.HexColor("#2563eb")
-    C_PRI_DEEP = colors.HexColor("#1e40af")
-    C_PRI_SOFT = colors.HexColor("#dbeafe")
-    C_OK = colors.HexColor("#16a34a")
-    C_WARN = colors.HexColor("#ea580c")
-    C_ERR = colors.HexColor("#dc2626")
-    C_FATAL = colors.HexColor("#7f1d1d")
-    C_IDLE = colors.HexColor("#94a3b8")
-    SC = {"完成": C_OK, "警告": C_WARN, "异常": C_ERR, "错误": C_FATAL,
-          "未检测": C_IDLE}
-    SC_HEX = {"完成": "#16a34a", "警告": "#ea580c", "异常": "#dc2626",
-              "错误": "#7f1d1d", "未检测": "#94a3b8"}
-    SC_SOFT = {"完成": "#dcfce7", "警告": "#fed7aa", "异常": "#fecaca",
-               "错误": "#fecaca", "未检测": "#e2e8f0"}
-
-    # ── 样式 ──
-    h_title = ParagraphStyle("h_title", fontName=FONT, fontSize=18,
-                             textColor=colors.white, leading=22, spaceAfter=0)
-    h_sub = ParagraphStyle("h_sub", fontName=FONT, fontSize=8.5,
-                           textColor=colors.HexColor("#9db8e8"), leading=12)
-    h_score = ParagraphStyle("h_score", fontName=FONT, fontSize=26,
-                             textColor=colors.white, leading=30, alignment=1)
-    h_score_lbl = ParagraphStyle("h_score_lbl", fontName=FONT, fontSize=9,
-                                 textColor=colors.HexColor("#c6d6f0"), leading=12,
-                                 alignment=1)
-    sec = ParagraphStyle("sec", fontName=FONT, fontSize=13,
-                         textColor=C_INK, leading=17, spaceBefore=12, spaceAfter=6)
-    lbl = ParagraphStyle("lbl", fontName=FONT, fontSize=9,
-                         textColor=C_SUB, leading=13)
-    val = ParagraphStyle("val", fontName=FONT, fontSize=9.5, textColor=C_INK, leading=13)
-    val_bold = ParagraphStyle("val_bold", fontName=FONT, fontSize=10,
-                              textColor=C_INK, leading=13, fontWeight="bold")
-    mod_title = ParagraphStyle("mt", fontName=FONT, fontSize=11.5,
-                               textColor=C_INK, leading=15)
-    mod_sub = ParagraphStyle("ms", fontName=FONT, fontSize=9,
-                            textColor=C_SUB, leading=13, spaceBefore=2)
-    th = ParagraphStyle("th", fontName=FONT, fontSize=8.5,
-                        textColor=C_PRI_DEEP, leading=12)
-    cell = ParagraphStyle("cell", fontName=FONT, fontSize=8.5,
-                          textColor=C_INK, leading=12)
-    concl = ParagraphStyle("concl", fontName=FONT, fontSize=9.5,
-                           textColor=C_INK, leading=14)
-    err_style = ParagraphStyle("err", fontName=FONT, fontSize=9,
-                               textColor=C_ERR, leading=13, spaceBefore=1)
-    warn_style = ParagraphStyle("warn", fontName=FONT, fontSize=9,
-                                textColor=C_WARN, leading=13, spaceBefore=1)
-    action_style = ParagraphStyle("act", fontName=FONT, fontSize=8.5,
-                                  textColor=colors.HexColor("#0c4a6e"),
-                                  leading=12, spaceBefore=1)
-    badge_style = ParagraphStyle("badge", fontName=FONT, fontSize=8.5,
-                                 textColor=colors.white, leading=11, alignment=1)
-    detail_cap = ParagraphStyle("detail_cap", fontName=FONT, fontSize=8,
-                                textColor=C_FAINT, leading=11, spaceBefore=2)
-    detail_sec = ParagraphStyle("detail_sec", fontName=FONT, fontSize=8,
-                                textColor=C_SUB, leading=11, spaceBefore=3,
-                                spaceAfter=1)
-    tech_cell = ParagraphStyle("tech_cell", fontName=FONT, fontSize=7.5,
-                               textColor=C_INK, leading=10)
-    metric_lbl = ParagraphStyle("mlbl", fontName=FONT, fontSize=8.5,
-                                textColor=C_SUB, leading=12)
-    metric_val_ok = ParagraphStyle("mv_ok", fontName=FONT, fontSize=10,
-                                  textColor=C_OK, leading=13, alignment=0)
-    metric_val_warn = ParagraphStyle("mv_warn", fontName=FONT, fontSize=10,
-                                    textColor=C_WARN, leading=13, alignment=0)
-    metric_val_err = ParagraphStyle("mv_err", fontName=FONT, fontSize=10,
-                                   textColor=C_ERR, leading=13, alignment=0)
-    metric_val_idle = ParagraphStyle("mv_idle", fontName=FONT, fontSize=10,
-                                     textColor=C_IDLE, leading=13, alignment=0)
-    metric_val_map = {"ok": metric_val_ok, "warn": metric_val_warn,
-                      "err": metric_val_err, "idle": metric_val_idle}
-
-    def _badge(status, width=24 * mm):
-        c = SC_HEX.get(status, "#57606a")
-        t = Table([[Paragraph(f"<b>{status}</b>", badge_style)]], colWidths=[width])
-        t.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(c)),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
-        return t
-
-    def _stat_cards(cnt):
-        order = ["完成", "警告", "异常", "错误", "未检测"]
-        items = [(k, cnt.get(k, 0)) for k in order if cnt.get(k, 0)]
-        if not items:
-            items = [("未检测", 0)]
-        n = len(items)
-        cw = content_w / n
-        row = []
-        for k, v in items:
-            soft = colors.HexColor(SC_SOFT.get(k, "#f1f3f7"))
-            fg = colors.HexColor(SC_HEX.get(k, "#8a94a6"))
-            sn = ParagraphStyle("sn", fontName=FONT, fontSize=17,
-                                textColor=fg, leading=21, alignment=1)
-            sl = ParagraphStyle("sl", fontName=FONT, fontSize=8.5,
-                                textColor=fg, leading=11, alignment=1)
-            inner = Table(
-                [[Paragraph(f"<b>{v}</b>", sn)],
-                 [Paragraph(k, sl)]],
-                colWidths=[cw])
-            inner.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), soft),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("TOPPADDING", (0, 0), (-1, 0), 7),
-                ("BOTTOMPADDING", (0, -1), (-1, -1), 8)]))
-            row.append(inner)
-        t = Table([row], colWidths=[cw] * n)
-        t.setStyle(TableStyle([
-            ("LEFTPADDING", (0, 0), (-1, -1), 3),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-            ("TOPPADDING", (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
-        return t
-
-    def _fmt_val(vv, max_len=80):
-        """把原始值格式化为适合 PDF 的简短字符串, 避免 Python repr。"""
-        # 嵌套 list/dict 用 _humanize_cell 摘要, 避免裸 JSON / repr
-        if isinstance(vv, (list, dict)):
-            s = _humanize_cell(vv, max_len=max_len)
-        elif isinstance(vv, tuple):
-            s = ", ".join(str(x) for x in vv)
-        else:
-            s = str(vv)
-        return s[:max_len]
-
-    g = report["generated_at"].strftime("%Y-%m-%d %H:%M:%S")
-    PW, PH = A4
-    LM = RM = 14 * mm
-    TM = 16 * mm
-    BM = 14 * mm
-
-    def _on_page(canvas, doc_):
-        canvas.saveState()
-        canvas.setStrokeColor(C_LINE)
-        canvas.setLineWidth(0.5)
-        canvas.line(LM, BM - 4 * mm, PW - RM, BM - 4 * mm)
-        canvas.setFont(FONT, 7.5)
-        canvas.setFillColor(C_FAINT)
-        canvas.drawString(LM, BM - 8 * mm,
-                          f"{report['app']} / {report['version']} · 自动生成诊断报告")
-        canvas.drawRightString(PW - RM, BM - 8 * mm, f"第 {doc_.page} 页")
-        canvas.restoreState()
-
-    doc = BaseDocTemplate(path, pagesize=A4, leftMargin=LM, rightMargin=RM,
-                          topMargin=TM, bottomMargin=BM,
-                          title=f"{report['app']} 诊断报告")
-    frame = Frame(LM, BM, PW - LM - RM, PH - TM - BM, id="main")
-    doc.addPageTemplates([PageTemplate(id="all", frames=[frame], onPage=_on_page)])
-
-    flow = []
-    content_w = PW - LM - RM
-
-    sys_i = report["system"]
-    health = report["health"]
-    counts = report["counts"]
-    modules = report["modules"]
-
-    # ── 页眉深带 (含健康分) ──
-    score_box = Table(
-        [[Paragraph(f"<b>{health['score']}</b>", h_score)],
-         [Paragraph(f"{health['grade']} · {health['label']}", h_score_lbl)]],
-        colWidths=[36 * mm], rowHeights=[28 * mm, 8 * mm])
-    score_box.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#2563eb")),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("VALIGN", (0, 0), (0, 0), "MIDDLE"),
-        ("VALIGN", (0, 1), (0, 1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, 0), 6),
-        ("BOTTOMPADDING", (0, 1), (-1, 1), 8)]))
-
-    header = Table(
-        [[Paragraph(f"<b>{report['app']}</b><br/>{report['version']}",
-                    h_title),
-          score_box],
-         [Paragraph(f"<b>网络诊断报告</b><br/>"
-                    f"生成时间: {g}<br/>"
-                    f"健康分: {health['score']} / 100 ({health['grade']})",
-                    h_sub),
-          Paragraph("", h_sub)]],
-        colWidths=[content_w - 36 * mm, 36 * mm])
-    header.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), C_BAND),
-        ("SPAN", (0, 1), (-1, 1)),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 10),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-        ("TOPPADDING", (0, 0), (-1, -1), 9),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 9)]))
-    flow.append(header)
-    flow.append(Spacer(1, 10))
-
-    # ── 待办问题 (按严重度) ──
-    todo_issues = []
-    for m in modules:
-        for issue in m.get("issues", []):
-            todo_issues.append({**issue, "_module": m["name"]})
-    sev_order = {"异常": 0, "错误": 0, "警告": 1, "信息": 2}
-    todo_issues.sort(key=lambda i: sev_order.get(i.get("severity", "信息"), 3))
-
-    if todo_issues:
-        flow.append(Paragraph(
-            f"<b>需要您关注 ({len(todo_issues)} 项)</b>", sec))
-        todo_rows = []
-        todo_rows.append([
-            Paragraph("<b>严重度</b>", th),
-            Paragraph("<b>问题</b>", th),
-            Paragraph("<b>建议</b>", th),
-        ])
-        for issue in todo_issues[:10]:
-            sev = issue.get("severity", "信息")
-            sev_color = {"异常": "#dc2626", "错误": "#7f1d1d",
-                         "警告": "#ea580c", "信息": "#64748b"}.get(sev, "#64748b")
-            todo_rows.append([
-                Paragraph(f"<b><font color='{sev_color}'>{sev}</font></b>", cell),
-                Paragraph(f"<b>{issue.get('text', '')}</b>", cell),
-                Paragraph(issue.get("action", "—") or "—", cell),
-            ])
-        todo_t = Table(todo_rows,
-                       colWidths=[16 * mm, (content_w - 16 * mm) * 0.45,
-                                  (content_w - 16 * mm) * 0.55],
-                       repeatRows=1)
-        todo_t.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), C_PRI_SOFT),
-            ("BOX", (0, 0), (-1, -1), 0.5, C_LINE),
-            ("LINEBELOW", (0, 0), (-1, -1), 0.3, C_LINE),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ]))
-        flow.append(todo_t)
-        flow.append(Spacer(1, 6))
-    else:
-        flow.append(Paragraph("<b>所有检测通过</b>", sec))
-        flow.append(Paragraph(
-            "<font color='#16a34a'>网络状态良好，所有 18 项检测均正常，无需特别处理。</font>",
-            mod_sub))
-        flow.append(Spacer(1, 6))
-
-    # ── 主机信息 + 状态统计卡 ──
-    flow.append(Paragraph("<b>主机信息</b>", sec))
-    sys_pairs = [
-        ("本机 IP", sys_i.get("local_ip", "未知")),
-        ("默认网关", sys_i.get("gateway", "未知")),
-        ("DNS", sys_i.get("dns", "未知")),
-        ("公网 IP", sys_i.get("public_ip", "未知")),
-    ]
-    if sys_i.get("asn") or sys_i.get("geo"):
-        loc = []
-        if sys_i.get("geo"):
-            loc.append(sys_i["geo"])
-        if sys_i.get("asn"):
-            loc.append(sys_i["asn"])
-        sys_pairs.append(("出口位置", " / ".join(loc)))
-    if sys_i.get("ipv6_public_ip"):
-        sys_pairs.append(("IPv6 公网", sys_i["ipv6_public_ip"]))
-
-    # 2 列布局, 每行 2 项
-    rows = []
-    for i in range(0, len(sys_pairs), 2):
-        row = [Paragraph("<b>" + sys_pairs[i][0] + "</b>", lbl),
-               Paragraph(sys_pairs[i][1], val)]
-        if i + 1 < len(sys_pairs):
-            row += [Paragraph("<b>" + sys_pairs[i + 1][0] + "</b>", lbl),
-                    Paragraph(sys_pairs[i + 1][1], val)]
-        else:
-            row += [Paragraph("", lbl), Paragraph("", val)]
-        rows.append(row)
-    if not rows:
-        rows = [[Paragraph("(无)", val), Paragraph("", val),
-                 Paragraph("", lbl), Paragraph("", val)]]
-    st = Table(rows, colWidths=[22 * mm, (content_w - 44 * mm) / 2,
-                                 22 * mm, (content_w - 44 * mm) / 2])
-    st.setStyle(TableStyle([
-        ("FONTNAME", (0, 0), (-1, -1), FONT),
-        ("BACKGROUND", (0, 0), (-1, -1), C_CARD),
-        ("BOX", (0, 0), (-1, -1), 0.5, C_LINE),
-        ("INNERGRID", (0, 0), (-1, -1), 0.5, C_LINE),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6)]))
-    flow.append(st)
-    flow.append(Spacer(1, 6))
-
-    flow.append(Paragraph("<b>检测汇总</b>", sec))
-    flow.append(_stat_cards(counts))
-    flow.append(Spacer(1, 6))
-    total = len(modules)
-    ok_n = counts.get("完成", 0)
-    flow.append(Paragraph(
-        f"共 {total} 项检测, 其中 <b>{ok_n}</b> 项正常、"
-        f"<b>{counts.get('警告',0)}</b> 项警告、"
-        f"<b>{counts.get('异常',0)+counts.get('错误',0)}</b> 项异常。"
-        f" {health['verdict']}。",
-        mod_sub))
-
-    # ── 详细结果 (每模块一张卡片) ──
-    flow.append(Paragraph("<b>详细结果</b>", sec))
-    flow.append(HRFlowable(width="100%", thickness=0.5, color=C_LINE,
-                           spaceBefore=0, spaceAfter=6))
-
-    for m in modules:
-        status = m["status"]
-        c = SC.get(status, C_IDLE)
-        verdict = m.get("verdict", "")
-
-        # ── 标题条 (仅 1 行的小块, KeepTogether 不会造成大段空白) ──
-        dot = Table([[""]], colWidths=[3 * mm], rowHeights=[3 * mm])
-        dot.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), c),
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-            ("TOPPADDING", (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
-        heading = Table(
-            [[dot, Paragraph(f"<b>{m['name']}</b>", mod_title),
-              _badge(status)]],
-            colWidths=[5 * mm, content_w - 29 * mm, 24 * mm])
-        heading.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-            ("LINEBEFORE", (0, 0), (0, -1), 3, c)]))
-        # 接近页底时先分页, 避免标题孤行; 不会因整块 KeepTogether 留大空白
-        flow.append(CondPageBreak(22 * mm))
-        flow.append(KeepTogether(heading))
-        flow.append(Spacer(1, 3))
-
-        # 结论 (流式段落, 可跨页)
-        if verdict:
-            flow.append(Paragraph(
-                f"<font color='{SC_HEX.get(status, '#1e40af')}'>"
-                f"<b>结论</b></font>　{_html_esc(verdict)}", concl))
-            flow.append(Spacer(1, 3))
-
-        # 模块说明 (装维视角: 这是在测什么、结果怎么看)
-        explain = MODULE_EXPLAINS.get(m.get("key", ""), "")
-        if explain:
-            flow.append(Paragraph(
-                f"<font size=7.5 color='#64748b'>📖 {_html_esc(explain)}</font>", concl))
-            flow.append(Spacer(1, 3))
-
-        # 关键指标 (流式 2 列键值表, 行可拆分, 不整体 KeepTogether)
-        metrics = m.get("key_metrics", [])
-        if metrics:
-            mrows = []
-            for me in metrics:
-                # 与 HTML 口径一致: 空值指标 (—/N/A/无) 不占行
-                if str(me.get("value", "")).strip() in ("—", "N/A", "无", ""):
-                    continue
-                lvl = me.get("level", "ok")
-                vstyle = metric_val_map.get(lvl, metric_val_ok)
-                hint = me.get("hint", "")
-                vtext = me.get("value", "")
-                # PDF 是静态文档无悬停: 所有 hint 全部内联 (自包含),
-                # 换小号浅色字与数值区分, 不影响主体可读性
-                if hint:
-                    vtext += (f"  <font size=7 color='#64748b'>"
-                              f"{_html_esc(hint)}</font>")
-                mrows.append([
-                    Paragraph(_html_esc(me.get("label", "")), metric_lbl),
-                    Paragraph(vtext, vstyle)])
-            mt = Table(mrows, colWidths=[52 * mm, content_w - 52 * mm])
-            mt.setStyle(TableStyle([
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LINEBELOW", (0, 0), (-1, -1), 0.3, C_LINE),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-                ("LEFTPADDING", (0, 0), (-1, -1), 2),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4)]))
-            flow.append(mt)
-            flow.append(Spacer(1, 4))
-
-        # 问题/建议 (流式段落)
-        issues = m.get("issues", [])
-        for issue in issues:
-            sev = issue.get("severity", "信息")
-            text = issue.get("text", "")
-            impact = issue.get("impact", "")
-            action = issue.get("action", "")
-            sev_color = {"异常": "#dc2626", "错误": "#7f1d1d",
-                         "警告": "#ea580c", "信息": "#64748b"}.get(sev, "#64748b")
-            bullet = Table([[""]], colWidths=[2.5 * mm], rowHeights=[2.5 * mm])
-            bullet.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(sev_color)),
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                ("TOPPADDING", (0, 0), (-1, -1), 0),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
-            flow.append(Table(
-                [[bullet, Paragraph(
-                    f"<b><font color='{sev_color}'>[{sev}]</font></b> "
-                    f"{_html_esc(text)}",
-                    warn_style if sev == "警告" else err_style)]],
-                colWidths=[5 * mm, content_w - 5 * mm]))
-            if impact:
-                flow.append(Paragraph(
-                    f"<b>影响:</b> {_html_esc(impact)}", cell))
-            if action:
-                flow.append(Paragraph(
-                    f"<b><font color='#b45309'>建议:</font></b> "
-                    f"{_html_esc(action)}", action_style))
-            flow.append(Spacer(1, 2))
-
-        # 技术细节 (简化摘要, 表格可拆分跨页; 完整数据见 JSON)
-        if m.get("has_tech_details"):
-            pres = MODULE_PRESENTATION.get(m["key"], {})
-            tech_keys = pres.get("tech_keys", [])
-            raw = m.get("raw", {})
-            tech_elems = []
-            for k in tech_keys:
-                v = raw.get(k)
-                if v is None:
-                    continue
-                if isinstance(v, (list, dict, tuple)) and not v:
-                    continue
-                label = HEADER_MAP.get(k, k)
-                tech_elems.append(Paragraph(
-                    f"<b>{_html_esc(label)}</b>", detail_sec))
-
-                if isinstance(v, list) and v:
-                    if all(isinstance(x, dict) for x in v):
-                        rt = _record_table(v)
-                    else:
-                        rt = None
-                    if rt:
-                        headers, rows = rt
-                        show = rows[:5]
-                        cell_data = [[Paragraph(_html_esc(h), th)
-                                      for h in headers]]
-                        for r in show:
-                            cell_data.append([
-                                Paragraph(_html_esc(str(c)[:60]), tech_cell)
-                                for c in r])
-                        n_cols = len(headers)
-                        cw = (content_w - 12) / max(n_cols, 1)
-                        rtbl = Table(cell_data,
-                                     colWidths=[cw] * n_cols,
-                                     repeatRows=1)
-                        rtbl.setStyle(TableStyle([
-                            ("BACKGROUND", (0, 0), (-1, 0), C_PRI_SOFT),
-                            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                            ("BOX", (0, 0), (-1, -1), 0.4, C_LINE),
-                            ("INNERGRID", (0, 0), (-1, -1), 0.3, C_LINE),
-                            ("TOPPADDING", (0, 0), (-1, -1), 3),
-                            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-                            ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                        ]))
-                        tech_elems.append(Spacer(1, 2))
-                        tech_elems.append(rtbl)
-                        if len(rows) > 5:
-                            tech_elems.append(Paragraph(
-                                f"<font color='#94a3b8'>"
-                                f"⋯ 还有 {len(rows) - 5} 行, 详见 JSON 报告</font>",
-                                detail_cap))
-                        continue
-                    s = ", ".join(str(x) for x in v)
-                    tech_elems.append(Paragraph(_html_esc(s[:150]), tech_cell))
-                    continue
-
-                if isinstance(v, dict):
-                    pairs = []
-                    for kk, vv in list(v.items())[:6]:
-                        if vv is None or vv == "":
-                            continue
-                        pairs.append((HEADER_MAP.get(kk, kk),
-                                      _fmt_val(vv, 80)))
-                    if pairs:
-                        p_rows = []
-                        for lbl, val in pairs:
-                            p_rows.append([
-                                Paragraph(f"<b>{_html_esc(lbl)}</b>",
-                                          metric_lbl),
-                                Paragraph(_html_esc(val), tech_cell)])
-                        ptbl = Table(p_rows,
-                                     colWidths=[40 * mm,
-                                                content_w - 40 * mm])
-                        ptbl.setStyle(TableStyle([
-                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                            ("TOPPADDING", (0, 0), (-1, -1), 1),
-                            ("BOTTOMPADDING", (0, 0), (-1, -1), 1)]))
-                        tech_elems.append(Spacer(1, 2))
-                        tech_elems.append(ptbl)
-                else:
-                    tech_elems.append(Paragraph(
-                        _html_esc(str(v)[:150]), tech_cell))
-
-            if tech_elems:
-                flow.append(Spacer(1, 3))
-                flow.append(Paragraph(
-                    "<font color='#94a3b8'>"
-                    "技术细节（完整数据见 .json 报告）</font>", detail_cap))
-                for elem in tech_elems:
-                    flow.append(elem)
-
-        flow.append(Spacer(1, 8))
-        flow.append(HRFlowable(width="100%", thickness=0.4, color=C_LINE,
-                               spaceBefore=1, spaceAfter=6))
-
-    doc.build(flow)
-    return True
-
-
 # ============================================================
 # JSON 报告 (技术员/脚本用, 包含 raw 原始数据 + 阈值定义)
 # ============================================================
@@ -13341,19 +12711,18 @@ def _normalize_report_path(path):
     return path
 
 
-def export_report(path, auto_install=False, pip_mirror=None):
-    """按扩展名导出客户版报告: .html / .pdf / .json。
+def export_report(path):
+    """按扩展名导出客户版报告: .html / .json。
 
     客户版设计:
       - .html → 客户版 HTML (健康分 + 问题清单 + 关键指标 + 折叠技术细节)
-      - .pdf  → 客户版 PDF (浅色主题, 适合打印/归档)
       - .json → 技术员/脚本用 (含 raw 原始数据 + 阈值定义)
+
+    PDF 直接导出已移除; 需要纸质留档时, 用浏览器打开 HTML 后 Ctrl+P
+    打印或另存为 PDF (打印样式已内置: 技术细节全部展开、去阴影配色)。
 
     老的 .txt 报告 (拍平所有数据) 已废弃, 导出 .txt 现在会返回错误提示。
     如需旧格式, 请手动调用 render_report_text()。
-
-    auto_install: True 时允许 PDF 导出时自动 pip install reportlab
-    pip_mirror: 显式指定 pip 镜像 (CLI --pip-mirror)
     """
     path = _normalize_report_path(path)
     report = build_report()
@@ -13361,21 +12730,7 @@ def export_report(path, auto_install=False, pip_mirror=None):
         return "尚无诊断数据，无法生成报告（请先运行诊断）"
     ext = os.path.splitext(path)[1].lower()
     try:
-        if ext == ".pdf":
-            ok = render_report_pdf(report, path, auto_install=auto_install,
-                                   pip_mirror=pip_mirror)
-            if ok:
-                return None
-            # 降级: 自动导出同名 HTML, 保证用户总能拿到可读报告
-            html_path = os.path.splitext(path)[0] + ".html"
-            try:
-                with open(html_path, "w", encoding="utf-8") as f:
-                    f.write(render_report_html_customer(report))
-                return ("PDF 导出失败（reportlab 未就绪），已自动降级导出 HTML: "
-                        + os.path.abspath(html_path))
-            except Exception as e2:
-                return f"PDF 导出失败: {e2}"
-        elif ext in (".html", ".htm"):
+        if ext in (".html", ".htm"):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(render_report_html_customer(report))
             return None
@@ -13383,45 +12738,36 @@ def export_report(path, auto_install=False, pip_mirror=None):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(render_report_json(report))
             return None
+        elif ext == ".pdf":
+            return ("PDF 直接导出已移除。请导出 .html 后用浏览器打开, "
+                    "Ctrl+P 打印或另存为 PDF。")
         elif ext == ".txt":
-            return ("TXT 客户版未提供, 改用 --export report.html / .pdf / .json。"
-                    "如需旧拍平格式, 可手动调用 render_report_text()。")
+            return "TXT 客户版未提供, 改用 --export report.html / .json。"
         else:
-            return f"不支持的扩展名: {ext} (支持: .html / .pdf / .json)"
+            return f"不支持的扩展名: {ext} (支持: .html / .json)"
     except Exception as e:
         return f"导出失败: {e}"
 
 
-def prompt_export_report(auto_install=False, pip_mirror=None):
+def prompt_export_report():
     """交互菜单跑完后, 询问是否将本次诊断导出为报告文件。
 
-    优化: 默认直接生成 HTML (最常用格式), 一次回车即可;
-    输入 p 改 PDF, t 改 TXT, 其他输入均按默认 HTML 处理。
-
-    auto_install: True 时 PDF 导出允许自动安装 reportlab
-    (例如 CLI 加了 --install, 在交互菜单中也保持一致行为)。
-    pip_mirror: 透传给 export_report。
+    默认直接生成 HTML (最常用格式), 一次回车即可;
+    输入 t 改 TXT(会提示不支持), 其他输入均按默认 HTML 处理。
     """
     if not LAST_RUN:
         return
     try:
-        ans = input(_c("  生成诊断报告? [Enter=HTML / p=PDF / t=TXT / N=不导出] ",
+        ans = input(_c("  生成诊断报告? [Enter=HTML / t=TXT / N=不导出] ",
                        C_GREEN)).strip().lower()
     except (EOFError, KeyboardInterrupt):
         return
     if ans in ("n", "no", "q", "quit"):
         return
-    # 默认 HTML, p=PDF, t=TXT
-    ext = ".html"
-    if ans in ("p", "pdf"):
-        ext = ".pdf"
-    elif ans in ("t", "txt"):
-        ext = ".txt"
+    ext = ".txt" if ans in ("t", "txt") else ".html"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    default_name = f"netdiag_report_{ts}{ext}"
-    # 直接用默认文件名, 不再问 (减少一轮输入; 文件名带时间戳不会重名)
-    name = default_name
-    err = export_report(name, auto_install=auto_install, pip_mirror=pip_mirror)
+    name = f"netdiag_report_{ts}{ext}"
+    err = export_report(name)
     if err:
         print(_c(f"  ✗ {err}", C_RED))
     else:
@@ -13446,8 +12792,8 @@ def interactive_menu(install=False, pip_mirror=None):
     """交互式数字选择菜单 (cmd 窗口)。
 
     install: 是否允许在交互过程中自动安装缺失依赖
-             (与 CLI --install 联动, 让 PDF 导出等行为可预测)。
-    pip_mirror: 透传给 ensure_scapy / ensure_reportlab。
+             (与 CLI --install 联动)。
+    pip_mirror: 透传给 ensure_scapy。
 
     并发策略:
       - 选 0 / 选多个模块 -> 默认并发 (跟 CLI `all --parallel` 对齐,
@@ -13547,7 +12893,7 @@ def interactive_menu(install=False, pip_mirror=None):
             if not LAST_RUN:
                 print(_c("  尚无诊断数据，请先运行一次诊断。", C_YELLOW))
             else:
-                prompt_export_report(auto_install=install, pip_mirror=pip_mirror)
+                prompt_export_report()
             try:
                 input(_c("  按 Enter 返回菜单...", C_GRAY))
             except (EOFError, KeyboardInterrupt):
@@ -13616,7 +12962,7 @@ def interactive_menu(install=False, pip_mirror=None):
                 print(_c(f"  测速报告已自动保存至 reports/ 目录 ({keys[0]}_时间戳.html/.json)。",
                          C_GRAY))
             else:
-                prompt_export_report(auto_install=install, pip_mirror=pip_mirror)
+                prompt_export_report()
         try:
             input(_c("\n  按 Enter 返回菜单...", C_GRAY))
         except (EOFError, KeyboardInterrupt):
@@ -13661,8 +13007,8 @@ def main():
                         help="端口探测内部并发度 (默认 8, 1=串行, 上限 64)。"
                              "并发下 60s 内能扫 20-50 个端口, 串行只扫 4-5 个")
     parser.add_argument("--export", metavar="FILE",
-                        help="诊断后将报告导出到文件 (支持 .txt / .html / .pdf); "
-                             "多个目标用逗号分隔可一次导出多种格式, 例: report.pdf,report.html,report.txt")
+                        help="诊断后将报告导出到文件 (支持 .html / .json); "
+                             "多个目标用逗号分隔可一次导出多种格式, 例: report.html,report.json")
     parser.add_argument("--parallel", action="store_true",
                         help="多模块并发执行 (典型场景: `all` 时速度提升 2-3x; "
                              "输出经线程锁同步, 详细结果仍按 keys 顺序排列)")
@@ -13806,8 +13152,7 @@ def main():
             if not targets:
                 targets = [args.export]
             for t in targets:
-                err = export_report(t, auto_install=args.install,
-                                    pip_mirror=args.pip_mirror)
+                err = export_report(t)
                 if err:
                     print(_c(f"  ✗ {err}", C_RED))
                 else:
