@@ -11842,6 +11842,150 @@ def _render_html_tech_block(key, raw_result, tech_keys, auto_open=True):
     return "".join(out)
 
 
+# ============================================================
+# HTML 报告图表辅助: 纯 SVG, 离线可打开, 无外部依赖
+# 数据不足时返回空串, 由调用方决定隐藏对应图表卡
+# ============================================================
+def _html_status_color(status):
+    """状态中文 -> HTML 颜色 (导航点 / 图表共用)。"""
+    return {
+        "完成": "#16a34a", "警告": "#d97706", "异常": "#dc2626",
+        "错误": "#7f1d1d", "未检测": "#94a3b8",
+    }.get(status, "#94a3b8")
+
+
+def _svg_health_ring(score):
+    """健康分环形进度图 (r=54, 周长≈339.3)。配色随分数: ≥90 绿, ≥70 橙, 其余红。"""
+    score = max(0, min(100, int(score or 0)))
+    c = 2 * 3.14159265 * 54
+    off = c * (1 - score / 100.0)
+    color = "#16a34a" if score >= 90 else "#d97706" if score >= 70 else "#dc2626"
+    return (f'<svg width="132" height="132" viewBox="0 0 132 132">'
+            f'<circle class="track" cx="66" cy="66" r="54"/>'
+            f'<circle class="bar" cx="66" cy="66" r="54" stroke="{color}" '
+            f'stroke-dasharray="{c:.2f}" stroke-dashoffset="{off:.2f}"/></svg>')
+
+
+def _svg_ping_line(rtts):
+    """网关逐次 ping 延迟折线图。成功样本 <3 时返回空串。
+
+    注意: 丢包时刻无法从 ping 输出精确还原 (rtts 只含成功样本),
+    故折线只画成功样本, 峰值用红点标注。
+    """
+    vals = [float(x) for x in (rtts or [])
+            if isinstance(x, (int, float)) and x >= 0]
+    if len(vals) < 3:
+        return ""
+    W, H = 420, 120
+    top, bot = 12, 16
+    vmax = max(vals)
+    ceil = max(50.0, vmax * 1.25)
+
+    def _y(v):
+        return H - bot - (v / ceil) * (H - top - bot)
+
+    step = W / (len(vals) - 1)
+    pts = " ".join(f"{i * step:.1f},{_y(v):.1f}"
+                   for i, v in enumerate(vals))
+    max_i = vals.index(vmax)
+    area = (f'<polygon points="{pts} {W},{H:.1f} 0,{H:.1f}" '
+            f'fill="url(#np-grad)"/>')
+    return (f'<svg width="100%" height="120" viewBox="0 0 {W} {H}" preserveAspectRatio="none">'
+            f'<defs><linearGradient id="np-grad" x1="0" y1="0" x2="0" y2="1">'
+            f'<stop offset="0" stop-color="#2563eb" stop-opacity=".25"/>'
+            f'<stop offset="1" stop-color="#2563eb" stop-opacity="0"/></linearGradient></defs>'
+            f'<line x1="0" y1="{_y(ceil):.1f}" x2="{W}" y2="{_y(ceil):.1f}" '
+            f'stroke="#e6e9f0" stroke-width="1"/>'
+            f'<line x1="0" y1="{H - bot:.1f}" x2="{W}" y2="{H - bot:.1f}" '
+            f'stroke="#e6e9f0" stroke-width="1"/>'
+            f'{area}'
+            f'<polyline points="{pts}" fill="none" stroke="#2563eb" stroke-width="2"/>'
+            f'<circle cx="{max_i * step:.1f}" cy="{_y(vmax):.1f}" r="3.5" fill="#dc2626"/>'
+            f'<text x="4" y="{_y(ceil) - 4:.1f}" font-size="10" fill="#94a3b8">{ceil:.0f}ms</text>'
+            f'</svg>')
+
+
+def _svg_speed_bars(raw):
+    """测速下载/上传条形图。download/upload 均为 0 时返回空串。"""
+    if not raw:
+        return ""
+    dl = raw.get("download_mbps")
+    ul = raw.get("upload_mbps")
+    dl = float(dl) if isinstance(dl, (int, float)) else 0.0
+    ul = float(ul) if isinstance(ul, (int, float)) else 0.0
+    if dl <= 0 and ul <= 0:
+        return ""
+    scale = max(dl, ul, 1.0) * 1.15
+    bw = 258.0
+    w_dl = bw * min(dl / scale, 1.0)
+    w_ul = bw * min(ul / scale, 1.0)
+    lat = raw.get("server_latency_ms")
+    lat_s = f"{lat:g}ms" if isinstance(lat, (int, float)) else "—"
+    jit = raw.get("jitter_ms")
+    jit_s = f"{jit:g}ms" if isinstance(jit, (int, float)) else "—"
+    loss = raw.get("packet_loss_pct")
+    loss_s = f"{loss:g}%" if isinstance(loss, (int, float)) else "0%"
+    return (f'<svg width="100%" height="120" viewBox="0 0 300 120" preserveAspectRatio="none">'
+            f'<text x="0" y="14" font-size="10" fill="#94a3b8">下载 {dl:g} Mbps</text>'
+            f'<rect x="0" y="20" width="{bw:.1f}" height="22" rx="6" fill="#dbeafe"/>'
+            f'<rect x="0" y="20" width="{w_dl:.1f}" height="22" rx="6" fill="#2563eb"/>'
+            f'<text x="0" y="64" font-size="10" fill="#94a3b8">上传 {ul:g} Mbps</text>'
+            f'<rect x="0" y="70" width="{bw:.1f}" height="22" rx="6" fill="#fef3c7"/>'
+            f'<rect x="0" y="70" width="{w_ul:.1f}" height="22" rx="6" fill="#d97706"/>'
+            f'<text x="0" y="112" font-size="10" fill="#94a3b8">延迟 {lat_s} · 抖动 {jit_s} · 丢包 {loss_s}</text>'
+            f'</svg>')
+
+
+def _svg_status_bar(all_counts):
+    """模块状态分布堆叠条 (全口径 counts)。无数据时返回空串。"""
+    order = [("完成", "#16a34a"), ("警告", "#d97706"), ("异常", "#dc2626"),
+             ("错误", "#7f1d1d"), ("未检测", "#94a3b8")]
+    total = sum(all_counts.values())
+    if total <= 0:
+        return ""
+    x = 0.0
+    rects = []
+    for k, color in order:
+        v = all_counts.get(k, 0)
+        if v <= 0:
+            continue
+        w = v / total * 1000
+        rects.append(f'<rect x="{x:.1f}" y="0" width="{w - 0.6:.1f}" '
+                     f'height="34" rx="6" fill="{color}"/>')
+        x += w
+    return (f'<svg width="100%" height="46" viewBox="0 0 1000 46" '
+            f'preserveAspectRatio="none">{"".join(rects)}</svg>')
+
+
+def _build_report_nav(report):
+    """左侧浮动导航: 固定条目 + 按 MODULE_CATEGORIES 分组的模块树。"""
+    by_key = {m["key"]: m for m in report["modules"]}
+    fixed = [
+        ("报告概览", "#overview", "#2563eb"),
+        ("待办问题", "#todo", "#dc2626"),
+        ("状态统计", "#stats", "#f59e0b"),
+        ("关键指标图", "#charts", "#0284c7"),
+        ("检测结果一览", "#list", "#64748b"),
+    ]
+    out = ['<div class="g">导航</div>']
+    for name, href, color in fixed:
+        out.append(f'<a href="{href}"><span class="st" '
+                   f'style="background:{color}"></span>{name}</a>')
+    for cat, keys, _desc in MODULE_CATEGORIES:
+        out.append(f'<div class="grp">{_html_esc(cat)}</div>')
+        out.append('<div class="mods">')
+        for key in keys:
+            m = by_key.get(key)
+            st = m["status"] if m else "未检测"
+            name = m["name"] if m else key
+            color = _html_status_color(st)
+            out.append(f'<a href="#mod-{_html_esc(key)}">'
+                       f'<span class="st" style="background:{color}"></span>'
+                       f'{_html_esc(name)}</a>')
+        out.append('</div>')
+    return "".join(out)
+
+
 # 常见英文工具原句 → 中文 (代理检测的 netsh/注册表输出等)
 _EN_ZH_MAP = {
     "direct access (no proxy server).": "直连 (未配置代理)",
@@ -12035,19 +12179,6 @@ def render_report_html_customer(report):
     输入: build_report() 的输出 (双视图)
     输出: 完整可独立打开的 HTML 字符串
     """
-    # 评分卡配色: 90+=绿, 70-89=橙, <70=红
-    def _score_class(score):
-        if score >= 90:
-            return "score-90"
-        elif score >= 80:
-            return "score-80"
-        elif score >= 70:
-            return "score-70"
-        elif score >= 60:
-            return "score-60"
-        else:
-            return "score-50"
-
     if not report:
         return "<p>尚无诊断数据，请先运行诊断</p>"
 
@@ -12062,41 +12193,57 @@ def render_report_html_customer(report):
     SKEY = {"完成": "ok", "警告": "warn", "异常": "err", "错误": "fatal", "未检测": "idle"}
     SC = {"ok": "#16a34a", "warn": "#ea580c", "err": "#dc2626", "fatal": "#7f1d1d", "idle": "#94a3b8"}
 
-    # ── 顶部 hero ──
-    geo_line = ""
-    if sys_i.get("asn") or sys_i.get("geo"):
-        geo_bits = []
-        if sys_i.get("geo"):
-            geo_bits.append(sys_i["geo"])
-        if sys_i.get("asn"):
-            geo_bits.append(sys_i["asn"])
-        geo_line = f"<div class='chips'><span class='chip'>📍 {' / '.join(geo_bits)}</span></div>"
-    ipv6_line = ""
-    if sys_i.get("ipv6_public_ip"):
-        ipv6_line = (f"<div class='chips'><span class='chip'>"
-                     f"IPv6: {_html_esc(sys_i['ipv6_public_ip'])}</span></div>")
+    # ── 顶部 hero (方案 A: 白卡 + SVG 环形健康分) ──
+    nav_html = _build_report_nav(report)
 
-    host_line = f"本机 {_html_esc(sys_i.get('local_ip', '?'))} · 公网 {_html_esc(sys_i.get('public_ip', '?'))}"
+    # meta chips: 本机 / 网关 / 公网 / DNS / 出口位置 / IPv6
+    hero_meta = []
+    hero_meta.append(f"本机 <b>{_html_esc(sys_i.get('local_ip') or '?')}</b>")
+    if sys_i.get("gateway"):
+        hero_meta.append(f"网关 <b>{_html_esc(sys_i['gateway'])}</b>")
+    if sys_i.get("public_ip"):
+        hero_meta.append(f"公网 <b>{_html_esc(sys_i['public_ip'])}</b>")
     if sys_i.get("dns"):
-        host_line += f" · DNS {_html_esc(sys_i['dns'])}"
+        hero_meta.append(f"DNS <b>{_html_esc(sys_i['dns'])}</b>")
+    if sys_i.get("asn") or sys_i.get("geo"):
+        hero_meta.append(f"📍 <b>{_html_esc(' / '.join(x for x in (sys_i.get('geo'), sys_i.get('asn')) if x))}</b>")
+    if sys_i.get("ipv6_public_ip"):
+        hero_meta.append(f"IPv6 <b>{_html_esc(sys_i['ipv6_public_ip'])}</b>")
+    meta_chips = "".join(f"<span>{m}</span>" for m in hero_meta)
 
+    score = health.get("score", 0)
+    score_ring = _svg_health_ring(score)
     hero = f"""
-<header class="hero">
-  <div class="hero-left">
-    <div class="brand"><span class="logo"></span>
-      <span class="brand-name">{_html_esc(report['app'])}</span>
-      <span class="ver">v{_html_esc(report['version'])}</span></div>
+<header class="hero" id="overview">
+  <div style="flex:1;min-width:0">
+    <div class="app"><div class="mark"></div>
+      <b>{_html_esc(report['app'])}</b><span class="ver">v{_html_esc(report['version'])}</span></div>
     <h1>网络诊断报告</h1>
-    <div class="sub">生成于 {_html_esc(g)}</div>
-    <div class="chips"><span class="chip">{host_line}</span></div>
-    {geo_line}
-    {ipv6_line}
+    <div class="sub">{_html_esc(health.get('verdict', ''))} · 生成于 {_html_esc(g)}</div>
+    <div class="meta">{meta_chips}</div>
   </div>
-  <div class="score {_html_esc(_score_class(health["score"]))}">
-    <div class="score-num">{health['score']}</div>
-    <div class="score-label">{_html_esc(health['verdict'])}</div>
+  <div class="gauge">
+    {score_ring}
+    <div class="in"><div class="num">{score}</div><div class="lbl">{_html_esc(health.get('label', ''))}</div></div>
   </div>
 </header>"""
+
+    # ── 信息条 (模块总数 / 豁免 / 扣分项 / 生成时间) ──
+    all_counts = {}
+    for m in modules:
+        all_counts[m["status"]] = all_counts.get(m["status"], 0) + 1
+    total_modules = len(modules)
+    exempt_count = report.get("exempt_count", 0) or 0
+    err_cnt = all_counts.get("异常", 0) + all_counts.get("错误", 0)
+    warn_cnt = all_counts.get("警告", 0)
+    band_bits = [f"共 <b>{total_modules}</b> 个模块"]
+    if exempt_count:
+        band_bits.append(f"评分豁免 <b>{exempt_count}</b>（iperf3 / ipv6 / proxy / nattype）")
+    if err_cnt or warn_cnt:
+        band_bits.append(f"扣分项 <b>{err_cnt}</b> 异常级 / <b>{warn_cnt}</b> 警告级")
+    band_bits.append(f"生成于 <b>{_html_esc(g)}</b>")
+    band_html = ('<div class="band">' +
+                 '<span class="sep"></span>'.join(band_bits) + '</div>')
 
     # ── 待办问题 ──
     # 1) 收集所有 issue; 2) 按 (severity, text) 去重避免多模块重复同一警告;
@@ -12173,18 +12320,18 @@ def render_report_html_customer(report):
         info_extra = (f" <span class='extra-count'>({'；'.join(extra_bits)})</span>"
                       if extra_bits else "")
         todo_section = f"""
-<div class="sec"><h2><span class="icon">⚠</span>{len(need_attention)} 项需要您关注{info_extra}</h2></div>
+<div class="sec" id="todo"><h2><span class="icon">⚠</span>{len(need_attention)} 项需要您关注{info_extra}</h2></div>
 <div class="todo">{"".join(todo_blocks)}</div>"""
     elif todo_issues:
         todo_section = """
-<div class="sec"><h2><span class="icon">✓</span>所有核心检测通过</h2></div>
+<div class="sec" id="todo"><h2><span class="icon">✓</span>所有核心检测通过</h2></div>
 <div class="todo ok">
   <div class="todo-head">✓ 网络状态良好</div>
   <div class="impact">所有核心检测均正常, 部分提示项可在下方模块详情查看。</div>
 </div>"""
     else:
         todo_section = f"""
-<div class="sec"><h2><span class="icon">✓</span>所有检测通过</h2></div>
+<div class="sec" id="todo"><h2><span class="icon">✓</span>所有检测通过</h2></div>
 <div class="todo ok">
   <div class="todo-head">✓ 网络状态良好</div>
   <div class="impact">全部 {len(modules)} 项检测均正常, 无需特别处理。</div>
@@ -12200,9 +12347,8 @@ def render_report_html_customer(report):
         f"<div class='label'>{k}</div></div>"
         for k, v in stat_items
     )
-    # 模块总数 + 豁免模块数 (避免 stats-grid 只显示 17+1 误导用户以为只剩 18 个模块)
-    total_modules = len(modules)
-    exempt_count = report.get("exempt_count", 0) or 0
+    # 模块总数 + 豁免模块数 (已在 hero 段计算 total_modules / exempt_count,
+    # 避免 stats-grid 只显示部分模块误导用户以为模块变少了)
     stats_caption = ""
     if total_modules:
         if exempt_count:
@@ -12210,6 +12356,7 @@ def render_report_html_customer(report):
         else:
             stats_caption = f"<div class='stats-caption'>共 {total_modules} 个模块</div>"
     stats_section = f"""
+<div class="sec" id="stats"><h2><span class="icon">📊</span>状态统计</h2></div>
 <div class="stats-grid">{stat_cards}</div>{stats_caption}"""
 
     # ── 检测结果一览 ──
@@ -12230,8 +12377,55 @@ def render_report_html_customer(report):
             f"</li>"
         )
     overview_section = f"""
-<div class="sec"><h2><span class="icon">📋</span>检测结果一览</h2></div>
+<div class="sec" id="list"><h2><span class="icon">📋</span>检测结果一览</h2></div>
 <div class="overview"><ul>{"".join(overview_items)}</ul></div>"""
+
+    # ── 图表区 (纯 SVG, 数据不足时对应图卡自动隐藏) ──
+    chart_cards = []
+
+    gateway_raw = next((m.get("raw", {}) for m in modules
+                        if m["key"] == "gateway"), {})
+    ping_info = (gateway_raw or {}).get("ping") or {}
+    ping_rtts = ping_info.get("rtts") or []
+    ping_chart = _svg_ping_line(ping_rtts)
+    if ping_chart:
+        cap_bits = [f"共 {len(ping_rtts)} 次成功样本"]
+        if isinstance(ping_info.get("avg_ms"), (int, float)):
+            cap_bits.append(f"平均 {ping_info['avg_ms']}ms")
+        if isinstance(ping_info.get("loss_pct"), (int, float)) \
+                and ping_info.get("loss_pct", 0) > 0:
+            cap_bits.append(f"丢包 {ping_info['loss_pct']}%")
+        chart_cards.append(
+            f"<div class='chart'><h4>网关延迟时间序列 <span class='tag'>逐次 Ping</span></h4>"
+            f"{ping_chart}<div class='cap'>" + " · ".join(cap_bits) + "。</div></div>")
+
+    speed_raw = next((m.get("raw", {}) for m in modules
+                      if m["key"] == "speedtest"), {})
+    speed_chart = _svg_speed_bars(speed_raw)
+    if speed_chart:
+        method = "Ookla 官方节点" if speed_raw.get("method") == "ookla" else "国内节点"
+        cap_bits = []
+        if isinstance(speed_raw.get("download_mbps"), (int, float)):
+            cap_bits.append(f"下载 {speed_raw['download_mbps']:g} Mbps")
+        if isinstance(speed_raw.get("upload_mbps"), (int, float)):
+            cap_bits.append(f"上传 {speed_raw['upload_mbps']:g} Mbps")
+        chart_cards.append(
+            f"<div class='chart'><h4>宽带测速 <span class='tag'>{_html_esc(method)}</span></h4>"
+            f"{speed_chart}<div class='cap'>" + " · ".join(cap_bits) + "。</div></div>")
+
+    status_chart = _svg_status_bar(all_counts)
+    if status_chart:
+        dist = " · ".join(f"{k} {v}" for k, v in all_counts.items())
+        chart_cards.append(
+            f"<div class='chart wide'><h4>状态分布 <span class='tag'>{total_modules} 模块</span></h4>"
+            f"{status_chart}<div class='cap'>" + dist
+            + ("（含评分豁免模块）" if exempt_count else "") + "</div></div>")
+
+    if chart_cards:
+        charts_section = (f'<div class="sec" id="charts"><h2><span class="icon">📈</span>关键指标图</h2></div>'
+                          f'<div class="charts">{"".join(chart_cards)}</div>')
+    else:
+        charts_section = ""
 
     # ── 详细模块 ──
     mod_blocks = []
@@ -12320,13 +12514,15 @@ def render_report_html_customer(report):
         else:
             issues_html = ""
 
-        # 技术细节折叠 (默认展开, 便于装维留档时一眼看全; 用户可手动折叠)
+        # 技术细节折叠: 问题模块默认展开, 正常模块默认折叠
+        problem_status = st in ("警告", "异常", "错误")
         tech_html = ""
         if m.get("has_tech_details"):
             pres = MODULE_PRESENTATION.get(m["key"], {})
             tech_keys = pres.get("tech_keys", [])
             tech_html = _render_html_tech_block(
-                m["key"], m.get("raw", {}), tech_keys, auto_open=True)
+                m["key"], m.get("raw", {}), tech_keys,
+                auto_open=problem_status)
 
         # WiFi 等模块原始数据全空时, 给出友好提示而非空列表
         empty_note_html = ""
@@ -12337,7 +12533,7 @@ def render_report_html_customer(report):
             if not nets and not chans:
                 empty_note_html = "<div class='impact-line warn'><b>[提示]</b> 当前未连接 Wi-Fi, 因此未扫描周边网络与信道占用 (这是正常现象, 而非故障)。</div>"
 
-        # 整个模块卡
+        # 整个模块卡 (方案 A: details 折叠, 问题模块自动展开)
         verdict = m.get("verdict", "")
         explain = MODULE_EXPLAINS.get(m["key"], "")
         explain_html = (f"<div class='explain'>📖 {_html_esc(explain)}</div>"
@@ -12351,14 +12547,17 @@ def render_report_html_customer(report):
             "idle": "○"
         }
         mod_icon = mod_icons.get(sk, "○")
+        open_attr = " open" if problem_status else ""
         mod_blocks.append(f"""
-<div class="mod {sk}" id="mod-{_html_esc(m["key"])}">
-  <div class="mod-head">
-    <div class="mod-icon {sk}">{mod_icon}</div>
-    <div class="name">{_html_esc(m['name'])}<a class="anchor" href="#mod-{_html_esc(m["key"])}" title="复制此模块链接" aria-label="复制 {_html_esc(m['name'])} 模块链接">🔗</a></div>
-    <span class="badge {sk}">{_html_esc(st)}</span>
-  </div>
-  <div class="mod-body">
+<details class="mod {sk}" id="mod-{_html_esc(m["key"])}"{open_attr}>
+  <summary>
+    <span class="ic {sk}">{mod_icon}</span>
+    <span class="nm">{_html_esc(m['name'])}</span>
+    <span class="vd">{_html_esc(verdict)}</span>
+    <span class="b {sk}">{_html_esc(st)}</span>
+    <span class="arr">▸</span>
+  </summary>
+  <div class="bd">
     <div class="verdict"><span class="tag">结论</span>{_html_esc(verdict)}</div>
     {explain_html}
     {metrics_html}
@@ -12366,10 +12565,13 @@ def render_report_html_customer(report):
     {empty_note_html}
     {tech_html}
   </div>
-</div>""")
+</details>""")
 
+    # 问题模块自动展开, 正常模块折叠 — 在章节标题给出提示
+    problem_cnt = sum(1 for m in modules if m["status"] in ("警告", "异常", "错误"))
     modules_section = f"""
-<div class="sec"><h2><span class="icon">🔍</span>详细结果</h2></div>
+<div class="sec" id="modules"><h2><span class="icon">🔍</span>详细结果
+<span class="cnt">{problem_cnt} 个问题模块已展开 · 正常模块点击展开</span></h2></div>
 {"".join(mod_blocks)}"""
 
     # ── 主机信息 ──
@@ -12395,7 +12597,7 @@ def render_report_html_customer(report):
         for lab, val in sys_pairs
     )
     host_section = f"""
-<div class="sec"><h2><span class="icon">🖥</span>主机信息</h2></div>
+<div class="sec" id="host"><h2><span class="icon">🖥</span>主机信息</h2></div>
 <div class="host-grid">{host_cards}</div>"""
 
     # ── 诊断标准表 (THRESHOLDS + _metrics_linkspeed 硬编码阈值, 折叠显示) ──
@@ -12435,7 +12637,7 @@ def render_report_html_customer(report):
 </div>
 </details>"""
 
-    # ── CSS ──
+    # ── CSS (方案 A: 晨雾浅色仪表盘) ──
     CSS = """
 *{box-sizing:border-box;margin:0;padding:0;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 .skip-link{position:absolute;left:-9999px;top:0;z-index:9999;background:#0a1628;color:#fff;padding:8px 16px;text-decoration:none;border-radius:0 0 8px 0}
@@ -12444,81 +12646,128 @@ def render_report_html_customer(report):
 *{animation:none!important;transition:none!important}
 }
 /* 报告需可离线打开: 全部使用系统字体, 不引入任何在线资源 */
-body{background:linear-gradient(180deg,#f8fafc 0%,#e2e8f0 100%);color:#1e293b;font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding:32px 16px 80px}
-.wrap{max-width:900px;margin:0 auto}
-.hero{background:linear-gradient(135deg,#0b1f3a 0%,#153e6b 55%,#1d4e89 100%);color:#fff;padding:36px 40px;display:grid;grid-template-columns:1fr auto;gap:32px;align-items:center;border-radius:20px;box-shadow:0 12px 32px -12px rgba(11,31,58,.45);margin-bottom:28px;position:relative;overflow:hidden}
-.hero::before{content:'';position:absolute;top:-50%;right:-15%;width:420px;height:420px;background:radial-gradient(circle,rgba(96,165,250,.22) 0%,transparent 70%);pointer-events:none}
-.hero h1{font-size:26px;font-weight:800;letter-spacing:.5px;margin:10px 0 4px}
-.hero .brand{display:flex;align-items:center;gap:9px}
-.hero .logo{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#7ab3f5,#3b82f6);display:inline-block;position:relative;flex:none}
-.hero .logo::after{content:'';position:absolute;inset:6px;border:2px solid rgba(255,255,255,.92);border-radius:3px}
-.hero .brand-name{font-size:15px;font-weight:700;color:#dbeafe;letter-spacing:.3px}
-.hero .ver{font-size:11px;font-weight:600;color:#bfdbfe;background:rgba(255,255,255,.14);padding:1px 9px;border-radius:999px}
-.hero .sub{font-size:13px;color:#9db8dd;margin-bottom:14px}
-.hero .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
-.hero .chip{font-size:12px;color:#cfe0f5;background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.14);border-radius:999px;padding:3px 12px;font-family:'JetBrains Mono',Cascadia Mono,Consolas,monospace}
-.score{background:rgba(255,255,255,.1);backdrop-filter:blur(20px);border-radius:16px;padding:22px 30px;text-align:center;min-width:150px;border:1px solid rgba(255,255,255,.22);position:relative;z-index:1}.score.score-90{background:linear-gradient(135deg,rgba(16,185,129,.3),rgba(5,150,105,.4))}.score.score-80{background:linear-gradient(135deg,rgba(16,185,129,.25),rgba(5,150,105,.35))}.score.score-70{background:linear-gradient(135deg,rgba(245,158,11,.3),rgba(217,119,6,.4))}.score.score-60,.score.score-50{background:linear-gradient(135deg,rgba(239,68,68,.35),rgba(220,38,38,.45))}
-.score-num{font-size:56px;font-weight:900;line-height:1;font-variant-numeric:tabular-nums}
-.score.score-90 .score-num{color:#34d399}.score.score-80 .score-num{color:#6ee7b7}.score.score-70 .score-num{color:#fbbf24}.score.score-60 .score-num,.score.score-50 .score-num{color:#f87171}
-.score-label{font-size:13px;opacity:.9;margin-top:4px}
-.sec{margin:32px 0 12px}
-.sec h2{font-size:18px;font-weight:700;display:flex;align-items:center;gap:8px;color:#111827}
-.sec h2 .icon{width:28px;height:28px;border-radius:8px;background:#e0e7ff;color:#4338ca;display:inline-flex;align-items:center;justify-content:center;font-size:14px}.sec h2 .extra-count{font-size:12px;font-weight:400;color:#64748b;margin-left:6px}
-.stats-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin-bottom:8px}
-.stats-caption{text-align:center;font-size:11.5px;color:#94a3b8;margin-bottom:24px}
-.stat-card{background:#fff;border-radius:12px;padding:16px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.08);border:1px solid #e5e7eb;transition:transform .2s,box-shadow .2s}
-.stat-card:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.12)}
-.stat-card .count{font-size:32px;font-weight:800}
-.stat-card.ok .count{color:#10b981}.stat-card.warn .count{color:#f59e0b}.stat-card.err .count,.stat-card.danger .count{color:#ef4444}.stat-card.info .count{color:#6b7280}
-.stat-card .label{font-size:12px;color:#9ca3af;margin-top:2px}
-.todo{background:#fff;border-radius:20px;padding:24px;margin-bottom:32px;box-shadow:0 1px 3px rgba(0,0,0,.08);border:1px solid #e5e7eb}
-.todo.ok{background:linear-gradient(180deg,#f0fdf4 0%,#f7fee7 100%);border-color:#bbf7d0}
+body{background:#eef1f6;color:#1e293b;font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding-bottom:60px}
+/* ── 左侧浮动导航 ── */
+.nav{position:fixed;left:18px;top:18px;bottom:18px;width:236px;background:#fff;border:1px solid #e6e9f0;border-radius:18px;padding:18px 14px;overflow-y:auto;z-index:50;box-shadow:0 8px 28px -14px rgba(15,23,42,.16)}
+.nav::-webkit-scrollbar{width:4px}.nav::-webkit-scrollbar-thumb{background:#d7dce6;border-radius:2px}
+.nav .logo{display:flex;align-items:center;gap:9px;padding:2px 6px 16px;border-bottom:1px solid #eef1f5;margin-bottom:12px}
+.nav .logo .mark{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,#7ab3f5,#2563eb);position:relative;flex:none}
+.nav .logo .mark::after{content:'';position:absolute;inset:7px;border:2px solid rgba(255,255,255,.9);border-radius:4px}
+.nav .logo b{font-size:15px;letter-spacing:.3px;display:block}
+.nav .logo span{font-size:10.5px;color:#94a3b8;display:block;font-weight:500}
+.nav .g{font-size:10.5px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;padding:10px 8px 5px}
+.nav a{display:flex;align-items:center;gap:9px;padding:6.5px 10px;border-radius:9px;color:#1e293b;text-decoration:none;font-size:12.8px;line-height:1.3}
+.nav a .st{width:7px;height:7px;border-radius:50%;flex:none}
+.nav a:hover{background:#f4f6fa}
+.nav a.on{background:#dbeafe;color:#1d4ed8;font-weight:600}
+.nav .grp{margin:8px 0 2px;font-size:11px;color:#94a3b8;padding:4px 10px 2px;display:flex;align-items:center;gap:6px}
+.nav .grp::after{content:'';flex:1;height:1px;background:#eef1f5}
+.nav .mods a{padding:5px 10px 5px 26px;font-size:12.3px}
+.nav .foot{margin-top:14px;padding:10px 8px 2px;border-top:1px solid #eef1f5;font-size:10.5px;color:#94a3b8;line-height:1.7}
+/* ── 主区 ── */
+.main{margin-left:282px;margin-right:24px;max-width:1060px}
+/* ── 头部 hero ── */
+.hero{background:#fff;border:1px solid #e6e9f0;border-radius:22px;padding:30px 36px;margin-top:18px;display:flex;gap:36px;align-items:center;box-shadow:0 10px 34px -18px rgba(15,23,42,.2)}
+.hero h1{font-size:26px;font-weight:800;letter-spacing:.3px}
+.hero .app{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.hero .app .mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,#7ab3f5,#2563eb);position:relative}
+.hero .app .mark::after{content:'';position:absolute;inset:8px;border:2px solid #fff;border-radius:4px}
+.hero .app b{font-size:16px}
+.hero .ver{font-size:11px;color:#3b82f6;background:#dbeafe;padding:1px 9px;border-radius:999px;font-weight:600}
+.hero .sub{font-size:12.5px;color:#64748b;margin-top:2px}
+.hero .meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
+.hero .meta span{font-size:12px;color:#64748b;background:#f4f6fa;border:1px solid #e6e9f0;border-radius:999px;padding:2.5px 11px;font-family:Cascadia Mono,Consolas,monospace}
+.hero .meta span b{color:#1e293b;font-weight:600}
+/* 分数环形 */
+.gauge{position:relative;width:132px;height:132px;flex:none;margin-left:auto}
+.gauge svg{transform:rotate(-90deg)}
+.gauge .track{fill:none;stroke:#eef1f6;stroke-width:11}
+.gauge .bar{fill:none;stroke-width:11;stroke-linecap:round}
+.gauge .in{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px}
+.gauge .num{font-size:38px;font-weight:900;color:#1e293b;font-variant-numeric:tabular-nums;line-height:1}
+.gauge .lbl{font-size:12px;font-weight:700;color:#b45309;background:#fef3c7;padding:1px 10px;border-radius:999px}
+/* 信息条 */
+.band{background:linear-gradient(90deg,#0f2a52,#1d4ed8);color:#e2ebfb;border-radius:16px;padding:16px 24px;margin:14px 0 26px;display:flex;gap:8px 28px;flex-wrap:wrap;align-items:center;font-size:12.5px}
+.band b{color:#fff}
+.band .sep{width:1px;height:14px;background:rgba(255,255,255,.25)}
+/* 分区标题 */
+.sec{margin:34px 0 12px}
+.sec h2{font-size:17px;font-weight:800;display:flex;align-items:center;gap:10px;color:#111827}
+.sec h2 .icon{width:26px;height:26px;border-radius:8px;background:#e0e7ff;color:#4338ca;display:inline-flex;align-items:center;justify-content:center;font-size:13px}
+.sec h2 .extra-count{font-size:12px;font-weight:400;color:#64748b;margin-left:6px}
+.sec h2 .cnt{font-size:11.5px;color:#94a3b8;font-weight:500;margin-left:auto}
+/* 待办问题 */
+.todo{background:#fff;border:1px solid #e6e9f0;border-radius:16px;padding:6px 22px 14px}
+.todo.ok{background:linear-gradient(180deg,#f0fdf4,#f7fee7);border-color:#bbf7d0}
 .todo-head{font-size:15px;font-weight:700;color:#991b1b;margin-bottom:12px}
 .todo.ok .todo-head{color:#166534}
-.issue{padding:12px 0;border-top:1px dashed #fecaca}
-.issue:first-of-type{border-top:none;padding-top:0}
+.issue{padding:13px 0;border-top:1px dashed #fecaca}
+.issue:first-of-type{border-top:none;padding-top:14px}
 .issue.ok{border-top-color:#bbf7d0}
-.issue h3{font-size:14.5px;font-weight:700;color:#7f1d1d;margin-bottom:4px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.issue h3{font-size:14px;font-weight:700;color:#7f1d1d;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-bottom:2px}
 .issue.ok h3{color:#166534}
-.issue .sev{display:inline-block;padding:2px 10px;border-radius:999px;font-size:11px;font-weight:700;background:#dc2626;color:#fff}
+.issue .sev{display:inline-block;padding:2px 10px;border-radius:999px;font-size:10.5px;font-weight:700;background:#dc2626;color:#fff;flex:none}
 .issue.warn .sev{background:#ea580c}
 .issue.info .sev{background:#64748b}
-.issue .meta{font-size:11.5px;color:#94a3b8;margin-bottom:6px}
-.issue .impact{font-size:12.5px;color:#991b1b;margin:4px 0 6px;padding:6px 10px;background:rgba(255,255,255,.6);border-radius:6px}
-.issue.ok .impact{color:#166534}
-.issue .action{font-size:12.5px;color:#1e293b;padding:8px 12px;background:#fffbeb;border-left:3px solid #f59e0b;border-radius:0 6px 6px 0;line-height:1.7}
+.issue .meta{font-size:11.5px;color:#94a3b8;margin:2px 0 4px}
+.issue .impact{font-size:12.5px;color:#991b1b;margin:4px 0 6px;padding:6px 10px;background:#fef2f2;border-radius:6px;line-height:1.7}
+.issue.ok .impact{color:#166534;background:#f0fdf4}
+.issue .action{font-size:12.5px;color:#0c4a6e;padding:7px 12px;background:#f0f9ff;border-left:3px solid #0284c7;border-radius:0 8px 8px 0;line-height:1.7}
 .issue.consult{border-top:1px dashed #fecaca}
-.overview{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:6px 0;margin-bottom:8px;box-shadow:0 1px 3px rgba(15,23,42,.05)}
+/* 统计卡 */
+.stats-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:8px}
+.stats-caption{text-align:center;font-size:11.5px;color:#94a3b8;margin-bottom:24px}
+.stat-card{background:#fff;border:1px solid #e6e9f0;border-radius:14px;padding:14px 8px;text-align:center}
+.stat-card .count{font-size:30px;font-weight:800;font-variant-numeric:tabular-nums}
+.stat-card.ok .count{color:#16a34a}.stat-card.warn .count{color:#d97706}.stat-card.err .count,.stat-card.danger .count{color:#dc2626}.stat-card.info .count{color:#6b7280}
+.stat-card .label{font-size:11.5px;color:#94a3b8;margin-top:2px}
+/* 图表区 */
+.charts{display:grid;grid-template-columns:1.1fr .9fr;gap:14px}
+.chart{background:#fff;border:1px solid #e6e9f0;border-radius:16px;padding:18px 20px}
+.chart h4{font-size:13px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px;color:#1e293b}
+.chart h4 .tag{font-size:10px;background:#eef2ff;color:#4338ca;border-radius:6px;padding:1px 8px;font-weight:600;margin-left:auto}
+.chart .cap{font-size:11px;color:#94a3b8;margin-top:8px}
+.chart.wide{grid-column:1/-1}
+/* 检测结果一览 */
+.overview{background:#fff;border:1px solid #e6e9f0;border-radius:16px;overflow:hidden}
 .overview ul{list-style:none}
-.overview li{padding:0;border-bottom:1px solid #f1f5f9;font-size:13.5px}
+.overview li{border-bottom:1px solid #f1f5f9;font-size:13.5px}
 .overview li:last-child{border-bottom:none}
-.overview li a{padding:10px 22px;display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none;transition:background .1s;line-height:1.4}
+.overview li a{padding:9px 20px;display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none;line-height:1.4}
 .overview li a:hover{background:#f8fafc}
 .overview li a:hover .name{color:#2563eb}
-.overview .name{font-weight:600;min-width:130px;color:#0f172a;line-height:1.4}
-.overview .verdict{color:#475569;flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.4}
+.overview .name{font-weight:600;min-width:110px;color:#0f172a;line-height:1.4}
+.overview .verdict{color:#475569;flex:1;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.4}
 .overview .badge{padding:2px 11px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.5px;flex:none;line-height:1.4}
-.badge.ok{background:#dcfce7;color:#15803d}
-.badge.warn{background:#fed7aa;color:#9a3412}
-.badge.err{background:#fecaca;color:#991b1b}
-.badge.fatal{background:#7f1d1d;color:#fff}
-.badge.idle{background:#e2e8f0;color:#475569}
-.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
-.dot.ok{background:#16a34a}.dot.warn{background:#ea580c}.dot.err{background:#dc2626}.dot.fatal{background:#7f1d1d}.dot.idle{background:#94a3b8}
-.mod{background:#fff;border:1px solid #e2e8f0;border-radius:20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08);border:1px solid #e5e7eb;overflow:hidden;transition:box-shadow .2s}
-.mod:hover{box-shadow:0 4px 12px rgba(0,0,0,.1)}
-.mod-head{padding:16px 24px;display:flex;align-items:center;gap:16px;border-bottom:1px solid #f3f4f6;background:#fafbfc}
-.mod-icon{width:40px;height:40px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px}
-.mod-icon.ok{background:#d1fae5}.mod-icon.warn{background:#fef3c7}.mod-icon.err{background:#fee2e2}.mod-icon.info{background:#f3f4f6}
-.mod-head .name{font-size:16px;font-weight:700;color:#111827;flex:1}.mod-head .subtitle{font-size:12px;color:#9ca3af}
-.mod-head a.anchor{color:#94a3b8;font-size:13px;text-decoration:none;margin-left:6px}.mod-head a.anchor:hover{color:#2563eb}.mod{scroll-margin-top:80px}
-.mod-head .badge{margin-left:auto;padding:4px 14px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:.5px}
-.mod-body{padding:24px}
-.verdict{font-size:14px;line-height:1.7;color:#1e293b;margin-bottom:12px}
-.explain{font-size:12px;line-height:1.7;color:#64748b;background:#f8fafc;border-left:3px solid #cbd5e1;padding:7px 12px;border-radius:0 6px 6px 0;margin:-4px 0 12px 0}
-.verdict .tag{display:inline-block;padding:2px 9px;border-radius:5px;font-size:11px;font-weight:700;background:#e0e7ff;color:#4338ca;margin-right:8px;vertical-align:1px}
-.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:8px}
-.metric{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 13px;display:flex;flex-direction:column;align-items:flex-start;gap:3px;min-width:0}
+.badge.ok,.b.ok{background:#dcfce7;color:#15803d}
+.badge.warn,.b.warn{background:#fef3c7;color:#9a3412}
+.badge.err,.b.err{background:#fee2e2;color:#991b1b}
+.badge.fatal,.b.fatal{background:#fecaca;color:#7f1d1d}
+.badge.idle,.b.idle{background:#e2e8f0;color:#475569}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
+.dot.ok{background:#16a34a}.dot.warn{background:#d97706}.dot.err{background:#dc2626}.dot.fatal{background:#7f1d1d}.dot.idle{background:#94a3b8}
+/* 模块卡 (details 折叠, 问题模块自动展开) */
+details.mod{background:#fff;border:1px solid #e6e9f0;border-radius:16px;margin-bottom:12px;overflow:hidden;box-shadow:0 1px 2px rgba(15,23,42,.04);scroll-margin-top:16px}
+details.mod[open]{border-color:#c7cbd8}
+details.mod>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:12px;padding:14px 20px;user-select:none}
+details.mod>summary::-webkit-details-marker{display:none}
+details.mod>summary .ic{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:16px;flex:none}
+details.mod.ok>summary .ic{background:#dcfce7;color:#15803d}
+details.mod.warn>summary .ic{background:#fef3c7;color:#b45309}
+details.mod.err>summary .ic{background:#fee2e2;color:#b91c1c}
+details.mod.fatal>summary .ic{background:#7f1d1d;color:#fff}
+details.mod.idle>summary .ic{background:#f1f5f9;color:#64748b}
+details.mod>summary .nm{font-size:14.5px;font-weight:700;flex:none}
+details.mod>summary .vd{font-size:12px;color:#64748b;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+details.mod>summary .b{font-size:11px;font-weight:700;padding:2px 11px;border-radius:999px;flex:none}
+details.mod>summary .arr{color:#94a3b8;font-size:11px;transition:transform .15s}
+details.mod[open]>summary .arr{transform:rotate(90deg)}
+details.mod>.bd{padding:4px 22px 20px;border-top:1px dashed #e6e9f0}
+details.mod .verdict{font-size:13.5px;color:#1e293b;padding:12px 0 4px;line-height:1.7}
+details.mod .verdict .tag{display:inline-block;font-size:10.5px;font-weight:700;background:#eef2ff;color:#4338ca;border-radius:5px;padding:1px 8px;margin-right:8px}
+.explain{font-size:12px;line-height:1.7;color:#64748b;background:#f8fafc;border-left:3px solid #cbd5e1;padding:7px 12px;border-radius:0 6px 6px 0;margin:4px 0 12px}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:10px 0 8px}
+.metric{background:#f8fafc;border:1px solid #e6e9f0;border-radius:9px;padding:9px 13px;display:flex;flex-direction:column;align-items:flex-start;gap:3px;min-width:0}
 .metric .v{font-size:15px;font-weight:700;font-family:Cascadia Mono,Consolas,monospace;text-align:left;max-width:100%;overflow-wrap:break-word}
 .metric .lab{font-size:11.5px;color:#64748b;overflow-wrap:break-word;white-space:normal;line-height:1.45;max-width:100%}
 .metric .v.ok{color:#15803d}.metric .v.warn{color:#c2410c}.metric .v.err{color:#b91c1c}.metric .v.info{color:#64748b}.metric .v.idle{color:#94a3b8}
@@ -12526,12 +12775,12 @@ body{background:linear-gradient(180deg,#f8fafc 0%,#e2e8f0 100%);color:#1e293b;fo
 .metric.show-hint::after{content:attr(data-hint);display:block;font-size:11px;color:#475569;background:#eef2ff;border-radius:4px;padding:4px 8px;margin-top:4px;line-height:1.5}
 .metric .hint{font-size:11px;color:#b45309;font-weight:400;display:block;margin-top:2px;line-height:1.45}
 .impact-line{background:#fef2f2;border-left:3px solid #dc2626;padding:6px 12px;border-radius:0 6px 6px 0;font-size:12.5px;color:#7f1d1d;margin:8px 0}
-.impact-line.warn{background:#fffbeb;border-left-color:#f59e0b;color:#78350f}.impact-line.info{background:#f1f5f9;border-left-color:#94a3b8;color:#475569;font-size:12px}
+.impact-line.warn{background:#fffbeb;border-left-color:#d97706;color:#78350f}.impact-line.info{background:#f1f5f9;border-left-color:#94a3b8;color:#475569;font-size:12px}
 .action-line{background:#f0f9ff;border-left:3px solid #0284c7;padding:6px 12px;border-radius:0 6px 6px 0;font-size:12.5px;color:#0c4a6e;margin:4px 0 8px;line-height:1.6}
-details.collapse{margin-top:10px;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:8px}details.collapse[data-auto-open="1"]{border-style:solid;border-color:#cbd5e1}
-details.collapse summary{padding:9px 14px;font-size:12.5px;color:#475569;cursor:pointer;font-weight:600;user-select:none;list-style:none;display:flex;align-items:center;gap:6px}
+details.collapse{margin-top:10px;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:10px}details.collapse[data-auto-open="1"]{border-style:solid;border-color:#cbd5e1}
+details.collapse summary{padding:9px 14px;font-size:12px;color:#64748b;cursor:pointer;font-weight:600;user-select:none;list-style:none;display:flex;align-items:center;gap:6px}
 details.collapse summary::-webkit-details-marker{display:none}
-details.collapse summary::before{content:"▸";color:#64748b;transition:transform .15s;display:inline-block}
+details.collapse summary::before{content:"▸";color:#94a3b8;transition:transform .15s;display:inline-block}
 details.collapse[open] summary::before{transform:rotate(90deg)}
 details.collapse .cnt{background:#e2e8f0;color:#475569;border-radius:999px;font-size:10.5px;padding:1px 8px;margin-left:6px;font-weight:600}
 details.collapse .body{padding:4px 14px 12px;font-size:12px;color:#475569;line-height:1.7}
@@ -12547,8 +12796,9 @@ details.collapse td{padding:4px 10px;border-top:1px solid #e2e8f0;font-family:Ca
 details.collapse td.k{width:35%;color:#64748b;background:#f8fafc;white-space:normal}
 details.collapse p.mono{font-family:Cascadia Mono,Consolas,monospace;background:#f1f5f9;padding:6px 10px;border-radius:4px;word-break:break-all}
 details.collapse p.muted{color:#94a3b8;font-size:11.5px;margin-top:6px}
-.host-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
-.host-card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:11px 14px;box-shadow:0 1px 2px rgba(15,23,42,.04)}
+/* 主机信息 */
+.host-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+.host-card{background:#fff;border:1px solid #e6e9f0;border-radius:12px;padding:12px 16px}
 .host-card .lab{font-size:11px;color:#94a3b8;margin-bottom:3px;font-weight:500}
 .host-card .val{font-size:13px;font-weight:600;font-family:Cascadia Mono,Consolas,monospace;color:#0f172a;cursor:pointer;word-break:break-all}.host-card .val:hover{color:#2563eb;background:#f1f5f9}.host-card .val.copied{color:#16a34a !important}
 /* 诊断标准表 */
@@ -12561,9 +12811,9 @@ details.collapse p.muted{color:#94a3b8;font-size:11.5px;margin-top:6px}
 .kw.warn{background:#fed7aa;color:#9a3412}
 .kw.err{background:#fecaca;color:#991b1b}
 details.collapse .subcap code{background:#fff;padding:1px 6px;border-radius:3px;border:1px solid #cbd5e1;font-size:11.5px;color:#475569}
-@media(max-width:768px){.hero{grid-template-columns:1fr;text-align:center;padding:32px}.score{justify-self:center}.stats-grid{grid-template-columns:repeat(3,1fr)}.speed-stats{grid-template-columns:repeat(2,1fr)}.hero .meta{justify-content:center}}
-@media print{body{background:#fff;padding:0;font-size:12px}.hero{background:#1e3a8a !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.mod,.host-card,.todo{box-shadow:none;break-inside:avoid}.mod-head{break-after:avoid}details.collapse .body{display:block !important}details.collapse>summary::before{display:none}details.collapse{border-style:solid}.score{background:rgba(255,255,255,.2) !important}}
-footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-top:20px;border-top:1px solid #e2e8f0}
+@media(max-width:960px){.nav{display:none}.main{margin:0 14px}.hero{flex-wrap:wrap}.gauge{margin:0}.stats-grid{grid-template-columns:repeat(3,1fr)}.charts{grid-template-columns:1fr}}
+@media print{body{background:#fff;padding:0;font-size:12px}.nav,.sec .cnt,.chart .tag{display:none}.main{margin:0}.hero,.stat-card,.chart,.mod,.todo,.overview,.host-card{box-shadow:none}.hero{background:#f8fafc !important;border:1px solid #ddd !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.mod,.host-card,.todo{break-inside:avoid}details.mod>.bd,details.collapse .body{display:block !important}details.mod>summary .arr,details.collapse>summary::before{display:none}details.mod>summary{cursor:default}details.mod,details.collapse{border-style:solid}}
+footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-top:20px;border-top:1px solid #e6e9f0}
 """
 
     return f"""<!DOCTYPE html>
@@ -12577,11 +12827,19 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 </head>
 <body>
 <a href="#main-content" class="skip-link">跳到主要内容</a>
-<div class="wrap">
+<nav class="nav" aria-label="报告导航">
+  <div class="logo"><div class="mark"></div>
+    <div><b>{_html_esc(report['app'])}</b><span>网络诊断报告</span></div></div>
+  {nav_html}
+  <div class="foot">v{_html_esc(report['version'])} · 生成于 {_html_esc(g)}<br>点条目跳转到对应模块</div>
+</nav>
+<div class="main">
 <main id="main-content">
 {hero}
+{band_html}
 {todo_section}
 {stats_section}
+{charts_section}
 {overview_section}
 {modules_section}
 {host_section}
@@ -12590,6 +12848,21 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 <footer>由 {_html_esc(report['app'])} v{_html_esc(report['version'])} 自动生成 · {_html_esc(g)}</footer>
 </div>
 <script>
+// 左侧导航滚动高亮
+(function(){{
+  var links = document.querySelectorAll('.nav a[href^="#"]');
+  var map = {{}};
+  document.querySelectorAll('[id]').forEach(function(el){{ map[el.id] = el; }});
+  window.addEventListener('scroll', function(){{
+    var y = window.scrollY + 120, cur = null;
+    Object.keys(map).forEach(function(id){{
+      if (map[id].offsetTop <= y) cur = id;
+    }});
+    links.forEach(function(a){{
+      a.classList.toggle('on', a.getAttribute('href') === '#' + cur);
+    }});
+  }}, {{passive:true}});
+}})();
 // 指标卡点击展开说明 (触摸设备无 hover; 桌面点击也可用)
 (function(){{
   document.querySelectorAll('.metric[data-hint]').forEach(function(el){{
