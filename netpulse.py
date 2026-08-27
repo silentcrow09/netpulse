@@ -12296,7 +12296,6 @@ def render_report_html_customer(report):
         band_bits.append(f"评分豁免 <b>{exempt_count}</b>（iperf3 / ipv6 / proxy / nattype）")
     if err_cnt or warn_cnt:
         band_bits.append(f"扣分项 <b>{err_cnt}</b> 异常级 / <b>{warn_cnt}</b> 警告级")
-    band_bits.append(f"生成于 <b>{_html_esc(g)}</b>")
     band_html = ('<div class="band">' +
                  '<span class="sep"></span>'.join(band_bits) + '</div>')
 
@@ -12746,7 +12745,8 @@ body{background:#eef1f6;color:#1e293b;font:14px/1.65 -apple-system,BlinkMacSyste
 .gauge .num{font-size:38px;font-weight:900;color:#1e293b;font-variant-numeric:tabular-nums;line-height:1}
 .gauge .lbl{font-size:12px;font-weight:700;color:#b45309;background:#fef3c7;padding:1px 10px;border-radius:999px}
 /* 信息条 */
-.band{background:linear-gradient(90deg,#0f2a52,#1d4ed8);color:#e2ebfb;border-radius:16px;padding:16px 24px;margin:14px 0 26px;display:flex;gap:8px 28px;flex-wrap:wrap;align-items:center;font-size:12.5px}
+/* gap 作用于 .sep 两侧: 10px+1px+10px≈21px 视觉间距; 生成时间与 hero/页脚重复, 不再在此显示 */
+.band{background:linear-gradient(90deg,#0f2a52,#1d4ed8);color:#e2ebfb;border-radius:16px;padding:14px 24px;margin:12px 0 22px;display:flex;gap:6px 10px;flex-wrap:wrap;align-items:center;font-size:12.5px}
 .band b{color:#fff}
 .band .sep{width:1px;height:14px;background:rgba(255,255,255,.25)}
 /* 分区标题 */
