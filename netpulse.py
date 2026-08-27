@@ -11846,20 +11846,41 @@ def _render_html_tech_block(key, raw_result, tech_keys, auto_open=True):
 # HTML 报告图表辅助: 纯 SVG, 离线可打开, 无外部依赖
 # 数据不足时返回空串, 由调用方决定隐藏对应图表卡
 # ============================================================
+# 状态语义键与配色 — 全报告唯一来源 (导航点 / 徽章 / 统计卡 / 图表分段共用)。
+# 改颜色只改这里, 不要在各渲染函数里另立映射 (曾因三份映射并存出现过两种「警告橙」)。
+STATUS_KEY = {"完成": "ok", "警告": "warn", "异常": "err", "错误": "fatal",
+              "超时": "timeout", "未检测": "idle"}
+STATUS_COLORS = {"ok": "#16a34a", "warn": "#d97706", "err": "#dc2626",
+                 "fatal": "#7f1d1d", "timeout": "#334155", "idle": "#94a3b8"}
+# 状态分布条的分段绘制顺序。「超时」是真实可达状态 (_run_module_with_timeout 返回),
+# 必须绘制且参与问题判定, 否则条形留无名缺口、硬故障模块被当成灰色折叠行。
+STATUS_BAR_ORDER = ["完成", "警告", "异常", "错误", "超时", "未检测"]
+# 参与问题判定 (默认展开 / 问题计数) 的状态。注意与扣分口径区分:
+# compute_health_score 只对 异常/错误/警告 扣分, 超时不扣分但需要人工关注。
+PROBLEM_STATUSES = ("警告", "异常", "错误", "超时")
+
+# 等级配色: 阈值唯一来源是 HEALTH_GRADE_TABLE (A≥90/B≥75/C≥60/D≥40/F<40),
+# 环形图与徽章按等级取色, 不再用裸分数暗阈值 (那套 ≥90/≥70 与等级表必然漂移)。
+GRADE_COLORS = {"A": "#16a34a", "B": "#65a30d", "C": "#d97706",
+                "D": "#ea580c", "F": "#dc2626"}
+GRADE_BADGE = {   # (前景色, 底色), 与环色同色系
+    "A": ("#15803d", "#dcfce7"), "B": ("#4d7c0f", "#ecfccb"),
+    "C": ("#b45309", "#fef3c7"), "D": ("#c2410c", "#ffedd5"),
+    "F": ("#991b1b", "#fee2e2"),
+}
+
+
 def _html_status_color(status):
-    """状态中文 -> HTML 颜色 (导航点 / 图表共用)。"""
-    return {
-        "完成": "#16a34a", "警告": "#d97706", "异常": "#dc2626",
-        "错误": "#7f1d1d", "未检测": "#94a3b8",
-    }.get(status, "#94a3b8")
+    """状态中文 -> HTML 颜色 (导航点 / 图表共用)。源自 STATUS_COLORS。"""
+    return STATUS_COLORS.get(STATUS_KEY.get(status, ""), STATUS_COLORS["idle"])
 
 
-def _svg_health_ring(score):
-    """健康分环形进度图 (r=54, 周长≈339.3)。配色随分数: ≥90 绿, ≥70 橙, 其余红。"""
+def _svg_health_ring(score, grade=""):
+    """健康分环形进度图 (r=54, 周长≈339.3)。配色随 HEALTH_GRADE_TABLE 等级。"""
     score = max(0, min(100, int(score or 0)))
     c = 2 * 3.14159265 * 54
     off = c * (1 - score / 100.0)
-    color = "#16a34a" if score >= 90 else "#d97706" if score >= 70 else "#dc2626"
+    color = GRADE_COLORS.get((grade or "").strip()[:1].upper(), GRADE_COLORS["F"])
     return (f'<svg width="132" height="132" viewBox="0 0 132 132">'
             f'<circle class="track" cx="66" cy="66" r="54"/>'
             f'<circle class="bar" cx="66" cy="66" r="54" stroke="{color}" '
@@ -11905,12 +11926,29 @@ def _svg_ping_line(rtts):
             f'</svg>')
 
 
-def _svg_speed_bars(raw):
-    """测速下载/上传条形图。download/upload 均为 0 时返回空串。"""
-    if not raw:
-        return ""
-    dl = raw.get("download_mbps")
-    ul = raw.get("upload_mbps")
+def _resolve_speed_chart_src(raw):
+    """解析测速图表数据源: 优先 Ookla 官方结果 (嵌套 raw['speedtest'], 与指标卡
+    _metrics_speedtest 同口径), 回退国内 HTTP 的顶层字段。
+
+    返回 (扁平数据 dict, 来源标签)。数据缺位时对应值为 None, 由
+    _svg_speed_bars 判空处理。
+    """
+    ookla = raw.get("speedtest")
+    if isinstance(ookla, dict) and "error" not in ookla and ookla.get("download_mbps"):
+        d = {k: ookla.get(k) for k in
+             ("download_mbps", "upload_mbps", "server_latency_ms",
+              "jitter_ms", "packet_loss_pct")}
+        return d, "Ookla 官方节点"
+    return ({k: raw.get(k) for k in ("download_mbps", "upload_mbps")},
+            "国内节点")
+
+
+def _svg_speed_bars(data):
+    """测速下载/上传条形图。入参为 _resolve_speed_chart_src 的扁平 dict;
+    下载/上传均无数值时返回空串。延迟/抖动/丢包仅在数据来源实际提供时
+    显示真实值, 缺失显示 "—" (不伪造数字)。"""
+    dl = data.get("download_mbps")
+    ul = data.get("upload_mbps")
     dl = float(dl) if isinstance(dl, (int, float)) else 0.0
     ul = float(ul) if isinstance(ul, (int, float)) else 0.0
     if dl <= 0 and ul <= 0:
@@ -11919,17 +11957,17 @@ def _svg_speed_bars(raw):
     bw = 258.0
     w_dl = bw * min(dl / scale, 1.0)
     w_ul = bw * min(ul / scale, 1.0)
-    lat = raw.get("server_latency_ms")
+    lat = data.get("server_latency_ms")
     lat_s = f"{lat:g}ms" if isinstance(lat, (int, float)) else "—"
-    jit = raw.get("jitter_ms")
+    jit = data.get("jitter_ms")
     jit_s = f"{jit:g}ms" if isinstance(jit, (int, float)) else "—"
-    loss = raw.get("packet_loss_pct")
-    loss_s = f"{loss:g}%" if isinstance(loss, (int, float)) else "0%"
+    loss = data.get("packet_loss_pct")
+    loss_s = f"{loss:g}%" if isinstance(loss, (int, float)) else "—"
     return (f'<svg width="100%" height="120" viewBox="0 0 300 120" preserveAspectRatio="none">'
-            f'<text x="0" y="14" font-size="10" fill="#94a3b8">下载 {dl:g} Mbps</text>'
+            f'<text x="0" y="14" font-size="10" fill="#94a3b8">下载 {format_speed(dl)}</text>'
             f'<rect x="0" y="20" width="{bw:.1f}" height="22" rx="6" fill="#dbeafe"/>'
             f'<rect x="0" y="20" width="{w_dl:.1f}" height="22" rx="6" fill="#2563eb"/>'
-            f'<text x="0" y="64" font-size="10" fill="#94a3b8">上传 {ul:g} Mbps</text>'
+            f'<text x="0" y="64" font-size="10" fill="#94a3b8">上传 {format_speed(ul)}</text>'
             f'<rect x="0" y="70" width="{bw:.1f}" height="22" rx="6" fill="#fef3c7"/>'
             f'<rect x="0" y="70" width="{w_ul:.1f}" height="22" rx="6" fill="#d97706"/>'
             f'<text x="0" y="112" font-size="10" fill="#94a3b8">延迟 {lat_s} · 抖动 {jit_s} · 丢包 {loss_s}</text>'
@@ -11937,29 +11975,41 @@ def _svg_speed_bars(raw):
 
 
 def _svg_status_bar(all_counts):
-    """模块状态分布堆叠条 (全口径 counts)。无数据时返回空串。"""
-    order = [("完成", "#16a34a"), ("警告", "#d97706"), ("异常", "#dc2626"),
-             ("错误", "#7f1d1d"), ("未检测", "#94a3b8")]
+    """模块状态分布堆叠条 (全口径 counts)。无数据时返回空串。
+
+    分段顺序/配色统一取自 STATUS_BAR_ORDER × _html_status_color; 除六大已知
+    状态外若还冒出其他状态值, 残余部分补一段浅灰兜底, 保证条形铺满全长。
+    """
     total = sum(all_counts.values())
     if total <= 0:
         return ""
     x = 0.0
     rects = []
-    for k, color in order:
-        v = all_counts.get(k, 0)
+    for st in STATUS_BAR_ORDER:
+        v = all_counts.get(st, 0)
         if v <= 0:
             continue
         w = v / total * 1000
         rects.append(f'<rect x="{x:.1f}" y="0" width="{w - 0.6:.1f}" '
-                     f'height="34" rx="6" fill="{color}"/>')
+                     f'height="34" rx="6" fill="{_html_status_color(st)}"/>')
+        x += w
+    rest = total - sum(all_counts.get(st, 0) for st in STATUS_BAR_ORDER)
+    if rest > 0:
+        w = rest / total * 1000
+        rects.append(f'<rect x="{x:.1f}" y="0" width="{w - 0.6:.1f}" '
+                     f'height="34" rx="6" fill="#cbd5e1"/>')
         x += w
     return (f'<svg width="100%" height="46" viewBox="0 0 1000 46" '
             f'preserveAspectRatio="none">{"".join(rects)}</svg>')
 
 
-def _build_report_nav(report):
-    """左侧浮动导航: 固定条目 + 按 MODULE_CATEGORIES 分组的模块树。"""
-    by_key = {m["key"]: m for m in report["modules"]}
+def _build_report_nav(modules):
+    """左侧浮动导航: 固定锚点 + 按 MODULE_CATEGORIES 分组的模块树。
+
+    只列出本次实际运行的模块 — 子集运行 (--module speedtest …) 时未执行的
+    模块在页面上没有对应锚点 id, 渲染成死链会让界面显得损坏。
+    """
+    by_key = {m["key"]: m for m in modules}
     fixed = [
         ("报告概览", "#overview", "#2563eb"),
         ("待办问题", "#todo", "#dc2626"),
@@ -11972,16 +12022,17 @@ def _build_report_nav(report):
         out.append(f'<a href="{href}"><span class="st" '
                    f'style="background:{color}"></span>{name}</a>')
     for cat, keys, _desc in MODULE_CATEGORIES:
+        present = [k for k in keys if k in by_key]
+        if not present:
+            continue   # 整个分类都没跑就不渲染该分组
         out.append(f'<div class="grp">{_html_esc(cat)}</div>')
         out.append('<div class="mods">')
-        for key in keys:
-            m = by_key.get(key)
-            st = m["status"] if m else "未检测"
-            name = m["name"] if m else key
-            color = _html_status_color(st)
+        for key in present:
+            m = by_key[key]
+            color = _html_status_color(m["status"])
             out.append(f'<a href="#mod-{_html_esc(key)}">'
                        f'<span class="st" style="background:{color}"></span>'
-                       f'{_html_esc(name)}</a>')
+                       f'{_html_esc(m["name"])}</a>')
         out.append('</div>')
     return "".join(out)
 
@@ -12188,13 +12239,14 @@ def render_report_html_customer(report):
     health = report["health"]
     counts = report["counts"]
     modules = report["modules"]
+    by_key = {m["key"]: m for m in modules}   # 一次建索引, 下文各处复用
 
-    # 状态色
-    SKEY = {"完成": "ok", "警告": "warn", "异常": "err", "错误": "fatal", "未检测": "idle"}
-    SC = {"ok": "#16a34a", "warn": "#ea580c", "err": "#dc2626", "fatal": "#7f1d1d", "idle": "#94a3b8"}
+    # 状态语义键: 引用全局唯一来源 (见 STATUS_COLORS 定义处), 不要在本函数
+    # 里再立局部映射 — 多份映射并存曾导致同一份报告出现两种「警告橙」。
+    SKEY = STATUS_KEY
 
     # ── 顶部 hero (方案 A: 白卡 + SVG 环形健康分) ──
-    nav_html = _build_report_nav(report)
+    nav_html = _build_report_nav(modules)
 
     # meta chips: 本机 / 网关 / 公网 / DNS / 出口位置 / IPv6
     hero_meta = []
@@ -12212,7 +12264,9 @@ def render_report_html_customer(report):
     meta_chips = "".join(f"<span>{m}</span>" for m in hero_meta)
 
     score = health.get("score", 0)
-    score_ring = _svg_health_ring(score)
+    grade_key = str(health.get("grade") or "").strip()[:1].upper()
+    lbl_fg, lbl_bg = GRADE_BADGE.get(grade_key, GRADE_BADGE["C"])
+    score_ring = _svg_health_ring(score, grade_key)
     hero = f"""
 <header class="hero" id="overview">
   <div style="flex:1;min-width:0">
@@ -12224,18 +12278,19 @@ def render_report_html_customer(report):
   </div>
   <div class="gauge">
     {score_ring}
-    <div class="in"><div class="num">{score}</div><div class="lbl">{_html_esc(health.get('label', ''))}</div></div>
+    <div class="in"><div class="num">{score}</div><div class="lbl" style="color:{lbl_fg};background:{lbl_bg}">{_html_esc(health.get('label', ''))}</div></div>
   </div>
 </header>"""
 
     # ── 信息条 (模块总数 / 豁免 / 扣分项 / 生成时间) ──
-    all_counts = {}
-    for m in modules:
-        all_counts[m["status"]] = all_counts.get(m["status"], 0) + 1
+    # 「扣分项」必须用 counts (report["counts"], 不含豁免模块的扣分口径),
+    # 与 compute_health_score 一致; 用全口径会在 100 分绿环旁边谎报扣分。
+    # all_counts (全口径) 从 report["summary"] 派生即可, 供状态分布条使用。
+    all_counts = Counter(report.get("summary", {}).values())
     total_modules = len(modules)
     exempt_count = report.get("exempt_count", 0) or 0
-    err_cnt = all_counts.get("异常", 0) + all_counts.get("错误", 0)
-    warn_cnt = all_counts.get("警告", 0)
+    err_cnt = counts.get("异常", 0) + counts.get("错误", 0)
+    warn_cnt = counts.get("警告", 0)
     band_bits = [f"共 <b>{total_modules}</b> 个模块"]
     if exempt_count:
         band_bits.append(f"评分豁免 <b>{exempt_count}</b>（iperf3 / ipv6 / proxy / nattype）")
@@ -12339,7 +12394,7 @@ def render_report_html_customer(report):
 
     # ── 统计卡片 ──
     # 始终显示全部 5 个卡片 (含 0 值), 与 stats-grid 的 5 列布局对齐
-    stats_order = ["完成", "警告", "异常", "错误", "未检测"]
+    stats_order = ["完成", "警告", "异常", "错误", "超时", "未检测"]
     stat_items = [(k, counts.get(k, 0)) for k in stats_order]
     stat_cards = "".join(
         f"<div class='stat-card {SKEY.get(k, 'idle').replace('fatal', 'err')}'>"
@@ -12383,8 +12438,8 @@ def render_report_html_customer(report):
     # ── 图表区 (纯 SVG, 数据不足时对应图卡自动隐藏) ──
     chart_cards = []
 
-    gateway_raw = next((m.get("raw", {}) for m in modules
-                        if m["key"] == "gateway"), {})
+    gw_mod = by_key.get("gateway") or {}
+    gateway_raw = gw_mod.get("raw") or {}
     ping_info = (gateway_raw or {}).get("ping") or {}
     ping_rtts = ping_info.get("rtts") or []
     ping_chart = _svg_ping_line(ping_rtts)
@@ -12399,18 +12454,17 @@ def render_report_html_customer(report):
             f"<div class='chart'><h4>网关延迟时间序列 <span class='tag'>逐次 Ping</span></h4>"
             f"{ping_chart}<div class='cap'>" + " · ".join(cap_bits) + "。</div></div>")
 
-    speed_raw = next((m.get("raw", {}) for m in modules
-                      if m["key"] == "speedtest"), {})
-    speed_chart = _svg_speed_bars(speed_raw)
+    sp_mod = by_key.get("speedtest") or {}
+    speed_src, speed_method = _resolve_speed_chart_src(sp_mod.get("raw") or {})
+    speed_chart = _svg_speed_bars(speed_src)
     if speed_chart:
-        method = "Ookla 官方节点" if speed_raw.get("method") == "ookla" else "国内节点"
         cap_bits = []
-        if isinstance(speed_raw.get("download_mbps"), (int, float)):
-            cap_bits.append(f"下载 {speed_raw['download_mbps']:g} Mbps")
-        if isinstance(speed_raw.get("upload_mbps"), (int, float)):
-            cap_bits.append(f"上传 {speed_raw['upload_mbps']:g} Mbps")
+        for kk, lab in (("download_mbps", "下载"), ("upload_mbps", "上传")):
+            v = speed_src.get(kk)
+            if isinstance(v, (int, float)) and v > 0:
+                cap_bits.append(f"{lab} {format_speed(v)}")
         chart_cards.append(
-            f"<div class='chart'><h4>宽带测速 <span class='tag'>{_html_esc(method)}</span></h4>"
+            f"<div class='chart'><h4>宽带测速 <span class='tag'>{_html_esc(speed_method)}</span></h4>"
             f"{speed_chart}<div class='cap'>" + " · ".join(cap_bits) + "。</div></div>")
 
     status_chart = _svg_status_bar(all_counts)
@@ -12515,7 +12569,8 @@ def render_report_html_customer(report):
             issues_html = ""
 
         # 技术细节折叠: 问题模块默认展开, 正常模块默认折叠
-        problem_status = st in ("警告", "异常", "错误")
+        # 「超时」也是硬故障 (测了但没结果), 不自动展开会被当成无关紧要的灰行
+        problem_status = st in PROBLEM_STATUSES
         tech_html = ""
         if m.get("has_tech_details"):
             pres = MODULE_PRESENTATION.get(m["key"], {})
@@ -12544,6 +12599,7 @@ def render_report_html_customer(report):
             "warn": "⚠",
             "err": "✕",
             "fatal": "✕",
+            "timeout": "⏱",
             "idle": "○"
         }
         mod_icon = mod_icons.get(sk, "○")
@@ -12555,6 +12611,8 @@ def render_report_html_customer(report):
     <span class="nm">{_html_esc(m['name'])}</span>
     <span class="vd">{_html_esc(verdict)}</span>
     <span class="b {sk}">{_html_esc(st)}</span>
+    <a class="anchor" href="#mod-{_html_esc(m['key'])}" data-mod="mod-{_html_esc(m['key'])}"
+       title="复制本模块链接">🔗</a>
     <span class="arr">▸</span>
   </summary>
   <div class="bd">
@@ -12568,7 +12626,8 @@ def render_report_html_customer(report):
 </details>""")
 
     # 问题模块自动展开, 正常模块折叠 — 在章节标题给出提示
-    problem_cnt = sum(1 for m in modules if m["status"] in ("警告", "异常", "错误"))
+    problem_cnt = sum(1 for s in report["summary"].values()
+                      if s in PROBLEM_STATUSES)
     modules_section = f"""
 <div class="sec" id="modules"><h2><span class="icon">🔍</span>详细结果
 <span class="cnt">{problem_cnt} 个问题模块已展开 · 正常模块点击展开</span></h2></div>
@@ -12715,11 +12774,11 @@ body{background:#eef1f6;color:#1e293b;font:14px/1.65 -apple-system,BlinkMacSyste
 .issue .action{font-size:12.5px;color:#0c4a6e;padding:7px 12px;background:#f0f9ff;border-left:3px solid #0284c7;border-radius:0 8px 8px 0;line-height:1.7}
 .issue.consult{border-top:1px dashed #fecaca}
 /* 统计卡 */
-.stats-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:8px}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:12px;margin-bottom:8px}
 .stats-caption{text-align:center;font-size:11.5px;color:#94a3b8;margin-bottom:24px}
 .stat-card{background:#fff;border:1px solid #e6e9f0;border-radius:14px;padding:14px 8px;text-align:center}
 .stat-card .count{font-size:30px;font-weight:800;font-variant-numeric:tabular-nums}
-.stat-card.ok .count{color:#16a34a}.stat-card.warn .count{color:#d97706}.stat-card.err .count,.stat-card.danger .count{color:#dc2626}.stat-card.info .count{color:#6b7280}
+.stat-card.ok .count{color:#16a34a}.stat-card.warn .count{color:#d97706}.stat-card.err .count,.stat-card.danger .count{color:#dc2626}.stat-card.timeout .count{color:#334155}.stat-card.info .count{color:#6b7280}
 .stat-card .label{font-size:11.5px;color:#94a3b8;margin-top:2px}
 /* 图表区 */
 .charts{display:grid;grid-template-columns:1.1fr .9fr;gap:14px}
@@ -12744,8 +12803,9 @@ body{background:#eef1f6;color:#1e293b;font:14px/1.65 -apple-system,BlinkMacSyste
 .badge.err,.b.err{background:#fee2e2;color:#991b1b}
 .badge.fatal,.b.fatal{background:#fecaca;color:#7f1d1d}
 .badge.idle,.b.idle{background:#e2e8f0;color:#475569}
+.badge.timeout,.b.timeout{background:#cbd5e1;color:#1e293b}
 .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
-.dot.ok{background:#16a34a}.dot.warn{background:#d97706}.dot.err{background:#dc2626}.dot.fatal{background:#7f1d1d}.dot.idle{background:#94a3b8}
+.dot.ok{background:#16a34a}.dot.warn{background:#d97706}.dot.err{background:#dc2626}.dot.fatal{background:#7f1d1d}.dot.timeout{background:#334155}.dot.idle{background:#94a3b8}
 /* 模块卡 (details 折叠, 问题模块自动展开) */
 details.mod{background:#fff;border:1px solid #e6e9f0;border-radius:16px;margin-bottom:12px;overflow:hidden;box-shadow:0 1px 2px rgba(15,23,42,.04);scroll-margin-top:16px}
 details.mod[open]{border-color:#c7cbd8}
@@ -12756,12 +12816,18 @@ details.mod.ok>summary .ic{background:#dcfce7;color:#15803d}
 details.mod.warn>summary .ic{background:#fef3c7;color:#b45309}
 details.mod.err>summary .ic{background:#fee2e2;color:#b91c1c}
 details.mod.fatal>summary .ic{background:#7f1d1d;color:#fff}
+details.mod.timeout>summary .ic{background:#334155;color:#fff}
 details.mod.idle>summary .ic{background:#f1f5f9;color:#64748b}
 details.mod>summary .nm{font-size:14.5px;font-weight:700;flex:none}
 details.mod>summary .vd{font-size:12px;color:#64748b;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 details.mod>summary .b{font-size:11px;font-weight:700;padding:2px 11px;border-radius:999px;flex:none}
 details.mod>summary .arr{color:#94a3b8;font-size:11px;transition:transform .15s}
 details.mod[open]>summary .arr{transform:rotate(90deg)}
+/* 🔗 复制模块链接按钮 */
+details.mod>summary .anchor{flex:none;font-size:11px;text-decoration:none;color:#94a3b8;padding:2px 7px;border-radius:999px;opacity:.35;transition:opacity .12s;line-height:1.4;cursor:pointer}
+details.mod:hover>summary .anchor,details.mod>summary .anchor:focus-visible,details.mod>summary .anchor.copied{opacity:1}
+details.mod>summary .anchor:hover{color:#2563eb;background:#eef2ff}
+details.mod>summary .anchor.copied{color:#15803d;background:#dcfce7}
 details.mod>.bd{padding:4px 22px 20px;border-top:1px dashed #e6e9f0}
 details.mod .verdict{font-size:13.5px;color:#1e293b;padding:12px 0 4px;line-height:1.7}
 details.mod .verdict .tag{display:inline-block;font-size:10.5px;font-weight:700;background:#eef2ff;color:#4338ca;border-radius:5px;padding:1px 8px;margin-right:8px}
@@ -12811,8 +12877,8 @@ details.collapse p.muted{color:#94a3b8;font-size:11.5px;margin-top:6px}
 .kw.warn{background:#fed7aa;color:#9a3412}
 .kw.err{background:#fecaca;color:#991b1b}
 details.collapse .subcap code{background:#fff;padding:1px 6px;border-radius:3px;border:1px solid #cbd5e1;font-size:11.5px;color:#475569}
-@media(max-width:960px){.nav{display:none}.main{margin:0 14px}.hero{flex-wrap:wrap}.gauge{margin:0}.stats-grid{grid-template-columns:repeat(3,1fr)}.charts{grid-template-columns:1fr}}
-@media print{body{background:#fff;padding:0;font-size:12px}.nav,.sec .cnt,.chart .tag{display:none}.main{margin:0}.hero,.stat-card,.chart,.mod,.todo,.overview,.host-card{box-shadow:none}.hero{background:#f8fafc !important;border:1px solid #ddd !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.mod,.host-card,.todo{break-inside:avoid}details.mod>.bd,details.collapse .body{display:block !important}details.mod>summary .arr,details.collapse>summary::before{display:none}details.mod>summary{cursor:default}details.mod,details.collapse{border-style:solid}}
+@media(max-width:960px){.nav{display:none}.main{margin:0 14px}.hero{flex-wrap:wrap}.gauge{margin:0}.charts{grid-template-columns:1fr}}
+@media print{body{background:#fff;padding:0;font-size:12px}.nav,.sec .cnt,.chart .tag{display:none}.main{margin:0}.hero,.stat-card,.chart,.mod,.todo,.overview,.host-card{box-shadow:none}.hero{background:#f8fafc !important;border:1px solid #ddd !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.mod,.host-card,.todo{break-inside:avoid}details.mod>summary .arr,details.collapse>summary::before{display:none}details.mod>summary{cursor:default}details.mod,details.collapse{border-style:solid}}
 footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-top:20px;border-top:1px solid #e6e9f0}
 """
 
@@ -12852,9 +12918,17 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 (function(){{
   var links = document.querySelectorAll('.nav a[href^="#"]');
   var map = {{}};
-  document.querySelectorAll('[id]').forEach(function(el){{ map[el.id] = el; }});
+  // 只收集导航目标 id (mod-* 与固定分区), 避免 SVG 渐变 id 等混入;
+  // offsetTop 不是数字的直接跳过 (SVG 内部元素没有 offsetTop)
+  var NAV_IDS = ['overview', 'todo', 'stats', 'charts', 'list'];
+  document.querySelectorAll('[id]').forEach(function(el){{
+    if (!el.id || typeof el.offsetTop !== 'number') return;
+    if (el.id.indexOf('mod-') !== 0 && NAV_IDS.indexOf(el.id) < 0) return;
+    map[el.id] = el;
+  }});
   window.addEventListener('scroll', function(){{
-    var y = window.scrollY + 120, cur = null;
+    // 阈值须小于折叠模块行的间距 (约 76px), 否则密集列表会提前高亮到下一行
+    var y = window.scrollY + 40, cur = null;
     Object.keys(map).forEach(function(id){{
       if (map[id].offsetTop <= y) cur = id;
     }});
@@ -12871,36 +12945,77 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
     }});
   }});
 }})();
+// 复制工具 (全局): clipboard API 优先, 失败回退 execCommand; done 为成功回调
+function fallbackCopy(txt, done){{
+  var ta = document.createElement('textarea');
+  ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try {{ document.execCommand('copy'); }} catch(e) {{}}
+  document.body.removeChild(ta);
+  if (done) done();
+}}
+function copyText(txt, done){{
+  if (navigator.clipboard && navigator.clipboard.writeText){{
+    navigator.clipboard.writeText(txt).then(done).catch(function(){{ fallbackCopy(txt, done); }});
+  }} else {{
+    fallbackCopy(txt, done);
+  }}
+}}
 // IP/MAC 值点击复制
 (function(){{
   document.querySelectorAll('.host-card .val').forEach(function(el){{
     el.addEventListener('click', function(){{
       var txt = el.textContent.trim();
       if (!txt || txt === '—') return;
-      if (navigator.clipboard && navigator.clipboard.writeText){{
-        navigator.clipboard.writeText(txt).then(function(){{
-          var orig = el.textContent;
-          el.textContent = '✓ 已复制';
-          el.classList.add('copied');
-          setTimeout(function(){{ el.textContent = orig; el.classList.remove('copied'); }}, 1200);
-        }}).catch(function(){{ fallbackCopy(txt, el); }});
-      }} else {{
-        fallbackCopy(txt, el);
-      }}
+      copyText(txt, function(){{
+        var orig = el.textContent;
+        el.textContent = '✓ 已复制';
+        el.classList.add('copied');
+        setTimeout(function(){{ el.textContent = orig; el.classList.remove('copied'); }}, 1200);
+      }});
     }});
     el.title = '点击复制: ' + el.textContent.trim();
   }});
-  function fallbackCopy(txt, el){{
-    var ta = document.createElement('textarea');
-    ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta); ta.select();
-    try {{ document.execCommand('copy'); }} catch(e) {{}}
-    document.body.removeChild(ta);
-    var orig = el.textContent;
-    el.textContent = '✓ 已复制';
-    el.classList.add('copied');
-    setTimeout(function(){{ el.textContent = orig; el.classList.remove('copied'); }}, 1200);
+}})();
+// 模块卡 🔗 按钮: 复制带锚点的报告链接; preventDefault 避免 <summary> 折叠与页面跳转
+(function(){{
+  document.querySelectorAll('.mod > summary a.anchor').forEach(function(a){{
+    a.addEventListener('click', function(e){{
+      e.preventDefault();
+      var id = a.getAttribute('href').slice(1);
+      copyText(location.href.split('#')[0] + '#' + id, function(){{
+        a.classList.add('copied');
+        setTimeout(function(){{ a.classList.remove('copied'); }}, 1200);
+      }});
+      location.hash = id;   // 触发下方 hashchange: 展开卡片并定位
+    }});
+  }});
+}})();
+// 锚点跳转: 浏览器只负责滚动到折叠卡, 内容需先展开才能看到
+(function(){{
+  function openByHash(){{
+    var h = decodeURIComponent((location.hash || '').slice(1));
+    if (!h) return;
+    var t = document.getElementById(h);
+    if (t && t.tagName === 'DETAILS' && !t.open) t.open = true;
   }}
+  window.addEventListener('hashchange', openByHash);
+  window.addEventListener('DOMContentLoaded', openByHash);
+}})();
+// 打印/另存 PDF: 闭合的 <details> 无法靠 CSS 强制展开 (需 [open] 属性或 JS),
+// 打印前全部展开、打印后恢复原状 — 保证纸质留档包含技术细节全文
+(function(){{
+  var touched = [];
+  window.addEventListener('beforeprint', function(){{
+    touched = [];
+    document.querySelectorAll('details').forEach(function(d){{
+      if (!d.open){{ d.open = true; touched.push(d); }}
+    }});
+  }});
+  window.addEventListener('afterprint', function(){{
+    touched.forEach(function(d){{ d.open = false; }});
+    touched = [];
+  }});
 }})();
 </script>
 </body>
