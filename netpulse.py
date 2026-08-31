@@ -1156,6 +1156,496 @@ def probe_wifi_v2(callback=None):
 
 
 # ============================================================
+# SECTION 1f: DIAGNOSIS  (阶段 C · v1.3.0 引入)
+# ============================================================
+# 根因分析引擎: 把"23 项独立检测"升级为"故障定位"。
+# 输入: run_diagnostics 输出的 full dict ({key: results_dict})
+# 输出: DiagnosisReport (list[RootCause] + overall_confidence)
+#
+# 设计要点:
+#   1. 规则 = 纯函数 (results_dict) → RootCause | None
+#   2. 每条规则可独立测试, 不依赖其他规则
+#   3. RootCause 引用 evidence IDs (B 阶段 DiagnosticResult.evidence 字段)
+#   4. confidence 基于: evidence 数量 × 模块 status × 阈值偏差
+#   5. 同根因多个证据合并, 避免"同一根因重复扣分"
+#
+# 6 条内置规则:
+#   _rule_dns_failure      DNS 解析异常 (gateway OK + DNS fail > 50%)
+#   _rule_wan_interruption WAN 中断    (gateway OK + external ping/TCP 全失败)
+#   _rule_wifi_weak        WiFi 干扰   (WiFi 干扰等级 >= 较高)
+#   _rule_bufferbloat      Bufferbloat (loaded_latency 远大于 idle_latency)
+#   _rule_gateway_loss     网关丢包    (gateway loss >= 5%)
+#   _rule_nat_restricted   NAT 限制    (STUN 测得 Symmetric NAT)
+
+@dataclass
+class RootCause:
+    """根因: 跨模块证据聚合出的故障定位.
+
+    与 Issue 区别: Issue 是单模块内部问题 (e.g. gateway.high_latency),
+    RootCause 是跨模块聚合 (e.g. "DNS 故障" 关联 gateway OK + external OK + dns fail).
+    """
+    id: str                                # "dns_failure"
+    category: str                          # "DNS" / "WAN" / "WiFi" / "Bufferbloat" / "LAN" / "NAT"
+    severity: Severity
+    title: str                             # "DNS 解析异常"
+    description: str                       # 影响范围说明
+    confidence: float = 0.0                # 0.0-1.0
+    evidence_ids: list[str] = field(default_factory=list)    # 引用的 evidence IDs (B 阶段字段)
+    affected_modules: list[str] = field(default_factory=list) # 涉及哪些模块 key
+    recommendations: list[str] = field(default_factory=list)  # 建议清单
+
+    def to_dict(self):
+        return {
+            "id": self.id, "category": self.category,
+            "severity": self.severity.value,
+            "title": self.title, "description": self.description,
+            "confidence": round(self.confidence, 3),
+            "evidence_ids": list(self.evidence_ids),
+            "affected_modules": list(self.affected_modules),
+            "recommendations": list(self.recommendations),
+        }
+
+
+@dataclass
+class DiagnosisReport:
+    """根因分析报告: 一次完整诊断的所有根因."""
+    root_causes: list[RootCause] = field(default_factory=list)
+    overall_confidence: float = 0.0       # 多根因加权平均
+    timestamp: str = ""
+    rules_evaluated: int = 0               # 评估的规则数
+    rules_fired: int = 0                   # 触发的规则数
+
+    def to_dict(self):
+        return {
+            "root_causes": [rc.to_dict() for rc in self.root_causes],
+            "overall_confidence": round(self.overall_confidence, 3),
+            "timestamp": self.timestamp,
+            "rules_evaluated": self.rules_evaluated,
+            "rules_fired": self.rules_fired,
+        }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# confidence 加权算法 (C2)
+# ────────────────────────────────────────────────────────────────────────────
+# 设计: confidence = 模块可信度 × 证据强度 × 阈值偏差
+#   - 模块可信度: 模块 status 是 OK/WARNING/ERROR 的基础可信度 (1.0/0.7/0.95)
+#   - 证据强度: evidence 数量 / 期望数量 (0.0-1.0)
+#   - 阈值偏差: 实际值偏离阈值的程度 (0.0-1.0, 偏差越大越确信是问题)
+# 最终 confidence = 加权平均, 钳到 [0.0, 1.0]
+
+
+def _module_status_confidence(results):
+    """模块 status 基础可信度: ERROR=0.95 (高), WARNING=0.7, OK=0.4 (低)."""
+    if not results:
+        return 0.0
+    err = results.get("error")
+    if err:
+        return 0.0
+    issues = results.get("issues") or []
+    if any(isinstance(i, dict) and i.get("severity") == "critical" for i in issues):
+        return 0.95
+    if any(isinstance(i, dict) and i.get("severity") == "warning" for i in issues):
+        return 0.7
+    return 0.4
+
+
+def _rule_confidence(modules, base=0.5):
+    """综合多个模块的置信度.
+
+    modules: list of (results_dict, weight) tuples
+    返回: 0.0-1.0 加权平均
+    """
+    if not modules:
+        return 0.0
+    total_w = 0.0
+    weighted = 0.0
+    for results, weight in modules:
+        c = _module_status_confidence(results)
+        weighted += c * weight
+        total_w += weight
+    if total_w == 0:
+        return 0.0
+    # 钳到 [base, 1.0], 避免永远 0.4
+    return max(base, min(1.0, weighted / total_w))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 6 条内置规则 (C1)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _rule_dns_failure(results_dict):
+    """DNS 故障: gateway OK + DNS 解析失败率 > 50%."""
+    dns_res = results_dict.get("dns", {})
+    if not dns_res:
+        return None
+    # DNS 失败率: success_count / total_count
+    sc = dns_res.get("success_count", 0)
+    tc = dns_res.get("total_count", 0) or 1
+    fail_rate = 1 - (sc / tc) if tc > 0 else 0
+    if fail_rate <= 0.5:
+        return None
+    # gateway 必须可达 (排除 WAN 全断)
+    gw = results_dict.get("gateway", {})
+    gw_ok = not gw.get("error") and (gw.get("ping", {}).get("loss_pct", 100) < 50)
+    if not gw_ok:
+        return None  # 网关都不可达, 不归 DNS
+    confidence = _rule_confidence([(dns_res, 1.0), (gw, 0.3)], base=0.7)
+    return RootCause(
+        id="dns_failure", category="DNS", severity=Severity.HIGH,
+        title=f"DNS 解析异常 (失败率 {fail_rate*100:.0f}%)",
+        description="公网域名解析失败, 网页/应用可能无法访问; 网关和外网均可达, 故障点在 DNS.",
+        confidence=confidence,
+        evidence_ids=["dns.success_count", "dns.total_count", "gateway.ping.loss_pct"],
+        affected_modules=["dns", "gateway"],
+        recommendations=[
+            "1. 换 DNS 服务器 (推荐 223.5.5.5 / 119.29.29.29 / 114.114.114.114)",
+            "2. 检查路由器 DNS 转发配置",
+            "3. 排除安全软件 / 代理的 DNS 劫持",
+            "4. 若仅系统 DNS 异常, 系统设置里手动指定公共 DNS",
+        ],
+    )
+
+
+def _rule_wan_interruption(results_dict):
+    """WAN 中断: gateway OK + external ping/TCP 全失败."""
+    ext_res = results_dict.get("external", {})
+    gw = results_dict.get("gateway", {})
+    if not ext_res or not gw:
+        return None
+    gw_ok = not gw.get("error") and (gw.get("ping", {}).get("loss_pct", 100) < 50)
+    if not gw_ok:
+        return None  # 网关不通, 不归 WAN
+    # external 模块失败标志
+    ext_failed = ext_res.get("error") or ext_res.get("overall_status") == "全部失败"
+    if not ext_failed:
+        # 看 detail: 所有目标都失败才算 WAN 中断
+        detail = ext_res.get("detail", []) or []
+        if detail:
+            ok_count = sum(1 for t in detail if isinstance(t, dict) and t.get("success"))
+            if ok_count > 0:
+                return None  # 至少有一个目标成功, 不算 WAN 中断
+            # 全部失败 → 触发 WAN (下面的逻辑)
+        else:
+            return None  # 无 detail 信息, 无法判定
+    confidence = _rule_confidence([(ext_res, 1.0), (gw, 0.3)], base=0.7)
+    return RootCause(
+        id="wan_interruption", category="WAN", severity=Severity.CRITICAL,
+        title="WAN 中断 (运营商链路故障)",
+        description="网关可达但外网不可达, 故障点在『网关 ↔ 运营商』这一段; 需联系运营商.",
+        confidence=confidence,
+        evidence_ids=["external.targets", "gateway.ping.loss_pct"],
+        affected_modules=["external", "gateway"],
+        recommendations=[
+            "1. 检查光猫 LOS 灯是否变红 (光纤断)",
+            "2. 重启光猫+路由器",
+            "3. 联系运营商客服报修",
+        ],
+    )
+
+
+def _rule_wifi_weak(results_dict):
+    """WiFi 干扰: WiFi 干扰等级 >= 较高."""
+    wifi = results_dict.get("wifi", {})
+    if not wifi:
+        return None
+    interference = wifi.get("overall_interference", "正常")
+    if "干扰" not in interference or interference == "正常":
+        return None
+    if interference not in ("干扰较高", "严重干扰"):
+        return None
+    confidence = _rule_confidence([(wifi, 1.0)], base=0.7)
+    severity = Severity.CRITICAL if "严重" in interference else Severity.HIGH
+    return RootCause(
+        id="wifi_weak", category="WiFi", severity=severity,
+        title=f"WiFi 信道{interference}",
+        description="WiFi 速率下降/延迟增加/设备连接不稳定; 干扰等级越高, 表现越明显.",
+        confidence=confidence,
+        evidence_ids=["wifi.overall_interference", "wifi.channel_analysis"],
+        affected_modules=["wifi"],
+        recommendations=[
+            "1. 路由器后台切换到推荐信道 (见报告『建议信道』)",
+            "2. 优先使用 5GHz 频段 (穿墙弱但干扰少)",
+            "3. 路由器放房屋中心位置, 远离微波炉/蓝牙设备",
+        ],
+    )
+
+
+def _rule_bufferbloat(results_dict):
+    """Bufferbloat: loaded_latency / idle_latency 比值过大."""
+    bb = results_dict.get("bufferbloat", {})
+    if not bb:
+        return None
+    idle = bb.get("idle_latency_ms", 0) or 0
+    loaded = bb.get("loaded_latency_ms", 0) or 0
+    grade = bb.get("grade", "A")
+    if grade not in ("D", "F") and loaded < idle * 3:
+        return None
+    increase = loaded - idle
+    confidence = _rule_confidence([(bb, 1.0)], base=0.7)
+    severity = Severity.CRITICAL if grade == "F" else Severity.HIGH
+    return RootCause(
+        id="bufferbloat", category="Bufferbloat", severity=severity,
+        title=f"Bufferbloat 严重 (等级 {grade}, 延迟增加 {increase:.0f}ms)",
+        description="网络空闲时延迟正常, 加载下载时延迟飙升; 是上游带宽/路由器缓存调优差.",
+        confidence=confidence,
+        evidence_ids=["bufferbloat.grade", "bufferbloat.loaded_latency_ms",
+                       "bufferbloat.idle_latency_ms"],
+        affected_modules=["bufferbloat"],
+        recommendations=[
+            "1. 登录路由器后台开启 SQM / QoS (智能队列管理)",
+            "2. 联系运营商确认上联带宽是否过度订阅",
+            "3. 考虑更换为支持 fq_codel / CAKE 的路由器固件",
+        ],
+    )
+
+
+def _rule_gateway_loss(results_dict):
+    """网关丢包: gateway loss >= 5%."""
+    gw = results_dict.get("gateway", {})
+    if not gw or gw.get("error"):
+        return None
+    ping = gw.get("ping", {})
+    loss = ping.get("loss_pct", 0)
+    if loss < 5:
+        return None
+    confidence = _rule_confidence([(gw, 1.0)], base=0.7)
+    severity = Severity.CRITICAL if loss >= 20 else Severity.HIGH
+    return RootCause(
+        id="gateway_loss", category="LAN", severity=severity,
+        title=f"网关丢包 {loss}%",
+        description="『本机 ↔ 网关』链路有丢包; 故障点在网线/WiFi/路由器, 与运营商无关.",
+        confidence=confidence,
+        evidence_ids=["gateway.ping.loss_pct", "gateway.ping.avg_ms"],
+        affected_modules=["gateway"],
+        recommendations=[
+            "1. 检查网线是否松动/破损 (更换 Cat5e 以上网线)",
+            "2. WiFi 连接时: 检查信号强度 (<-65dBm 为弱)",
+            "3. 路由器后台查看 CPU/内存占用 (过载会丢包)",
+            "4. 排除家用交换机/电力猫过载",
+        ],
+    )
+
+
+def _rule_nat_restricted(results_dict):
+    """NAT 限制: STUN 测得 Symmetric NAT (游戏/P2P 不友好)."""
+    nat = results_dict.get("nattype", {})
+    if not nat:
+        return None
+    nattype_str = nat.get("nat_type", "") or nat.get("nattype", "")
+    if "Symmetric" not in nattype_str and "对称" not in nattype_str:
+        return None
+    confidence = _rule_confidence([(nat, 0.8)], base=0.65)
+    return RootCause(
+        id="nat_restricted", category="NAT", severity=Severity.MEDIUM,
+        title="运营商 NAT 类型受限 (Symmetric)",
+        description="对称型 NAT 对游戏主机/视频通话/P2P 不友好, 直连建立困难; 影响游戏联机和 VoIP 质量.",
+        confidence=confidence,
+        evidence_ids=["nattype.nat_type"],
+        affected_modules=["nattype"],
+        recommendations=[
+            "1. 路由器开启 UPnP (自动端口映射)",
+            "2. 或手动为游戏主机配置端口转发 / DMZ 主机",
+            "3. 极端情况: 联系运营商申请公网 IP (需企业级)",
+        ],
+    )
+
+
+# 规则注册表 (C1)
+ALL_RULES = [
+    _rule_dns_failure,
+    _rule_wan_interruption,
+    _rule_wifi_weak,
+    _rule_bufferbloat,
+    _rule_gateway_loss,
+    _rule_nat_restricted,
+]
+
+
+def diagnose(results_dict):
+    """根因分析主入口 (C1 + C2). 评估所有内置规则, 返回 DiagnosisReport.
+
+    results_dict: run_diagnostics 输出的 full dict ({key: results_dict})
+    """
+    root_causes = []
+    for rule in ALL_RULES:
+        rc = rule(results_dict)
+        if rc is not None:
+            root_causes.append(rc)
+    # overall_confidence: 加权平均 (severity 权重)
+    if root_causes:
+        sev_weight = {Severity.CRITICAL: 3.0, Severity.HIGH: 2.0,
+                      Severity.MEDIUM: 1.0, Severity.LOW: 0.5,
+                      Severity.INFO: 0.2}
+        total_w = sum(sev_weight.get(rc.severity, 1.0) for rc in root_causes)
+        weighted = sum(rc.confidence * sev_weight.get(rc.severity, 1.0)
+                       for rc in root_causes)
+        overall_confidence = weighted / total_w if total_w > 0 else 0.0
+    else:
+        overall_confidence = 1.0  # 无故障, 高置信度
+    return DiagnosisReport(
+        root_causes=root_causes,
+        overall_confidence=overall_confidence,
+        timestamp=datetime.now().isoformat(),
+        rules_evaluated=len(ALL_RULES),
+        rules_fired=len(root_causes),
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 5 个 Profile 定义 (C3)
+# ────────────────────────────────────────────────────────────────────────────
+# 用户场景驱动的模块组合, 不再要求客户背 23 个模块名.
+# 后续 C4 实现 netpulse diagnose <profile> 子命令.
+
+DIAGNOSE_PROFILES = {
+    # 网速慢/卡顿: 链路 + 干扰 + 测速 + 缓冲膨胀 + TCP 质量 + DNS
+    "slow": ["gateway", "wifi", "speedtest", "bufferbloat", "tcp", "dns"],
+    # 频繁断网: 链路 + 外网 + DNS + TCP + 环路检测 (monitor 是 CLI 模式不是模块)
+    "disconnect": ["gateway", "external", "dns", "tcp", "loop"],
+    # 网页打不开/慢: DNS + TCP + HTTP + TCP 质量 + MTU + 路由
+    "web": ["dns", "tcp", "web", "tcpstats", "mtu", "route"],
+    # 游戏卡顿/延迟高: 网关 + 抖动/丢包 + NAT + Bufferbloat + MTU + TCP
+    "gaming": ["gateway", "tcp", "nattype", "bufferbloat", "mtu", "tcpstats"],
+    # WiFi 不稳/信号弱: WiFi + 网关 + LAN
+    "wifi": ["wifi", "gateway", "lan"],
+}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# _print_diagnosis: 格式化输出根因报告 (阶段 C · CLI)
+# ────────────────────────────────────────────────────────────────────────────
+# 用户场景下"先看根因 → 再看证据": 顶部突出主要问题 + 置信度 + 建议,
+# 客户不必读 23 项原始数据.
+# 注意: C_RED/C_GREEN 等 ANSI 常量在 SECTION 5 才定义, 这里用函数延迟计算
+# 避免模块加载时前置引用 NameError.
+
+
+def _severity_color(sev):
+    """Severity → ANSI 颜色代码 (C_RED 等在 SECTION 5 定义, 延迟计算)."""
+    return {
+        Severity.CRITICAL: C_RED,
+        Severity.HIGH: C_RED,
+        Severity.MEDIUM: C_YELLOW,
+        Severity.LOW: C_GRAY,
+        Severity.INFO: C_GRAY,
+    }.get(sev, C_WHITE)
+
+
+def _print_diagnosis(diagnosis):
+    """CLI: 格式化打印 DiagnosisReport (根因 + 置信度 + 建议)."""
+    if not diagnosis.root_causes:
+        print(_c(f"  ✓ 根因分析: 未发现故障 "
+                 f"(评估 {diagnosis.rules_evaluated} 条规则, 整体置信度 "
+                 f"{diagnosis.overall_confidence*100:.0f}%)", C_GREEN))
+        return
+    print(_c(f"  🔴 根因分析 ({diagnosis.rules_fired}/{diagnosis.rules_evaluated} "
+             f"条规则触发, 整体置信度 {diagnosis.overall_confidence*100:.0f}%)",
+             C_BOLD))
+    print()
+    for i, rc in enumerate(diagnosis.root_causes, 1):
+        color = _severity_color(rc.severity)
+        print(_c(f"  [{i}] {rc.severity.value.upper()} · {rc.title}", color))
+        print(f"      类别: {rc.category} | 置信度: {rc.confidence*100:.0f}%")
+        print(f"      {rc.description}")
+        if rc.affected_modules:
+            print(f"      影响模块: {', '.join(rc.affected_modules)}")
+        if rc.recommendations:
+            print(_c(f"      建议:", C_CYAN))
+            for r in rc.recommendations:
+                print(f"        {r}")
+        print()
+
+
+def _render_diagnosis_section_html(diagnosis_dict):
+    """阶段 C · v1.3.0: HTML 报告根因摘要区块.
+
+    输入: build_report() 输出的 diagnosis dict (to_dict() 结果)
+    输出: HTML section 字符串 (嵌入到 hero 之后), 无根因时返回 ""
+    """
+    import html as _html
+    if not diagnosis_dict:
+        return ""
+    root_causes = diagnosis_dict.get("root_causes") or []
+    if not root_causes:
+        # 健康时显示一行轻提示
+        return ('<section class="diagnosis healthy" id="diagnosis">'
+                '<div class="dhead">'
+                '<span class="dbadge ok">✓ 无故障</span>'
+                f'<span class="dconf">整体置信度 '
+                f'{diagnosis_dict.get("overall_confidence", 1.0)*100:.0f}%, '
+                f'评估 {diagnosis_dict.get("rules_evaluated", 0)} 条规则'
+                '</span></div>'
+                '</section>')
+    cards = []
+    for i, rc in enumerate(root_causes, 1):
+        sev = rc.get("severity", "medium")
+        sev_label = {"critical": "严重", "high": "高",
+                     "medium": "中", "low": "低"}.get(sev, sev)
+        conf_pct = rc.get("confidence", 0) * 100
+        recs = rc.get("recommendations") or []
+        recs_html = "".join(f"<li>{_html.escape(r)}</li>" for r in recs)
+        affected = ", ".join(rc.get("affected_modules") or []) or " - "
+        cards.append(
+            f'<div class="rcard severity-{_html.escape(sev)}">'
+            f'<div class="rhead">'
+            f'<span class="rbadge">{_html.escape(sev_label)}</span>'
+            f'<strong>{_html.escape(rc.get("title", ""))}</strong>'
+            f'<span class="rconf">置信度 {conf_pct:.0f}%</span>'
+            f'</div>'
+            f'<p class="rdesc">{_html.escape(rc.get("description", ""))}</p>'
+            f'<p class="rmods">影响模块: {_html.escape(affected)}</p>'
+            f'<details><summary>建议 ({len(recs)} 条)</summary>'
+            f'<ul>{recs_html}</ul></details>'
+            f'</div>')
+    header = (
+        f'<div class="dhead">'
+        f'<span class="dbadge warn">🔴 {len(root_causes)} 个主要问题</span>'
+        f'<span class="dconf">整体置信度 '
+        f'{diagnosis_dict.get("overall_confidence", 0)*100:.0f}%, '
+        f'触发 {diagnosis_dict.get("rules_fired", 0)}/{diagnosis_dict.get("rules_evaluated", 0)} 条规则'
+        f'</span></div>')
+    return (f'<section class="diagnosis" id="diagnosis">'
+            f'<h2>主要问题</h2>{header}{"".join(cards)}</section>')
+
+
+# === Diagnosis CSS (阶段 C · v1.3.0) ===
+# 注入到 HTML 报告头部 <style> 内部 (紧贴现有 _BRAND_HEADER_CSS 之后).
+# 注意: 不嵌套 <style> 标签, 由调用方在 <style> 块内嵌.
+_DIAGNOSIS_CSS = """
+.diagnosis { padding: 16px 20px; margin: 16px 0; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+.diagnosis h2 { margin: 0 0 12px; font-size: 18px; color: #1e293b; }
+.diagnosis .dhead { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.diagnosis .dbadge { padding: 4px 10px; border-radius: 4px; font-weight: 600; font-size: 13px; }
+.diagnosis .dbadge.ok { background: #dcfce7; color: #166534; }
+.diagnosis .dbadge.warn { background: #fee2e2; color: #991b1b; }
+.diagnosis .dconf { color: #64748b; font-size: 13px; }
+.diagnosis .rcard { padding: 12px 16px; border-left: 4px solid #94a3b8; margin-bottom: 12px; background: #f8fafc; border-radius: 0 6px 6px 0; }
+.diagnosis .rcard.severity-critical { border-color: #dc2626; background: #fef2f2; }
+.diagnosis .rcard.severity-high { border-color: #ea580c; background: #fff7ed; }
+.diagnosis .rcard.severity-medium { border-color: #d97706; background: #fffbeb; }
+.diagnosis .rcard.severity-low { border-color: #65a30d; }
+.diagnosis .rhead { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+.diagnosis .rbadge { padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; background: #e2e8f0; color: #334155; }
+.diagnosis .rcard.severity-critical .rbadge { background: #dc2626; color: #fff; }
+.diagnosis .rcard.severity-high .rbadge { background: #ea580c; color: #fff; }
+.diagnosis .rcard.severity-medium .rbadge { background: #d97706; color: #fff; }
+.diagnosis .rhead strong { flex: 1; font-size: 15px; color: #1e293b; }
+.diagnosis .rconf { font-size: 13px; color: #475569; font-weight: 600; }
+.diagnosis .rdesc { margin: 6px 0; color: #334155; font-size: 13px; line-height: 1.5; }
+.diagnosis .rmods { margin: 4px 0; color: #64748b; font-size: 12px; }
+.diagnosis details { margin-top: 8px; }
+.diagnosis details summary { cursor: pointer; color: #0891b2; font-size: 13px; padding: 4px 0; }
+.diagnosis details ul { margin: 6px 0 0 0; padding-left: 20px; }
+.diagnosis details li { margin: 4px 0; color: #334155; font-size: 13px; line-height: 1.5; }
+@media print {
+  .diagnosis details { open: true; }
+  .diagnosis details ul { display: block !important; }
+}
+"""
+
+
+# ============================================================
 # PIP 镜像自动选源
 # ============================================================
 #
@@ -4744,6 +5234,7 @@ def _render_speedtest_html(res):
 <title>NetPulse 宽带测速报告</title>
 <style>
   {_BRAND_HEADER_CSS}
+  {_DIAGNOSIS_CSS}
   body {{ font-family: "Microsoft YaHei", "Segoe UI", sans-serif; margin: 0; background: #eef2f6; color: #1c2430; }}
   .wrap {{ max-width: 880px; margin: 0 auto; padding: 28px 20px 48px; }}
   h1 {{ font-size: 23px; margin: 0; font-weight: 600; letter-spacing: .3px; }}
@@ -11885,10 +12376,17 @@ def build_report():
     返回结构 (供 render_report_html_customer / render_report_json 使用):
       {
         "app": ..., "version": ..., "generated_at": ...,
+        "schema_version": "1.1.0",  # 阶段 C · v1.3.0 新增 (C6)
         "system": {local_ip, gateway, dns, public_ip, asn, geo, ipv6_public_ip},
         "health": {score, grade, label, verdict, counts},
         "summary": {key: status},  # 各模块状态 (老格式, 兼容)
         "counts": {完成: N, 警告: N, ...},  # 状态计数
+        "diagnosis": {  # 阶段 C · v1.3.0 新增 (C5+C6)
+          "root_causes": [...],  # RootCause.to_dict() 列表
+          "overall_confidence": 0.85,
+          "rules_evaluated": 6,
+          "rules_fired": 2,
+        },
         "modules": [  # 客户视图模块列表
           {key, name, status, verdict, key_metrics, issues, has_tech_details, raw},
           ...
@@ -11940,12 +12438,16 @@ def build_report():
     return {
         "app": run["app"],
         "version": run["version"],
+        "schema_version": "1.1.0",          # 阶段 C · v1.3.0 新增 (C6): JSON 演进版本号
         "generated_at": run["generated_at"],
         "system": run["system"],
         "health": health,
         "counts": counts,
         "exempt_count": exempt_count,        # 评分豁免的模块数 (iperf3/ipv6/proxy/nattype)
         "summary": {m["key"]: m["status"] for m in modules},
+        # 阶段 C · v1.3.0 新增 (C5+C6): 根因分析报告
+        # 6 条内置规则 (DNS/WAN/WiFi/Bufferbloat/网关丢包/NAT) 跨模块证据聚合.
+        "diagnosis": diagnose(run["results"]).to_dict(),
         "modules": modules,
         "tech": {
             "raw_results": run["results"],
@@ -13140,6 +13642,11 @@ def render_report_html_customer(report):
     grade_key = str(health.get("grade") or "").strip()[:1].upper()
     lbl_fg, lbl_bg = GRADE_BADGE.get(grade_key, GRADE_BADGE["C"])
     score_ring = _svg_health_ring(score, grade_key)
+
+    # 阶段 C · v1.3.0: 根因摘要 (hero 之后紧接, 客户第一屏直接看到主要问题)
+    diagnosis_section = _render_diagnosis_section_html(
+        report.get("diagnosis", {}))
+
     hero = f"""
 <header class="hero" id="overview">
   <div style="flex:1;min-width:0">
@@ -13792,7 +14299,7 @@ details.collapse .subcap code{background:#fff;padding:1px 6px;border-radius:3px;
 @media(max-width:960px){.nav{display:none}.main{margin:0 14px}.hero{flex-wrap:wrap}.gauge{margin:0}.charts{grid-template-columns:1fr}}
 @media print{body{background:#fff;padding:0;font-size:12px}.nav,.sec .cnt,.chart .tag{display:none}.main{margin:0}.hero,.stat-card,.chart,.mod,.todo,.overview,.host-card{box-shadow:none}.hero{background:#f8fafc !important;border:1px solid #ddd !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.mod,.host-card,.todo{break-inside:avoid}details.mod>summary .arr,details.collapse>summary::before{display:none}details.mod>summary{cursor:default}details.mod,details.collapse{border-style:solid}}
 footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-top:20px;border-top:1px solid #e6e9f0}
-"""
+""" + _DIAGNOSIS_CSS  # 阶段 C · v1.3.0: 根因摘要 CSS
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -13814,6 +14321,7 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 <div class="main">
 <main id="main-content">
 {hero}
+{diagnosis_section}
 {band_html}
 {todo_section}
 {stats_section}
@@ -14283,6 +14791,12 @@ def main():
                         help="完整输出, 不截断长字段")
     parser.add_argument("--no-color", action="store_true",
                         help="禁用彩色输出 (兼容老旧终端)")
+    parser.add_argument("--diagnose", metavar="PROFILE",
+                        choices=sorted(list(DIAGNOSE_PROFILES.keys())),
+                        help="按场景 Profile 诊断 (阶段 C · v1.3.0 引入). "
+                             "可选: slow / disconnect / web / gaming / wifi. "
+                             "诊断完成后输出根因分析 (置信度 + 建议). "
+                             "例: netpulse.py --diagnose slow")
     parser.add_argument("--install", action="store_true",
                         help="自动安装缺失依赖 (scapy/Npcap), 无需交互确认")
     parser.add_argument("--no-scapy", action="store_true",
@@ -14411,6 +14925,22 @@ def main():
 
     if args.list:
         _print_module_list()
+        return
+    # 按场景 Profile 诊断 (阶段 C · v1.3.0 引入): 跑 profile 模块后追加根因分析
+    if args.diagnose:
+        profile = args.diagnose
+        keys = DIAGNOSE_PROFILES[profile]
+        print(_c(f"  按场景诊断: {profile} "
+                 f"(模块: {', '.join(keys)})", C_BOLD))
+        run_diagnostics(keys, verbose=args.verbose, as_json=args.json,
+                        no_color=args.no_color, install=args.install,
+                        parallel=args.parallel, max_workers=args.max_workers,
+                        pip_mirror=args.pip_mirror)
+        # 根因分析 (基于 run_diagnostics 写入的 LAST_RUN["results"])
+        if LAST_RUN and LAST_RUN.get("results"):
+            diagnosis = diagnose(LAST_RUN["results"])
+            print(_c("─" * 60, C_BLUE))
+            _print_diagnosis(diagnosis)
         return
     # 盯障模式: 独立顶层运行模式 (与模块诊断互斥)
     if args.monitor:

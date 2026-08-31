@@ -7,6 +7,45 @@
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-31
+
+### 新增
+- **根因引擎 (SECTION 1f)**：从"23 项独立检测"升级为"故障定位"
+  - `RootCause` / `DiagnosisReport` dataclass（id/category/severity/title/description/confidence/evidence_ids/affected_modules/recommendations）
+  - **6 条内置规则**：
+    - `dns_failure` — DNS 解析失败率 > 50% 且网关可达
+    - `wan_interruption` — 网关可达但外网目标全失败
+    - `wifi_weak` — WiFi 干扰等级 ≥ 较高
+    - `bufferbloat` — 加载延迟比空闲延迟高得多（grade D/F）
+    - `gateway_loss` — 网关丢包 ≥ 5%
+    - `nat_restricted` — STUN 测得 Symmetric NAT
+  - `diagnose(results_dict) -> DiagnosisReport`：主入口，跨模块证据聚合
+  - `_module_status_confidence` + `_rule_confidence`：基于模块 status + 证据数量的置信度算法
+  - **整体置信度加权**：`overall_confidence` 按 severity 权重 (CRITICAL=3, HIGH=2, MEDIUM=1) 计算
+- **5 个 Profile**（用户场景驱动的模块组合）：
+  - `slow`：网关 + WiFi + 测速 + Bufferbloat + TCP + DNS
+  - `disconnect`：网关 + 外网 + DNS + TCP + 环路
+  - `web`：DNS + TCP + Web + TCP 质量 + MTU + 路由
+  - `gaming`：网关 + TCP + NAT + Bufferbloat + MTU + TCP 质量
+  - `wifi`：WiFi + 网关 + LAN
+- **CLI `--diagnose PROFILE`** 子命令：按场景诊断并输出根因分析
+- **HTML 报告根因摘要区块**：第一屏（hero 之后）显示主要问题卡（severity 配色 + 置信度% + 影响模块 + 可折叠建议）
+- **JSON 报告 schema_version 1.1.0** + `diagnosis` 顶层字段
+
+### 测试
+- `tests/test_diagnosis.py` **32 项** unittest（覆盖 6 条规则 + 5 profile + diagnose 主入口 + confidence 加权 + Profile 模块注册验证）
+- `_smoke_report.py` 109 → **126 项**（17 项新增 diagnose 集成）
+- HTML 报告长度 56505 → 60643 字节（CSS + diagnosis section）
+- 用户视觉体验：第一屏直接看到「主要问题 + 置信度 + 建议」，再下拉看 evidence 详情
+
+### 不变更（向后兼容）
+- CLI `--help` / `--list` 输出不变（仅新增 `--diagnose` 选项）
+- `netpulse <modules>` 旧调用方式完全不变
+- JSON 报告新增 `schema_version` + `diagnosis` 字段，旧解析器忽略未知字段即可兼容
+- HTML 报告布局变化：hero 之后**插入** diagnosis section（原有 todo / stats / mod 区块不变）
+
+[1.3.0]: https://github.com/silentcrow09/netpulse/compare/v1.2.0...v1.3.0
+
 ## [1.2.0] - 2026-08-31
 
 ### 新增
