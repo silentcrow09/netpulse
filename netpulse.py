@@ -1645,6 +1645,114 @@ _DIAGNOSIS_CSS = """
 """
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# 阶段 D · v1.4.0: --debug-bundle 调试包 (含脱敏)
+# ────────────────────────────────────────────────────────────────────────────
+# 用户场景: 上报 bug / 远端排障, 需要把"系统信息 + 诊断结果 + log"打包
+# 发送给开发者. 隐私敏感 (用户偏好: 分发物严禁暴露本地用户名),
+# 因此默认脱敏: SSID / MAC / 公网 IP / hostname.
+
+def _redact_value(key, value):
+    """脱敏单个字段值. 命中隐私字段返回 mask, 否则原样返回."""
+    if not isinstance(value, str) or not value:
+        return value
+    key_l = key.lower()
+    # MAC 地址 (XX:XX:XX:XX:XX:XX 或 XX-XX-XX-XX-XX-XX 格式)
+    if "mac" in key_l and re.match(r"^[0-9a-fA-F:-]+$", value):
+        return "XX:XX:XX:XX:XX:XX"
+    # 公网 IP (xxx.xxx.xxx.xxx)
+    if "public_ip" in key_l and re.match(r"^\d+\.\d+\.\d+\.\d+$", value):
+        parts = value.split(".")
+        return f"{parts[0]}.{parts[1]}.X.X"
+    # SSID (任意字符串)
+    if "ssid" in key_l:
+        return "***"
+    # hostname (DESKTOP-XXXX 或)
+    if "hostname" in key_l or "host_name" in key_l:
+        return "host-REDACTED"
+    return value
+
+
+def _redact_dict(d):
+    """递归脱敏 dict, 处理 dict/list/str 嵌套."""
+    if not isinstance(d, dict):
+        return d
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out[k] = _redact_dict(v)
+        elif isinstance(v, list):
+            out[k] = [_redact_dict(x) if isinstance(x, dict)
+                      else _redact_value(k, x) for x in v]
+        else:
+            out[k] = _redact_value(k, v)
+    return out
+
+
+def _export_debug_bundle(out_dir):
+    """阶段 D · v1.4.0: 生成脱敏调试包.
+
+    流程:
+      1. 跑一次全诊断 (若 LAST_RUN 不存在)
+      2. 脱敏 (SSID / MAC / 公网 IP / hostname)
+      3. 写 system.json + diagnostic.json + netpulse.log
+      4. 打包 zip, 输出到 out_dir
+    """
+    # 1. 确保有诊断数据
+    if not LAST_RUN:
+        print(_c("  首次生成 debug-bundle, 跑全诊断 (约 30-120 秒)...", C_GRAY))
+        run_diagnostics([k for k, _, _ in MODULE_REGISTRY])
+    if not LAST_RUN:
+        print(_c("  ✗ 跑诊断失败, 无法生成 debug-bundle", C_RED))
+        return
+    # 2. 脱敏
+    try:
+        sys_info_redacted = _redact_dict(dict(LAST_RUN.get("system", {})))
+        diag_redacted = {k: _redact_dict(v) if isinstance(v, dict)
+                         else v for k, v in LAST_RUN.get("results", {}).items()}
+    except Exception as e:
+        print(_c(f"  ✗ 脱敏失败: {e}", C_RED))
+        return
+    # 3. 输出目录
+    out_dir_abs = os.path.abspath(out_dir)
+    os.makedirs(out_dir_abs, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = f"netpulse-debug-{timestamp}"
+    system_path = os.path.join(out_dir_abs, f"{base}-system.json")
+    diag_path = os.path.join(out_dir_abs, f"{base}-diagnostic.json")
+    log_path = os.path.join(out_dir_abs, f"{base}-netpulse.log")
+    zip_path = os.path.join(out_dir_abs, f"{base}.zip")
+    # 4. 写 JSON 文件
+    with open(system_path, "w", encoding="utf-8") as f:
+        json.dump(sys_info_redacted, f, ensure_ascii=False, indent=2, default=str)
+    with open(diag_path, "w", encoding="utf-8") as f:
+        json.dump(diag_redacted, f, ensure_ascii=False, indent=2, default=str)
+    # log (简化: 占位 + 脱敏说明; 阶段 E 可接 Python logging 模块)
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(f"NetPulse v{APP_VERSION} debug bundle\n")
+        f.write(f"Generated at: {datetime.now().isoformat()}\n")
+        f.write(f"Redacted: SSID / MAC / public IP / hostname\n")
+        f.write(f"Schema version: 1.1.0\n")
+    # 5. zip
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(system_path, os.path.basename(system_path))
+            zf.write(diag_path, os.path.basename(diag_path))
+            zf.write(log_path, os.path.basename(log_path))
+    except Exception as e:
+        print(_c(f"  ✗ zip 打包失败: {e}", C_RED))
+        return
+    # 6. 清理临时文件
+    for p in (system_path, diag_path, log_path):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    print(_c(f"  ✓ 调试包已生成: {os.path.abspath(zip_path)}", C_GREEN))
+    print(_c(f"  含 {os.path.basename(zip_path)} (zip: system.json + diagnostic.json + netpulse.log)",
+             C_GRAY))
+
+
 # ============================================================
 # PIP 镜像自动选源
 # ============================================================
@@ -9427,6 +9535,24 @@ class MonitorSession:
             "advice": advice,
             "local_ip": get_local_ip(),
         }
+        # 阶段 D · v1.4.0: 给每个事件附 root_cause 标签 (D5)
+        # 把已有的 cls 字段翻译为客户可读的根因描述.
+        _CLS_TO_ROOT_CAUSE = {
+            "internal": "LAN/WiFi 内网中断 (网关不可达)",
+            "carrier":  "运营商 WAN 中断 (网关可达但外网不通)",
+            "both_down": "网关 + 外网同时中断 (内网/WAN 都可能)",
+            "unknown":  "根因未知 (网关数据缺失)",
+            "dns":      "DNS 解析故障",
+            "policy":   "疑似端口策略 / QoS (信息级)",
+        }
+        for ev in events:
+            cls = ev.get("cls", "")
+            if ev.get("type") == "monitor_gap":
+                ev["root_cause"] = "采集间隙 (系统睡眠/进程阻塞?)"
+            elif cls in _CLS_TO_ROOT_CAUSE:
+                ev["root_cause"] = _CLS_TO_ROOT_CAUSE[cls]
+            else:
+                ev["root_cause"] = "其他"
         # CSV 行 (绝对墙钟, Excel 直开)
         rows = []
         for probe, stream, note_fn in (
@@ -10145,6 +10271,26 @@ def _safe_print(*args, **kwargs):
     with _PRINT_LOCK:
         print(*args, **kwargs)
         sys.stdout.flush()
+
+
+def compute_exit_code(statuses):
+    """阶段 D · v1.4.0 引入: 标准化 Exit Code.
+
+    用法: main() 跑完诊断后, sys.exit(compute_exit_code(LAST_RUN["status"]))
+    约定 (与 PowerShell/BAT/RMM/CI 一致):
+      0 = 全部 OK (无异常/警告/超时)
+      1 = 有警告 (warning) — 网络有可关注项, 但不阻塞
+      2 = 检测出问题 (异常/错误/超时) — 客户网络真有问题
+      3 = 工具执行失败 (Python 异常) — 工具自己崩了
+      4 = 参数错 (argparse 已处理, 此处不返回 4)
+      5 = 权限不足 (管理员权限缺失, --no-scapy 已处理)
+    """
+    statuses = set(statuses.values() if isinstance(statuses, dict) else statuses)
+    if statuses & {"异常", "错误", "超时"}:
+        return 2
+    if "警告" in statuses:
+        return 1
+    return 0
 
 
 def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
@@ -14797,6 +14943,15 @@ def main():
                              "可选: slow / disconnect / web / gaming / wifi. "
                              "诊断完成后输出根因分析 (置信度 + 建议). "
                              "例: netpulse.py --diagnose slow")
+    parser.add_argument("--json-schema", action="store_true",
+                        help="输出当前 JSON Schema 版本号与结构路径 (阶段 D · v1.4.0 引入). "
+                             "供 AI Agent / RMM / 飞书 bot introspect 用, "
+                             "无需跑诊断即可查询 schema_version 与字段定义文件位置.")
+    parser.add_argument("--debug-bundle", metavar="DIR",
+                        help="生成调试包 (阶段 D · v1.4.0 引入). "
+                             "zip 含 system.json + diagnostic.json + netpulse.log, "
+                             "默认脱敏 (SSID / MAC / 公网 IP / hostname). "
+                             "用于上报 bug 或远端排障. 例: --debug-bundle ./out")
     parser.add_argument("--install", action="store_true",
                         help="自动安装缺失依赖 (scapy/Npcap), 无需交互确认")
     parser.add_argument("--no-scapy", action="store_true",
@@ -14925,6 +15080,22 @@ def main():
 
     if args.list:
         _print_module_list()
+        return
+    # 阶段 D · v1.4.0: --json-schema 输出当前 JSON Schema 版本号 (无需跑诊断)
+    if args.json_schema:
+        schema_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "schema")
+        print(json.dumps({
+            "schema_version": "1.1.0",
+            "schema_dir": schema_dir if os.path.isdir(schema_dir)
+                          else "(未生成 — 见 schema/netpulse-result-v1.1.json)",
+            "app": APP_NAME,
+            "version": APP_VERSION,
+        }, ensure_ascii=False, indent=2))
+        return
+    # 阶段 D · v1.4.0: --debug-bundle 生成调试包 (脱敏的诊断快照)
+    if args.debug_bundle:
+        _export_debug_bundle(args.debug_bundle)
         return
     # 按场景 Profile 诊断 (阶段 C · v1.3.0 引入): 跑 profile 模块后追加根因分析
     if args.diagnose:

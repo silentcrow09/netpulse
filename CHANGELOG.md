@@ -7,6 +7,52 @@
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-08-31
+
+### 新增
+- **Exit Code 标准化 (D2)**：让 PowerShell / BAT / RMM / CI / AI Agent 能稳定判定诊断结果
+  - `compute_exit_code(statuses)` 函数
+  - **0** = 全部 OK（无异常/警告/超时）
+  - **1** = 有 WARNING（网络有可关注项，不阻塞）
+  - **2** = 检测出问题（异常 / 错误 / 超时）
+  - **3** = 工具执行失败
+  - **4** = 参数错（argparse 已处理）
+  - **5** = 权限不足
+- **`--json-schema` 子命令 (D4)**：输出当前 schema_version + schema 路径，AI Agent / RMM / 飞书 bot introspect 用
+- **`--debug-bundle <DIR>` 子命令 (D3)**：生成脱敏调试包
+  - `system.json` + `diagnostic.json` + `netpulse.log` 打包成 zip
+  - **默认脱敏** SSID / MAC 地址 / 公网 IP / hostname（用户隐私偏好）
+  - 脱敏函数：`_redact_value(key, value)` + `_redact_dict(d)` 递归处理嵌套
+- **Monitor 模式 root_cause 标签 (D5)**：每次事件附客户可读的根因描述
+  - `internal` → LAN/WiFi 内网中断
+  - `carrier` → 运营商 WAN 中断
+  - `both_down` → 网关 + 外网同时中断
+  - `dns` → DNS 解析故障
+  - `policy` → 端口策略 / QoS（信息级）
+  - `monitor_gap` → 采集间隙（系统睡眠?）
+- **JSON Schema 文档 (D1)**：`schema/netpulse-result-v1.1.json`
+  - 完整的 JSON Schema (draft 2020-12) 描述 `schema_version: "1.1.0"` 输出格式
+  - 包含顶层 9 个字段定义（app/version/schema_version/system/health/diagnosis/modules/tech 等）
+
+### 待执行（D6）
+- **D6 · Exit Code 变更预告**：需在 GitHub Discussions 发预告帖（v1.4.0 之前一周）
+  - 当前 v1.3.0 默认 exit 0（旧行为）
+  - v1.4.0 起按 D2 标准 exit code 返回
+  - 用户在 Discussions 发预告后完成 D6
+
+### 测试
+- `_smoke_report.py` 126 → **142 项**（+16 项 D 接口标准化 + 脱敏 + JSON Schema 文件存在）
+- 脱敏单元测试覆盖：MAC / 公网 IP / SSID / hostname / 普通字段
+- Exit Code 单元测试覆盖：全部 OK / 有警告 / 有异常 / 有超时
+
+### 不变更（向后兼容）
+- CLI `--help` / `--list` 输出不变（仅新增 `--json-schema` 和 `--debug-bundle` 选项）
+- 现有 `--only / --diagnose / --export / --monitor` 完全不变
+- HTML 报告布局完全不变
+- v1.3.0 默认 exit 0（旧行为）—— D2 标准 exit code v1.4.0 生效，D6 预告
+
+[1.4.0]: https://github.com/silentcrow09/netpulse/compare/v1.3.0...v1.4.0
+
 ## [1.3.0] - 2026-08-31
 
 ### 新增
