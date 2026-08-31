@@ -13492,7 +13492,7 @@ def main():
                         help="iperf3 单方向测速时长 (秒, 默认 10)")
     parser.add_argument("--iperf3-udp", action="store_true",
                         help="iperf3 改用 UDP 模式测抖动/丢包 (1 Mbps 发包率, 语音/游戏"
-                             "质量口径): 抖动 >30ms 或丢包 >1% 给出告警; 默认 TCP 测吞吐")
+                             "质量口径): 抖动 >30ms 或丢包 >1%% 给出告警; 默认 TCP 测吞吐")
     parser.add_argument("--speedtest-net", action="store_true",
                         help="启用 Ookla Speedtest 官方测速 (CLI 默认关闭; "
                              "交互菜单默认启用, 上海电信节点 3633)。"
