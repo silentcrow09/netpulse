@@ -42,3 +42,7 @@ ehthumbs.db
 /report_redesign_*.html
 /report_full_v2.*
 .codegraph/
+
+# ── 单元测试目录 (含真实 Windows 输出 fixture, MAC/SSID/IP/hostname 隐私) ──
+# 与 _smoke_*.py 模式一致: 本地跑测试不入仓
+/tests/

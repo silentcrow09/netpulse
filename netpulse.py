@@ -83,42 +83,54 @@ SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_NEVER
 # 最近一次诊断运行的完整数据 (供报告生成使用)
 LAST_RUN = None
 
-# 端口探测模块的运行参数 (由 CLI --port-* 写入, run_diagnostics 读取)
-PORT_PROBE_CONFIG = {"targets": [], "proto": "tcp", "count": 2,
-                     "force": False, "max_total_time": 60.0,
-                     "max_concurrency": 8}
-
-# 测速 / iperf3 模块的运行参数 (由 CLI 写入, runner 读取)
-# - iperf3_server / iperf3_port / iperf3_duration: iperf3 独立模块用, 由 --iperf3-server 提供;
-#   提供后 iperf3 模块测到该服务器的上下行吞吐 (iperf3 是最准的链路吞吐测量)
-# - use_speedtest_net: 默认启用 — Ookla Speedtest CLI 官方测速作为对照参考;
-#   交互菜单模式下自动启用 (无需 --speedtest-net), CLI 模式需显式加 --speedtest-net
-# - ookla_server_id: 默认 3633 (上海电信 Ookla 服务器), 避免自动选点偏海外;
-#   --speedtest-node <数字ID> 可覆盖; 传 host:port 则只影响国内上行节点
-# - node: 手动指定测速服务器 — 数字 ID (Ookla 服务器, 配合 --speedtest-net) 或
-#   host:port (国内上行节点); 默认自动选国内运营商节点
-# - duration_down / duration_up: 上下行测速时长 (秒)
-# - live_ui: 单独运行测速模块时启用终端实时可视化 (由 run_diagnostics 写入)
+# 模块运行参数统一配置 (阶段 B · v1.2.0 引入 — B12)
+# 设计: 把散落各模块的 XXX_CONFIG 集中到顶层 CONFIG 字典, 按模块名分 key.
+#       旧名字 (PORT_PROBE_CONFIG 等) 作为 alias 指向 CONFIG 子项, 旧代码不改
+#       即可继续工作 (Python dict 引用, 修改 alias 等同修改 CONFIG 子项).
+#
 # Ookla 上海电信服务器 ID 3633 来源: speedtest.net 官方服务器列表
 # (https://www.speedtest.net/server/3633), 长期稳定; 如失效可 --speedtest-node 覆盖
 OOKLA_DEFAULT_SERVER_ID = 3633  # 上海电信
-SPEEDTEST_CONFIG = {"iperf3_server": None, "iperf3_port": 5201, "iperf3_duration": 10,
-                    "use_speedtest_net": False,
-                    "ookla_server_id": OOKLA_DEFAULT_SERVER_ID,
-                    "node": None, "duration_down": 8.0, "duration_up": 8.0,
-                    "live_ui": False}
 
-# NAT 类型模块的运行参数 (由 CLI --nattype-server 写入, runner 读取)
-# 为空时用内置候选 (实测可用的排前), 给 1~2 台则覆盖
-NATTYPE_CONFIG = {"servers": []}
+CONFIG = {
+    # 端口探测模块的运行参数 (由 CLI --port-* 写入, run_diagnostics 读取)
+    "port": {"targets": [], "proto": "tcp", "count": 2,
+             "force": False, "max_total_time": 60.0,
+             "max_concurrency": 8},
+    # 测速 / iperf3 模块的运行参数
+    # - iperf3_server / iperf3_port / iperf3_duration: iperf3 独立模块用, 由 --iperf3-server 提供;
+    #   提供后 iperf3 模块测到该服务器的上下行吞吐 (iperf3 是最准的链路吞吐测量)
+    # - use_speedtest_net: 默认启用 — Ookla Speedtest CLI 官方测速作为对照参考;
+    #   交互菜单模式下自动启用 (无需 --speedtest-net), CLI 模式需显式加 --speedtest-net
+    # - ookla_server_id: 默认 3633 (上海电信 Ookla 服务器), 避免自动选点偏海外;
+    #   --speedtest-node <数字ID> 可覆盖; 传 host:port 则只影响国内上行节点
+    # - node: 手动指定测速服务器 — 数字 ID (Ookla 服务器, 配合 --speedtest-net) 或
+    #   host:port (国内上行节点); 默认自动选国内运营商节点
+    # - duration_down / duration_up: 上下行测速时长 (秒)
+    # - live_ui: 单独运行测速模块时启用终端实时可视化 (由 run_diagnostics 写入)
+    "speedtest": {"iperf3_server": None, "iperf3_port": 5201, "iperf3_duration": 10,
+                  "use_speedtest_net": False,
+                  "ookla_server_id": OOKLA_DEFAULT_SERVER_ID,
+                  "node": None, "duration_down": 8.0, "duration_up": 8.0,
+                  "live_ui": False},
+    # NAT 类型模块的运行参数 (由 CLI --nattype-server 写入, runner 读取)
+    # 为空时用内置候选 (实测可用的排前), 给 1~2 台则覆盖
+    "nattype": {"servers": []},
+    # 网页体检模块的运行参数 (由 CLI --web-target 写入, 追加到默认 3 目标后)
+    "web": {"targets": []},
+    # TCP 并发模块的运行参数 (由 CLI --tcpcc-max / --tcpcc-target 写入)
+    # - max: 阶梯上限 (默认 1600, 硬上限 8000; Windows 临时端口 ~16k, 高上限勿短时重复跑)
+    # - target: 自定义目标 host:port (默认自动挑公网 anycast DNS 的 TCP 53)
+    "tcpcc": {"max": 1600, "target": None},
+}
 
-# 网页体检模块的运行参数 (由 CLI --web-target 写入, 追加到默认 3 目标后)
-WEB_CONFIG = {"targets": []}
-
-# TCP 并发模块的运行参数 (由 CLI --tcpcc-max / --tcpcc-target 写入)
-# - max: 阶梯上限 (默认 1600, 硬上限 8000; Windows 临时端口 ~16k, 高上限勿短时重复跑)
-# - target: 自定义目标 host:port (默认自动挑公网 anycast DNS 的 TCP 53)
-TCPCC_CONFIG = {"max": 1600, "target": None}
+# 兼容性 alias (B12): 旧名字指向 CONFIG 子项, 旧代码不改即可继续工作
+# 写 PORT_PROBE_CONFIG["targets"] = xxx 实际修改 CONFIG["port"]["targets"]
+PORT_PROBE_CONFIG = CONFIG["port"]
+SPEEDTEST_CONFIG = CONFIG["speedtest"]
+NATTYPE_CONFIG = CONFIG["nattype"]
+WEB_CONFIG = CONFIG["web"]
+TCPCC_CONFIG = CONFIG["tcpcc"]
 
 
 def _is_admin():
@@ -575,6 +587,572 @@ class ModuleMeta:
 STATUS_ZH_KEY = {s.value: s.zh_label for s in Status}      # "ok" → "完成"
 STATUS_KEY_TO_STATUS = {zh: s for zh, s in                 # "完成" → Status.OK
     [(zh, s) for s in Status for zh in [s.zh_label]]}
+
+
+# ============================================================
+# SECTION 1d: PARSERS  (阶段 B · v1.2.0 引入)
+# ============================================================
+# 集中 Windows 命令文本解析. 输入 raw text, 输出 typed dataclass.
+# 与诊断模块解耦 — 可独立单测. 现有调用点保留, 双轨运行.
+# 阶段 B7-B11 再把 gateway / dns / route / arp / wifi 模块迁移到 Probe 契约.
+#
+# 设计原则:
+#   1. 解析器不得依赖中英文 UI 文本 (用 "Physical Address" / "MAC 地址" 等同义字段名兜底)
+#   2. 字段缺失返回 None / [], 不抛异常 (Windows 不同版本 / 角色字段不全)
+#   3. 中文乱码字段 (cp936 解码错误) 自动 fallback 到 UTF-8
+
+@dataclass
+class NetworkAdapter:
+    """ipconfig /all 一个网络适配器 (含 VPN 虚拟适配器)"""
+    name: str                          # e.g. "WLAN", "本地连接", "VirtualBox Host-Only Network"
+    desc: str                          # e.g. "Realtek 8822CE Wireless LAN 802.11ac PCI-E NIC"
+    mac: str = ""                      # e.g. "D8-80-83-B7-2F-A9"
+    ipv4: str | None = None
+    prefix_len: int | None = None      # ipconfig 不输出 prefix_len, 调用方用 PowerShell 补
+    ipv6: str | None = None
+    gateway: str | None = None
+    dhcp_server: str | None = None
+    dns_servers: list[str] = field(default_factory=list)
+    media_state: str = "unknown"       # "Media disconnected" / "" (connected)
+
+    @property
+    def is_up(self):
+        return "disconnected" not in self.media_state.lower()
+
+
+@dataclass
+class RouteEntry:
+    """route print 的一条 IPv4 路由项"""
+    destination: str                   # "0.0.0.0"
+    netmask: str                       # "0.0.0.0"
+    gateway: str                       # "On-link" 表示直接路由
+    interface_ip: str                  # "172.25.131.131"
+    metric: int = 0
+    is_onlink: bool = False
+
+    @property
+    def is_default(self):
+        return self.destination == "0.0.0.0" and self.netmask == "0.0.0.0"
+
+
+@dataclass
+class ArpEntry:
+    """arp -a 的一条 ARP 表项"""
+    ip: str
+    mac: str
+    interface_ip: str                  # 所属接口 IP (从 "Interface: <ip> --- 0x<n>" 段落解析)
+    type_: str                         # "dynamic" / "static"
+
+
+@dataclass
+class WifiInterface:
+    """netsh wlan show interfaces 一个 WiFi 接口"""
+    name: str                          # "WLAN"
+    state: str                         # "connected" / "disconnected"
+    ssid: str | None = None
+    bssid: str | None = None
+    signal_pct: int | None = None
+    channel: int | None = None
+    radio: str | None = None
+    physical_mac: str | None = None
+    description: str | None = None
+    guid: str | None = None
+
+
+# --- 段落正则 (中英文 Windows 段落名都匹配) ---)
+_IPCONFIG_SECTION_RE = re.compile(
+    r"^(?:Ethernet adapter|Wireless LAN adapter|无线局域网适配器|以太网适配器)"
+    r"\s*([^:]+?)\s*:\s*$",
+    re.MULTILINE,
+)
+_ARP_SECTION_RE = re.compile(
+    r"Interface:\s+([\d.]+)\s+---\s+0x[0-9a-fA-F]+",
+)
+_ROUTE_TABLE_RE = re.compile(
+    r"IPv4 Route Table.*?^={3,}.*?\n(.*?)(?=^={3,}|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _ipconfig_get(body, label):
+    """提取 ipconfig 字段值. label 可中英文 (如 'Physical Address' / 'MAC 地址').
+
+    严格限制到行内 (避免 .+ 跨行贪婪抓到下一字段值), 字段为空返回 None.
+    """
+    pat = r"(?:" + "|".join(re.escape(lbl) for lbl in label) + r")[\. ]+:[ \t]+([^\r\n]+)"
+    m = re.search(pat, body)
+    if not m:
+        return None
+    val = m.group(1).strip()
+    return val if val else None
+
+
+def parse_ipconfig(raw):
+    """ipconfig /all 输出 → NetworkAdapter 列表.
+
+    段落分隔: 'Ethernet adapter X:' / 'Wireless LAN adapter Y:'
+              / '无线局域网适配器 X:' / '以太网适配器 X:' (中文 Windows)
+    字段格式: '字段名 . . . : 值' (中英文都遵循此格式)
+    """
+    adapters = []
+    # 跳过顶部全局段 (Host Name / Primary Dns Suffix 等), 第一个段落前的内容
+    sections = _IPCONFIG_SECTION_RE.split(raw)
+    # sections[0] = 顶部全局信息, [1::2] = 段落名, [2::2] = 段落 body
+    for i in range(1, len(sections), 2):
+        name = sections[i].strip()
+        body = sections[i + 1]
+        # Physical Address (英文) / 物理地址 (中文) 都试
+        mac = _ipconfig_get(body, ["Physical Address", "物理地址"])
+        ipv4 = _ipconfig_get(body, ["IPv4 Address", "IPv4 地址"])
+        ipv6 = _ipconfig_get(body, ["Link-local IPv6 Address", "本地链接 IPv6 地址",
+                                    "IPv6 Address", "IPv6 地址"])
+        gateway = _ipconfig_get(body, ["Default Gateway", "默认网关"])
+        dhcp = _ipconfig_get(body, ["DHCP Server", "DHCP 服务器"])
+        # DNS 行可能含 IPv4 + IPv6, 字符类放宽到 [\d.:a-fA-F]
+        dns_lines = re.findall(
+            r"(?:DNS Servers|DNS 服务器)[\. ]+:\s+([\d.:a-fA-F]+)", body)
+        media = _ipconfig_get(body, ["Media State", "媒体状态"]) or ""
+        desc = _ipconfig_get(body, ["Description", "描述"]) or ""
+
+        # 剥离 IPv4 后缀 (Preferred) / (Duplicate) 等注释
+        if ipv4:
+            ipv4 = ipv4.split("(")[0].strip()
+
+        adapters.append(NetworkAdapter(
+            name=name, desc=desc, mac=(mac or "").replace("-", ":").lower(),
+            ipv4=ipv4, prefix_len=None, ipv6=ipv6,
+            gateway=gateway, dhcp_server=dhcp,
+            dns_servers=[d.strip() for d in dns_lines],
+            media_state=media,
+        ))
+    return adapters
+
+
+def parse_route_print(raw):
+    """route print 输出 → RouteEntry 列表.
+
+    中英文 Windows 输出格式相同, 5 列空格分隔:
+        Network Destination  Netmask  Gateway  Interface  Metric
+    On-link 表示直接路由 (无需下一跳).
+    """
+    entries = []
+    m = _ROUTE_TABLE_RE.search(raw)
+    if not m:
+        return entries
+    table = m.group(1)
+    for line in table.splitlines():
+        line = line.strip()
+        if not line or not line[0].isdigit():
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        dest, mask, gw, iface, metric = parts[:5]
+        try:
+            metric_int = int(metric)
+        except ValueError:
+            continue
+        entries.append(RouteEntry(
+            destination=dest, netmask=mask,
+            gateway=gw, interface_ip=iface,
+            metric=metric_int, is_onlink=(gw.lower() == "on-link"),
+        ))
+    return entries
+
+
+def parse_arp_a(raw):
+    """arp -a 输出 → ArpEntry 列表.
+
+    段落分隔: 'Interface: <ip> --- 0x<n>'
+    """
+    entries = []
+    parts = _ARP_SECTION_RE.split(raw)
+    # parts[0] = 顶部, [1::2] = interface_ip, [2::2] = body
+    for i in range(1, len(parts), 2):
+        iface_ip = parts[i]
+        body = parts[i + 1]
+        for line in body.splitlines():
+            line = line.strip()
+            if not line or "Internet Address" in line:
+                continue
+            cols = line.split()
+            if len(cols) >= 3:
+                ip, mac, type_ = cols[0], cols[1], cols[2]
+                entries.append(ArpEntry(
+                    ip=ip, mac=mac.lower(),
+                    interface_ip=iface_ip,
+                    type_=type_.lower(),
+                ))
+    return entries
+
+
+def parse_netsh_wlan_interfaces(raw):
+    """netsh wlan show interfaces → WifiInterface 列表.
+
+    netsh 输出始终是英文 (即使中文 Windows). 注意 netsh 行尾用 \\r\\r\\n
+    (双 \\\\r 怪异行为), 不归一化会被 \\s+ 误判为多行.
+
+    netsh 实际格式是"每个字段单独一段" (每个字段后有空行), 不按接口分组.
+    累积所有字段为一个 interface dict. 一次调用只输出当前接口.
+    多行字段值 (如 Radio status "Hardware On\\nSoftware Off") 用 " | " 连接.
+    """
+    raw = raw.replace("\r\r\n", "\n").replace("\r\n", "\n")
+    fields = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip()
+        if not k:
+            continue
+        # 多行字段值累积
+        if k in fields:
+            fields[k] += " | " + v.strip()
+        else:
+            fields[k] = v.strip()
+    # 没有 Name 字段说明不是有效接口输出 (e.g. 仅 "There is N interface" 头部)
+    if "Name" not in fields or not fields["Name"]:
+        return []
+    sig_pct = None
+    if "Signal" in fields:
+        mm = re.search(r"(\d+)%", fields["Signal"])
+        sig_pct = int(mm.group(1)) if mm else None
+    channel = None
+    if "Channel" in fields:
+        try:
+            channel = int(fields["Channel"])
+        except ValueError:
+            pass
+    ssid = fields.get("SSID")
+    bssid = fields.get("BSSID")
+    return [WifiInterface(
+        name=fields.get("Name", ""),
+        state=fields.get("State", ""),
+        ssid=ssid if ssid else None,
+        bssid=bssid if bssid else None,
+        signal_pct=sig_pct,
+        channel=channel,
+        radio=fields.get("Radio type"),
+        physical_mac=fields.get("Physical address"),
+        description=fields.get("Description"),
+        guid=fields.get("GUID"),
+    )]
+
+
+# ============================================================
+# SECTION 1e: PROBES  (阶段 B · v1.2.0 引入 — B7 gateway 试点)
+# ============================================================
+# 模块契约 (Probe) 实现: 每个 Probe 返回 DiagnosticResult, 而不是 dict.
+# 双轨运行: _run_module_with_timeout 优先查 _V2_PROBES, 存在走 Probe,
+#           不存在走 GatewayTester 等旧类. 阶段 B13 再删除旧类.
+#
+# 设计要点:
+#   1. Probe 不依赖现有 Tester 类 (避免双重 ping)
+#   2. Probe 内部直接调 ping_host / get_default_gateway / THRESHOLDS 等工具
+#   3. Probe 返回 DiagnosticResult; run_diagnostics 把 .metrics 字段填到
+#      results[k], 兼容现有 verdict_fn / metrics_fn / _print_result / 报告渲染
+#   4. issues 用 dataclass Issue (替代 dict), status 用 Status 枚举
+#   5. Evidence 字段填充关键数据, 阶段 C 根因引擎可直接消费
+
+_V2_PROBES = {}       # key -> probe_fn(callback=..., **kwargs) -> DiagnosticResult
+
+
+def _register_probe(key):
+    """装饰器: 把 probe_fn 注册到 _V2_PROBES (B7+ 阶段使用)."""
+    def deco(fn):
+        _V2_PROBES[key] = fn
+        return fn
+    return deco
+
+
+@_register_probe("gateway")
+def probe_gateway_v2(count=20, callback=None):
+    """B7 gateway 探测 Probe 契约实现.
+
+    与 GatewayTester.detect() 并行验证 (双轨), 输出零差异后 B13 删除旧实现.
+    返回 DiagnosticResult, .metrics 字段保留 ping 结果供现有 verdict_fn /
+    metrics_fn / _print_result / 报告渲染继续使用 (向后兼容).
+    """
+    started_mono = time.monotonic()
+    started_at = datetime.now().isoformat()
+
+    if callback:
+        callback("正在检测网关延迟...")
+    gateway = get_default_gateway()
+    if not gateway:
+        return DiagnosticResult(
+            module_id="gateway", status=Status.ERROR,
+            started_at=started_at,
+            duration_ms=int((time.monotonic() - started_mono) * 1000),
+            error=DiagnosticError(
+                code="NO_GATEWAY", category="network",
+                message="无法获取默认网关", retryable=True,
+                severity=Severity.HIGH),
+        )
+
+    if callback:
+        callback(f"Ping 网关 {gateway} ({count} 次)...")
+
+    # wait_ms=3000 与系统默认接近, 避免 2.4G WiFi 偶发 >1.5s 响应被误判丢包
+    ping_result = ping_host(gateway, count=count, timeout=count + 15, wait_ms=3000)
+
+    avg = ping_result["avg_ms"]
+    loss = ping_result["loss_pct"]
+    jitter = ping_result.get("jitter_ms", 0)
+    ttl = ping_result.get("ttl")
+
+    # --- assessment (与 GatewayTester 完全一致) ---
+    if loss > 5 and avg > 10:
+        assessment = "网络质量差"
+    elif loss > 5:
+        assessment = "丢包严重"
+    elif loss > 0:
+        assessment = "存在丢包"
+    elif avg > 100:
+        assessment = "延迟严重"
+    elif avg > 50:
+        assessment = "延迟偏高"
+    elif avg > 10:
+        assessment = "延迟略高"
+    else:
+        assessment = "正常"
+
+    # --- issues 转 dataclass Issue ---
+    issues = []
+    if avg >= 30:
+        issues.append(Issue(
+            id="gateway.high_latency", severity=Severity.CRITICAL,
+            title=f"网关平均延迟 {avg}ms 超过阈值 30ms",
+            description="网页加载变慢、视频会议可能卡顿、在线游戏高延迟",
+            confidence=0.95,
+            recommendations=[
+                "① 检查网线是否松动",
+                "② 查看 WiFi 信号强度 (<-65dBm 为弱)",
+                "③ 登录路由器后台查看 CPU 占用率",
+                "④ 如仍未改善请联系运营商",
+            ],
+        ))
+    elif avg >= 10:
+        issues.append(Issue(
+            id="gateway.latency_high", severity=Severity.MEDIUM,
+            title=f"网关平均延迟 {avg}ms 略高 (阈值 10ms)",
+            description="对一般上网无明显影响, 实时游戏可能有轻微延迟",
+            confidence=0.9,
+            recommendations=["如果频繁出现卡顿, 可检查网线质量或考虑 5GHz WiFi"],
+        ))
+    if loss >= 5:
+        issues.append(Issue(
+            id="gateway.packet_loss", severity=Severity.CRITICAL,
+            title=f"网关丢包 {loss}%",
+            description="丢包会直接导致网页加载失败、视频卡顿",
+            confidence=0.95,
+            recommendations=["检查网线/WiFi 信号; 排除路由器/交换机过载"],
+        ))
+    elif loss >= 1:
+        issues.append(Issue(
+            id="gateway.packet_loss", severity=Severity.MEDIUM,
+            title=f"网关丢包 {loss}%",
+            description="丢包会直接导致网页加载失败、视频卡顿",
+            confidence=0.9,
+            recommendations=["检查网线/WiFi 信号; 排除路由器/交换机过载"],
+        ))
+    if jitter >= 50:
+        issues.append(Issue(
+            id="gateway.jitter", severity=Severity.CRITICAL,
+            title=f"网关抖动 {jitter}ms 超过阈值 20ms",
+            description="视频会议卡顿、VoIP 通话断续、在线游戏跳ping",
+            confidence=0.9,
+            recommendations=["优先排查 WiFi 信号/网线质量; 路由器 QoS 设置可能也有影响"],
+        ))
+    elif jitter >= 20:
+        issues.append(Issue(
+            id="gateway.jitter", severity=Severity.MEDIUM,
+            title=f"网关抖动 {jitter}ms 超过阈值 20ms",
+            description="视频会议卡顿、VoIP 通话断续、在线游戏跳ping",
+            confidence=0.9,
+            recommendations=["优先排查 WiFi 信号/网线质量; 路由器 QoS 设置可能也有影响"],
+        ))
+
+    # --- Status 推导 (与 GatewayTester.determine_status 行为一致) ---
+    if any(i.severity == Severity.CRITICAL for i in issues):
+        diag_status = Status.ERROR
+    elif issues:
+        diag_status = Status.WARNING
+    else:
+        diag_status = Status.OK
+
+    # --- Evidence (阶段 C 根因引擎消费) ---
+    evidence = [
+        Evidence(id="gateway.ping.avg_ms", source="gateway.ping",
+                 metric="avg_latency_ms", value=avg, unit="ms",
+                 confidence=0.95, timestamp=started_at),
+        Evidence(id="gateway.ping.loss_pct", source="gateway.ping",
+                 metric="packet_loss_pct", value=loss, unit="%",
+                 confidence=0.98, timestamp=started_at),
+        Evidence(id="gateway.ping.jitter_ms", source="gateway.ping",
+                 metric="jitter_ms", value=jitter, unit="ms",
+                 confidence=0.9, timestamp=started_at),
+    ]
+    if ttl is not None:
+        evidence.append(Evidence(id="gateway.ping.ttl", source="gateway.ping",
+                                 metric="ttl", value=ttl, confidence=0.85,
+                                 timestamp=started_at))
+
+    # --- metrics 字段: 兼容 GatewayTester.results 格式, 现有 verdict_fn /
+    # metrics_fn / 报告渲染全部继续用 .metrics["ping"] / .metrics["issues"] 等 ---
+    summary_text = (f"网关 {gateway}: 平均 {ping_result['avg_ms']}ms, "
+                    f"丢包 {ping_result['loss_pct']}%, 抖动 {ping_result['jitter_ms']}ms")
+    metrics = {
+        "gateway": gateway,
+        "ping": ping_result,
+        "assessment": assessment,
+        "issues": [
+            {
+                "type": i.id,
+                "severity": "critical" if i.severity == Severity.CRITICAL else "warning",
+                "message": i.title,
+                "detail": i.description,
+                "action": "\n".join(i.recommendations) if i.recommendations else "",
+            }
+            for i in issues
+        ],
+        "timestamp": started_at,
+        "summary": summary_text,
+    }
+
+    return DiagnosticResult(
+        module_id="gateway", status=diag_status,
+        started_at=started_at,
+        duration_ms=int((time.monotonic() - started_mono) * 1000),
+        metrics=metrics, evidence=evidence, issues=issues,
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# B8-B11 通用 helper: Tester.results dict → DiagnosticResult
+# ────────────────────────────────────────────────────────────────────────────
+# 与 gateway probe 不同, dns/route/arp/wifi 模块逻辑复杂 (DNS 多服务器并行 /
+# WiFi 信道分析 / ARP 重复去重), 完全重写探测逻辑工作量大且风险高.
+# 务实方案: 调 Tester.detect() 拿 results dict, 再用 helper 包装为
+# DiagnosticResult. _run_module_with_timeout 走 v2 路径时不会重复跑 detect()
+# (旧 Tester.detect 路径已被覆盖), 因此无双重探测成本.
+
+_SEVERITY_FROM_ZH = {
+    "critical": Severity.CRITICAL, "error": Severity.CRITICAL,
+    "warning": Severity.MEDIUM, "warn": Severity.MEDIUM,
+    "info": Severity.LOW, "low": Severity.LOW,
+}
+
+
+def _wrap_as_diagnostic_result(results, module_id, started_at, duration_ms):
+    """通用: Tester.results dict → DiagnosticResult (B8-B11 共享 helper).
+
+    复用 determine_status() 推中文状态 → Status 枚举, 不破坏现有 verdict_fn /
+    metrics_fn / _print_result / 报告渲染的语义.
+    metrics 字段完整保留旧 results dict (兼容 _verdict_xxx / _metrics_xxx).
+    """
+    if not results:
+        return DiagnosticResult(
+            module_id=module_id, status=Status.UNKNOWN,
+            started_at=started_at, duration_ms=duration_ms)
+
+    status_zh = determine_status(results)
+    diag_status = Status.from_zh(status_zh)
+
+    error = None
+    if "error" in results:
+        error = DiagnosticError(
+            code="MODULE_ERROR", category="module",
+            message=str(results["error"]),
+            retryable=True, severity=Severity.MEDIUM,
+            exception_type="Exception")
+        # 模块级 error 标志: 若 determine_status 未升级到 ERROR, 这里强制升级
+        if diag_status == Status.OK:
+            diag_status = Status.ERROR
+
+    issues = []
+    for i in results.get("issues") or []:
+        if not isinstance(i, dict):
+            continue
+        sev_str = str(i.get("severity", "warning")).lower()
+        severity = _SEVERITY_FROM_ZH.get(sev_str, Severity.MEDIUM)
+        action = i.get("action", "")
+        if isinstance(action, str) and action:
+            recommendations = [action]
+        else:
+            recommendations = []
+        issues.append(Issue(
+            id=str(i.get("type", "issue")),
+            severity=severity,
+            title=str(i.get("message", str(i))),
+            description=str(i.get("detail", "")),
+            confidence=0.85,
+            recommendations=recommendations,
+        ))
+
+    return DiagnosticResult(
+        module_id=module_id, status=diag_status,
+        started_at=started_at, duration_ms=duration_ms,
+        metrics=results,      # 完整保留旧 dict, 供 verdict_fn / 报告渲染
+        issues=issues, error=error)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# B8 dns · B9 route · B10 arp · B11 wifi — 模块契约 probe 实现
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@_register_probe("dns")
+def probe_dns_v2(callback=None):
+    """B8 DNS 诊断 Probe 契约. 调用 DNSTester.detect() + wrap helper."""
+    started_mono = time.monotonic()
+    started_at = datetime.now().isoformat()
+    t = DNSTester()
+    t.detect(callback=callback)
+    return _wrap_as_diagnostic_result(
+        t.results, module_id="dns",
+        started_at=started_at,
+        duration_ms=int((time.monotonic() - started_mono) * 1000))
+
+
+@_register_probe("route")
+def probe_route_v2(callback=None):
+    """B9 路由表分析 Probe 契约. 调用 RouteTableAnalyzer.detect() + wrap helper."""
+    started_mono = time.monotonic()
+    started_at = datetime.now().isoformat()
+    t = RouteTableAnalyzer()
+    t.detect(callback=callback)
+    return _wrap_as_diagnostic_result(
+        t.results, module_id="route",
+        started_at=started_at,
+        duration_ms=int((time.monotonic() - started_mono) * 1000))
+
+
+@_register_probe("arp")
+def probe_arp_v2(callback=None):
+    """B10 ARP 表分析 Probe 契约. 调用 ARPAnalyzer.detect() + wrap helper."""
+    started_mono = time.monotonic()
+    started_at = datetime.now().isoformat()
+    t = ARPAnalyzer()
+    t.detect(callback=callback)
+    return _wrap_as_diagnostic_result(
+        t.results, module_id="arp",
+        started_at=started_at,
+        duration_ms=int((time.monotonic() - started_mono) * 1000))
+
+
+@_register_probe("wifi")
+def probe_wifi_v2(callback=None):
+    """B11 WiFi 干扰分析 Probe 契约. 调用 WiFiAnalyzer.detect() + wrap helper."""
+    started_mono = time.monotonic()
+    started_at = datetime.now().isoformat()
+    t = WiFiAnalyzer()
+    t.detect(callback=callback)
+    return _wrap_as_diagnostic_result(
+        t.results, module_id="wifi",
+        started_at=started_at,
+        duration_ms=int((time.monotonic() - started_mono) * 1000))
 
 
 # ============================================================
@@ -2463,7 +3041,7 @@ class DHCPDetector:
         return self.results
 
 
-class GatewayTester:
+class GatewayTester:  # @deprecated v1.2.0 (B7): 已迁移到 probe_gateway_v2 (SECTION 1e)
     """网关延迟 / 丢包检测"""
 
     def __init__(self):
@@ -3168,7 +3746,7 @@ class LinkSpeedDetector:
         return self.results
 
 
-class WiFiAnalyzer:
+class WiFiAnalyzer:  # @deprecated v1.2.0 (B11): 已迁移到 probe_wifi_v2 (SECTION 1e)
     """WiFi 干扰分析"""
 
     def __init__(self):
@@ -5001,7 +5579,7 @@ class MultiEgressDetector:
 
 # --- 补充诊断模块 ---
 
-class DNSTester:
+class DNSTester:  # @deprecated v1.2.0 (B8): 已迁移到 probe_dns_v2 (SECTION 1e)
     """DNS 解析诊断"""
 
     def __init__(self):
@@ -5286,7 +5864,7 @@ class MTUDetector:
         return self.results
 
 
-class ARPAnalyzer:
+class ARPAnalyzer:  # @deprecated v1.2.0 (B10): 已迁移到 probe_arp_v2 (SECTION 1e)
     """ARP 表分析 / 欺骗检测"""
 
     def __init__(self):
@@ -5666,7 +6244,7 @@ class IPv6Tester:
         return self.results
 
 
-class RouteTableAnalyzer:
+class RouteTableAnalyzer:  # @deprecated v1.2.0 (B9): 已迁移到 probe_route_v2 (SECTION 1e)
     """路由表异常分析"""
 
     def __init__(self):
@@ -9292,17 +9870,44 @@ def _module_timeout(key):
 
 
 def _run_module_with_timeout(key, callback):
-    """在 daemon 线程中执行模块 detect(), 超时返回 ("超时", {error})。
+    """在 daemon 线程中执行模块探测, 超时返回 ("超时", {error})。
 
     返回 (status, res_dict):
-      - 正常完成: (determine_status(res), res)
+      - 正常完成: (status_zh, res_dict)
       - 模块抛异常: ("错误", {"error": ...})
       - 超过 _module_timeout(key): ("超时", {"error": ...})
     超时后模块线程继续在后台运行 (daemon, 进程退出时被强杀), 结果被丢弃,
     不影响其它模块。
+
+    V2 双轨 (B7+): key 在 _V2_PROBES 里时, 走 probe 路径 (返回 DiagnosticResult),
+    .metrics 字段填到 res_dict, .status.zh_label 作状态; 否则走旧 Tester.detect().
     """
-    name, cls = MODULE_MAP[key]
     timeout = _module_timeout(key)
+    box = {}
+
+    # ── V2 Probe 路径 (B7 gateway 试点) ──
+    if key in _V2_PROBES:
+        probe_fn = _V2_PROBES[key]
+
+        def _work_v2():
+            try:
+                box["result"] = probe_fn(callback=callback)
+            except Exception as e:
+                box["err"] = e
+
+        t = threading.Thread(target=_work_v2, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            return "超时", {"error": f"模块执行超时（超过 {timeout:.0f} 秒）"}
+        if "err" in box:
+            return "错误", {"error": str(box["err"])}
+        result = box["result"]
+        # DiagnosticResult.metrics 兼容旧 res_dict 接口 (verdict_fn / metrics_fn / 报告)
+        return result.status.zh_label, result.metrics
+
+    # ── 旧 Tester 路径 (向后兼容) ──
+    name, cls = MODULE_MAP[key]
     if key == "port":
         inst = cls(targets=PORT_PROBE_CONFIG["targets"],
                    proto=PORT_PROBE_CONFIG["proto"],
@@ -9313,8 +9918,6 @@ def _run_module_with_timeout(key, callback):
     else:
         inst = cls()
     detect_kwargs = _module_detect_kwargs(key)
-    box = {}
-
     def _work():
         try:
             inst.detect(callback=callback, **detect_kwargs)

@@ -7,6 +7,40 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-31
+
+### 新增
+- **Parsers 区块** (SECTION 1d)：集中 Windows 命令文本解析
+  - `parse_ipconfig(raw)` → `list[NetworkAdapter]`（中英文 Windows 都支持）
+  - `parse_route_print(raw)` → `list[RouteEntry]`（含 On-link 判定）
+  - `parse_arp_a(raw)` → `list[ArpEntry]`（含 interface 段落归属）
+  - `parse_netsh_wlan_interfaces(raw)` → `list[WifiInterface]`（行尾归一化）
+- **Probes 区块** (SECTION 1e)：5 模块迁移到 Probe 契约
+  - `probe_gateway_v2` / `probe_dns_v2` / `probe_route_v2` / `probe_arp_v2` / `probe_wifi_v2`
+  - 统一返回 `DiagnosticResult`，`.metrics` 字段保留旧 results dict 兼容
+  - `_V2_PROBES` 注册表 + `_register_probe(key)` 装饰器
+  - `_wrap_as_diagnostic_result()` helper（B8-B11 共享 dict→DR 包装）
+- **`CONFIG` 顶层字典**：把散落的 `PORT_PROBE_CONFIG` / `SPEEDTEST_CONFIG` / `NATTYPE_CONFIG` / `WEB_CONFIG` / `TCPCC_CONFIG` 集中到 `CONFIG["port"]` / ...
+- 旧 CONFIG 名字作为 alias 指向 CONFIG 子项（dict 引用同一对象，零侵入）
+
+### 变更
+- `_run_module_with_timeout` 双轨化：key 在 `_V2_PROBES` 走 probe 路径，否则走旧 Tester.detect()
+- 5 个 Tester 类加 `@deprecated v1.2.0 (B7-B11)` 注释（仍被 probe 函数调 detect()，等 v1.3.0 用户无感知后再硬删除）
+
+### 测试
+- `_smoke_report.py` 60 → **109 项**（含 parser + probe + CONFIG 集中化 + 双轨分支）
+- `tests/test_parsers.py` **23 项** unittest（覆盖 4 parser + dataclass + 边界场景）
+- `tests/test_probes.py` **33 项** unittest（覆盖 5 probe + helper + status 推导）
+- HTML 报告长度 56505 字节零差异（用户视觉零回归）
+
+### 不变更（向后兼容）
+- CLI / HTML / JSON 字段完全一致
+- `--list` 仍列 23 项
+- 用户感知：`netpulse gateway` / `dns` / `route` / `arp` / `wifi` 输出与 v1.1.0 逐字一致
+- 旧 `STATUS_KEY` / `STATUS_COLORS` / `STATUS_BAR_ORDER` / `PROBLEM_STATUSES` 完全保留
+
+[1.2.0]: https://github.com/silentcrow09/netpulse/compare/v1.1.0...v1.2.0
+
 ## [1.1.0] - 2026-08-31
 
 ### 变更（内部基建，**无对外行为变化**）
