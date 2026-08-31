@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-31
+
+### 变更（内部基建，**无对外行为变化**）
+- V2 演进路线图（A 线路）阶段 A 完成——为后续根因引擎 / Profiles / JSON Schema 铺路
+- 新增 `Status` / `Severity` / `RiskLevel` 枚举（替代散落字符串 `完成/警告/异常/错误/超时/未检测`）
+- 新增 `DiagnosticResult` / `Evidence` / `Issue` / `DiagnosticError` / `ModuleMeta` dataclass
+- 新增 `STATUS_ZH_KEY` / `STATUS_KEY_TO_STATUS` 兼容桥接映射
+- `_smoke_report.py` 断言 25 → 60 项（覆盖新模型序列化往返 + 旧 `STATUS_KEY` / `STATUS_COLORS` 完整性）
+- 现有 `STATUS_KEY` / `STATUS_COLORS` / `STATUS_BAR_ORDER` / `PROBLEM_STATUSES` 完全保留
+- HTML 报告 / CLI 输出 / JSON 字段保持完全一致（`_verify_latest.html` 长度 56505 字节零差异）
+- 不引入任何新依赖（`dataclasses` + `enum` 标准库）
+
+[1.1.0]: https://github.com/silentcrow09/netpulse/compare/v1.0.0...v1.1.0
+
 ## [1.0.0] - 2026-08-31
 
 ### 新增

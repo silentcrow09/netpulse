@@ -347,6 +347,237 @@ def _pip_install_scapy(mirror=None):
 
 
 # ============================================================
+# SECTION 1c: V2 CORE MODELS  (阶段 A · v1.1.0 引入)
+# ============================================================
+# 设计目标: 把"散落 dict"变成"有名字的对象", 不动对外行为
+# 现有 STATUS_KEY / STATUS_COLORS / STATUS_BAR_ORDER 保持兼容, 新模块可选用枚举
+# 冻结红线: HTML/CLI/JSON 字段保持完全一致 (_smoke_report.py 全绿, 像素级 HTML 一致)
+#
+# 不引入 Pydantic/dataclasses-json 等新依赖 — 保持单文件 EXE 形态不变
+# 不修改现有 STATUS_KEY 字典 — 旧渲染代码继续按中文字符串取色
+# 新枚举/dataclass 仅作"可选新基建", 阶段 B 起再逐步迁移旧模块调用点
+
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+
+
+class Status(Enum):
+    """模块级运行状态 — 替代散落字符串 "完成/警告/异常/错误/超时/未检测".
+
+    现有渲染代码按中文字符串取色 (STATUS_KEY["完成"] → "ok"),
+    新代码可直接用 Status.OK 等枚举值。
+    """
+    OK = "ok"
+    INFO = "info"
+    WARNING = "warn"
+    ERROR = "err"
+    FATAL = "fatal"
+    TIMEOUT = "timeout"
+    SKIPPED = "skipped"
+    IDLE = "idle"            # 未检测
+    UNKNOWN = "unknown"
+
+    # --- 中文字符串 ↔ 枚举桥接 (供新旧两套代码共存) ---
+    @classmethod
+    def from_zh(cls, zh_label):
+        _ZH_TO_STATUS = {
+            "完成": cls.OK, "警告": cls.WARNING,
+            "异常": cls.ERROR, "错误": cls.FATAL,
+            "超时": cls.TIMEOUT, "未检测": cls.IDLE,
+        }
+        return _ZH_TO_STATUS.get(zh_label, cls.UNKNOWN)
+
+    @property
+    def zh_label(self):
+        return _STATUS_ZH.get(self, self.value)
+
+    @property
+    def is_problem(self):
+        """是否参与问题判定 (默认展开 / 问题计数 / 红色徽章).
+        与 PROBLEM_STATUSES = ("警告", "异常", "错误", "超时") 口径一致."""
+        return self in (Status.WARNING, Status.ERROR, Status.FATAL, Status.TIMEOUT)
+
+
+_STATUS_ZH = {
+    Status.OK: "完成", Status.WARNING: "警告", Status.ERROR: "异常",
+    Status.FATAL: "错误", Status.TIMEOUT: "超时", Status.IDLE: "未检测",
+    Status.INFO: "信息", Status.SKIPPED: "已跳过", Status.UNKNOWN: "未知",
+}
+
+
+class Severity(Enum):
+    """问题严重度 (Issue 级别)."""
+    INFO = "info"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class RiskLevel(Enum):
+    """模块风险等级 — 决定是否需用户确认 / 是否默认跳过."""
+    PASSIVE = "passive"      # 只读系统信息 (ipconfig / route / WiFi 信息 / Gateway ping)
+    ACTIVE = "active"        # 主动发起网络请求 (DNS 查询 / HTTP / Speedtest)
+    STRESS = "stress"        # 高负载 / 持续发包 (TCPCC / iperf3 UDP 高并发)
+
+    @property
+    def zh_label(self):
+        return _RISK_ZH.get(self, self.value)
+
+
+_RISK_ZH = {
+    RiskLevel.PASSIVE: "只读",
+    RiskLevel.ACTIVE: "主动探测",
+    RiskLevel.STRESS: "压力测试",
+}
+
+
+@dataclass
+class DiagnosticError:
+    """统一错误模型 — 替代散落 except Exception: pass.
+
+    错误必须: 被捕获 / 被分类 / 被记录 / 必要时展示 / 不影响其他模块继续运行.
+    """
+    code: str                       # e.g. "TIMEOUT", "PARSE_FAILED", "CMD_NOT_FOUND"
+    category: str                   # e.g. "network", "permission", "parse", "internal"
+    message: str
+    retryable: bool = True
+    severity: Severity = Severity.MEDIUM
+    exception_type: str | None = None
+
+    def to_dict(self):
+        return {
+            "code": self.code,
+            "category": self.category,
+            "message": self.message,
+            "retryable": self.retryable,
+            "severity": self.severity.value,
+            "exception_type": self.exception_type,
+        }
+
+
+@dataclass
+class Evidence:
+    """诊断证据 — 任何模块结论必须可追溯到具体观察值.
+
+    示例 (网关 ping):
+        Evidence(id="gateway.ping.packet_loss", source="gateway.ping",
+                 metric="packet_loss", value=14.3, unit="%",
+                 confidence=0.98, metadata={"sent": 7, "received": 6})
+    """
+    id: str                         # 全局唯一 (惯例: "<module>.<step>.<metric>")
+    source: str                     # 数据来源 (模块 key 或子步骤名)
+    metric: str                     # 指标名
+    value: object
+    unit: str | None = None
+    timestamp: str = ""             # ISO 8601
+    confidence: float = 1.0         # 0.0-1.0
+    metadata: dict = field(default_factory=dict)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class Issue:
+    """诊断问题 — 模块级或跨模块聚合的故障点.
+
+    HTML/CLI/JSON 不再各自重新解释模块结果, 直接渲染 Issue.to_dict().
+    """
+    id: str
+    severity: Severity
+    title: str
+    description: str = ""
+    evidence_ids: list[str] = field(default_factory=list)
+    confidence: float = 1.0
+    recommendations: list[str] = field(default_factory=list)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "severity": self.severity.value,
+            "title": self.title,
+            "description": self.description,
+            "evidence_ids": list(self.evidence_ids),
+            "confidence": self.confidence,
+            "recommendations": list(self.recommendations),
+        }
+
+
+@dataclass
+class DiagnosticResult:
+    """模块级诊断结果 — 替代 results[k] = {...} 散落 dict.
+
+    调用约定 (阶段 B 起逐步迁移):
+        result = probe.run(context)
+        results[k] = result.metrics          # 旧入口 (向后兼容)
+        if result.error: ...
+        for ev in result.evidence: ...
+    """
+    module_id: str
+    status: Status
+    started_at: str = ""                     # ISO 8601
+    duration_ms: int = 0
+    metrics: dict = field(default_factory=dict)
+    evidence: list[Evidence] = field(default_factory=list)
+    issues: list[Issue] = field(default_factory=list)
+    error: DiagnosticError | None = None
+
+    @property
+    def is_problem(self):
+        return self.status.is_problem
+
+    def to_dict(self):
+        return {
+            "module_id": self.module_id,
+            "status": self.status.value,
+            "zh_status": self.status.zh_label,
+            "started_at": self.started_at,
+            "duration_ms": self.duration_ms,
+            "metrics": self.metrics,
+            "evidence": [e.to_dict() for e in self.evidence],
+            "issues": [i.to_dict() for i in self.issues],
+            "error": self.error.to_dict() if self.error else None,
+        }
+
+
+@dataclass
+class ModuleMeta:
+    """模块元数据 — 替代 MODULE_REGISTRY 字符串三件套 (id, name, category).
+
+    阶段 B 起用于统一模块描述, 阶段 A 暂保留 MODULE_REGISTRY 不动.
+    """
+    id: str
+    name: str
+    category: str
+    runner: object = None                    # Callable[[], DiagnosticResult]
+    timeout: float = 30.0
+    risk: RiskLevel = RiskLevel.PASSIVE
+    dependencies: list[str] = field(default_factory=list)
+    prerequisites: list[str] = field(default_factory=list)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "category": self.category,
+            "timeout": self.timeout,
+            "risk": self.risk.value,
+            "risk_zh": self.risk.zh_label,
+            "dependencies": list(self.dependencies),
+            "prerequisites": list(self.prerequisites),
+        }
+
+
+# === 兼容性桥接 (阶段 A 不动现有调用点, 阶段 B 再逐步替换) ===
+# 新模块可直接用 Status 枚举 + DiagnosticResult dataclass;
+# 旧模块继续用散落 dict + STATUS_KEY 字符串映射, 两者并存零冲突.
+STATUS_ZH_KEY = {s.value: s.zh_label for s in Status}      # "ok" → "完成"
+STATUS_KEY_TO_STATUS = {zh: s for zh, s in                 # "完成" → Status.OK
+    [(zh, s) for s in Status for zh in [s.zh_label]]}
+
+
+# ============================================================
 # PIP 镜像自动选源
 # ============================================================
 #
