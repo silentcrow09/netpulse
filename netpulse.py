@@ -10875,6 +10875,14 @@ def _present_module(key, raw_result, status):
     name = MODULE_MAP.get(key, (key, key))[0]
     verdict = verdict_fn(raw_result) if raw_result else "未检测"
 
+    # 超时/失败时 verdict_fn 可能把 {"error": ...} 当空数据解读, 给出与故障无关的
+    # 结论文案 (实测: linkspeed 超时 → "检测到 0 个适配器, 无在线网卡";
+    # wifi 超时 → "发现 0 个 WiFi 网络, 干扰等级: 正常")。这类文案会误导装维
+    # 去查网卡/WiFi, 而真实原因只是这一个模块没跑完, 故一律以 error 原文为准。
+    if (status in ("超时", "错误") and isinstance(raw_result, dict)
+            and raw_result.get("error")):
+        verdict = str(raw_result["error"])
+
     # 指标: 兼容老格式 (label, value) 和新格式 (label, value, level) / (label, value, level, hint)
     raw_metrics = metrics_fn(raw_result) if raw_result else []
     metrics = []
@@ -10992,7 +11000,11 @@ def compute_health_score(counts, text_counts=None):
             豁免模块不扣分, 但客户看得到它的红色徽章, 文案少报会自相矛盾。
 
     评分口径: 异常 -20 / 错误 -30 (硬故障), 警告 -2 (仅提示, 不压垮总分),
+    超时 -10 (检测未跑完, 结果不可信, 严重程度介于警告与异常之间),
     未检测不扣分 (环境缺测如无 WiFi 网卡不应被记过)。
+    「超时」必须扣分: 超时模块会被 _issues_* 登记成 severity="异常" 的 issue,
+    若评分不认它, 就会出现"23 个模块全超时 → 100 分 A 级 '网络良好, 无问题'"、
+    而同一份报告的待办清单与详细结果却说有问题的自相矛盾。
     verdict 口径: 按模块状态计数 — 按实际 issue 条目计数会把同一模块的
     多条 issue 算成多项异常, 与一览徽章数对不上。
     """
@@ -11000,17 +11012,27 @@ def compute_health_score(counts, text_counts=None):
     score -= counts.get("异常", 0) * 20
     score -= counts.get("错误", 0) * 30
     score -= counts.get("警告", 0) * 2
+    score -= counts.get("超时", 0) * 10
     score = max(0, min(100, score))
 
     tc = text_counts if text_counts is not None else counts
     err_mod = tc.get("异常", 0) + tc.get("错误", 0)
     warn_mod = tc.get("警告", 0)
+    timeout_mod = tc.get("超时", 0)
     for threshold, grade, label in HEALTH_GRADE_TABLE:
         if score >= threshold:
-            if err_mod == 0 and warn_mod == 0:
+            if err_mod == 0 and warn_mod == 0 and timeout_mod == 0:
                 verdict = "网络良好, 无问题"
             elif err_mod > 0:
-                verdict = f"{err_mod + warn_mod} 个模块需关注 (含 {err_mod} 个异常)"
+                # 超时另计, 不与异常混为一谈: 前者是"没测出来", 后者是"测出来有问题"
+                extra = f" / {timeout_mod} 个未完成检测" if timeout_mod else ""
+                verdict = (f"{err_mod + warn_mod + timeout_mod} 个模块需关注 "
+                           f"(含 {err_mod} 个异常{extra})")
+            elif warn_mod > 0 and timeout_mod > 0:
+                verdict = (f"{warn_mod + timeout_mod} 个模块需关注 "
+                           f"(含 {warn_mod} 个警告 / {timeout_mod} 个未完成检测)")
+            elif timeout_mod > 0:
+                verdict = f"{timeout_mod} 个模块未完成检测, 本次结果仅供参考"
             else:
                 verdict = f"{warn_mod} 个模块提示警告"
             return {
@@ -11188,29 +11210,38 @@ def render_report_text(report):
     for st in report["summary"].values():
         cnt[st] = cnt.get(st, 0) + 1
     out.append("【诊断汇总】")
-    order = ["完成", "警告", "异常", "错误", "未检测"]
+    order = ["完成", "警告", "异常", "错误", "超时", "未检测"]
     parts = [f"{k} {cnt[k]}" for k in order if cnt.get(k)]
     out.append(f"  共 {len(report['modules'])} 项: " + ", ".join(parts))
     if parts:
         ok_n = cnt.get("完成", 0)
         warn_n = cnt.get("警告", 0)
         err_n = cnt.get("异常", 0) + cnt.get("错误", 0)
-        if err_n == 0 and warn_n == 0:
+        timeout_n = cnt.get("超时", 0)
+        if err_n == 0 and warn_n == 0 and timeout_n == 0:
             verdict = "整体健康"
-        elif err_n == 0:
+        elif err_n == 0 and timeout_n == 0:
             verdict = "整体正常，但有警告项"
-        elif warn_n == 0:
+        elif warn_n == 0 and timeout_n == 0:
             verdict = "存在异常项，建议排查"
+        elif err_n == 0:
+            verdict = "检测未全部完成，结果仅供参考"
         else:
             verdict = "存在异常与警告项，建议排查"
-        out.append(f"  整体状态: {verdict}（正常 {ok_n} / 警告 {warn_n} / 异常 {err_n}）")
+        tail = f"正常 {ok_n} / 警告 {warn_n} / 异常 {err_n}"
+        if timeout_n:
+            tail += f" / 超时 {timeout_n}"
+        out.append(f"  整体状态: {verdict}（{tail}）")
     out.append("")
     # 逐模块
     out.append("【详细结果】")
     for m in report["modules"]:
         out.append("-" * 64)
         out.append(f"◆ {m['name']}  [{m['status']}]")
-        res = m["result"] or {}
+        # build_report 产出的模块字典用 "raw" 存原始结果 (没有 "result" 键),
+        # 直接 m["result"] 会 KeyError。本函数当前无调用点, 但键名必须与实际
+        # 数据结构一致, 否则哪天启用技术视图就是必崩。
+        res = m.get("raw") or {}
         if "error" in res:
             out.append(f"  诊断异常: {res['error']}")
             continue
@@ -11251,12 +11282,13 @@ def render_report_html(report):
 
     # 状态 → 语义键 → (前景色, 浅底色)
     SKEY = {"完成": "ok", "警告": "warn", "异常": "err", "错误": "fatal",
-            "未检测": "idle"}
+            "超时": "timeout", "未检测": "idle"}
     SC = {
         "ok":    ("#0e8a4f", "#e7f6ee"),
         "warn":  ("#b26a00", "#fdf3e3"),
         "err":   ("#d92d20", "#fdecec"),
         "fatal": ("#b42318", "#fbebea"),
+        "timeout": ("#334155", "#e9edf3"),
         "idle":  ("#8a94a6", "#f1f3f7"),
     }
 
@@ -11305,7 +11337,7 @@ def render_report_html(report):
     cnt = {}
     for st in report["summary"].values():
         cnt[st] = cnt.get(st, 0) + 1
-    order = ["完成", "警告", "异常", "错误", "未检测"]
+    order = ["完成", "警告", "异常", "错误", "超时", "未检测"]
     stats = ""
     for k in order:
         v = cnt.get(k, 0)
@@ -11334,7 +11366,8 @@ def render_report_html(report):
     # ── 模块卡片 ──
     blocks = []
     for m in report["modules"]:
-        res = m["result"] or {}
+        # 同 render_report_text: 模块原始数据在 "raw" 键下, 不是 "result"
+        res = m.get("raw") or {}
         fg, bg = SC[_sk(m["status"])]
         body = ""
         if "error" in res:
@@ -11855,8 +11888,9 @@ STATUS_COLORS = {"ok": "#16a34a", "warn": "#d97706", "err": "#dc2626",
 # 状态分布条的分段绘制顺序。「超时」是真实可达状态 (_run_module_with_timeout 返回),
 # 必须绘制且参与问题判定, 否则条形留无名缺口、硬故障模块被当成灰色折叠行。
 STATUS_BAR_ORDER = ["完成", "警告", "异常", "错误", "超时", "未检测"]
-# 参与问题判定 (默认展开 / 问题计数) 的状态。注意与扣分口径区分:
-# compute_health_score 只对 异常/错误/警告 扣分, 超时不扣分但需要人工关注。
+# 参与问题判定 (默认展开 / 问题计数) 的状态。与扣分口径已对齐:
+# compute_health_score 对 异常-20 / 错误-30 / 警告-2 / 超时-10 均扣分,
+# 本元组即"报告里会被标红展开"的状态, 两者一致才不会出现分数与徽章打架。
 PROBLEM_STATUSES = ("警告", "异常", "错误", "超时")
 
 # 等级配色: 阈值唯一来源是 HEALTH_GRADE_TABLE (A≥90/B≥75/C≥60/D≥40/F<40),
@@ -12296,11 +12330,19 @@ def render_report_html_customer(report):
     exempt_count = report.get("exempt_count", 0) or 0
     err_cnt = counts.get("异常", 0) + counts.get("错误", 0)
     warn_cnt = counts.get("警告", 0)
+    timeout_cnt = counts.get("超时", 0)
     band_bits = [f"共 <b>{total_modules}</b> 个模块"]
     if exempt_count:
         band_bits.append(f"评分豁免 <b>{exempt_count}</b>（iperf3 / ipv6 / proxy / nattype）")
-    if err_cnt or warn_cnt:
-        band_bits.append(f"扣分项 <b>{err_cnt}</b> 异常级 / <b>{warn_cnt}</b> 警告级")
+    deduct_bits = []
+    if err_cnt:
+        deduct_bits.append(f"<b>{err_cnt}</b> 异常级")
+    if warn_cnt:
+        deduct_bits.append(f"<b>{warn_cnt}</b> 警告级")
+    if timeout_cnt:
+        deduct_bits.append(f"<b>{timeout_cnt}</b> 超时")
+    if deduct_bits:
+        band_bits.append("扣分项 " + " / ".join(deduct_bits))
     band_html = ('<div class="band">' +
                  '<span class="sep"></span>'.join(band_bits) + '</div>')
 
@@ -12308,15 +12350,23 @@ def render_report_html_customer(report):
     # 1) 收集所有 issue; 2) 按 (severity, text) 去重避免多模块重复同一警告;
     # 3) 顶部列表只展示异常/错误/警告, 信息级不进顶部 (详情里仍可见)
     todo_issues = []
-    seen_keys = set()
+    seen_keys = {}
     for m in modules:
         for issue in m.get("issues", []) or []:
             text = (issue.get("text", "") or "").strip()
             dedup_key = (issue.get("severity", "信息"), text)
-            if dedup_key in seen_keys:
+            hit = seen_keys.get(dedup_key)
+            if hit is not None:
+                # 同样文案合并成一条卡, 但记下波及的模块数 —
+                # 否则 23 个模块同样超时会压成 1 条, 与"23 个问题模块已展开"自相矛盾
+                hit["_dup"] += 1
+                if m["name"] not in hit["_modules"]:
+                    hit["_modules"].append(m["name"])
                 continue
-            seen_keys.add(dedup_key)
-            todo_issues.append({**issue, "_module": m["name"], "_status": m["status"]})
+            entry = {**issue, "_module": m["name"], "_status": m["status"],
+                     "_dup": 1, "_modules": [m["name"]]}
+            seen_keys[dedup_key] = entry
+            todo_issues.append(entry)
 
     sev_order = {"异常": 0, "错误": 0, "警告": 1, "信息": 2}
     todo_issues.sort(key=lambda i: sev_order.get(i.get("severity", "信息"), 3))
@@ -12334,7 +12384,13 @@ def render_report_html_customer(report):
             gkey = (issue.get("_module", ""), issue.get("impact", ""),
                     issue.get("action", ""), issue.get("severity", "信息"))
             if gkey in merge_index:
-                merged[merge_index[gkey]]["_texts"].append(issue.get("text", ""))
+                hit = merged[merge_index[gkey]]
+                hit["_texts"].append(issue.get("text", ""))
+                # 合并卡片时累加波及模块数, 否则"影响 23 个模块"会被算成 1
+                hit["_dup"] = hit.get("_dup", 1) + issue.get("_dup", 1)
+                for nm in issue.get("_modules", []):
+                    if nm not in hit["_modules"]:
+                        hit["_modules"].append(nm)
             else:
                 merge_index[gkey] = len(merged)
                 merged.append({**issue, "_texts": [issue.get("text", "")]})
@@ -12350,6 +12406,14 @@ def render_report_html_customer(report):
             # 把 raw_summary 也加到来源 meta 行, 让装维一眼看到原始数据
             # (例如网关丢包: 立即看到 "20 发 / 19 收 / 1 丢", 不必展开技术细节)
             meta_line = f"📍 来源: {_html_esc(module)}"
+            dup = issue.get("_dup", 1) or 1
+            if dup > 1:
+                # 去重后必须告诉用户波及范围, 否则顶部"1 项需要您关注"与
+                # 下方"23 个问题模块已展开"看起来互相打架
+                mods = issue.get("_modules", []) or []
+                scope = "、".join(mods[:4]) + (" 等" if len(mods) > 4 else "")
+                meta_line += (f" · ⚠ 波及 <b>{dup}</b> 个模块"
+                              f"（{_html_esc(scope)}）")
             if raw_summary:
                 meta_line += f" · 📊 {_html_esc(raw_summary)}"
             todo_blocks.append(f"""
@@ -12397,7 +12461,7 @@ def render_report_html_customer(report):
 </div>"""
 
     # ── 统计卡片 ──
-    # 始终显示全部 5 个卡片 (含 0 值), 与 stats-grid 的 5 列布局对齐
+    # 始终显示全部 6 个卡片 (含 0 值), 与 stats-grid 的 6 列布局对齐
     stats_order = ["完成", "警告", "异常", "错误", "超时", "未检测"]
     stat_items = [(k, counts.get(k, 0)) for k in stats_order]
     stat_cards = "".join(
@@ -12407,11 +12471,20 @@ def render_report_html_customer(report):
         for k, v in stat_items
     )
     # 模块总数 + 豁免模块数 (已在 hero 段计算 total_modules / exempt_count,
-    # 避免 stats-grid 只显示部分模块误导用户以为模块变少了)
+    # 避免 stats-grid 只显示部分模块误导用户以为模块变少了)。
+    # 注意两种口径并存, 必须在文案里讲清楚, 否则并排的统计卡(扣分口径)与
+    # 状态分布条(全口径)数字不一致会让人以为算错了:
+    #   counts  = 扣分口径, 排除豁免模块  → 统计卡
+    #   summary = 全口径,   含豁免模块    → 状态分布条 / 检测结果一览
     stats_caption = ""
     if total_modules:
+        scored_total = sum(v for _, v in stat_items)
         if exempt_count:
-            stats_caption = f"<div class='stats-caption'>共 {total_modules} 个模块 (含 {exempt_count} 个评分豁免: iperf3/ipv6/proxy/nattype, 不参与扣分)</div>"
+            stats_caption = (
+                f"<div class='stats-caption'>上方为<b>扣分口径</b> {scored_total} 个模块"
+                f"（全量 {total_modules} 个, 其中 {exempt_count} 个评分豁免不计入: "
+                f"iperf3 / ipv6 / proxy / nattype）；下方状态分布条为<b>全口径</b> "
+                f"{total_modules} 个模块</div>")
         else:
             stats_caption = f"<div class='stats-caption'>共 {total_modules} 个模块</div>"
     stats_section = f"""
