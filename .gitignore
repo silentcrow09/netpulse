@@ -7,7 +7,9 @@ __pycache__/
 # ── 打包产物 (PyInstaller) ──
 dist/
 build/
+# NetPulse.spec 是打包配置, 必须入仓 (其他 *.spec 仍忽略)
 *.spec
+!NetPulse.spec
 
 # ── 运行时生成的诊断报告 (输出目录, 由程序自动创建) ──
 reports/

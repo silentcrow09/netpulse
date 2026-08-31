@@ -1,0 +1,92 @@
+name: release
+
+# 触发条件：推送 v*.*.* 形式的 tag 时自动构建并发布 Release
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write   # 允许创建/上传 Release 资源
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 安装构建依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller scapy
+
+      - name: 检查 speedtest 二进制
+        run: |
+          if (-not (Test-Path "speedtest/speedtest.exe")) {
+            Write-Host "::warning::speedtest/speedtest.exe 不存在, 继续构建（可选依赖缺失不影响主功能）"
+          } else {
+            Write-Host "speedtest/speedtest.exe 就绪"
+          }
+
+      - name: PyInstaller 打包
+        run: pyinstaller --noconfirm NetPulse.spec
+
+      - name: 校验产物
+        run: |
+          if (-not (Test-Path "dist/NetPulse.exe")) {
+            Write-Error "dist/NetPulse.exe 未生成, 构建失败"
+            exit 1
+          }
+          $size = (Get-Item "dist/NetPulse.exe").Length
+          Write-Host "NetPulse.exe 大小: $([math]::Round($size / 1MB, 2)) MB"
+
+      - name: 计算 SHA256
+        id: hash
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/NetPulse.exe").Hash.ToLower()
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "SHA256: $hash"
+
+      - name: 准备 Release 资源
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/NetPulse.exe" -DestinationPath "dist/NetPulse.zip" -Force
+          Copy-Item "dist/NetPulse.exe" -Destination "dist/NetPulse.exe.sha256.txt"
+          # 把哈希写进 .sha256 文件
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/NetPulse.exe").Hash.ToLower()
+          Set-Content -Path "dist/NetPulse.exe.sha256.txt" -Value "$hash  NetPulse.exe"
+
+      - name: 创建 Release 并上传
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/NetPulse.exe
+            dist/NetPulse.zip
+            dist/NetPulse.exe.sha256.txt
+          body: |
+            ## NetPulse ${{ github.ref_name }}
+
+            **SHA256**: `${{ steps.hash.outputs.sha256 }}`
+
+            ### 下载说明
+            - `NetPulse.exe` — 单文件可执行版本（约 25 MB）
+            - `NetPulse.zip` — 同上，ZIP 压缩版（解压后与 .exe 等价）
+            - `.sha256.txt` — 哈希校验文件
+
+            ### 校验方法
+            ```powershell
+            # Windows PowerShell
+            Get-FileHash .\NetPulse.exe -Algorithm SHA256
+            # 应与上方 SHA256 一致
+            ```
+
+            完整变更见 [CHANGELOG.md](./CHANGELOG.md)。

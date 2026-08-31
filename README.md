@@ -2,6 +2,18 @@
 
 > 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.0.0
 
+[![GitHub release](https://img.shields.io/github/v/release/henu_09/netpulse)](https://github.com/henu_09/netpulse/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)]()
+
+## ⬇️ 下载
+
+**最新稳定版：[v1.0.0](https://github.com/henu_09/netpulse/releases/latest)**
+
+直接下载 `NetPulse.exe`（约 25 MB，单文件可执行，免安装），双击即可运行。
+
+> SHA256 见 [Releases 页面](https://github.com/henu_09/netpulse/releases/latest)，下载后可对照 `*.sha256.txt` 校验。
+
 NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `netpulse.py` 文件即可运行**（核心功能仅依赖 Python 标准库），覆盖局域网、网关、DNS、外网、WiFi、测速、TCP、路由等常见排障场景，并可将结果导出为 HTML / JSON 报告（HTML 支持浏览器打印/另存为 PDF）。
 
 ## ✨ 特性
