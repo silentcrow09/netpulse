@@ -7,6 +7,45 @@
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-08-31
+
+v1.4.0 代码审查修复：v1.2.0–v1.4.0 有多项路线图标 [x] 但未真正交付的功能，本版本补齐。
+
+### 修复（v1.4.0 未兑现的承诺）
+- **Exit Code 真正接入 (D2)**：`compute_exit_code` 此前零调用点，CLI 恒 exit 0。现在 `modules` / `diagnose` 两条路径跑完诊断后按 D2 标准退出（0=OK / 1=警告 / 2=检测出问题）；参数错（无效模块名 / 缺 `--port-target` / 未知 profile）exit 4
+- **report.json 对齐自带 Schema (D1)**：`render_report_json` 此前丢弃 `schema_version` 与 `diagnosis` 顶层字段。现在输出与 `schema/netpulse-result-v1.1.json` 必填字段完全一致（`meta` 兼容视图保留），`jq .diagnosis` / `jq .schema_version` 可用
+- **`netpulse diagnose <profile>` 子命令 (C4/C8)**：文档记载的调用形式此前是静默空操作（实际只有 `--diagnose` 旗标）。现在两种形式等价；`--diagnose` 路径不再吞 `--export`
+- **调试包脱敏补漏 (D3)**：新增公网 IPv6（`ipv6_public_ip` 及文本中的全球单播地址）、STUN 映射地址（`mapped_ip` / `mapped_addr` / `mapped_port` / `public_ip_tcp` / `servers[].mapped_addr`）、文案内嵌的公网 `ip:port` 打码；内网/回环/链路本地地址保留（排障刚需）；`netpulse.log` 由 4 行占位文本改为真实运行概要（模块状态 + 模块级 error）
+- **`APP_VERSION` 修正**：常量停留在 1.0.0，报告/CLI 显示与 CHANGELOG 脱节，升至 1.4.1
+
+### 修复（v1.3.0 根因引擎键名错位）
+- 6 条根因规则中 3 条对真实数据永不触发或误触发（测试喂的是想象键名）：
+  - `_rule_bufferbloat`：改读 `idle_rtt_ms`/`loaded_rtt_ms`/`bloat_ms`（原读不存在的 `idle_latency_ms`），grade 按前缀匹配（实际值为 `"D (较差)"` 等中文串），`load_warning` 时跳过 —— 此前健康网络每次都误报「Bufferbloat 严重」
+  - `_rule_wan_interruption`：改读 `tcp_ok`/`tcp_total`（原读不存在的 `overall_status`/`detail`）—— 此前真断网漏报、模块超时反而误报 CRITICAL
+  - `_rule_nat_restricted`：改读 `nat_behavior`（原读不存在的 `nat_type`）—— 此前永不触发
+  - `_rule_dns_failure`：模块自身 error/超时不再被当成 100% 解析失败（纯工具故障被当网络根因）
+
+### 修复（v1.2.0 B 阶段「输出零差异」回归）
+- **网关无网关路径**：v2 probe 失败时错误文案被丢弃、状态从「错误」变「异常」（健康分虚高 10 分）。现在 `_run_module_with_timeout` 把 `.error` 回填到结果且状态恢复「错误」，与旧 `GatewayTester` 零差异
+- **报告证据行消失**：`_issues_gateway` 现在同时认旧下划线（`gateway_packet_loss`）与新点分（`gateway.packet_loss`）issue id，「20 发 / 19 收 / 1 丢」证据行恢复
+- **Parser 双语缺陷**：`parse_arp_a` 段落正则补中文「接口:」（原英文-only，中文系统返回空表）；`parse_netsh_wlan_interfaces` 补中文字段名（名称/状态/物理地址/信号/通道…），与 LinkSpeedDetector 口径一致；新增中文 fixture（此前 "zh" fixture 实为英文输出，测试从未覆盖中文）
+
+### 修复（Monitor 模式）
+- `target_unreachable` / `no_data` / `with_outage` 三类事件的 `root_cause` 不再落到「其他」
+
+### 测试
+- 新增 `tests/test_redaction.py`（12 项：IPv6 / STUN / 文案打码 / 内网保留 / 嵌套结构）
+- `tests/test_diagnosis.py` 夹具改用生产者真实键名（原喂想象键名），32 → 39 项（+7 回归：模块 error 不触发 / load_warning / UDP 受阻等）
+- `tests/test_probes.py` 30 → 39 项（+9：无网关错误语义 / wrap 型 error 保留 metrics / 点分 id 兼容）
+- `tests/test_parsers.py` 23 → 29 项（+6：中文 arp / 中文 netsh fixture）
+
+### 已知未完成（如实记录）
+- SECTION 1d parser 仍未接入生产调用点（Tester 内部解析仍在用）；接线需先在真实中文 Windows 上做零差异验证（B13 门槛）
+- `GatewayTester` 等 5 个旧 Tester 类为已标记 `@deprecated` 的死代码，待 B13 删除
+- Monitor 模式 exit code 仍恒为 0（盯障是长驻交互模式，退出码语义待定义）
+
+[1.4.1]: https://github.com/silentcrow09/netpulse/compare/v1.4.0...v1.4.1
+
 ## [1.4.0] - 2026-08-31
 
 ### 新增

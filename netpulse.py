@@ -666,7 +666,7 @@ _IPCONFIG_SECTION_RE = re.compile(
     re.MULTILINE,
 )
 _ARP_SECTION_RE = re.compile(
-    r"Interface:\s+([\d.]+)\s+---\s+0x[0-9a-fA-F]+",
+    r"(?:Interface|接口):\s+([\d.]+)\s+---\s+0x[0-9a-fA-F]+",
 )
 _ROUTE_TABLE_RE = re.compile(
     r"IPv4 Route Table.*?^={3,}.*?\n(.*?)(?=^={3,}|\Z)",
@@ -763,7 +763,9 @@ def parse_route_print(raw):
 def parse_arp_a(raw):
     """arp -a 输出 → ArpEntry 列表.
 
-    段落分隔: 'Interface: <ip> --- 0x<n>'
+    段落分隔: 'Interface: <ip> --- 0x<n>' (英文) / '接口: <ip> --- 0x<n>' (中文).
+    表头行 ('Internet Address' / 'Internet 地址') 靠首列必须是 IPv4 自然过滤.
+    type 保留原文小写: 英文系统 dynamic/static, 中文系统 动态/静态.
     """
     entries = []
     parts = _ARP_SECTION_RE.split(raw)
@@ -773,10 +775,10 @@ def parse_arp_a(raw):
         body = parts[i + 1]
         for line in body.splitlines():
             line = line.strip()
-            if not line or "Internet Address" in line:
+            if not line:
                 continue
             cols = line.split()
-            if len(cols) >= 3:
+            if len(cols) >= 3 and re.match(r"^\d+\.\d+\.\d+\.\d+$", cols[0]):
                 ip, mac, type_ = cols[0], cols[1], cols[2]
                 entries.append(ArpEntry(
                     ip=ip, mac=mac.lower(),
@@ -786,15 +788,32 @@ def parse_arp_a(raw):
     return entries
 
 
+# netsh wlan show interfaces 字段名双语别名 (中文 Windows 输出中文字段名,
+# SSID/BSSID/GUID 为协议名保持原样). LinkSpeedDetector 的行内解析已按双语
+# 处理, 此表让 parser 与之口径一致, 不再分叉.
+_NETSH_WLAN_FIELD_ALIASES = {
+    "name":         ("Name", "名称"),
+    "description":  ("Description", "描述"),
+    "guid":         ("GUID",),
+    "physical_mac": ("Physical address", "物理地址"),
+    "state":        ("State", "状态"),
+    "ssid":         ("SSID",),
+    "bssid":        ("BSSID",),
+    "signal":       ("Signal", "信号"),
+    "channel":      ("Channel", "通道"),
+    "radio":        ("Radio type", "无线电类型"),
+}
+
+
 def parse_netsh_wlan_interfaces(raw):
     """netsh wlan show interfaces → WifiInterface 列表.
 
-    netsh 输出始终是英文 (即使中文 Windows). 注意 netsh 行尾用 \\r\\r\\n
-    (双 \\\\r 怪异行为), 不归一化会被 \\s+ 误判为多行.
+    中英文字段名都认 (英文 Name/State/..., 中文 名称/状态/...).
+    注意 netsh 行尾用 \\r\\r\\n (双 \\r 怪异行为), 不归一化会被 \\s+ 误判为多行.
 
     netsh 实际格式是"每个字段单独一段" (每个字段后有空行), 不按接口分组.
     累积所有字段为一个 interface dict. 一次调用只输出当前接口.
-    多行字段值 (如 Radio status "Hardware On\\nSoftware Off") 用 " | " 连接.
+    多行字段值 (如 "Hardware On\\nSoftware Off" / "硬件打开\\n软件关闭") 用 " | " 连接.
     """
     raw = raw.replace("\r\r\n", "\n").replace("\r\n", "\n")
     fields = {}
@@ -811,32 +830,41 @@ def parse_netsh_wlan_interfaces(raw):
             fields[k] += " | " + v.strip()
         else:
             fields[k] = v.strip()
-    # 没有 Name 字段说明不是有效接口输出 (e.g. 仅 "There is N interface" 头部)
-    if "Name" not in fields or not fields["Name"]:
+
+    def _f(canonical):
+        for alias in _NETSH_WLAN_FIELD_ALIASES[canonical]:
+            if fields.get(alias):
+                return fields[alias]
+        return None
+
+    # 没有 Name/名称 字段说明不是有效接口输出
+    # (e.g. 仅 "There is N interface" / "系统上有 N 个接口" 头部)
+    name = _f("name")
+    if not name:
         return []
     sig_pct = None
-    if "Signal" in fields:
-        mm = re.search(r"(\d+)%", fields["Signal"])
+    sig_raw = _f("signal")
+    if sig_raw:
+        mm = re.search(r"(\d+)%", sig_raw)
         sig_pct = int(mm.group(1)) if mm else None
     channel = None
-    if "Channel" in fields:
+    ch_raw = _f("channel")
+    if ch_raw:
         try:
-            channel = int(fields["Channel"])
+            channel = int(ch_raw)
         except ValueError:
             pass
-    ssid = fields.get("SSID")
-    bssid = fields.get("BSSID")
     return [WifiInterface(
-        name=fields.get("Name", ""),
-        state=fields.get("State", ""),
-        ssid=ssid if ssid else None,
-        bssid=bssid if bssid else None,
+        name=name,
+        state=_f("state") or "",
+        ssid=_f("ssid"),
+        bssid=_f("bssid"),
         signal_pct=sig_pct,
         channel=channel,
-        radio=fields.get("Radio type"),
-        physical_mac=fields.get("Physical address"),
-        description=fields.get("Description"),
-        guid=fields.get("GUID"),
+        radio=_f("radio"),
+        physical_mac=_f("physical_mac"),
+        description=_f("description"),
+        guid=_f("guid"),
     )]
 
 
@@ -1279,7 +1307,10 @@ def _rule_dns_failure(results_dict):
     dns_res = results_dict.get("dns", {})
     if not dns_res:
         return None
-    # DNS 失败率: success_count / total_count
+    if dns_res.get("error"):
+        # 模块自身崩溃/超时 → DNS 从未被测试, 工具故障不是网络根因
+        return None
+    # DNS 失败率: success_count / total_count (键名与 DNSTester.results 一致)
     sc = dns_res.get("success_count", 0)
     tc = dns_res.get("total_count", 0) or 1
     fail_rate = 1 - (sc / tc) if tc > 0 else 0
@@ -1308,33 +1339,29 @@ def _rule_dns_failure(results_dict):
 
 
 def _rule_wan_interruption(results_dict):
-    """WAN 中断: gateway OK + external ping/TCP 全失败."""
+    """WAN 中断: gateway OK + external TCP 全失败."""
     ext_res = results_dict.get("external", {})
     gw = results_dict.get("gateway", {})
     if not ext_res or not gw:
         return None
+    if ext_res.get("error"):
+        # 模块自身崩溃/超时 → 外网从未被测试, 不能当 WAN 中断的证据
+        return None
     gw_ok = not gw.get("error") and (gw.get("ping", {}).get("loss_pct", 100) < 50)
     if not gw_ok:
         return None  # 网关不通, 不归 WAN
-    # external 模块失败标志
-    ext_failed = ext_res.get("error") or ext_res.get("overall_status") == "全部失败"
-    if not ext_failed:
-        # 看 detail: 所有目标都失败才算 WAN 中断
-        detail = ext_res.get("detail", []) or []
-        if detail:
-            ok_count = sum(1 for t in detail if isinstance(t, dict) and t.get("success"))
-            if ok_count > 0:
-                return None  # 至少有一个目标成功, 不算 WAN 中断
-            # 全部失败 → 触发 WAN (下面的逻辑)
-        else:
-            return None  # 无 detail 信息, 无法判定
+    # ExternalNetworkTester.results 的键: tcp_ok / tcp_total / unreachable_count
+    tcp_total = ext_res.get("tcp_total", 0) or 0
+    tcp_ok = ext_res.get("tcp_ok", 0) or 0
+    if tcp_total <= 0 or tcp_ok > 0:
+        return None  # 至少一个目标 TCP 可达 / 无目标数据, 不算 WAN 中断
     confidence = _rule_confidence([(ext_res, 1.0), (gw, 0.3)], base=0.7)
     return RootCause(
         id="wan_interruption", category="WAN", severity=Severity.CRITICAL,
         title="WAN 中断 (运营商链路故障)",
         description="网关可达但外网不可达, 故障点在『网关 ↔ 运营商』这一段; 需联系运营商.",
         confidence=confidence,
-        evidence_ids=["external.targets", "gateway.ping.loss_pct"],
+        evidence_ids=["external.tcp_ok", "external.tcp_total", "gateway.ping.loss_pct"],
         affected_modules=["external", "gateway"],
         recommendations=[
             "1. 检查光猫 LOS 灯是否变红 (光纤断)",
@@ -1372,25 +1399,33 @@ def _rule_wifi_weak(results_dict):
 
 
 def _rule_bufferbloat(results_dict):
-    """Bufferbloat: loaded_latency / idle_latency 比值过大."""
+    """Bufferbloat: loaded_rtt / idle_rtt 比值过大."""
     bb = results_dict.get("bufferbloat", {})
-    if not bb:
+    if not bb or bb.get("error"):
         return None
-    idle = bb.get("idle_latency_ms", 0) or 0
-    loaded = bb.get("loaded_latency_ms", 0) or 0
-    grade = bb.get("grade", "A")
-    if grade not in ("D", "F") and loaded < idle * 3:
+    if bb.get("load_warning"):
+        return None  # 测速源不可用, 负载未建立, 结果不可信
+    idle = bb.get("idle_rtt_ms")
+    loaded = bb.get("loaded_rtt_ms")
+    if idle is None or loaded is None:
         return None
-    increase = loaded - idle
+    bloat = bb.get("bloat_ms")
+    if bloat is None:
+        bloat = loaded - idle
+    # BufferbloatTester 的 grade 是带说明的中文串, 取首字母判定档位
+    grade = bb.get("grade", "") or ""
+    grade_letter = grade[:1].upper()
+    if grade_letter not in ("D", "F") and (idle <= 0 or loaded < idle * 3):
+        return None
     confidence = _rule_confidence([(bb, 1.0)], base=0.7)
-    severity = Severity.CRITICAL if grade == "F" else Severity.HIGH
+    severity = Severity.CRITICAL if grade_letter == "F" else Severity.HIGH
     return RootCause(
         id="bufferbloat", category="Bufferbloat", severity=severity,
-        title=f"Bufferbloat 严重 (等级 {grade}, 延迟增加 {increase:.0f}ms)",
+        title=f"Bufferbloat 严重 (等级 {grade}, 延迟增加 {bloat:.0f}ms)",
         description="网络空闲时延迟正常, 加载下载时延迟飙升; 是上游带宽/路由器缓存调优差.",
         confidence=confidence,
-        evidence_ids=["bufferbloat.grade", "bufferbloat.loaded_latency_ms",
-                       "bufferbloat.idle_latency_ms"],
+        evidence_ids=["bufferbloat.grade", "bufferbloat.loaded_rtt_ms",
+                       "bufferbloat.idle_rtt_ms", "bufferbloat.bloat_ms"],
         affected_modules=["bufferbloat"],
         recommendations=[
             "1. 登录路由器后台开启 SQM / QoS (智能队列管理)",
@@ -1428,20 +1463,21 @@ def _rule_gateway_loss(results_dict):
 
 
 def _rule_nat_restricted(results_dict):
-    """NAT 限制: STUN 测得 Symmetric NAT (游戏/P2P 不友好)."""
+    """NAT 限制: STUN 测得对称型 NAT (游戏/P2P 不友好)."""
     nat = results_dict.get("nattype", {})
-    if not nat:
+    if not nat or nat.get("error"):
         return None
-    nattype_str = nat.get("nat_type", "") or nat.get("nattype", "")
-    if "Symmetric" not in nattype_str and "对称" not in nattype_str:
+    # NATTypeTester.results 的键: nat_behavior ('对称型'/'EIM(锥形)'/未知) + cone_type
+    behavior = nat.get("nat_behavior", "") or ""
+    if "对称" not in behavior and "symmetric" not in behavior.lower():
         return None
     confidence = _rule_confidence([(nat, 0.8)], base=0.65)
     return RootCause(
         id="nat_restricted", category="NAT", severity=Severity.MEDIUM,
-        title="运营商 NAT 类型受限 (Symmetric)",
+        title="运营商 NAT 类型受限 (对称型)",
         description="对称型 NAT 对游戏主机/视频通话/P2P 不友好, 直连建立困难; 影响游戏联机和 VoIP 质量.",
         confidence=confidence,
-        evidence_ids=["nattype.nat_type"],
+        evidence_ids=["nattype.nat_behavior", "nattype.cone_type"],
         affected_modules=["nattype"],
         recommendations=[
             "1. 路由器开启 UPnP (自动端口映射)",
@@ -1652,24 +1688,90 @@ _DIAGNOSIS_CSS = """
 # 发送给开发者. 隐私敏感 (用户偏好: 分发物严禁暴露本地用户名),
 # 因此默认脱敏: SSID / MAC / 公网 IP / hostname.
 
+def _is_private_ipv4(ip):
+    """内网/保留/组播段返回 True (排障需要, 脱敏时保留)."""
+    try:
+        a, b = int(ip.split(".")[0]), int(ip.split(".")[1])
+    except (ValueError, IndexError):
+        return True
+    return (a in (0, 10, 127) or a >= 224
+            or (a == 172 and 16 <= b <= 31)
+            or (a == 192 and b == 168)
+            or (a == 169 and b == 254))
+
+
+def _mask_public_ipv4_text(text):
+    """把文本里的公网 IPv4 (可带 :port) 打码为 a.b.X.X; 内网 IP 原样保留."""
+    def _sub(m):
+        ip = m.group(1)
+        if _is_private_ipv4(ip):
+            return m.group(0)
+        parts = ip.split(".")
+        return f"{parts[0]}.{parts[1]}.X.X" + (":X" if m.group(2) else "")
+    return re.sub(r"\b(\d{1,3}(?:\.\d{1,3}){3})(:\d+)?\b", _sub, text)
+
+
+# IPv6 文本匹配: 全形式 / 首尾 :: / 中间单 :: (覆盖 NAT/egress summary 里的真实形态)
+_IPV6_TEXT_RE = re.compile(
+    r"(?<![0-9A-Fa-f:.])((?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}"
+    r"|(?:[0-9A-Fa-f]{1,4}:){1,7}:"
+    r"|:(?::[0-9A-Fa-f]{1,4}){1,7}"
+    r"|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4})(?![0-9A-Fa-f:.])")
+
+
+def _mask_public_ipv6_text(text):
+    """把文本里的公网 IPv6 (2000::/3 全球单播) 打码; fe80/fd 等本地段保留."""
+    def _sub(m):
+        addr = m.group(0).lower()
+        if addr.startswith(("fe", "fc", "fd")) or addr.startswith("::"):
+            return m.group(0)
+        groups = [g for g in addr.split(":") if g]
+        head = ":".join(groups[:2]) if len(groups) >= 2 else groups[0]
+        return f"{head}:…:REDACTED"
+    return _IPV6_TEXT_RE.sub(_sub, text)
+
+
+def _redact_text_value(value):
+    """对自由文本 (summary/message/error 等) 做值级打码."""
+    return _mask_public_ipv6_text(_mask_public_ipv4_text(value))
+
+
+# 需要值级文本打码的字段 (文案里常嵌公网 IP:port, 如 NAT summary 的映射地址)
+_REDACT_TEXTY_KEYS = {"summary", "message", "detail", "action", "description",
+                      "error", "assessment", "verdict", "note", "title", "text"}
+
+
 def _redact_value(key, value):
     """脱敏单个字段值. 命中隐私字段返回 mask, 否则原样返回."""
+    key_l = key.lower()
+    # STUN 映射端口 (int): 与 mapped_ip 组合即出口身份, 一并打码
+    if "mapped_port" in key_l:
+        return "X"
     if not isinstance(value, str) or not value:
         return value
-    key_l = key.lower()
     # MAC 地址 (XX:XX:XX:XX:XX:XX 或 XX-XX-XX-XX-XX-XX 格式)
     if "mac" in key_l and re.match(r"^[0-9a-fA-F:-]+$", value):
         return "XX:XX:XX:XX:XX:XX"
-    # 公网 IP (xxx.xxx.xxx.xxx)
-    if "public_ip" in key_l and re.match(r"^\d+\.\d+\.\d+\.\d+$", value):
-        parts = value.split(".")
-        return f"{parts[0]}.{parts[1]}.X.X"
     # SSID (任意字符串)
     if "ssid" in key_l:
         return "***"
     # hostname (DESKTOP-XXXX 或)
     if "hostname" in key_l or "host_name" in key_l:
         return "host-REDACTED"
+    # STUN 映射地址 (mapped_ip/mapped_addr/public_ip_tcp): 用户出口身份,
+    # 值形如 "1.2.3.4" 或 "1.2.3.4:50000" (内网映射不会被 STUN 返回, 全打码)
+    if any(t in key_l for t in ("mapped_ip", "mapped_addr", "public_ip_tcp")):
+        return _mask_public_ipv4_text(value)
+    # 公网 IP 字段: IPv4 打末两段, IPv6 全球单播保前两组
+    if "public_ip" in key_l or "ipv6" in key_l:
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", value):
+            parts = value.split(".")
+            return f"{parts[0]}.{parts[1]}.X.X"
+        if ":" in value:
+            return _mask_public_ipv6_text(value)
+    # 文案字段: 值级打码 (嵌在中文句子里的公网 ip:port / IPv6)
+    if key_l in _REDACT_TEXTY_KEYS:
+        return _redact_text_value(value)
     return value
 
 
@@ -1727,12 +1829,21 @@ def _export_debug_bundle(out_dir):
         json.dump(sys_info_redacted, f, ensure_ascii=False, indent=2, default=str)
     with open(diag_path, "w", encoding="utf-8") as f:
         json.dump(diag_redacted, f, ensure_ascii=False, indent=2, default=str)
-    # log (简化: 占位 + 脱敏说明; 阶段 E 可接 Python logging 模块)
+    # log: 运行概要 (模块状态 + 模块级 error; 阶段 E 可接 Python logging 模块)
     with open(log_path, "w", encoding="utf-8") as f:
         f.write(f"NetPulse v{APP_VERSION} debug bundle\n")
         f.write(f"Generated at: {datetime.now().isoformat()}\n")
-        f.write(f"Redacted: SSID / MAC / public IP / hostname\n")
+        f.write("Redacted: SSID / MAC / 公网 IPv4+IPv6 / STUN 映射地址 / hostname\n")
         f.write(f"Schema version: 1.1.0\n")
+        f.write("-" * 60 + "\n")
+        f.write("模块运行状态:\n")
+        for k, st in (LAST_RUN.get("status") or {}).items():
+            f.write(f"  [{st}] {k}\n")
+        f.write(f"运行模块: {', '.join(LAST_RUN.get('keys') or [])}\n")
+        for k, res in (LAST_RUN.get("results") or {}).items():
+            err = res.get("error") if isinstance(res, dict) else None
+            if err:
+                f.write(f"  ERROR {k}: {_redact_text_value(str(err)[:200])}\n")
     # 5. zip
     try:
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -2106,7 +2217,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.4.1"
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -9544,6 +9655,10 @@ class MonitorSession:
             "unknown":  "根因未知 (网关数据缺失)",
             "dns":      "DNS 解析故障",
             "policy":   "疑似端口策略 / QoS (信息级)",
+            # classify_event 的另三类 cls (v1.4.1 前落到"其他")
+            "target_unreachable": "外网目标不可达 (网关正常, 目标或出口链路问题)",
+            "no_data":  "无有效采样 (外网 ping 无输出, 采集失败/系统睡眠?)",
+            "with_outage": "异常随中断出现 (DNS/端口异常与掉线同时发生)",
         }
         for ev in events:
             cls = ev.get("cls", "")
@@ -10293,6 +10408,23 @@ def compute_exit_code(statuses):
     return 0
 
 
+def _export_reports(spec):
+    """按逗号分隔的 spec 导出报告 (modules / diagnose 两条 CLI 路径共用)."""
+    targets = [t.strip() for t in spec.split(",") if t.strip()] or [spec]
+    for t in targets:
+        err = export_report(t)
+        if err:
+            print(_c(f"  ✗ {err}", C_RED))
+        else:
+            print(_c(f"  ✓ 报告已导出: {os.path.abspath(_normalize_report_path(t))}", C_GREEN))
+
+
+def _exit_with_status():
+    """诊断跑完后按 D2 标准退出码结束 (0=OK / 1=警告 / 2=检测出问题)."""
+    if LAST_RUN and LAST_RUN.get("status"):
+        sys.exit(compute_exit_code(LAST_RUN["status"]))
+
+
 def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
                    banner=True, install=False, parallel=False, max_workers=4,
                    pip_mirror=None):
@@ -10540,6 +10672,13 @@ def _run_module_with_timeout(key, callback):
         if "err" in box:
             return "错误", {"error": str(box["err"])}
         result = box["result"]
+        # probe 失败 (error 非 None) 时: 状态用「错误」且错误文案回填 res —
+        # 与旧 Tester 路径 determine_status({'error':…})='错误' 零差异
+        # (metrics 一并保留, wrap 型 probe 的完整 results 不丢)
+        if result.error is not None:
+            res = dict(result.metrics or {})
+            res["error"] = result.error.message
+            return "错误", res
         # DiagnosticResult.metrics 兼容旧 res_dict 接口 (verdict_fn / metrics_fn / 报告)
         return result.status.zh_label, result.metrics
 
@@ -10782,7 +10921,9 @@ def _issues_gateway(res):
             # 把 ping 原始数据塞进 raw_summary, 让顶部 todo 块能直接显示
             # "20 发 / 19 收 / 1 丢" (不必展开技术细节也能看到依据)
             raw_summary = None
-            if issue.get("type") in ("gateway_packet_loss",):
+            # 两种 id 形态都认: 旧 GatewayTester 下划线 (gateway_packet_loss)
+            # 与 v2 probe 点分 (gateway.packet_loss)
+            if issue.get("type") in ("gateway_packet_loss", "gateway.packet_loss"):
                 p = res.get("ping", {}) or {}
                 sent = p.get("sent")
                 recv = p.get("received")
@@ -14603,10 +14744,14 @@ def _json_default(o):
 def render_report_json(report, indent=2):
     """渲染 JSON 报告 (技术员/脚本用)。
 
-    结构 (build_report 双视图):
-      - meta: 应用信息 + 生成时间 + 主机信息 + 模块运行列表
+    顶层结构对齐 schema/netpulse-result-v1.1.json (阶段 D · D1):
+    app / version / schema_version / generated_at / system / health /
+    counts / summary / diagnosis / modules 为必填字段, 可直接用仓库自带的
+    schema 文件校验。meta 为旧解析器兼容视图 (schema 允许未知字段)。
+
       - health: 健康评分 (score, grade, label, verdict) + counts
       - modules: 客户视图 (verdict + key_metrics + issues)
+      - diagnosis: 根因分析 (root_causes + 置信度, 阶段 C 引入)
       - tech.raw_results: 每个模块的原始 result 字典 (含 30 个 RTT 全序列等)
       - tech.thresholds: 阈值定义 (为啥这个值是"异常"的依据)
       - tech.module_presentation: 每个模块的客户视图配置 key
@@ -14614,17 +14759,25 @@ def render_report_json(report, indent=2):
     if not report:
         return "{}"
     out = {
+        "app": report["app"],
+        "version": report["version"],
+        "schema_version": report["schema_version"],
+        "generated_at": report["generated_at"],
+        "system": report["system"],
+        "health": report["health"],
+        "counts": report["counts"],
+        "exempt_count": report.get("exempt_count", 0),
+        "summary": report["summary"],
+        "diagnosis": report["diagnosis"],
+        "modules": report["modules"],
+        "tech": report["tech"],
+        # 兼容视图: v1.4.0 之前的消费方读 meta.host / meta.app
         "meta": {
             "app": report["app"],
             "version": report["version"],
             "generated_at": report["generated_at"],
             "host": report["system"],
         },
-        "health": report["health"],
-        "counts": report["counts"],
-        "summary": report["summary"],
-        "modules": report["modules"],
-        "tech": report["tech"],
     }
     return json.dumps(out, ensure_ascii=False, indent=indent, default=_json_default)
 
@@ -14942,6 +15095,7 @@ def main():
                         help="按场景 Profile 诊断 (阶段 C · v1.3.0 引入). "
                              "可选: slow / disconnect / web / gaming / wifi. "
                              "诊断完成后输出根因分析 (置信度 + 建议). "
+                             "也支持子命令形式: netpulse diagnose <profile>. "
                              "例: netpulse.py --diagnose slow")
     parser.add_argument("--json-schema", action="store_true",
                         help="输出当前 JSON Schema 版本号与结构路径 (阶段 D · v1.4.0 引入). "
@@ -15025,6 +15179,23 @@ def main():
                         help="盯障外网 ping 目标 (默认 223.5.5.5, 同时对该目标 TCP 53 "
                              "建连; 可用域名)")
     args = parser.parse_args()
+
+    # `netpulse diagnose <profile>` 子命令形式 (与 README/CHANGELOG 文档口径
+    # 一致): 等价转写为 --diagnose <profile>, 剩余 token 仍按模块名处理
+    if args.modules and args.modules[0] == "diagnose":
+        profiles = "/".join(sorted(DIAGNOSE_PROFILES.keys()))
+        if args.diagnose:
+            print(_c("  错误: 'diagnose' 子命令与 --diagnose 不能同时使用", C_RED))
+            sys.exit(4)
+        if len(args.modules) < 2:
+            print(_c(f"  用法: netpulse diagnose <profile>  (可选: {profiles})", C_RED))
+            sys.exit(4)
+        profile = args.modules[1]
+        if profile not in DIAGNOSE_PROFILES:
+            print(_c(f"  错误: 未知 profile '{profile}'  (可选: {profiles})", C_RED))
+            sys.exit(4)
+        args.diagnose = profile
+        args.modules = args.modules[2:]
 
     # 禁用 scapy 二层抓包 (避免 Npcap 不稳定导致段错误)
     if args.no_scapy:
@@ -15112,6 +15283,10 @@ def main():
             diagnosis = diagnose(LAST_RUN["results"])
             print(_c("─" * 60, C_BLUE))
             _print_diagnosis(diagnosis)
+        # 与 modules 路径同权: --export / --json-schema 等后续动作不再被吞
+        if args.export:
+            _export_reports(args.export)
+        _exit_with_status()
         return
     # 盯障模式: 独立顶层运行模式 (与模块诊断互斥)
     if args.monitor:
@@ -15125,7 +15300,7 @@ def main():
             keys = parse_module_names(args.modules)
         if not keys:
             print("可用模块: " + ", ".join(k for k, _, _ in MODULE_REGISTRY))
-            return
+            sys.exit(4)  # D2: 参数错 (模块名无效)
         # 端口探测: 不管是 all 还是单选 port, 跑之前都要求用户输入目标
         # (用户偏好: 端口探测必须有显式目标, 不再有隐式默认)
         if "port" in keys and not PORT_PROBE_CONFIG.get("targets"):
@@ -15143,21 +15318,14 @@ def main():
                 print(_c("  用法: netpulse.py port --port-target HOST:PORT [...]", C_GRAY))
                 print(_c("  例:   netpulse.py port --port-target 192.168.1.1:443,8.8.8.8:53", C_GRAY))
                 print(_c("       或: netpulse.py all --port-target 8.8.8.8:53", C_GRAY))
-                sys.exit(2)
+                sys.exit(4)  # D2: 参数错 (缺少 --port-target)
         run_diagnostics(keys, verbose=args.verbose, as_json=args.json,
                         no_color=args.no_color, install=args.install,
                         parallel=args.parallel, max_workers=args.max_workers,
                         pip_mirror=args.pip_mirror)
         if args.export:
-            targets = [t.strip() for t in args.export.split(",") if t.strip()]
-            if not targets:
-                targets = [args.export]
-            for t in targets:
-                err = export_report(t)
-                if err:
-                    print(_c(f"  ✗ {err}", C_RED))
-                else:
-                    print(_c(f"  ✓ 报告已导出: {os.path.abspath(_normalize_report_path(t))}", C_GREEN))
+            _export_reports(args.export)
+        _exit_with_status()
         return
     # 无参数 -> 进入交互式菜单
     interactive_menu(install=args.install, pip_mirror=args.pip_mirror)
