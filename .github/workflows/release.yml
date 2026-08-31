@@ -27,16 +27,42 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller scapy
 
+      - name: 下载 Ookla Speedtest CLI
+        shell: pwsh
+        run: |
+          # speedtest/ 目录被 .gitignore 忽略, GitHub 上没有 speedtest.exe
+          # 但 NetPulse.spec 把它作为 datas 打包, 所以 Actions 必须先下载一份
+          $dst = "speedtest/speedtest.exe"
+          if (-not (Test-Path $dst)) {
+            New-Item -ItemType Directory -Force -Path "speedtest" | Out-Null
+            $url = "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-win64.zip"
+            Write-Host "正在从 Ookla 官方下载 Speedtest CLI..."
+            $zip = "$env:TEMP\ookla-speedtest.zip"
+            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+            Write-Host "下载完成, 解压中..."
+            Expand-Archive -Path $zip -DestinationPath "$env:TEMP\ookla-extract" -Force
+            # zip 结构: speedtest.exe 直接在根
+            Copy-Item "$env:TEMP\ookla-extract\speedtest.exe" -Destination $dst -Force
+            Write-Host "已就位: $dst"
+          } else {
+            Write-Host "speedtest.exe 已存在, 跳过下载"
+          }
+
       - name: 检查 speedtest 二进制
         run: |
           if (-not (Test-Path "speedtest/speedtest.exe")) {
-            Write-Host "::warning::speedtest/speedtest.exe 不存在, 继续构建（可选依赖缺失不影响主功能）"
-          } else {
-            Write-Host "speedtest/speedtest.exe 就绪"
+            Write-Error "speedtest/speedtest.exe 缺失, 打包失败"
+            exit 1
           }
+          Write-Host "speedtest/speedtest.exe 就绪: $((Get-Item speedtest/speedtest.exe).Length) bytes"
 
       - name: PyInstaller 打包
-        run: pyinstaller --noconfirm NetPulse.spec
+        run: |
+          pyinstaller --noconfirm NetPulse.spec 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::PyInstaller 退出码 $LASTEXITCODE, 详见 build.log"
+            exit $LASTEXITCODE
+          }
 
       - name: 校验产物
         run: |
@@ -46,6 +72,14 @@ jobs:
           }
           $size = (Get-Item "dist/NetPulse.exe").Length
           Write-Host "NetPulse.exe 大小: $([math]::Round($size / 1MB, 2)) MB"
+
+      - name: 上传构建日志（成功失败都上传, 便于排查）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: 计算 SHA256
         id: hash
