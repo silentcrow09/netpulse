@@ -1,18 +1,18 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.0.0
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.5.3
 
-[![GitHub release](https://img.shields.io/github/v/release/henu_09/netpulse)](https://github.com/henu_09/netpulse/releases/latest)
+[![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)]()
 
 ## ⬇️ 下载
 
-**最新稳定版：[v1.0.0](https://github.com/henu_09/netpulse/releases/latest)**
+**最新稳定版见 [Releases 页面](https://github.com/silentcrow09/netpulse/releases/latest)**
 
 直接下载 `NetPulse.exe`（约 25 MB，单文件可执行，免安装），双击即可运行。
 
-> SHA256 见 [Releases 页面](https://github.com/henu_09/netpulse/releases/latest)，下载后可对照 `*.sha256.txt` 校验。
+> SHA256 见 [Releases 页面](https://github.com/silentcrow09/netpulse/releases/latest)，下载后可对照 `*.sha256.txt` 校验。
 
 NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `netpulse.py` 文件即可运行**（核心功能仅依赖 Python 标准库），覆盖局域网、网关、DNS、外网、WiFi、测速、TCP、路由等常见排障场景，并可将结果导出为 HTML / JSON 报告（HTML 支持浏览器打印/另存为 PDF）。
 
@@ -20,11 +20,16 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 
 - **零依赖即可运行**：核心诊断只用 Python 标准库，无需安装任何第三方包。
 - **23 个诊断模块**：从局域网设备扫描、TCP 并发压测、网页分层体检到 NAT 类型与代理检测，覆盖端到端排障链路。
+- **根因分析引擎**：6 条内置规则（DNS / WAN / WiFi / Bufferbloat / 网关丢包 / NAT）跨模块聚合证据，按严重度排序输出根因 + 置信度 + 建议；HTML 报告每条根因带「为什么这样判断 / 已基本排除」证据链和**一句话报障卡**（可直接复制发给客服）。
+- **场景化诊断 Profile**：`--diagnose slow|disconnect|web|gaming|wifi` 按故障场景一键选模块组合，跑完直接给根因结论。
+- **并行执行**：`--parallel` 多模块并发跑（`--max-workers N` 控制并发数），交互菜单多模块默认并发。
+- **JSON Schema + 调试包**：结果文件遵循 `schema/netpulse-result-v1.1.json`（`--json-schema` 离线查询版本与字段，供 AI Agent / RMM introspect）；`--debug-bundle DIR` 一键导出脱敏调试包（system + diagnostic + log 的 zip）。
 - **TCP 并发能力压测**：阶梯并发连接测试（累计保持），判定网络路径（光猫/路由器 NAT）最大可持续并发；同跑本机回环对照，自动区分「本机瓶颈 vs 网络/NAT 瓶颈」，零依赖、无需自建服务器。
-- **盯障模式 `--monitor`**：分钟级持续监测网关/外网 ping + TCP + DNS，抓偶发掉线（普通模块全是快照抓不到）；自动事件检测 + 分段定位（内网侧/运营商侧/解析侧），输出带时间轴的 HTML 报告 + Excel 直开的 CSV + 完整 JSON。
+- **盯障模式 `--monitor`**：分钟级持续监测网关/外网 ping + TCP + DNS，抓偶发掉线（普通模块全是快照抓不到）；自动事件检测 + 分段定位（内网侧/运营商侧/解析侧/内外同抖），含**抖动窗口**检测（60s 窗口内反复丢包但未达连续中断 → 抖动集中段，偶发掉线最典型形态），输出带时间轴的 HTML 报告 + Excel 直开的 CSV + 完整 JSON。
 - **iperf3 UDP 模式**：`--iperf3-udp` 以 1 Mbps 发包率测点对点抖动/丢包 —— 语音/游戏质量的关键指标。
 - **宽带测速 = 带宽体检**：上下行测速 + 预估宽带 + Bufferbloat 评级一体化；
-  上行用内置国内运营商节点（电信/联通/移动官方测速服务器），零第三方依赖。
+  交互菜单默认叠加 **Ookla 官方测速**（`speedtest.exe`，支持指定国内服务器），
+  未启用/失败时回退内置方案（国内镜像多连接下行 + 运营商上行节点），零第三方 Python 依赖。
 - **iperf3 链路吞吐（独立模块）**：`iperf3` 模块测量到指定服务器的点对点上下行吞吐
   （需自建 iperf3 服务器），与互联网宽带测速完全分开，报告明确标注"链路吞吐非宽带"。
 - **测速实时可视化**：单独测速时终端实时刷新速率/进度，结束自动生成独立测速报告。
@@ -38,7 +43,7 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 
 ```bash
 # 可选：安装增强依赖 (不装也能跑, 对应功能自动降级)
-pip install scapy speedtest-cli
+pip install scapy          # Ookla speedtest.exe 随发行版打包/自动下载, 无需 pip
 
 # 进入交互式菜单 (可直接回车运行全部模块)
 python netpulse.py
@@ -84,10 +89,10 @@ python netpulse.py port --port-target a.com:80 --port-target b.com:443
 # 端口探测: 超过 1000 目标数, 加 --port-force
 python netpulse.py port --port-target "10.0.0.0/24:80" --port-force
 
-# 指定测速服务器 (可选): speedtest 服务器 ID 或 host:port (如 3633 或 112.25.80.50:8080); 默认自动选择延迟最低的国内运营商节点
+# 指定测速服务器 (可选): Ookla 服务器数字 ID (配合 --speedtest-net) 或上行节点 host:port; 默认自动选择延迟最低的国内运营商节点
 python netpulse.py speedtest --speedtest-node 112.25.80.50:8080
 
-# 启用 Speedtest.net 参考测速 (可选, 国内常选海外服务器, 结果仅供参考)
+# 启用 Ookla 官方测速 (CLI 显式指定; 交互菜单默认已启用, 支持国内服务器选点)
 python netpulse.py speedtest --speedtest-net
 
 # iperf3 链路吞吐测试 (独立模块): 测到指定服务器的上下行吞吐, 非互联网宽带
@@ -129,8 +134,6 @@ python netpulse.py --install
 
 常用参数说明：
 
-常用参数说明：
-
 | 参数 | 说明 |
 |------|------|
 | `modules` | 要运行的模块 key、序号或分类字母 `a/b/c`；`all` 表示全部；省略则进入交互菜单 |
@@ -153,8 +156,16 @@ python netpulse.py --install
 | `--iperf3-udp` | iperf3 改用 UDP 模式测抖动/丢包 (1 Mbps 发包率, 语音/游戏质量口径); 默认 TCP 测吞吐 |
 | `--monitor` | 盯障模式: 持续监测 `SEC` 秒找偶发掉线, 结束生成 CSV/HTML/JSON 报告 (不带值 = 600 秒; 范围 30-86400; Ctrl+C 提前结束同样生成报告); 与其他模块互斥 |
 | `--monitor-target` | 盯障外网 ping 目标 (默认 223.5.5.5, 同时对该目标 TCP 53 建连; 可用域名) |
-| `--speedtest-node` | 指定上行测速服务器 (可选): speedtest 服务器 host:port (如 112.25.80.50:8080); 默认自动选延迟最低的国内运营商节点 |
-| `--speedtest-net` | 启用 Speedtest.net 参考测速 (默认关闭: 国内网络下常选中海外服务器, 结果严重偏低) |
+| `--speedtest-node` | 指定测速服务器 (可选): Ookla 服务器数字 ID (配合 `--speedtest-net`) 或上行节点 `host:port`; 默认自动选延迟最低的国内运营商节点 |
+| `--speedtest-net` | 启用 Ookla 官方测速 (CLI 默认关闭, 交互菜单默认启用; 结论优先采用 Ookla 结果) |
+| `--diagnose` | 按场景 Profile 诊断: `slow` / `disconnect` / `web` / `gaming` / `wifi`, 跑完输出根因分析; 也支持 `netpulse diagnose <profile>` 子命令形式 |
+| `--parallel` | 多模块并行执行 (输出经线程锁同步, 详细结果仍按模块顺序排列); 交互菜单多模块默认并发 |
+| `--max-workers` | 并行模式最大并发数 (默认 4) |
+| `--port-timeout` | 端口探测总时长上限秒数 (默认 60), 超过跳过剩余目标并在报告 `timed_out_specs` 列出 |
+| `--port-concurrency` | 端口探测并发数 (默认 8) |
+| `--pip-mirror` | `--install` 自动装依赖时显式指定 pip 镜像 |
+| `--json-schema` | 输出当前 JSON Schema 版本号与结构路径 (供 AI Agent / RMM / bot introspect), 不跑诊断 |
+| `--debug-bundle` | 生成脱敏调试包 zip (system.json + diagnostic.json + netpulse.log, SSID/MAC/公网 IP/hostname 已脱敏), 用于上报 bug 或远端排障. 例: `--debug-bundle ./out` |
 | `--export` | 诊断后导出报告，逗号分隔多格式（`report.html,report.json`） |
 
 ## 📋 诊断模块（23 项）
@@ -243,8 +254,9 @@ python netpulse.py all --port-target 223.5.5.5:53 --export report.html,report.js
 
 ### 报告设计要点
 
-- **健康分（0-100）**：异常 -20 / 错误 -30 / 警告 -5 / 未检测 -2。等级 A/B/C/D/F。
+- **健康分（0-100）**：异常 -20 / 错误 -30 / 超时 -10 / 警告 -2 / 未检测不扣分（环境缺测不记过）；iperf3 / ipv6 / proxy / nattype 四个环境相关模块评分豁免（不扣总分，异常仍展示）。等级 A/B/C/D/F。
 - **待办问题清单**：按严重度排序，每条带"影响 + 建议"（如"网关延迟高 → 检查网线/WiFi 信号/路由 CPU"）。
+- **根因摘要 + 证据链**：6 条内置规则跨模块聚合、按严重度排序；每条根因卡带「为什么这样判断 / 已基本排除」证据、影响模块、建议复测命令，并生成可直接复制发客服的**一句话报障卡**。
 - **装维可读**：每个模块卡片带一句"这是测什么的、结果怎么看"的说明；行话指标（首字节/P95/并发/CPS、NAT 锥形对称等）附通俗解释；存在异常级问题时清单尾部出现**会诊指引**——现场处置无效的，提示保留 HTML+JSON 报告带回专家分析（.json 含逐跳路径、时序等完整原始数据）。
 - **关键指标**：每个模块 3-5 个，颜色按阈值（绿/黄/红）。
 - **技术细节**：HTML 默认折叠；完整数据见 `.json`。
@@ -253,7 +265,7 @@ python netpulse.py all --port-target 223.5.5.5:53 --export report.html,report.js
 
 `--monitor N`（或交互菜单 `m`）持续监测 N 秒：网关/外网 ping（1s×2 路）+ 外网 TCP 53 + DNS 解析（各 5s），结束后自动保存 **`reports/YYYY-MM-DD/monitor_时间戳.{csv,html,json}`**：
 
-- **事件检测 + 分段定位**：连续丢包 ≥3s 判中断；外网中断且网关正常 → **运营商侧**（带 HTML 报告报障，分钟级时间轴可对齐客服记录）；与网关中断同时 → 内外同断；网关单独中断 → 内网侧；DNS 连续失败而 ping 正常 → 解析侧；另有延迟突增段检测（10s 桶 p95 对比基线）。
+- **事件检测 + 分段定位**：连续丢包 ≥3s 判中断；外网中断且网关正常 → **运营商侧**（带 HTML 报告报障，分钟级时间轴可对齐客服记录）；与网关中断同时 → 内外同断；网关单独中断 → 内网侧；DNS 连续失败而 ping 正常 → 解析侧；另有延迟突增段检测（10s 桶 p95 对比基线）和**抖动窗口**检测（60s 窗口内丢包 ≥3 次或丢包率 ≥10% → 抖动集中段，按段实际时长描述，网关同时丢包 ≥2 次判内外同抖）。
 - **HTML 报告**：结论 banner（含处置建议，服务"现场解决不了带回落诊"流程）+ 事件表（时刻/持续/定位/是否已恢复）+ 延迟时序双线图（红色区带标中断时段）+ TCP/DNS 连通率图。
 - **CSV 用 Excel 直接打开**（utf-8-sig），一列时间戳可精确对齐客户口述的掉线时刻；JSON 含全部原始样本。
 - **Ctrl+C 随时可停**：提前结束同样生成报告；网关漂移（切 WiFi/换路由）自动切换监测目标。
@@ -278,11 +290,11 @@ build_exe.bat
 
 > 若需 DHCP 完整检测，目标机需安装 [Npcap](https://npcap.com/)（勾选 WinPcap API 兼容模式）；
 > 默认测速 = 带宽体检：下行（国内镜像多连接）+ 上行（内置国内运营商节点）+ 预估宽带 +
-> Bufferbloat 评级，全程零第三方依赖。
+> Bufferbloat 评级，全程零第三方依赖；交互菜单默认叠加 Ookla 官方测速
+> （`speedtest.exe` 缺失时会询问自动下载，CLI 模式用 `--speedtest-net` 显式启用）。
 > iperf3 是独立模块（`netpulse.py iperf3 --iperf3-server HOST[:PORT]`）：测到指定服务器的
 > 链路吞吐（非互联网宽带），需自建 iperf3 服务器；缺少 `iperf3.exe` 时程序会询问是否自动下载
-> （或手动放到 EXE 同目录）。`--speedtest-net` 可开启 Speedtest.net 作参考（国内网络下常选中
-> 海外服务器，结果会严重偏低并给出提示）。
+> （或手动放到 EXE 同目录）。
 
 ## 🚀 一键分发部署
 
@@ -377,8 +389,9 @@ irm https://<bucket>.oss-cn-hangzhou.aliyuncs.com/netpulse/v1-beta/install.ps1 |
 
 | 依赖 | 用途 | 缺失时 |
 |------|------|--------|
-| `scapy` | DHCP 完整检测（发送 Discover） | DHCP 降级为仅读取当前 DHCP 服务器 |
-| `speedtest-cli` | Speedtest.net 参考测速（可选，`--speedtest-net`） | 不启用；上行仍用内置国内节点，不受影响 |
+| `scapy` | DHCP 完整检测（发送 Discover，需 Npcap） | DHCP 降级为仅读取当前 DHCP 服务器 |
+| `cryptography` | 修 scapy 可选模块的导入告警 | 不影响核心功能 |
+| Ookla `speedtest.exe` | 官方测速（`--speedtest-net` / 交互菜单默认） | 询问自动下载，或回退内置国内节点测速 |
 | `pyinstaller` | 打包为单文件 EXE | 不影响直接运行 |
 
 ## 💻 系统要求
@@ -390,11 +403,15 @@ irm https://<bucket>.oss-cn-hangzhou.aliyuncs.com/netpulse/v1-beta/install.ps1 |
 ## 📁 目录结构
 
 ```
-netpulse.py         单文件主程序 (~4000 行)
+netpulse.py         单文件主程序 (~16000 行)
 build_exe.bat       PyInstaller 打包脚本
 requirements.txt    依赖说明
+schema/
+└── netpulse-result-v1.1.json   JSON 结果 Schema (--json-schema 查询)
 deploy/
 └── install.ps1     客户端引导脚本 (上传到 OSS, 客户用 irm | iex 拉取)
+CHANGELOG.md        更新日志
+AGENTS.md           开发/验证约定 (AI 协作者先读)
 .gitignore          忽略缓存 / 打包产物 / 运行时报告
 reports/            诊断报告输出 (运行时自动生成, 已被 .gitignore 忽略)
 ```
