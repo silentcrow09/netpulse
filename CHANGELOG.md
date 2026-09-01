@@ -7,6 +7,28 @@
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-09-01
+
+修复测速模块结论信息泄露「代码噪声」问题（报告可信度回归）。
+
+用户反馈：Ookla 测速失败时，报告结论串出 `Protocol error: Did not receive HELLO; input:/VJ+... result:... key:...` 这类 base64 协议握手日志，看起来像代码崩溃。
+
+根因（三层链路每层都缺一道清洗）：
+
+1. 源头（probe）：Ookla 失败时把 `speedtest.exe` 原始 stdout 前 200 字符塞进 error，base64 是协议握手日志
+2. 拼装（`_verdict_speedtest`）：把完整 error 原样拼进一句话结论
+3. 渲染：详细模块卡「结论」行无长度上限完整展示 verdict
+
+修复（三层组合）：
+
+- 源头清洗：不再塞 `out[:200]`，优先提取 Ookla CLI log 行的 message（error/warning 级优先，info 级流水日志跳过），退化固定文案「speedtest.exe 输出异常 (无有效 result 行)」
+- verdict 截短：`_verdict_speedtest` 对失败原因统一截断 40 字 + `…`，模块级 error 分支同样防护
+- 渲染兜底：详细模块卡结论统一截断 60 字（与「检测结果一览」同口径）+ `title` 悬停看全文，防任何模块未来塞长文本
+
+同类排查：web / ipv6 / mtu / tcp 等模块 error 均已截断，测速是全仓唯一把原始命令输出塞进 error 的位置。
+
+测试：`_smoke_report.py` 170 → 178 项（新增 base64 噪声回归、源头清洗断言、error 截断断言、渲染兜底 60 字截断 + title 悬停 + 一览行同步截断）。
+
 ## [1.5.0] - 2026-09-01
 
 HTML 报告第二轮优化：从「诊断 Dashboard」走向「诊断报告」。依据专家评审 31 条逐条核对源码后落地 6 项（评审中 3 条与代码现状不符，未采纳；2 条与项目红线冲突，列为暂缓）。

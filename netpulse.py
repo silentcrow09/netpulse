@@ -2544,7 +2544,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -5053,8 +5053,29 @@ class SpeedTester:
             except json.JSONDecodeError:
                 continue
         if not result_data:
-            return {"error": f"speedtest.exe 输出无 result 行: {out[:200]}",
-                    "method": "ookla"}
+            # 优先提取 log 行的 message (可读原因), 避免把 base64 协议握手噪声塞进错误
+            fail_msg = ""
+            for line in out.strip().splitlines():
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") == "log" and obj.get("message"):
+                    msg = str(obj["message"]).strip()
+                    # 优先 error/warning 级 (info 级如 "Speedtest is running" 是流水日志)
+                    if obj.get("level") in ("error", "warning", "warn", "fatal", "critical"):
+                        fail_msg = msg
+                        break
+                    if not fail_msg:
+                        fail_msg = msg
+            if fail_msg:
+                err_text = f"speedtest.exe 无有效 result 行: {fail_msg[:80]}"
+            else:
+                err_text = "speedtest.exe 输出异常 (无有效 result 行)"
+            return {"error": err_text, "method": "ookla"}
 
         # 提取字段 (Ookla JSON 结构):
         #   download.bandwidth: bytes/s  → Mbps (×8 / 1e6)
@@ -11448,11 +11469,14 @@ def _issues_wifi(res):
 
 
 def _verdict_speedtest(res):
+    def _err_short(text):
+        text = str(text)
+        return text[:40] + ("…" if len(text) > 40 else "")
     if "error" in res:
         for k in ("speedtest", "http"):
             sub = res.get(k, {})
             if "error" in sub:
-                return f"测速失败 ({k}): {sub['error']}"
+                return f"测速失败 ({k}): {_err_short(sub['error'])}"
         return res.get("error", "测速失败")
     # 优先用 Ookla 结果作为结论 (更具权威性)
     ookla = res.get("speedtest")
@@ -11470,7 +11494,7 @@ def _verdict_speedtest(res):
     if ookla is None:
         base += " (未启用 Ookla 官方测速, 加 --speedtest-net 可对照参考)"
     elif isinstance(ookla, dict) and "error" in ookla:
-        base += f" (Ookla 测速失败: {ookla['error']})"
+        base += f" (Ookla 测速失败: {_err_short(ookla['error'])})"
     return base
 
 
@@ -14695,6 +14719,10 @@ def render_report_html_customer(report):
 
         # 整个模块卡 (方案 A: details 折叠, 问题模块自动展开)
         verdict = m.get("verdict", "")
+        # 渲染兜底: 结论统一截断 60 字 (与「检测结果一览」同口径), 全文走 title 悬停,
+        # 防任何模块未来把长文本 (如命令输出/协议日志) 塞进结论
+        v_short = verdict[:60] + ("…" if len(verdict) > 60 else "")
+        v_title = f' title="{_html_attr(verdict)}"' if len(verdict) > 60 else ""
         explain = MODULE_EXPLAINS.get(m["key"], "")
         explain_html = (f"<div class='explain'>📖 {_html_esc(explain)}</div>"
                         if explain else "")
@@ -14714,14 +14742,14 @@ def render_report_html_customer(report):
   <summary>
     <span class="ic {sk}">{mod_icon}</span>
     <span class="nm">{_html_esc(m['name'])}</span>
-    <span class="vd">{_html_esc(verdict)}</span>
+    <span class="vd"{v_title}>{_html_esc(v_short)}</span>
     <span class="b {sk}">{_html_esc(st)}</span>
     <a class="anchor" href="#mod-{_html_attr(m['key'])}" data-mod="mod-{_html_attr(m['key'])}"
        title="复制本模块链接">🔗</a>
     <span class="arr">▸</span>
   </summary>
   <div class="bd">
-    <div class="verdict"><span class="tag">结论</span>{_html_esc(verdict)}</div>
+    <div class="verdict"><span class="tag">结论</span><span{v_title}>{_html_esc(v_short)}</span></div>
     {explain_html}
     {metrics_html}
     {issues_html}
