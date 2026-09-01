@@ -418,4 +418,4 @@ reports/            诊断报告输出 (运行时自动生成, 已被 .gitignore
 
 ## 📜 许可证
 
-内部使用，无限制。
+[MIT](./LICENSE) © 2026 henu_09
