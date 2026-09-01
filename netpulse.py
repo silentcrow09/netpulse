@@ -35,6 +35,7 @@ import tempfile
 import ipaddress
 import shutil
 import zipfile
+from bisect import bisect_left
 from datetime import datetime
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1723,6 +1724,12 @@ def diagnose(results_dict):
         rc = rule(results_dict)
         if rc is not None:
             root_causes.append(rc)
+    # v1.5.3: 按严重度降序 (同级保持注册表顺序)。root_causes[0] 会被 HTML 报告
+    # 的模块折叠策略当作「首要根因」、CLI/报障工单按序展示 — 注册表顺序
+    # (dns 在前) 会让 HIGH 的 dns_failure 压住 CRITICAL 的 wan_interruption,
+    # 最严重问题的证据反而被折叠到一次点击之后。Severity 定义顺序即升序。
+    _sev_rank = {s: i for i, s in enumerate(Severity)}
+    root_causes.sort(key=lambda rc: -_sev_rank.get(rc.severity, len(_sev_rank)))
     # overall_confidence: 加权平均 (severity 权重)
     if root_causes:
         sev_weight = {Severity.CRITICAL: 3.0, Severity.HIGH: 2.0,
@@ -2544,7 +2551,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -9568,30 +9575,36 @@ def _strip_gaps(stream, gap_s):
 
 
 def _detect_jitter_segments(loss_times, all_times, window_s, step_s,
-                            min_loss, min_pct):
-    """滑动窗口扫描『窗口内丢包集中』段 (v1.6.0 盯障增强)。
+                            min_loss, min_pct, min_samples=10):
+    """真滑动窗口扫描『窗口内丢包集中』段 (v1.5.2 盯障增强, v1.5.3 修判据)。
 
     偶发掉线的典型形态不是连续中断, 而是短窗口内反复丢包 — 纯『连续丢包段』
-    检测 (MIN_LOSS_BURST) 会漏掉。本函数以 window_s 宽、step_s 步进扫描:
-    窗口内丢包 ≥ min_loss 且丢包率 ≥ min_pct 记一个抖动窗口, 相邻(重叠)触发
-    窗口合并成段, 段界取段内最早/最晚丢包时刻, 使事件时长贴合实际抖动期。
+    检测 (MIN_LOSS_BURST) 会漏掉。窗口起点只锚定在丢包时刻: 任意包含 ≥min_loss
+    次丢包的窗口都可平移到窗口内最早丢包处而不丢样本, 因此无需按固定网格
+    步进扫描, 也不依赖丢包束与会话起点的相位对齐 (v1.5.2 的固定 10s 网格会让
+    跨度 50-60s 的丢包束落进网格缝隙整体漏检)。窗口计数用 bisect 二分
+    (输入已时间有序), 不再逐窗全量线性扫描 — 24h 盯障汇总从分钟级降到毫秒级。
+    触发: 窗口内丢包 ≥ min_loss, 或 (丢包 ≥2 次且样本 ≥ min_samples 个且
+    丢包率 ≥ min_pct)。丢包率判据要求"反复丢包"且分母够大: 单次丢包不算抖动,
+    样本不足 min_samples 的稀疏窗口只按绝对次数判 (v1.5.2 的『样本 ≥ 窗口
+    一半』要求与丢包率 ≥ min_pct 在数学上互斥, 丢包率分支从未生效过)。
+    相邻触发窗口 (间隔 ≤ step_s) 合并成段, 段界取段内最早/最晚丢包时刻,
+    使事件时长贴合实际抖动期。
     返回 [{start, end, n_loss, n_total, loss_pct}] (绝对时间戳, 按 start 排序)。
     """
-    if len(loss_times) < min_loss or not all_times:
+    if len(loss_times) < 2 or not all_times:
         return []
-    t_min, t_max = min(all_times), max(all_times)
+    losses = sorted(loss_times)
+    samples = sorted(all_times)
     hits = []
-    w = t_min
-    while w <= t_max:
-        w_end = w + window_s
-        n_loss = sum(1 for t in loss_times if w <= t < w_end)
-        n_total = sum(1 for t in all_times if w <= t < w_end)
-        # 尾部不完整窗口 (样本 < 窗口一半) 只按绝对次数判, 防 1/10=10% 边界误报
-        full = n_total >= window_s * 0.5
-        if n_total >= min_loss and (n_loss >= min_loss
-                                    or (full and n_loss / n_total * 100 >= min_pct)):
-            hits.append((w, w_end))
-        w += step_s
+    for i, t0 in enumerate(losses):
+        t1 = t0 + window_s
+        n_loss = bisect_left(losses, t1) - i
+        n_total = bisect_left(samples, t1) - bisect_left(samples, t0)
+        if (n_loss >= min_loss
+                or (n_loss >= 2 and n_total >= min_samples
+                    and n_loss / n_total * 100 >= min_pct)):
+            hits.append((t0, t1))
     if not hits:
         return []
     # 相邻/重叠触发窗口合并 (间隔 ≤ step_s 视为连续抖动)
@@ -9734,41 +9747,50 @@ def _detect_monitor_events(snap, t0, ended_at):
                  f"基线 {baseline:.0f}ms → 峰值 {peak:.0f}ms",
                  baseline=round(baseline, 1), peak=round(peak, 1))
 
-    # 抖动窗口 (v1.6.0): 60s 桶内丢包集中但未达连续中断 — 盯障最常遇到的形态
-    outage_ranges = [(e["start_ts"], e["end_ts"])
-                     for e in events if e["type"] == "outage"]
+    # 抖动窗口 (v1.5.2): 短窗口内丢包集中但未达连续中断 — 盯障最常遇到的形态
     for name, stream in (("gw", gw), ("ext", ext)):
+        # v1.5.3: 重叠抑制只看本流的中断段 — 另一条流的中断与本流抖动是
+        # 相互独立的证据, 跨流相切 1s 就整段吞掉 40s+ 抖动会丢关键事件
+        outage_ranges = [(e["start_ts"], e["end_ts"]) for e in events
+                         if e["type"] == "outage" and e.get("stream") == name]
         losses = [s[1] for s in stream if s[0] == "loss"]
         all_t = [s[1] for s in stream]
         for seg in _detect_jitter_segments(
                 losses, all_t, MonitorSession.JITTER_WINDOW_S,
                 MonitorSession.JITTER_STEP_S, MonitorSession.MIN_JITTER_LOSS,
-                MonitorSession.MIN_JITTER_PCT):
+                MonitorSession.MIN_JITTER_PCT, MonitorSession.MIN_JITTER_SAMPLES):
             s0, s1 = seg["start"], seg["end"]
             if any(so <= s1 and eo >= s0 for so, eo in outage_ranges):
-                continue          # 中断段已覆盖, 不重复报抖动
+                continue          # 本流中断段已覆盖, 不重复报抖动
             pct = seg["loss_pct"]
+            # v1.5.3: detail 按段实际跨度描述 — 相邻触发窗口合并后可远超 60s,
+            # 硬编码"60s 窗口"会与段时长矛盾 (合并段的口径丢包率也可能低于
+            # 触发线, 不再引用"窗口"措辞)
+            dur = max(1, int(round(s1 - s0)))
             if name == "ext":
                 win0, win1 = s0 - 2, s1 + 2
                 gw_loss_n = sum(1 for s in gw if s[0] == "loss"
                                 and win0 <= s[1] <= win1)
                 gw_ok_n = sum(1 for s in gw if s[0] == "ok"
                               and win0 <= s[1] <= win1)
-                if gw_loss_n >= 1:
+                # v1.5.3: 网关 ≥2 次丢包才判 both_down — 单次孤立超时是背景
+                # 噪声 (与中断判据的网关连续 ≥3 丢包同口径), 1 次就翻转定位
+                # 会把运营商侧抖动误指向内网设备
+                if gw_loss_n >= 2:
                     cls = "both_down"
-                    detail = (f"60s 窗口内反复丢包 {seg['n_loss']}/{seg['n_total']} "
+                    detail = (f"{dur}s 内反复丢包 {seg['n_loss']}/{seg['n_total']} "
                               f"({pct}%), 网关同时丢包 {gw_loss_n} 次 — 链路/设备侧抖动")
                 elif gw_ok_n >= 3:
                     cls = "carrier"
-                    detail = (f"60s 窗口内反复丢包 {seg['n_loss']}/{seg['n_total']} "
+                    detail = (f"{dur}s 内反复丢包 {seg['n_loss']}/{seg['n_total']} "
                               f"({pct}%), 期间网关正常 — 运营商/上联侧抖动")
                 else:
                     cls = "unknown"
-                    detail = (f"60s 窗口内反复丢包 {seg['n_loss']}/{seg['n_total']} "
-                              f"({pct}%), 窗口内网关数据不足")
+                    detail = (f"{dur}s 内反复丢包 {seg['n_loss']}/{seg['n_total']} "
+                              f"({pct}%), 网关数据不足")
             else:
                 cls = "internal"
-                detail = (f"60s 窗口内网关反复丢包 {seg['n_loss']}/{seg['n_total']} "
+                detail = (f"{dur}s 内网关反复丢包 {seg['n_loss']}/{seg['n_total']} "
                           f"({pct}%) — 内网段抖动")
             _add("jitter_burst", name, s0, s1, False, cls, detail,
                  n_loss=seg["n_loss"], n_total=seg["n_total"], loss_pct=pct)
@@ -9829,7 +9851,7 @@ def _monitor_conclusion(events, stats, snap):
         advice_bits.append("解析侧问题: 本机/路由器 DNS 改 223.5.5.5 与 "
                            "119.29.29.29 复测; 仍失败带报告报障")
     elif has("jitter_burst"):
-        # v1.6.0: 无连续中断但短窗口内反复丢包 — 偶发掉线最典型形态
+        # v1.5.2: 无连续中断但短窗口内反复丢包 — 偶发掉线最典型形态
         verdict = "degraded"
         jbs = has("jitter_burst")
         ext_jb = [j for j in jbs if j["stream"] == "ext"]
@@ -9885,9 +9907,10 @@ class MonitorSession:
     MIN_DNS_FAIL = 2          # DNS 连续失败 ≥2 (~10s) 判事件
     DNS_DOMAIN = "www.qq.com"
     JITTER_WINDOW_S = 60      # 抖动窗口宽度 (秒)
-    JITTER_STEP_S = 10        # 抖动窗口扫描步进 (秒)
+    JITTER_STEP_S = 10        # 抖动触发窗口的合并间隔 (秒, ≤ 此间隔视为同一段)
     MIN_JITTER_LOSS = 3       # 窗口内丢包 ≥3 次判抖动 (与 MIN_LOSS_BURST 对齐)
-    MIN_JITTER_PCT = 10.0     # 窗口内丢包率 ≥10% 判抖动
+    MIN_JITTER_PCT = 10.0     # 窗口内丢包率 ≥10% 判抖动 (还需丢包 ≥2 次, 见下)
+    MIN_JITTER_SAMPLES = 10   # 丢包率判据的最小窗口样本数 (分母更小只按次数判)
 
     def __init__(self, duration_s, ext_target=None):
         self.duration_s = duration_s
@@ -10846,7 +10869,9 @@ def _parse_keys(tokens, *, strict=True):
             if strict:
                 return None
             print(_c(f"未知模块: {m}", C_RED))
-    return keys or None
+    # v1.5.3: 保序去重 — 重复 token ("dns dns" / "a c c a" 分类字母重复展开)
+    # 会使模块双跑、检测范围计数虚增
+    return list(dict.fromkeys(keys)) or None
 
 
 def parse_module_names(names):
@@ -11609,7 +11634,10 @@ def _verdict_speedtest(res):
             sub = res.get(k, {})
             if "error" in sub:
                 return f"测速失败 ({k}): {_err_short(sub['error'])}"
-        return res.get("error", "测速失败")
+        # v1.5.3: 顶层 error 同样截断 — 执行器把异常 str(exc) 整包塞进 error 时
+        # 可上百字符, 原样进结论正是 v1.5.1 要消灭的"像代码崩溃"噪声
+        err = _err_short(res.get("error", ""))
+        return f"测速失败: {err}" if err else "测速失败"
     # 优先用 Ookla 结果作为结论 (更具权威性)
     ookla = res.get("speedtest")
     if isinstance(ookla, dict) and "error" not in ookla and ookla.get("download_mbps"):
@@ -13224,7 +13252,8 @@ def build_report():
         # v1.5.0: 检测耗时 / 检测范围 — 只跑部分模块时健康分容易被误读为
         # "全部 23 项正常", Hero 必须显式给出覆盖比例
         "duration_ms": int(run.get("duration_ms") or 0),
-        "selected_modules": len(run.get("keys") or []),
+        # v1.5.3: 去重计数 — 重复键会使 sel > tot, Hero 反而显示「全覆盖」
+        "selected_modules": len(set(run.get("keys") or [])),
         "total_modules": int(run.get("total_modules") or len(MODULE_MAP)),
         # 阶段 C · v1.3.0 新增 (C5+C6): 根因分析报告
         # 6 条内置规则 (DNS/WAN/WiFi/Bufferbloat/网关丢包/NAT) 跨模块证据聚合.
@@ -14851,8 +14880,9 @@ def render_report_html_customer(report):
 
         # 整个模块卡 (方案 A: details 折叠, 问题模块自动展开)
         verdict = m.get("verdict", "")
-        # 渲染兜底: 结论统一截断 60 字 (与「检测结果一览」同口径), 全文走 title 悬停,
-        # 防任何模块未来把长文本 (如命令输出/协议日志) 塞进结论
+        # 摘要行 (折叠态) 空间受限: 截断 60 字 (与「检测结果一览」同口径),
+        # 全文走 title 悬停。v1.5.3: 只截摘要行 — 卡片正文「结论」行没有空间
+        # 约束, 打印/PDF 不显示 title, 截断会让纸质留档永久缺文
         v_short = verdict[:60] + ("…" if len(verdict) > 60 else "")
         v_title = f' title="{_html_attr(verdict)}"' if len(verdict) > 60 else ""
         explain = MODULE_EXPLAINS.get(m["key"], "")
@@ -14881,7 +14911,7 @@ def render_report_html_customer(report):
     <span class="arr">▸</span>
   </summary>
   <div class="bd">
-    <div class="verdict"><span class="tag">结论</span><span{v_title}>{_html_esc(v_short)}</span></div>
+    <div class="verdict"><span class="tag">结论</span><span>{_html_esc(verdict)}</span></div>
     {explain_html}
     {metrics_html}
     {issues_html}

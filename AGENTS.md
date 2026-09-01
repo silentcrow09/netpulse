@@ -49,24 +49,24 @@
   全仓只在 gateway 模块构造 4 处，覆盖率极低）。改为按"规则判定条件 → 证据项"生成——
   `_RC_EVIDENCE_BUILDERS` 里 6 条规则各对应一个 builder，只读规则验证过的字段，缺失即跳过，
   不伪造数字
-- **模块折叠**（v1.5.0）：有根因时**只展开首要根因**涉及的模块；**无根因时退回旧行为**
+- **模块折叠**（v1.5.0）：有根因时**只展开首要根因**涉及的模块（首要根因 = severity 最高，v1.5.3 起 `diagnose()` 按严重度降序保证）；**无根因时退回旧行为**
   （规则没命中时不能把异常藏起来）
 - **诊断标准**（v1.5.0）已归入统一「技术附录」折叠区块，原章节文案移除
 
 ## 验证
 
 ```bash
-python _smoke_report.py          # 185 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 7 项
+python _smoke_report.py          # 192 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项
 ```
 
 产物 `reports/_verify_latest.html` 用于人工核对（`reports/` 已 gitignore）。
 
 ## 盯障模式 (v1.5.2)
 
-- **抖动窗口** `_detect_jitter_segments`：60s 宽 × 10s 步进滑动窗口，窗口内丢包 ≥3 次**或**丢包率 ≥10%（窗口样本 ≥ 窗口一半才算完整，防会话尾部 1/10 边界误报）→ `jitter_burst` 事件
-- 事件定位：网关段 `internal`；外网段按窗口内网关状态分 `both_down` / `carrier` / `unknown`；与 `outage` 段重叠不重复报
+- **抖动窗口** `_detect_jitter_segments`（v1.5.3 重写判据）：60s 宽**真滑动窗口**（起点锚定丢包时刻，无固定网格的相位漏检；bisect 计数，24h 盯障汇总毫秒级），窗口内丢包 ≥3 次**或**丢包率 ≥10%（需丢包 ≥2 次且窗口样本 ≥10 个，防单次丢包/稀疏窗口误报）→ `jitter_burst` 事件；事件 detail 按段实际跨度描述（合并段可超 60s，不硬编码窗口宽度）
+- 事件定位：网关段 `internal`；外网段按段窗口内网关状态分 `both_down`（网关同时丢包 ≥2 次）/ `carrier` / `unknown`；与本**流** `outage` 段重叠不重复报（跨流是独立证据，不互相吞段）
 - 结论矩阵：`jitter_burst` 优先级高于 `latency_spike`，verdict=`degraded`
-- 阈值常量在 `MonitorSession`：`JITTER_WINDOW_S=60 / JITTER_STEP_S=10 / MIN_JITTER_LOSS=3 / MIN_JITTER_PCT=10.0`
+- 阈值常量在 `MonitorSession`：`JITTER_WINDOW_S=60 / JITTER_STEP_S=10（触发窗口合并间隔）/ MIN_JITTER_LOSS=3 / MIN_JITTER_PCT=10.0 / MIN_JITTER_SAMPLES=10`
 
 ## 其它
 
