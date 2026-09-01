@@ -1698,32 +1698,32 @@ def _enrich_diagnosis_evidence(report, results_dict):
     return report
 
 
-def _build_diagnosis_with_evidence(results_dict):
-    """diagnose() + 证据链增强 (报告渲染入口)。"""
-    return _enrich_diagnosis_evidence(diagnose(results_dict), results_dict)
+def _build_diagnosis_with_evidence(results_dict, rule_filter=None):
+    """diagnose() + 证据链增强 (报告渲染入口)。
+
+    rule_filter: 透传 diagnose() 的场景规则过滤 — 保证导出报告里的根因
+                 与完成屏一致 (gaming 报告不再夹带屏幕上已隐藏的 wifi_weak)。
+    """
+    return _enrich_diagnosis_evidence(
+        diagnose(results_dict, rule_filter=rule_filter), results_dict)
 
 
-# 规则注册表 (C1)
-ALL_RULES = [
-    _rule_dns_failure,
-    _rule_wan_interruption,
-    _rule_wifi_weak,
-    _rule_bufferbloat,
-    _rule_gateway_loss,
-    _rule_nat_restricted,
+# 规则注册表 (C1 · v1.6.1 收敛为单一有序注册表): ALL_RULES / _RULE_BY_ID /
+# _RULE_ID_OF 全部由 _RULE_REGISTRY 派生 — 新增规则只在此追加一行,
+# 杜绝多份手工注册表漂移导致规则静默失效 (v1.6.0 审查 #10)。
+_RULE_REGISTRY = [
+    # (规则 id, 规则函数): id 与 RootCause(id=...) / _RC_EVIDENCE_BUILDERS 同源
+    ("dns_failure", _rule_dns_failure),
+    ("wan_interruption", _rule_wan_interruption),
+    ("wifi_weak", _rule_wifi_weak),
+    ("bufferbloat", _rule_bufferbloat),
+    ("gateway_loss", _rule_gateway_loss),
+    ("nat_restricted", _rule_nat_restricted),
 ]
-
-# 规则 id → 规则函数 (PR-B · v1.6.0)。id 与 RootCause.id / _RC_EVIDENCE_BUILDERS 同源。
-_RULE_BY_ID = {
-    "dns_failure": _rule_dns_failure,
-    "wan_interruption": _rule_wan_interruption,
-    "wifi_weak": _rule_wifi_weak,
-    "bufferbloat": _rule_bufferbloat,
-    "gateway_loss": _rule_gateway_loss,
-    "nat_restricted": _rule_nat_restricted,
-}
+ALL_RULES = [fn for _rid, fn in _RULE_REGISTRY]
+_RULE_BY_ID = dict(_RULE_REGISTRY)
 # 函数 → id 反向映射 (兜底评估时按 PROFILE_RULE_EXCLUDES 跳过)
-_RULE_ID_OF = {fn: rid for rid, fn in _RULE_BY_ID.items()}
+_RULE_ID_OF = {fn: rid for rid, fn in _RULE_REGISTRY}
 
 
 def diagnose(results_dict, rule_filter=None):
@@ -1736,36 +1736,34 @@ def diagnose(results_dict, rule_filter=None):
                  与 HTML 报告"无根因时所有问题模块都展开"同哲学。
                  为 None 时评估全部规则 (v1.5.x 行为不变)。
     """
-    rules = ALL_RULES
-    excludes = set()
-    if rule_filter:
-        ids = PROFILE_RULES.get(rule_filter)
-        if ids:
-            filtered = [_RULE_BY_ID[i] for i in ids if i in _RULE_BY_ID]
-            if filtered:
-                rules = filtered
-        excludes = set(PROFILE_RULE_EXCLUDES.get(rule_filter) or [])
-    root_causes = []
-    rules_evaluated = 0
-    for rule in rules:
-        rules_evaluated += 1
-        rc = rule(results_dict)
-        if rc is not None:
-            root_causes.append(rc)
-    # 场景规则过滤后无命中 → 退回全规则评估 (不能把异常藏起来)。
-    # 但场景明确排除的规则 (PROFILE_RULE_EXCLUDES) 即使兜底也禁止评估,
-    # 防止排除规则借兜底路径绕回 (gaming 报 wifi 弱)。
-    # 最终评估集合 = 全规则 - 排除集, rules_evaluated 按实际评估条数重算。
-    if rule_filter and not root_causes and rules is not ALL_RULES:
-        root_causes = []
-        rules_evaluated = 0
-        for rule in ALL_RULES:
-            if _RULE_ID_OF.get(rule) in excludes:
-                continue
-            rules_evaluated += 1
+    def _run_rules(rule_list):
+        """评估一组规则 → (命中的根因列表, 实际评估条数)。"""
+        fired, n = [], 0
+        for rule in rule_list:
+            n += 1
             rc = rule(results_dict)
             if rc is not None:
-                root_causes.append(rc)
+                fired.append(rc)
+        return fired, n
+
+    if rule_filter and PROFILE_RULES.get(rule_filter):
+        excludes = set(PROFILE_RULE_EXCLUDES.get(rule_filter) or [])
+        first = [_RULE_BY_ID[i] for i in PROFILE_RULES[rule_filter]
+                 if i in _RULE_BY_ID]
+        root_causes, rules_evaluated = _run_rules(first)
+        if not root_causes:
+            # 场景规则过滤后无命中 → 兜底补评 (不能把异常藏起来)。
+            # 场景明确排除的规则 (PROFILE_RULE_EXCLUDES) 即使兜底也禁止评估,
+            # 防止排除规则借兜底路径绕回 (gaming 报 wifi 弱)。
+            # v1.6.1: 只补评首轮没跑过的规则, 不再整轮重复评估 (审查 #9);
+            # rules_evaluated 始终按实际评估条数累计。
+            rest = [r for r in ALL_RULES
+                    if r not in first and _RULE_ID_OF.get(r) not in excludes]
+            fired, n = _run_rules(rest)
+            root_causes = fired
+            rules_evaluated += n
+    else:
+        root_causes, rules_evaluated = _run_rules(ALL_RULES)
     # v1.5.3: 按严重度降序 (同级保持注册表顺序)。root_causes[0] 会被 HTML 报告
     # 的模块折叠策略当作「首要根因」、CLI/报障工单按序展示 — 注册表顺序
     # (dns 在前) 会让 HIGH 的 dns_failure 压住 CRITICAL 的 wan_interruption,
@@ -1803,8 +1801,10 @@ DIAGNOSE_PROFILES = {
     "slow": ["gateway", "wifi", "speedtest", "bufferbloat", "tcp", "dns"],
     # 频繁断网: 链路 + 外网 + DNS + TCP + 环路检测 (monitor 是 CLI 模式不是模块)
     "disconnect": ["gateway", "external", "dns", "tcp", "loop"],
-    # 网页打不开/慢: DNS + TCP + HTTP + TCP 质量 + MTU + 路由
-    "web": ["dns", "tcp", "web", "tcpstats", "mtu", "route"],
+    # 网页打不开/慢: 网关 + 外网 + DNS + TCP + HTTP + TCP 质量 + MTU + 路由
+    # (v1.6.1: 补 gateway/external — dns_failure / wan_interruption / gateway_loss
+    #  三条 web 规则都依赖网关或外网数据, 缺采集会让 web 场景永远零根因)
+    "web": ["gateway", "external", "dns", "tcp", "web", "tcpstats", "mtu", "route"],
     # 游戏卡顿/延迟高: 网关 + 抖动/丢包 + NAT + Bufferbloat + MTU + TCP
     "gaming": ["gateway", "tcp", "nattype", "bufferbloat", "mtu", "tcpstats"],
     # WiFi 不稳/信号弱: WiFi + 网关 + LAN
@@ -2630,7 +2630,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -10786,17 +10786,24 @@ def determine_status(result):
 
 
 def _cli_enable_vt():
-    """Windows 下启用 ANSI 虚拟终端, 让旧版 cmd 也支持颜色"""
+    """Windows 下启用 ANSI 虚拟终端, 让旧版 cmd 也支持颜色。
+
+    v1.6.1: 返回是否确认启用 (非 Windows 视为终端原生支持 ANSI = True;
+    输出重定向/无控制台/旧终端 = False), 让 _menu_clear 能据此决定
+    是否退化 cls/clear 子进程 — 原先忽略返回值时旧 conhost 菜单会
+    打出字面转义乱码且清屏回退不可达 (审查 #7)。
+    """
     if sys.platform != "win32":
-        return
+        return True  # POSIX 终端原生支持 ANSI 转义
     try:
         k = ctypes.windll.kernel32
         h = k.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
         m = ctypes.c_ulong()
-        k.GetConsoleMode(h, ctypes.byref(m))
-        k.SetConsoleMode(h, m.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        if not k.GetConsoleMode(h, ctypes.byref(m)):
+            return False  # 输出重定向/无控制台: 转义写了也没意义
+        return bool(k.SetConsoleMode(h, m.value | 0x0004))  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
     except Exception:
-        pass
+        return False
 
 
 def _clear_screen():
@@ -10992,11 +10999,11 @@ def compute_exit_code(statuses):
     return 0
 
 
-def _export_reports(spec):
+def _export_reports(spec, rule_filter=None):
     """按逗号分隔的 spec 导出报告 (modules / diagnose 两条 CLI 路径共用)."""
     targets = [t.strip() for t in spec.split(",") if t.strip()] or [spec]
     for t in targets:
-        err = export_report(t)
+        err = export_report(t, rule_filter=rule_filter)
         if err:
             print(_c(f"  ✗ {err}", C_RED))
         else:
@@ -13253,8 +13260,14 @@ def compute_health_score(counts, text_counts=None):
             "verdict": "严重 · 存在多项严重问题"}
 
 
-def build_report():
+def build_report(rule_filter=None, diagnosis=None):
     """基于最近一次诊断运行 (LAST_RUN) 构造完整报告数据结构 (双视图)。
+
+    rule_filter: 场景 profile id (可选, v1.6.1)。透传根因分析 — 导出报告的
+                 root_causes 与场景完成屏同一规则集; None = 全规则 (老行为)。
+    diagnosis:   预构建的根因 dict (DiagnosisReport.to_dict(), v1.6.1)。
+                 场景路径把完成屏那份诊断传进来, 报告复用同一结果,
+                 不再整轮重跑规则评估 (审查 #8); None = 内部自建。
 
     返回结构 (供 render_report_html_customer / render_report_json 使用):
       {
@@ -13318,6 +13331,11 @@ def build_report():
         counts, text_counts=all_counts,
     )
 
+    # v1.6.1: 优先复用调用方传入的诊断 (场景路径同源), 否则内部构建
+    if diagnosis is None:
+        diagnosis = _build_diagnosis_with_evidence(
+            run["results"], rule_filter=rule_filter).to_dict()
+
     return {
         "app": run["app"],
         "version": run["version"],
@@ -13337,7 +13355,9 @@ def build_report():
         # 阶段 C · v1.3.0 新增 (C5+C6): 根因分析报告
         # 6 条内置规则 (DNS/WAN/WiFi/Bufferbloat/网关丢包/NAT) 跨模块证据聚合.
         # v1.5.0: 额外挂 supports/excludes 证据链 (见 _enrich_diagnosis_evidence)
-        "diagnosis": _build_diagnosis_with_evidence(run["results"]).to_dict(),
+        # v1.6.1: rule_filter 透传 — 场景导出的报告与完成屏同规则集,
+        # 不再夹带屏幕上有意隐藏的根因 (如 gaming 报告里的 wifi_weak)
+        "diagnosis": diagnosis,
         "modules": modules,
         "tech": {
             "raw_results": run["results"],
@@ -15520,8 +15540,13 @@ def _normalize_report_path(path):
     return path
 
 
-def export_report(path):
+def export_report(path, rule_filter=None, report=None):
     """按扩展名导出客户版报告: .html / .json。
+
+    rule_filter: 场景 profile id (可选, v1.6.1), 透传 build_report() —
+                 场景导出与完成屏保持同一规则集。
+    report:      预构建的报告 dict (可选, v1.6.1) — 场景路径传入以复用
+                 同一份构建结果, 避免重复跑诊断 (审查 #8)。
 
     客户版设计:
       - .html → 客户版 HTML (健康分 + 问题清单 + 关键指标 + 折叠技术细节)
@@ -15534,7 +15559,8 @@ def export_report(path):
     如需旧格式, 请手动调用 render_report_text()。
     """
     path = _normalize_report_path(path)
-    report = build_report()
+    if report is None:
+        report = build_report(rule_filter=rule_filter)
     if not report:
         return "尚无诊断数据，无法生成报告（请先运行诊断）"
     ext = os.path.splitext(path)[1].lower()
@@ -15616,22 +15642,59 @@ def _format_error_for_user(exc):
     return ("检测过程中出错（请重试；连续失败请联系技术支持）", detail)
 
 
-def _desktop_netpulse_dir():
-    """桌面 NetPulse 目录 (OneDrive 重定向优先); 全不可用返回 None (PR-C)。
+def _known_folder_desktop():
+    """SHGetKnownFolderPath(FOLDERID_Desktop) 解析真实桌面路径 (v1.6.1)。
 
-    公司电脑桌面常被 OneDrive 重定向到 %USERPROFILE%\\OneDrive\\Desktop,
-    仅当该重定向真实存在 (OneDrive\\Desktop 目录已存在) 才优先使用,
-    避免在普通桌面环境误建 OneDrive 目录; 都不可写则返回 None,
-    由调用方退化到 reports/ 目录。
+    一次系统调用覆盖 OneDrive 重定向与本地化目录名 (中文 Windows 的
+    重定向桌面是 OneDrive\\桌面, 只探测 OneDrive\\Desktop 会漏); 失败
+    (非 Windows / 输出重定向 / API 异常) 返回 None, 由调用方走候选探测。
     """
-    base = os.environ.get("USERPROFILE") or ""
-    if not base:
+    if os.name != "nt":
         return None
+    try:
+        from ctypes import wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                        ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+        # FOLDERID_Desktop {B4BFCC3A-DB2C-424C-B029-FEFE9560C1C8}
+        folderid = _GUID(0xB4BFCC3A, 0xDB2C, 0x424C,
+                         (ctypes.c_ubyte * 8)(0xB0, 0x29, 0xFE, 0xFE,
+                                              0x95, 0x60, 0xC1, 0xC8))
+        buf = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(
+                ctypes.byref(folderid), 0, None, ctypes.byref(buf)) != 0:
+            return None
+        path = buf.value
+        ctypes.windll.ole32.CoTaskMemFree(buf)
+        return path or None
+    except Exception:
+        return None
+
+
+def _desktop_netpulse_dir():
+    """桌面 NetPulse 目录; 全不可用返回 None (PR-C / v1.6.1 加固)。
+
+    优先 SHGetKnownFolderPath(FOLDERID_Desktop) — 系统直接给出真实桌面
+    (含 OneDrive 重定向与中文本地化目录名); 解析失败再按候选目录探测
+    (仅当 OneDrive 桌面真实存在才纳入, 避免普通环境误建 OneDrive 目录);
+    都不可写则返回 None, 由调用方退化到 reports/ 目录。
+    """
     cands = []
-    one_desktop = os.path.join(base, "OneDrive", "Desktop")
-    if os.path.isdir(one_desktop):
-        cands.append(os.path.join(one_desktop, "NetPulse"))
-    cands.append(os.path.join(base, "Desktop", "NetPulse"))
+    real = _known_folder_desktop()
+    if real:
+        cands.append(os.path.join(real, "NetPulse"))
+    base = os.environ.get("USERPROFILE") or ""
+    if base:
+        one_desktop = os.path.join(base, "OneDrive", "Desktop")
+        if os.path.isdir(one_desktop):
+            cands.append(os.path.join(one_desktop, "NetPulse"))
+        one_desktop_cn = os.path.join(base, "OneDrive", "桌面")
+        if os.path.isdir(one_desktop_cn):
+            cands.append(os.path.join(one_desktop_cn, "NetPulse"))
+        cands.append(os.path.join(base, "Desktop", "NetPulse"))
+        cands.append(os.path.join(base, "桌面", "NetPulse"))
     for d in cands:
         try:
             os.makedirs(d, exist_ok=True)
@@ -15642,9 +15705,10 @@ def _desktop_netpulse_dir():
     return None
 
 
-def _export_scene_report(profile, title):
+def _export_scene_report(profile, title, report=None):
     """场景完成后保存 HTML 报告到 桌面\\NetPulse\\, 返回 (path, err) (PR-C)。
 
+    report: 预构建报告 dict (v1.6.1 审查 #8), 复用完成屏同一份构建结果。
     不可写时退化 _report_dir() (原 reports/ 逻辑), 与 CLI --export 无关。
     """
     if not LAST_RUN:
@@ -15652,23 +15716,28 @@ def _export_scene_report(profile, title):
     base = _desktop_netpulse_dir()
     if not base:
         base = _report_dir()
-    name = f"{datetime.now():%Y-%m-%d}_{title}.html"
+    # 文件名含时分秒: 纯日期命名会让同日复测静默覆盖上午的报告 (审查 #5)
+    name = f"{datetime.now():%Y-%m-%d_%H%M%S}_{title}.html"
     path = os.path.join(base, name)
-    err = export_report(path)
+    err = export_report(path, rule_filter=profile, report=report)
     if err:
         return path, err
     return path, None
 
 
-def _scene_summary(profile, title, diagnosis):
-    """场景完成屏: 健康分 + 一句话根因结论 (复用 _print_diagnosis, PR-A/PR-C)。"""
+def _scene_summary(profile, title, diagnosis, report=None):
+    """场景完成屏: 健康分 + 一句话根因结论 (复用 _print_diagnosis, PR-A/PR-C)。
+
+    report: 预构建报告 dict (v1.6.1 审查 #8), 缺省时兜底自建。
+    """
     print()
     print(_c("=" * 60, C_BLUE))
     print(_c(f"  {APP_NAME} > {title} > 检测完成", C_BOLD))
     print(_c("-" * 60, C_GRAY))
     try:
-        report = build_report()
-        health = report.get("health") or {}
+        if report is None:
+            report = build_report(rule_filter=profile)
+        health = (report or {}).get("health") or {}
         score = health.get("score")
         grade = health.get("grade")
         if score is not None:
@@ -15682,6 +15751,14 @@ def _scene_summary(profile, title, diagnosis):
     else:
         print(_c("  ⚠ 本次未能完成根因分析。", C_YELLOW))
     print(_c("-" * 60, C_GRAY))
+
+
+def _pause_enter(msg="  按 Enter 返回主菜单..."):
+    """菜单路径通用回车暂停; EOF/Ctrl+C 静默返回 (v1.6.1)。"""
+    try:
+        input(_c(msg, C_GRAY))
+    except (EOFError, KeyboardInterrupt):
+        print()
 
 
 def _run_scene_monitor(install=False, pip_mirror=None):
@@ -15702,15 +15779,14 @@ def _run_scene_monitor(install=False, pip_mirror=None):
     print(_c(f"  开始盯障 {minutes} 分钟（{minutes*60} 秒）... Ctrl+C 可提前结束", C_BOLD))
     try:
         run_monitor_mode(minutes * 60)
-    except Exception as e:
+    # (Exception, KeyboardInterrupt): Ctrl+C 是 BaseException, 只捕 Exception
+    # 会把原始回溯打到客户屏幕上, _format_error_for_user 的中断文案成死分支 (审查 #4)
+    except (Exception, KeyboardInterrupt) as e:
         user_msg, detail = _format_error_for_user(e)
         print(_c(f"  ✗ {user_msg}", C_RED))
         if sys.stdout.isatty():
             print(_c(f"    {detail}", C_GRAY))
-    try:
-        input(_c("  按 Enter 返回主菜单...", C_GRAY))
-    except (EOFError, KeyboardInterrupt):
-        print()
+    _pause_enter()
 
 
 def _run_scene(profile, install=False, pip_mirror=None):
@@ -15726,43 +15802,63 @@ def _run_scene(profile, install=False, pip_mirror=None):
     try:
         run_diagnostics(keys, banner=False, parallel=True, max_workers=4,
                         install=install, pip_mirror=pip_mirror)
-    except Exception as e:
+    # (Exception, KeyboardInterrupt): Ctrl+C 是 BaseException, 只捕 Exception
+    # 会把原始回溯打到客户屏幕上, _format_error_for_user 的中断文案成死分支 (审查 #4)
+    except (Exception, KeyboardInterrupt) as e:
         user_msg, detail = _format_error_for_user(e)
         print(_c(f"  ✗ {user_msg}", C_RED))
         if sys.stdout.isatty():
             print(_c(f"    {detail}", C_GRAY))
+        _pause_enter()
         return
     # 根因分析 (PR-B: 按场景规则集评估, 避免 gaming 报 wifi 弱等无关根因)
+    # v1.6.1 (审查 #8): 诊断只评一次, 完成屏/导出报告复用同一份构建结果 —
+    # 屏幕与文件必然一致, 也不再重复跑全量规则评估
     diagnosis = None
-    try:
-        if LAST_RUN and LAST_RUN.get("results"):
+    report = None
+    if LAST_RUN and LAST_RUN.get("results"):
+        try:
             diagnosis = _enrich_diagnosis_evidence(
                 diagnose(LAST_RUN["results"], rule_filter=profile),
                 LAST_RUN["results"])
-    except Exception:
-        diagnosis = None
-    _scene_summary(profile, title, diagnosis)
+        except Exception:
+            diagnosis = None
+        try:
+            report = build_report(
+                rule_filter=profile,
+                diagnosis=diagnosis.to_dict() if diagnosis else None)
+        except Exception:
+            report = None
+    _scene_summary(profile, title, diagnosis, report=report)
     # 报告存桌面 (PR-C)
-    path, err = _export_scene_report(profile, title)
+    path, err = _export_scene_report(profile, title, report=report)
     if err:
         print(_c(f"  ✗ 报告保存失败: {err}", C_RED))
     else:
         print(_c(f"  📄 报告已保存: {path}", C_GREEN))
+    # v1.6.1: 停一拍再回菜单 — 否则完成屏 (健康分/根因/报告路径) 瞬间被清掉
+    _pause_enter()
 
 
 def _menu_clear():
-    """清屏 (ANSI VT 已在 _cli_enable_vt 启用; 退化 cls/clear)。"""
-    if not _clear_screen():
-        if os.name == "nt":
-            try:
-                subprocess.run(["cls"], shell=True, timeout=2)
-            except Exception:
-                pass
-        else:
-            try:
-                subprocess.run(["clear"], timeout=2)
-            except Exception:
-                pass
+    """清屏 (v1.6.1): 先确认 VT 可用再写 ANSI 转义, 否则退化 cls/clear。
+
+    原实现先写转义再探返回值 — _clear_screen 只要写入不抛异常就返回
+    True, VT 未启用时旧 conhost 会打出字面乱码且子进程回退永不可达
+    (审查 #7)。_module_menu 的同款拷贝已收敛为本函数。
+    """
+    if _cli_enable_vt() and _clear_screen():
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(["cls"], shell=True, timeout=2)
+        except Exception:
+            pass
+    else:
+        try:
+            subprocess.run(["clear"], timeout=2)
+        except Exception:
+            pass
 
 
 def _scene_menu(install=False, pip_mirror=None):
@@ -15845,19 +15941,7 @@ def _module_menu(install=False, pip_mirror=None):
     退出 (q / Ctrl+C) 返回 False, 通知场景层结束整个程序。
     """
     while True:
-        # 清屏: 用 ANSI 转义 (VT 已在 _cli_enable_vt 启用) 替代 os.system('cls'),
-        # 避免 cmd.exe 解析 + 子进程阻塞。VT 未启用时退回到 subprocess 直调 cls。
-        if not _clear_screen():
-            if os.name == "nt":
-                try:
-                    subprocess.run(["cls"], shell=True, timeout=2)
-                except Exception:
-                    pass
-            else:
-                try:
-                    subprocess.run(["clear"], timeout=2)
-                except Exception:
-                    pass
+        _menu_clear()
         bar = "=" * 60
         print(_c(bar, C_BLUE))
         print(_c(f"  {APP_NAME} v{APP_VERSION}    命令行网络诊断", C_BOLD))
@@ -16214,8 +16298,9 @@ def main():
             print(_c("─" * 60, C_BLUE))
             _print_diagnosis(diagnosis)
         # 与 modules 路径同权: --export / --json-schema 等后续动作不再被吞
+        # v1.6.1: 导出与屏幕同一规则集, 报告不再夹带过滤掉的根因
         if args.export:
-            _export_reports(args.export)
+            _export_reports(args.export, rule_filter=profile)
         _exit_with_status()
         return
     # 盯障模式: 独立顶层运行模式 (与模块诊断互斥)

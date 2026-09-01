@@ -7,6 +7,30 @@
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-09-01
+
+代码审查修复 10 项（审查范围 v1.6.0 场景菜单提交）：2 项经真实构造数据实证的功能失效（导出报告绕过规则过滤、web 场景恒零根因），其余为交互兜底、健壮性与性能。
+
+### 修复
+
+- **场景/CLI 导出报告绕过规则过滤**（首要）：完成屏按场景过滤了根因，但 `export_report → build_report` 链路仍跑全规则 — gaming 完成屏隐藏了「WiFi 信号弱」，存桌面的 HTML 报告却照列（实测复现）。现 `rule_filter` 全链路透传（`export_report` / `build_report` / `_export_reports` / `_export_scene_report`），CLI `--diagnose <profile> --export` 同步
+- **web 场景恒零根因**：`DIAGNOSE_PROFILES["web"]` 不采集 gateway/external，而 web 的 3 条规则（dns_failure / wan_interruption / gateway_loss）全依赖这两个模块的数据 — DNS 全断也报「无根因」（实测复现）。现补采 gateway + external（6 → 8 模块）
+- **场景完成屏无回车暂停**：`_run_scene` 返回后菜单循环立即清屏，健康分/根因结论/报告路径瞬间被擦（错误路径同样）。新增 `_pause_enter()` 通用暂停；盯障路径的同款 input 拷贝一并收敛
+- **Ctrl+C 穿透场景错误兜底**：KeyboardInterrupt 是 BaseException，`except Exception` 拦不住 — 场景中断直接裸抛回溯，`_format_error_for_user` 的「已中断本次检测」成死分支。场景/盯障两处包装改为 `except (Exception, KeyboardInterrupt)`
+- **场景报告同日复测静默覆盖**：文件名只到日期（`YYYY-MM-DD_场景名.html`），下午复测覆盖上午记录且无警告。现含时分秒（`YYYY-MM-DD_HHMMSS_场景名.html`）
+- **中文 OneDrive 桌面漏判**：原只探测 `OneDrive\Desktop`，中文 Windows 的 OneDrive 重定向桌面是 `OneDrive\桌面`，报告会落进用户看不到的目录。现优先 `SHGetKnownFolderPath(FOLDERID_Desktop)` 一次系统调用解析真实桌面（覆盖一切重定向/本地化），候选探测兜底并补充 `桌面` 变体
+- **菜单清屏回退死代码**：`_menu_clear` 先写转义再探返回值，而 `_clear_screen` 只要写入不抛异常就返回 True — VT 未启用的旧 conhost 会打出字面转义乱码，且 cls/clear 子进程回退永不可达；同款块还在 `_module_menu` 逐字重复。现 `_cli_enable_vt()` 返回是否确认启用，`_menu_clear` 先确认再写转义（回退真正可达），`_module_menu` 收敛为调用 `_menu_clear()`
+
+### 变更
+
+- **场景诊断只评一次**：原一次场景运行完整构建报告 2-3 次（完成屏健康分、导出各一次），同一批规则最多被评估 4 遍。现 `_run_scene` 构建一份诊断 + 报告（`build_report` 接受预构建 `diagnosis`），完成屏/导出复用同一份 — 屏幕与文件必然一致，也省掉重复的全量规则评估
+- **diagnose 兜底不重复评估**：过滤无命中退回全规则时，原整轮重评（含首轮刚跑过的场景规则，慢速场景 10 次规则执行 vs 6 次足够）。现只补评首轮未跑过的规则，`rules_evaluated` 始终按实际评估条数累计；排除集在兜底路径的拦截不再依赖脆弱的身份比较
+- **规则注册表单一来源**：`ALL_RULES` / `_RULE_BY_ID` / `_RULE_ID_OF` 收敛为由 `_RULE_REGISTRY` 单张有序表派生 — 新增规则只加一行，杜绝手工同步漂移导致规则静默退出场景评估（且无测试能发现）
+
+### 验证
+
+`tests/` 136 → 142 项（新增 `TestV161` 6 项：注册表同源、web 规则依赖采集、兜底不重复评估、Ctrl+C 兜底、文件名时分秒、SHGetKnownFolderPath 优先）；`_smoke_report.py` 新增 4 项断言（注册表单一来源、兜底计数、web 补采、文件名时分秒）并随行为更新 2 项（web 模块数 8、版本号 1.6.1），全绿。审查中 2 项实证发现（gaming 报告夹带 wifi_weak、web 零根因）已用构造数据回归确认。
+
 ## [1.6.0] - 2026-09-01
 
 装维场景入口（阶段 E 收窄版：PR-A 场景菜单 + PR-B 规则过滤 + PR-C 完成屏/桌面报告/错误兜底）。
