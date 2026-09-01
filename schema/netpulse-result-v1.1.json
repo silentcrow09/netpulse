@@ -70,6 +70,21 @@
       "minimum": 0,
       "description": "评分豁免的模块数"
     },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "v1.5.0 引入: 本次检测耗时 (毫秒). 仅跑部分模块时 Hero 显示, 避免健康分 100 被误读为全量正常"
+    },
+    "selected_modules": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "v1.5.0 引入: 本次实际运行的模块数"
+    },
+    "total_modules": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "v1.5.0 引入: 系统可用的总模块数 (MODULE_REGISTRY 条数)"
+    },
     "summary": {
       "type": "object",
       "description": "{module_key: status_zh} 映射, 兼容 v1.0.0 旧格式"
@@ -104,7 +119,31 @@
               "confidence": {"type": "number", "minimum": 0, "maximum": 1},
               "evidence_ids": {"type": "array", "items": {"type": "string"}},
               "affected_modules": {"type": "array", "items": {"type": "string"}},
-              "recommendations": {"type": "array", "items": {"type": "string"}}
+              "recommendations": {"type": "array", "items": {"type": "string"}},
+              "supports": {
+                "type": "array",
+                "description": "v1.5.0 引入: 支持本结论的事实 (ok=false: 问题就在这; ok=true: 佐证). 由 _RC_EVIDENCE_BUILDERS 生成",
+                "items": {
+                  "type": "object",
+                  "required": ["text", "ok"],
+                  "properties": {
+                    "text": {"type": "string"},
+                    "ok": {"type": "boolean"}
+                  }
+                }
+              },
+              "excludes": {
+                "type": "array",
+                "description": "v1.5.0 引入: 已经排除的方向 (全部 ok=true). 由 _RC_EVIDENCE_BUILDERS 生成",
+                "items": {
+                  "type": "object",
+                  "required": ["text", "ok"],
+                  "properties": {
+                    "text": {"type": "string"},
+                    "ok": {"type": "boolean"}
+                  }
+                }
+              }
             }
           }
         },

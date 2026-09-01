@@ -1221,6 +1221,11 @@ class RootCause:
     evidence_ids: list[str] = field(default_factory=list)    # 引用的 evidence IDs (B 阶段字段)
     affected_modules: list[str] = field(default_factory=list) # 涉及哪些模块 key
     recommendations: list[str] = field(default_factory=list)  # 建议清单
+    # v1.5.0 证据链: 供报告渲染「为什么这样判断 / 已排除什么」
+    # 每项 {"text": str, "ok": bool}; supports 里 ok=False 表示"问题就在这",
+    # excludes 全部 ok=True。由 _enrich_diagnosis_evidence 填充。
+    supports: list[dict] = field(default_factory=list)
+    excludes: list[dict] = field(default_factory=list)
 
     def to_dict(self):
         return {
@@ -1231,6 +1236,8 @@ class RootCause:
             "evidence_ids": list(self.evidence_ids),
             "affected_modules": list(self.affected_modules),
             "recommendations": list(self.recommendations),
+            "supports": [dict(s) for s in self.supports],
+            "excludes": [dict(e) for e in self.excludes],
         }
 
 
@@ -1487,6 +1494,214 @@ def _rule_nat_restricted(results_dict):
     )
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# 证据链生成 (v1.5.0)
+# ────────────────────────────────────────────────────────────────────────────
+# 背景: B 阶段引入的 Evidence 实体目前只在 gateway 模块实际构造 (全仓 4 处),
+# 覆盖率极低, 因此 RootCause.evidence_ids **不能**直接渲染成"证据链" — 大多数
+# id 找不到对应实体。这里改为按规则的判定条件反向生成人话证据:
+#   supports — 支持本结论的事实 (ok=False: 问题就在这; ok=True: 佐证)
+#   excludes — 已经排除的方向 (全部 ok=True)
+# 约束: 只读取规则函数里已经验证过的字段名; 字段缺失就跳过该条, 不伪造数字。
+
+
+def _ev(text, ok):
+    """构造一条证据项。"""
+    return {"text": text, "ok": bool(ok)}
+
+
+def _mod(results, key):
+    """取模块原始结果 (不存在 / 出错 / 非 dict 时返回 None)。"""
+    res = (results or {}).get(key)
+    if not isinstance(res, dict) or not res or res.get("error"):
+        return None
+    return res
+
+
+def _ping(results, key):
+    """取模块的 ping 子结构。"""
+    res = _mod(results, key)
+    if not res:
+        return None
+    ping = res.get("ping")
+    return ping if isinstance(ping, dict) else None
+
+
+def _ev_gateway_reachable(results, suffix=""):
+    """通用的「网关可达」排除项。"""
+    ping = _ping(results, "gateway")
+    if not ping:
+        return None
+    loss = ping.get("loss_pct", 0)
+    if not isinstance(loss, (int, float)) or loss >= 50:
+        return None
+    txt = f"网关可达，丢包 {loss:g}%"
+    avg = ping.get("avg_ms")
+    if isinstance(avg, (int, float)):
+        txt += f"，平均 {avg:g}ms"
+    return _ev(txt + suffix, True)
+
+
+def _ev_external_reachable(results, suffix="（不是外网全断）"):
+    """通用的「外网 TCP 可达」排除项。"""
+    ext = _mod(results, "external")
+    if not ext:
+        return None
+    tcp_ok, tcp_total = ext.get("tcp_ok", 0) or 0, ext.get("tcp_total", 0) or 0
+    if not tcp_total or tcp_ok <= 0:
+        return None
+    return _ev(f"外网 TCP 可达 {tcp_ok}/{tcp_total}{suffix}", True)
+
+
+def _ev_dns_failure(results):
+    dns = _mod(results, "dns") or {}
+    supports = []
+    sc, tc = dns.get("success_count", 0) or 0, dns.get("total_count", 0) or 0
+    if tc:
+        supports.append(_ev(
+            f"DNS 解析仅 {sc}/{tc} 成功，失败率 {(1 - sc / tc) * 100:.0f}%", False))
+    excludes = []
+    for fn in (_ev_gateway_reachable, _ev_external_reachable):
+        item = fn(results)
+        if item:
+            excludes.append(item)
+    if excludes:
+        excludes.append(_ev("本机到网关这一段正常，问题不在网线 / 路由器内网侧", True))
+    return supports, excludes
+
+
+def _ev_wan_interruption(results):
+    ext = _mod(results, "external") or {}
+    supports = []
+    tcp_ok, tcp_total = ext.get("tcp_ok", 0) or 0, ext.get("tcp_total", 0) or 0
+    if tcp_total:
+        supports.append(_ev(f"外网 TCP 全部失败 {tcp_ok}/{tcp_total}", False))
+    excludes = []
+    item = _ev_gateway_reachable(results, "（内网到网关这一段没问题）")
+    if item:
+        excludes.append(item)
+    ping = _ping(results, "gateway")
+    if ping and isinstance(ping.get("loss_pct"), (int, float)) \
+            and ping["loss_pct"] < 5:
+        excludes.append(_ev("本机网卡与网线 / WiFi 链路无丢包", True))
+    return supports, excludes
+
+
+def _ev_wifi_weak(results):
+    wifi = _mod(results, "wifi") or {}
+    supports = []
+    interference = wifi.get("overall_interference")
+    if interference:
+        supports.append(_ev(f"WiFi 干扰等级：{interference}", False))
+    nets = wifi.get("networks")
+    if isinstance(nets, list) and nets:
+        supports.append(_ev(f"周边扫描到 {len(nets)} 个无线网络", True))
+    excludes = []
+    item = _ev_gateway_reachable(results, "（到网关的有线/链路层未受影响）")
+    if item:
+        excludes.append(item)
+    item = _ev_external_reachable(results, "（运营商侧链路正常）")
+    if item:
+        excludes.append(item)
+    return supports, excludes
+
+
+def _ev_bufferbloat(results):
+    bb = _mod(results, "bufferbloat") or {}
+    supports = []
+    idle, loaded = bb.get("idle_rtt_ms"), bb.get("loaded_rtt_ms")
+    if isinstance(idle, (int, float)) and isinstance(loaded, (int, float)):
+        bloat = bb.get("bloat_ms")
+        bloat = bloat if isinstance(bloat, (int, float)) else loaded - idle
+        supports.append(_ev(
+            f"空载延迟 {idle:g}ms → 满载 {loaded:g}ms（升高 {bloat:g}ms）", False))
+    grade = bb.get("grade")
+    if grade:
+        supports.append(_ev(f"Bufferbloat 等级 {grade}", False))
+    excludes = []
+    ping = _ping(results, "gateway")
+    if ping and isinstance(ping.get("avg_ms"), (int, float)) \
+            and isinstance(ping.get("loss_pct"), (int, float)) \
+            and ping["loss_pct"] < 5:
+        excludes.append(_ev(
+            f"网关空闲延迟 {ping['avg_ms']:g}ms 且无丢包（不是链路质量问题）", True))
+    return supports, excludes
+
+
+def _ev_gateway_loss(results):
+    ping = _ping(results, "gateway") or {}
+    supports = []
+    loss = ping.get("loss_pct", 0)
+    if isinstance(loss, (int, float)):
+        txt = f"网关丢包 {loss:g}%"
+        sent, recv = ping.get("sent"), ping.get("received")
+        if isinstance(sent, int) and isinstance(recv, int) and sent > 0:
+            txt += f"（{sent} 发 {recv} 收）"
+        supports.append(_ev(txt, False))
+    if isinstance(ping.get("max_ms"), (int, float)):
+        supports.append(_ev(f"网关最大延迟 {ping['max_ms']:g}ms", False))
+    excludes = []
+    item = _ev_external_reachable(results, "（不是运营商外网中断）")
+    if item:
+        excludes.append(item)
+    dns = _mod(results, "dns") or {}
+    sc, tc = dns.get("success_count", 0) or 0, dns.get("total_count", 0) or 0
+    if tc and sc == tc:
+        excludes.append(_ev(f"DNS 解析 {sc}/{tc} 全部正常", True))
+    return supports, excludes
+
+
+def _ev_nat_restricted(results):
+    nat = _mod(results, "nattype") or {}
+    supports = []
+    behavior = nat.get("nat_behavior")
+    if behavior:
+        supports.append(_ev(f"NAT 行为：{behavior}", False))
+    cone = nat.get("cone_type")
+    if cone:
+        supports.append(_ev(f"锥形类型：{cone}", True))
+    excludes = []
+    item = _ev_external_reachable(results, "（普通上网 / 网页访问不受影响）")
+    if item:
+        excludes.append(item)
+    return supports, excludes
+
+
+# 规则 id → 证据生成函数
+_RC_EVIDENCE_BUILDERS = {
+    "dns_failure": _ev_dns_failure,
+    "wan_interruption": _ev_wan_interruption,
+    "wifi_weak": _ev_wifi_weak,
+    "bufferbloat": _ev_bufferbloat,
+    "gateway_loss": _ev_gateway_loss,
+    "nat_restricted": _ev_nat_restricted,
+}
+
+
+def _enrich_diagnosis_evidence(report, results_dict):
+    """给 DiagnosisReport 里每个 RootCause 补 supports / excludes。
+
+    单条规则生成失败不影响整份报告 (吞异常后该根因退化为无证据链,
+    与 v1.4.x 渲染行为一致)。
+    """
+    for rc in getattr(report, "root_causes", []) or []:
+        fn = _RC_EVIDENCE_BUILDERS.get(getattr(rc, "id", ""))
+        if not fn:
+            continue
+        try:
+            supports, excludes = fn(results_dict)
+        except Exception:
+            continue
+        rc.supports = [s for s in (supports or []) if s and s.get("text")]
+        rc.excludes = [e for e in (excludes or []) if e and e.get("text")]
+    return report
+
+
+def _build_diagnosis_with_evidence(results_dict):
+    """diagnose() + 证据链增强 (报告渲染入口)。"""
+    return _enrich_diagnosis_evidence(diagnose(results_dict), results_dict)
+
+
 # 规则注册表 (C1)
 ALL_RULES = [
     _rule_dns_failure,
@@ -1593,10 +1808,58 @@ def _print_diagnosis(diagnosis):
         print()
 
 
-def _render_diagnosis_section_html(diagnosis_dict):
+def _build_trouble_ticket_text(report, diagnosis_dict):
+    """生成"一句话报障"纯文本 (v1.5.0).
+
+    客户真正想要的是"你帮我把问题说清楚, 我拿给客服", 而不是 P95 / TTFB / NAT Cone。
+    结构: 时间 + 总分 + 主要问题 + 已排除 + 建议首条。
+    """
+    import html as _html
+    if not report:
+        return ""
+    g = report.get("generated_at")
+    g_s = g.strftime("%Y-%m-%d %H:%M") if hasattr(g, "strftime") else str(g or "")
+    health = report.get("health") or {}
+    lines = [f"{g_s} · {report.get('app', 'NetPulse')} v{report.get('version', '')}"]
+
+    scope = ""
+    sel, tot = report.get("selected_modules"), report.get("total_modules")
+    if isinstance(sel, int) and isinstance(tot, int) and tot and sel < tot:
+        scope = f"（本次检测 {sel}/{tot} 项）"
+
+    rcs = (diagnosis_dict or {}).get("root_causes") or []
+    if not rcs:
+        lines.append(f"网络检测未发现明确故障{scope}，"
+                     f"健康度 {health.get('score', 0)}/100"
+                     f"（{health.get('label', '')}）。")
+        return "\n".join(lines)
+
+    lines.append(f"健康度 {health.get('score', 0)}/100"
+                 f"（{health.get('label', '')}）{scope}，检测到 "
+                 f"{len(rcs)} 个主要问题：")
+    for i, rc in enumerate(rcs, 1):
+        conf = (rc.get("confidence") or 0) * 100
+        lines.append(f"{i}. {rc.get('title', '')}（置信度 {conf:.0f}%）")
+        desc = (rc.get("description") or "").strip()
+        if desc:
+            lines.append(f"   现象：{desc}")
+        # 关键证据: 只取问题项 (ok=False), 客服不需要看"排除了什么"的全部细节
+        bad = [s.get("text", "") for s in (rc.get("supports") or [])
+               if not s.get("ok") and s.get("text")]
+        if bad:
+            lines.append("   实测：" + "；".join(bad))
+        recs = rc.get("recommendations") or []
+        if recs:
+            # 只带首条建议: 报障文本要短, 完整建议看报告本身
+            lines.append("   建议：" + str(recs[0]))
+    return "\n".join(lines)
+
+
+def _render_diagnosis_section_html(diagnosis_dict, report=None):
     """阶段 C · v1.3.0: HTML 报告根因摘要区块.
 
     输入: build_report() 输出的 diagnosis dict (to_dict() 结果)
+          report (v1.5.0, 可选): 完整 report, 用于生成"一句话报障"
     输出: HTML section 字符串 (嵌入到 hero 之后), 无根因时返回 ""
     """
     import html as _html
@@ -1620,19 +1883,49 @@ def _render_diagnosis_section_html(diagnosis_dict):
                      "medium": "中", "low": "低"}.get(sev, sev)
         conf_pct = rc.get("confidence", 0) * 100
         recs = rc.get("recommendations") or []
-        recs_html = "".join(f"<li>{_html.escape(r)}</li>" for r in recs)
+        recs_html = "".join(f"<li>{_html.escape(str(r))}</li>" for r in recs)
         affected = ", ".join(rc.get("affected_modules") or []) or " - "
+        # v1.5.0 证据链: 「为什么这样判断 / 已基本排除」—— 把"事实"与"判断"
+        # 分开写, 装维拿这份报告跟客户解释时最有用的就是这两块
+        sup_items, exc_items = [], []
+        for s in rc.get("supports") or []:
+            txt = str(s.get("text") or "").strip()
+            if not txt:
+                continue
+            cls = "yes" if s.get("ok") else "no"
+            sup_items.append(
+                f'<li class="{cls}">{"✓" if s.get("ok") else "✕"} {_html.escape(txt)}</li>')
+        for e in rc.get("excludes") or []:
+            txt = str(e.get("text") or "").strip()
+            if txt:
+                exc_items.append(f'<li class="yes">✓ {_html.escape(txt)}</li>')
+        evidence_html = ""
+        if sup_items or exc_items:
+            sup_block = (f'<div class="rev-t">为什么这样判断</div>'
+                         f'<ul class="rev-list">{"".join(sup_items)}</ul>') if sup_items else ""
+            exc_block = (f'<div class="rev-t">已基本排除</div>'
+                         f'<ul class="rev-list">{"".join(exc_items)}</ul>') if exc_items else ""
+            evidence_html = f'<div class="rev">{sup_block}{exc_block}</div>'
+        # v1.5.0 复测命令卡: 静态 HTML 无法直接执行, 但可以给一条可复制的命令
+        mods = [m for m in (rc.get("affected_modules") or []) if m]
+        cmd = "netpulse " + " ".join(mods) if mods else "netpulse all"
+        cmd_html = (f'<div class="cmd-card"><span class="cmd-lab">建议复测</span>'
+                    f'<code>{_html.escape(cmd)}</code>'
+                    f'<button type="button" class="copy-btn" '
+                    f'data-copy="{_html_attr(cmd)}">复制命令</button></div>')
         cards.append(
-            f'<div class="rcard severity-{_html.escape(sev)}">'
+            f'<div class="rcard severity-{_html_attr(sev)}">'
             f'<div class="rhead">'
             f'<span class="rbadge">{_html.escape(sev_label)}</span>'
             f'<strong>{_html.escape(rc.get("title", ""))}</strong>'
             f'<span class="rconf">置信度 {conf_pct:.0f}%</span>'
             f'</div>'
             f'<p class="rdesc">{_html.escape(rc.get("description", ""))}</p>'
+            f'{evidence_html}'
             f'<p class="rmods">影响模块: {_html.escape(affected)}</p>'
             f'<details><summary>建议 ({len(recs)} 条)</summary>'
             f'<ul>{recs_html}</ul></details>'
+            f'{cmd_html}'
             f'</div>')
     header = (
         f'<div class="dhead">'
@@ -1641,8 +1934,20 @@ def _render_diagnosis_section_html(diagnosis_dict):
         f'{diagnosis_dict.get("overall_confidence", 0)*100:.0f}%, '
         f'触发 {diagnosis_dict.get("rules_fired", 0)}/{diagnosis_dict.get("rules_evaluated", 0)} 条规则'
         f'</span></div>')
+    # v1.5.0 一句话报障: 客户不想看 P95 / TTFB / NAT Cone, 只想要一段能直接
+    # 发给客服 / 运营商的话。长文本走 <pre> + JS 读 textContent, 不塞进属性
+    ticket_html = ""
+    ticket = _build_trouble_ticket_text(report, diagnosis_dict)
+    if ticket:
+        ticket_html = (
+            f'<div class="ticket">'
+            f'<div class="ticket-head">📋 可直接提交给运营商 / 技术支持'
+            f'<button type="button" class="copy-btn" '
+            f'data-copy-from="np-ticket">复制报障描述</button></div>'
+            f'<pre class="ticket-body" id="np-ticket">{_html.escape(ticket)}</pre>'
+            f'</div>')
     return (f'<section class="diagnosis" id="diagnosis">'
-            f'<h2>主要问题</h2>{header}{"".join(cards)}</section>')
+            f'<h2>主要问题</h2>{header}{"".join(cards)}{ticket_html}</section>')
 
 
 # === Diagnosis CSS (阶段 C · v1.3.0) ===
@@ -1674,9 +1979,31 @@ _DIAGNOSIS_CSS = """
 .diagnosis details summary { cursor: pointer; color: #0891b2; font-size: 13px; padding: 4px 0; }
 .diagnosis details ul { margin: 6px 0 0 0; padding-left: 20px; }
 .diagnosis details li { margin: 4px 0; color: #334155; font-size: 13px; line-height: 1.5; }
+/* v1.5.0 证据链: 事实(支持项) / 排除项 分离展示 */
+.diagnosis .rev { margin: 10px 0; padding: 10px 14px; background: #fff; border: 1px solid #e6e9f0; border-radius: 8px; }
+.diagnosis .rev-t { font-size: 12px; font-weight: 600; color: #475569; margin: 6px 0 4px; letter-spacing: .3px; }
+.diagnosis .rev-t:first-child { margin-top: 0; }
+.diagnosis .rev-list { list-style: none; margin: 0; padding: 0; }
+.diagnosis .rev-list li { font-size: 12.5px; line-height: 1.75; color: #334155; }
+.diagnosis .rev-list li.yes { color: #166534; }
+.diagnosis .rev-list li.no { color: #991b1b; font-weight: 600; }
+/* v1.5.0 复测命令卡 */
+.diagnosis .cmd-card { display: flex; align-items: center; gap: 8px; margin-top: 10px; padding: 7px 10px; background: #0f172a; border-radius: 8px; }
+.diagnosis .cmd-card .cmd-lab { font-size: 11px; color: #94a3b8; flex: none; }
+.diagnosis .cmd-card code { font-family: Cascadia Mono,Consolas,monospace; font-size: 12.5px; color: #e2e8f0; flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; }
+.diagnosis .cmd-card .copy-btn { font: inherit; font-size: 11.5px; padding: 3px 10px; border: 1px solid rgba(255,255,255,.25); background: rgba(255,255,255,.08); color: #e2e8f0; border-radius: 6px; cursor: pointer; flex: none; }
+.diagnosis .cmd-card .copy-btn:hover { background: rgba(255,255,255,.18); }
+/* v1.5.0 一句话报障 */
+.ticket { margin-top: 14px; padding: 12px 16px; background: #f8fafc; border: 1px dashed #94a3b8; border-radius: 8px; }
+.ticket .ticket-head { display: flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 600; color: #1e293b; margin-bottom: 8px; }
+.ticket .ticket-head .copy-btn { margin-left: auto; font: inherit; font-size: 11.5px; padding: 3px 10px; border: 1px solid #cbd5e1; background: #fff; color: #1e293b; border-radius: 6px; cursor: pointer; flex: none; }
+.ticket .ticket-head .copy-btn:hover { background: #eef2f7; }
+.ticket .ticket-body { margin: 0; font: 12px/1.75 Cascadia Mono,Consolas,monospace; color: #334155; white-space: pre-wrap; word-break: break-word; }
+.copy-btn.done { background: #16a34a !important; border-color: #16a34a !important; color: #fff !important; }
 @media print {
   .diagnosis details { open: true; }
   .diagnosis details ul { display: block !important; }
+  .copy-btn { display: none; }
 }
 """
 
@@ -2217,7 +2544,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -10440,6 +10767,8 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
     global _C_NOCOLOR, LAST_RUN
     _C_NOCOLOR = no_color
     _cli_enable_vt()
+    # 报告「检测耗时」起点 (含系统信息采集, 与用户体感一致)
+    _run_t0 = time.time()
 
     # 依赖预检: DHCP 完整检测需要 scapy (+Npcap)
     if "dhcp" in keys and not SCAPY_AVAILABLE and not FORCE_NO_SCAPY:
@@ -10571,6 +10900,10 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
         "status": dict(results),
         "results": full,
         "keys": list(keys),
+        # v1.5.0: 检测耗时与检测范围 — 只跑 3 个模块时健康分 100 容易被
+        # 误读成"23 项全正常", Hero 必须显示覆盖了多少项
+        "duration_ms": int((time.time() - _run_t0) * 1000),
+        "total_modules": len(MODULE_MAP),
     }
     return results
 
@@ -12732,9 +13065,15 @@ def build_report():
         "counts": counts,
         "exempt_count": exempt_count,        # 评分豁免的模块数 (iperf3/ipv6/proxy/nattype)
         "summary": {m["key"]: m["status"] for m in modules},
+        # v1.5.0: 检测耗时 / 检测范围 — 只跑部分模块时健康分容易被误读为
+        # "全部 23 项正常", Hero 必须显式给出覆盖比例
+        "duration_ms": int(run.get("duration_ms") or 0),
+        "selected_modules": len(run.get("keys") or []),
+        "total_modules": int(run.get("total_modules") or len(MODULE_MAP)),
         # 阶段 C · v1.3.0 新增 (C5+C6): 根因分析报告
         # 6 条内置规则 (DNS/WAN/WiFi/Bufferbloat/网关丢包/NAT) 跨模块证据聚合.
-        "diagnosis": diagnose(run["results"]).to_dict(),
+        # v1.5.0: 额外挂 supports/excludes 证据链 (见 _enrich_diagnosis_evidence)
+        "diagnosis": _build_diagnosis_with_evidence(run["results"]).to_dict(),
         "modules": modules,
         "tech": {
             "raw_results": run["results"],
@@ -13411,11 +13750,43 @@ def _short_iface(name, max_len=32):
 
 
 def _html_esc(s):
-    """HTML escape, 中文和空格安全。"""
+    """文本节点转义: 只转义 & < > (quote=False)。
+
+    仅用于元素内容 (如 <td>{...}</td>)。**禁止**用于 HTML 属性 —
+    报告里属性普遍用单引号包裹, quote=False 不转义引号, 恶意 SSID /
+    DNS 名 / hostname / URL 可闭合属性后注入标签。属性一律用 _html_attr。
+    """
     import html as _html
     if s is None:
         return ""
     return _html.escape(str(s), quote=False)
+
+
+def _html_attr(s):
+    """HTML 属性转义: 额外转义 ' 和 " (quote=True), 属性值可安全用引号包裹。
+
+    审计范围 (v1.5.0 P0 修复): 所有 title= / data-hint= / href= / data-mod=
+    / id= / class= 的插值点都必须走这里。
+    """
+    import html as _html
+    if s is None:
+        return ""
+    return _html.escape(str(s), quote=True)
+
+
+def _fmt_duration(ms):
+    """毫秒 → 人话耗时 (报告 Hero 用)。<=0 返回空串 (未知就不显示, 不猜)。"""
+    try:
+        ms = int(ms or 0)
+    except (TypeError, ValueError):
+        return ""
+    if ms <= 0:
+        return ""
+    s = ms / 1000.0
+    if s < 60:
+        return f"{s:.1f} 秒"
+    m, sec = divmod(int(round(s)), 60)
+    return f"{m} 分 {sec:02d} 秒"
 
 
 def _render_html_tech_block(key, raw_result, tech_keys, auto_open=True):
@@ -13692,7 +14063,7 @@ def _build_report_nav(modules):
         for key in present:
             m = by_key[key]
             color = _html_status_color(m["status"])
-            out.append(f'<a href="#mod-{_html_esc(key)}">'
+            out.append(f'<a href="#mod-{_html_attr(key)}">'
                        f'<span class="st" style="background:{color}"></span>'
                        f'{_html_esc(m["name"])}</a>')
         out.append('</div>')
@@ -13923,7 +14294,26 @@ def render_report_html_customer(report):
         hero_meta.append(f"📍 <b>{_html_esc(' / '.join(x for x in (sys_i.get('geo'), sys_i.get('asn')) if x))}</b>")
     if sys_i.get("ipv6_public_ip"):
         hero_meta.append(f"IPv6 <b>{_html_esc(sys_i['ipv6_public_ip'])}</b>")
-    meta_chips = "".join(f"<span>{m}</span>" for m in hero_meta)
+    # v1.5.0: 检测耗时 + 检测范围。只跑几个模块时健康分 100 极容易被读成
+    # "23 项全正常", 必须显式写出覆盖了多少项
+    dur_txt = _fmt_duration(report.get("duration_ms"))
+    if dur_txt:
+        hero_meta.append(f"耗时 <b>{_html_esc(dur_txt)}</b>")
+    sel = report.get("selected_modules")
+    tot = report.get("total_modules")
+    if isinstance(sel, int) and isinstance(tot, int) and tot > 0:
+        if sel < tot:
+            # 部分检测: title 里说清未覆盖多少项, 避免只看到分数就下结论
+            hero_meta.append(
+                (f"检测范围 <b>{sel}/{tot}</b> 项",
+                 f"本次仅运行所选模块, 其余 {tot - sel} 项未检测"))
+        else:
+            hero_meta.append(f"检测范围 <b>{tot} 项全覆盖</b>")
+    # chip 支持 (内容, title) 二元组, 避免在 .hero .meta span 里再套一层 span
+    meta_chips = "".join(
+        (f"<span title='{_html_attr(m[1])}'>{m[0]}</span>"
+         if isinstance(m, tuple) else f"<span>{m}</span>")
+        for m in hero_meta)
 
     score = health.get("score", 0)
     grade_key = str(health.get("grade") or "").strip()[:1].upper()
@@ -13931,8 +14321,9 @@ def render_report_html_customer(report):
     score_ring = _svg_health_ring(score, grade_key)
 
     # 阶段 C · v1.3.0: 根因摘要 (hero 之后紧接, 客户第一屏直接看到主要问题)
+    # v1.5.0: 传入完整 report, 用于生成"一句话报障"
     diagnosis_section = _render_diagnosis_section_html(
-        report.get("diagnosis", {}))
+        report.get("diagnosis", {}), report=report)
 
     hero = f"""
 <header class="hero" id="overview">
@@ -14128,7 +14519,7 @@ def render_report_html_customer(report):
         verdict_short = m["verdict"][:60] + ("…" if len(m["verdict"]) > 60 else "")
         overview_items.append(
             f"<li>"
-            f"<a href='#mod-{_html_esc(m['key'])}' title='跳转到 {_html_esc(m['name'])} 详细结果'>"
+            f"<a href='#mod-{_html_attr(m['key'])}' title='跳转到 {_html_attr(m['name'])} 详细结果'>"
             f"<span class='dot {sk}'></span>"
             f"<span class='name'>{_html_esc(m['name'])}</span>"
             f"<span class='verdict'>{_html_esc(verdict_short)}</span>"
@@ -14187,6 +14578,12 @@ def render_report_html_customer(report):
         charts_section = ""
 
     # ── 详细模块 ──
+    # v1.5.0: 模块卡默认只展开首要根因涉及的模块。23 个模块里若有 5 个异常,
+    # 旧逻辑会一次刷出 5 张巨型卡片把客户第一屏淹没 — 只留主角展开
+    root_causes = (report.get("diagnosis") or {}).get("root_causes") or []
+    primary_modules = set(root_causes[0].get("affected_modules") or []) \
+        if root_causes else set()
+
     mod_blocks = []
     for m in modules:
         st = m["status"]
@@ -14212,8 +14609,8 @@ def render_report_html_customer(report):
                 # 数值在上、名称在下 (flex-column), 长名称可换行不再截断
                 # data-hint 供触摸设备点击展开 (桌面 hover 走 title)
                 metric_html.append(
-                    f"<div class='metric' title='{_html_esc(full_title)}'"
-                    f"{' data-hint=\'' + _html_esc(hint) + '\'' if hint else ''}>"
+                    f"<div class='metric' title='{_html_attr(full_title)}'"
+                    f"{' data-hint=\'' + _html_attr(hint) + '\'' if hint else ''}>"
                     f"<span class='v {level}'>{_html_esc(me['value'])}</span>"
                     f"<span class='lab'>{_html_esc(me['label'])}</span>"
                     f"</div>"
@@ -14273,16 +14670,19 @@ def render_report_html_customer(report):
         else:
             issues_html = ""
 
-        # 技术细节折叠: 问题模块默认展开, 正常模块默认折叠
-        # 「超时」也是硬故障 (测了但没结果), 不自动展开会被当成无关紧要的灰行
+        # 折叠策略 (v1.5.0 收窄):
+        #   有根因 → 只自动展开"首要根因"涉及的模块, 其余问题模块折叠
+        #   无根因 → 退回旧行为, 所有问题模块展开 (规则没命中时不能把异常藏起来)
+        # 「超时」也是硬故障 (测了但没结果), 两种情况都不该被当成无关紧要的灰行
         problem_status = st in PROBLEM_STATUSES
+        auto_open = (m["key"] in primary_modules) if primary_modules else problem_status
         tech_html = ""
         if m.get("has_tech_details"):
             pres = MODULE_PRESENTATION.get(m["key"], {})
             tech_keys = pres.get("tech_keys", [])
             tech_html = _render_html_tech_block(
                 m["key"], m.get("raw", {}), tech_keys,
-                auto_open=problem_status)
+                auto_open=auto_open)
 
         # WiFi 等模块原始数据全空时, 给出友好提示而非空列表
         empty_note_html = ""
@@ -14308,15 +14708,15 @@ def render_report_html_customer(report):
             "idle": "○"
         }
         mod_icon = mod_icons.get(sk, "○")
-        open_attr = " open" if problem_status else ""
+        open_attr = " open" if auto_open else ""
         mod_blocks.append(f"""
-<details class="mod {sk}" id="mod-{_html_esc(m["key"])}"{open_attr}>
+<details class="mod {sk}" id="mod-{_html_attr(m["key"])}"{open_attr}>
   <summary>
     <span class="ic {sk}">{mod_icon}</span>
     <span class="nm">{_html_esc(m['name'])}</span>
     <span class="vd">{_html_esc(verdict)}</span>
     <span class="b {sk}">{_html_esc(st)}</span>
-    <a class="anchor" href="#mod-{_html_esc(m['key'])}" data-mod="mod-{_html_esc(m['key'])}"
+    <a class="anchor" href="#mod-{_html_attr(m['key'])}" data-mod="mod-{_html_attr(m['key'])}"
        title="复制本模块链接">🔗</a>
     <span class="arr">▸</span>
   </summary>
@@ -14330,12 +14730,17 @@ def render_report_html_customer(report):
   </div>
 </details>""")
 
-    # 问题模块自动展开, 正常模块折叠 — 在章节标题给出提示
+    # 章节标题说明当前展开策略, 避免用户以为"没展开 = 没问题"
     problem_cnt = sum(1 for s in report["summary"].values()
                       if s in PROBLEM_STATUSES)
+    if primary_modules:
+        open_note = (f"共 {problem_cnt} 个问题模块 · 已展开首要问题项, "
+                     f"其余点击展开")
+    else:
+        open_note = f"{problem_cnt} 个问题模块已展开 · 正常模块点击展开"
     modules_section = f"""
 <div class="sec" id="modules"><h2><span class="icon">🔍</span>详细结果
-<span class="cnt">{problem_cnt} 个问题模块已展开 · 正常模块点击展开</span></h2></div>
+<span class="cnt">{_html_esc(open_note)}</span></h2></div>
 {"".join(mod_blocks)}"""
 
     # ── 主机信息 ──
@@ -14388,16 +14793,20 @@ def render_report_html_customer(report):
         f"<td>{_html_esc(u)}</td><td>{_html_esc(d)}</td></tr>"
         for m, l, w, e, u, d in standards_rows
     )
+    # v1.5.0: 判定阈值 / 评分规则属于工具内部实现, 对客户没有阅读价值
+    # (还会引来"为什么异常就是扣 20 分"的疑问), 统一收进默认折叠的技术附录
     standards_section = f"""
-<div class="sec"><h2><span class="icon">📐</span>本报告诊断标准</h2></div>
-<details class="collapse" data-auto-open="0"><summary>查看判定阈值与口径 <span class='cnt'>{len(standards_rows)} 项指标</span></summary>
+<div class="sec" id="appendix"><h2><span class="icon">🔧</span>技术附录
+<span class="cnt">默认折叠 · 供装维与技术人员查阅</span></h2></div>
+<details class="collapse" data-auto-open="0"><summary>查看本次诊断的判定标准与评分口径 <span class='cnt'>{len(standards_rows)} 项指标</span></summary>
 <div class="body">
-  <div class='subcap'>判定规则: "越低越差"的指标 (延迟/丢包/重传/抖动), 超过<span class='kw warn'>警告阈值</span>标 ⚠️ 警告, 超过<span class='kw err'>异常阈值</span>标 ❌ 异常; "越高越好"的指标 (速率/TCP 可达数), 低于警告阈值标警告, 低于异常阈值标异常。所有阈值集中维护在 <code>THRESHOLDS</code>, 链路速率另在 <code>_metrics_linkspeed</code> 硬编码。</div>
+  <div class='subcap'>本节是工具内部的判定口径，<b>不影响</b>上方已列出的实测数据与结论。阈值只决定状态标签（正常 / 警告 / 异常），所有原始测量值仍完整保留在各模块的「技术细节」中。</div>
+  <div class='subcap' style='margin-top:10px'>判定规则: "越低越差"的指标 (延迟/丢包/重传/抖动), 超过<span class='kw warn'>警告阈值</span>标 ⚠️ 警告, 超过<span class='kw err'>异常阈值</span>标 ❌ 异常; "越高越好"的指标 (速率/TCP 可达数), 低于警告阈值标警告, 低于异常阈值标异常。所有阈值集中维护在 <code>THRESHOLDS</code>, 链路速率另在 <code>_metrics_linkspeed</code> 硬编码。</div>
   <table class='tbl std'>
     <thead><tr><th>模块</th><th>指标</th><th>警告阈值</th><th>异常阈值</th><th>单位</th><th>判定方向</th></tr></thead>
     <tbody>{std_body}</tbody>
   </table>
-  <div class='subcap' style='margin-top:12px'>评分规则: 起始 100 分, 异常 -20/项, 错误 -30/项, 警告 -2/项, 未检测不扣分。<br>豁免模块 (不参与扣分): iperf3(未配置非故障), IPv6(可选), VPN/虚拟网卡(环境特性), NAT类型(运营商侧)。等级: A≥90 优秀, B≥75 良好, C≥60 一般, D≥40 欠佳, F&lt;40 严重。</div>
+  <div class='subcap' style='margin-top:12px'>评分规则 (健康分是用于快速排序问题优先级的规则分, 不是统计意义上的网络质量评分): 起始 100 分, 异常 -20/项, 错误 -30/项, 警告 -2/项, 未检测不扣分。<br>豁免模块 (不参与扣分): iperf3(未配置非故障), IPv6(可选), VPN/虚拟网卡(环境特性), NAT类型(运营商侧)。等级: A≥90 优秀, B≥75 良好, C≥60 一般, D≥40 欠佳, F&lt;40 严重。</div>
 </div>
 </details>"""
 
@@ -14682,6 +15091,30 @@ function copyText(txt, done){{
       }});
     }});
     el.title = '点击复制: ' + el.textContent.trim();
+  }});
+}})();
+// v1.5.0 通用复制按钮: data-copy 直接取短文本, data-copy-from 从目标元素读长文本
+(function(){{
+  document.querySelectorAll('.copy-btn[data-copy], .copy-btn[data-copy-from]').forEach(function(btn){{
+    btn.addEventListener('click', function(e){{
+      e.preventDefault();
+      var txt = btn.getAttribute('data-copy') || '';
+      if (!txt) {{
+        var src = document.getElementById(btn.getAttribute('data-copy-from') || '');
+        txt = src ? src.textContent : '';
+      }}
+      if (!txt) return;
+      copyText(txt, function(){{
+        var orig = btn.getAttribute('data-orig-text') || btn.textContent;
+        btn.setAttribute('data-orig-text', orig);
+        btn.textContent = '✓ 已复制';
+        btn.classList.add('done');
+        setTimeout(function(){{
+          btn.textContent = orig;
+          btn.classList.remove('done');
+        }}, 1200);
+      }});
+    }});
   }});
 }})();
 // 模块卡 🔗 按钮: 复制带锚点的报告链接; preventDefault 避免 <summary> 折叠与页面跳转

@@ -41,11 +41,22 @@
 - `render_report_html`（技术视图）和 `render_report_text`（纯文本）**当前零调用点**，
   属于死代码；修改后不会被线上路径覆盖，启用前需自行验证
 - 报告须**可离线打开**：全部用系统字体，不引入任何在线资源，图表用纯 SVG 手绘
+- **HTML 属性转义**（v1.5.0 P0）：文本节点用 `_html_esc(s)`（`quote=False`），
+  **属性值一律用 `_html_attr(s)`**（`quote=True`）—— `_html_esc` 不能进属性拼接。
+  评审发现旧版 `_html_esc` 在 `title=` / `data-hint=` / `href=` / `data-mod=` / `id=` 里裸拼，
+  恶意 SSID / DNS 名 / hostname 可闭合属性注入标签
+- **根因证据链**（v1.5.0）：`RootCause.evidence_ids` 不直接渲染（B 阶段 `Evidence` 实体
+  全仓只在 gateway 模块构造 4 处，覆盖率极低）。改为按"规则判定条件 → 证据项"生成——
+  `_RC_EVIDENCE_BUILDERS` 里 6 条规则各对应一个 builder，只读规则验证过的字段，缺失即跳过，
+  不伪造数字
+- **模块折叠**（v1.5.0）：有根因时**只展开首要根因**涉及的模块；**无根因时退回旧行为**
+  （规则没命中时不能把异常藏起来）
+- **诊断标准**（v1.5.0）已归入统一「技术附录」折叠区块，原章节文案移除
 
 ## 验证
 
 ```bash
-python _smoke_report.py          # 25 项断言: 图表/导航/折叠/打印/复制/超时扣分
+python _smoke_report.py          # 170 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡
 ```
 
 产物 `reports/_verify_latest.html` 用于人工核对（`reports/` 已 gitignore）。
