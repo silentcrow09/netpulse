@@ -37,7 +37,7 @@ import shutil
 import zipfile
 from bisect import bisect_left
 from datetime import datetime
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.request import urlopen, Request
 from urllib.parse import urlsplit, urlunsplit, urljoin
@@ -49,7 +49,7 @@ import webbrowser
 # 可选依赖 — 缺失时自动降级
 try:
     from scapy.all import (
-        Ether, IP, UDP, DHCP, BOOTP, ICMP, ARP,
+        Ether, IP, UDP, TCP, DNS, DHCP, BOOTP, ICMP, ARP,
         srp, sendp, sniff, conf, sr1, get_if_list, get_if_addr, get_if_hwaddr
     )
     SCAPY_AVAILABLE = True
@@ -2756,7 +2756,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -10471,6 +10471,28 @@ class MonitorSession:
         # MTU 探测线程不 join: 二分探测最坏 ~30s, 提前结束时由 build_result
         # 的 _mtu_done.wait(10) 决定等不等 (daemon, 不阻塞进程退出)
 
+    def _tcpstat_quality(self):
+        """TCP 重传会话差分 (v1.7.0): build_result 的权威口径与抓包层
+        poll_events 的增量检测共用, 避免两处判据漂移。
+        分母保护: sent 增量 < TCPSTAT_MIN_SENT_DELTA 时机器空闲, 单个重传
+        就能把比率冲高, 只展示原始增量不判比率 (retrans_rate_pct=None)。"""
+        with self._probe_lock:
+            series = list(self._tcpstat_samples)
+        tq = {"series": [], "sent_delta": 0, "retrans_delta": 0,
+              "retrans_rate_pct": None, "samples": len(series)}
+        if len(series) >= 2:
+            sent_delta = series[-1][1] - series[0][1]
+            retrans_delta = series[-1][2] - series[0][2]
+            if sent_delta >= 0:
+                tq["sent_delta"] = sent_delta
+                tq["retrans_delta"] = retrans_delta
+                tq["series"] = [[round(t - self._t0, 1), s, r]
+                                for t, s, r in series]
+                if sent_delta >= self.TCPSTAT_MIN_SENT_DELTA:
+                    tq["retrans_rate_pct"] = round(
+                        retrans_delta / sent_delta * 100, 2)
+        return tq
+
     @staticmethod
     def _stream_stats(stream):
         ok_vals = [s[2] for s in stream if s[0] == "ok" and s[2] is not None]
@@ -10520,23 +10542,9 @@ class MonitorSession:
         mtu_block = dict(mtu_raw or {})
         mtu_block["probe_status"] = mtu_status
         # v1.7.0 (PR-F0): TCP 重传会话差分 (开机累计计数器 → 会话口径)。
-        # 分母保护: sent 增量 < TCPSTAT_MIN_SENT_DELTA 时机器空闲, 单个重传
-        # 就能把比率冲高, 只展示原始增量不判比率。
         with self._probe_lock:
             tcpstat_series = list(self._tcpstat_samples)
-        tq = {"series": [], "sent_delta": 0, "retrans_delta": 0,
-              "retrans_rate_pct": None, "samples": len(tcpstat_series)}
-        if len(tcpstat_series) >= 2:
-            sent_delta = tcpstat_series[-1][1] - tcpstat_series[0][1]
-            retrans_delta = tcpstat_series[-1][2] - tcpstat_series[0][2]
-            if sent_delta >= 0:
-                tq["sent_delta"] = sent_delta
-                tq["retrans_delta"] = retrans_delta
-                tq["series"] = [[round(t - t0, 1), s, r]
-                                for t, s, r in tcpstat_series]
-                if sent_delta >= self.TCPSTAT_MIN_SENT_DELTA:
-                    tq["retrans_rate_pct"] = round(
-                        retrans_delta / sent_delta * 100, 2)
+        tq = self._tcpstat_quality()
         snap["mtu"] = mtu_block
         snap["tcp_quality"] = tq
         events = _detect_monitor_events(snap, self._t0, ended_at)
@@ -10803,6 +10811,11 @@ def _render_monitor_html(res):
     v_name = {"stable": "监测稳定", "no_data": "无有效数据", "target_unreachable": "目标不可达",
               "internal": "内网侧问题", "carrier": "运营商侧问题", "dns": "解析侧问题",
               "degraded": "质量劣化", "mixed": "混合问题"}.get(res.get("verdict"), "")
+    # v1.8.0 (PR-F4): 抓包证据置信度徽标 (无抓包佐证时不出该行)
+    conf_html = ""
+    if res.get("confidence"):
+        conf_html = (f"<div class='conf'>🎯 结论置信度 {res.get('confidence')}% — "
+                     f"{_esc_html(str(res.get('confidence_basis', '')))}</div>")
 
     ev_rows = []
     type_names = {"outage": "中断", "dns_fail": "DNS 故障", "tcp_fail": "TCP 失败",
@@ -10819,11 +10832,26 @@ def _render_monitor_html(res):
             continue
         status = ("<span class='pill open'>结束时未恢复</span>" if e.get("open_at_end")
                   else "<span class='pill ok'>已恢复</span>")
+        # v1.8.0 (PR-F2): 事件挂了切片时给取证链接 (Wireshark 可直接打开)
+        if e.get("pcap_slice"):
+            href = str(e["pcap_slice"]).replace("\\", "/")
+            status += (f"<br><a href='{href}' style='font-size:11px'>"
+                       f"📁 抓包切片</a>")
+        # v1.8.0 (PR-F4): 抓包证据确认的根因 → 徽标 (定位列同步展示)
+        if e.get("pcap_evidence"):
+            status += (f"<br><span class='pill' "
+                       f"style='background:#eef2ff;color:#4338ca'>"
+                       f"🔬 {_esc_html(e['pcap_evidence'])}</span>")
+        # v1.8.0 (PR-F4): 抓包佐证的根因 → 定位列加 "🔬 抓包分析" 标记
+        cls_cell = _esc_html(cls_names.get(e.get('cls', ''), e.get('cls', '—')))
+        if e.get("pcap_evidence"):
+            cls_cell += (f" <span class='pill' style='background:#eef2ff;"
+                         f"color:#4338ca'>🔬 抓包分析</span>")
         ev_rows.append(
             f"<tr><td>{_esc_html(e['start_disp'])}–{_esc_html(e['end_disp'])}</td>"
             f"<td>{e['duration_s']:.0f}s</td>"
             f"<td>{type_names.get(e['type'], e['type'])}</td>"
-            f"<td>{_esc_html(cls_names.get(e.get('cls', ''), e.get('cls', '—')))}</td>"
+            f"<td>{cls_cell}</td>"
             f"<td>{_esc_html(e.get('detail', ''))}</td><td>{status}</td></tr>")
     ev_table = ("<table><tr><th>时刻</th><th>持续</th><th>类型</th><th>定位</th>"
                 "<th>详情</th><th>状态</th></tr>"
@@ -10833,6 +10861,81 @@ def _render_monitor_html(res):
 
     notes_html = "".join(f"<div class='note-line'>· [{n['t']}s] {_esc_html(n['text'])}</div>"
                          for n in res.get("notes", []))
+    # v1.8.0 (PR-F1/F2): 抓包取证面板 — 切片清单/全程 pcap/隐私与清理声明
+    cap = res.get("capture") or {}
+    cap_panel = ""
+    if cap:
+        _slice_rows = []
+        for s in (cap.get("slices") or []):
+            href = s.get("rel") or s.get("path") or ""
+            _slice_rows.append(
+                f"<tr><td>{_esc_html(str(s.get('ts', '')))}</td>"
+                f"<td>{_esc_html(type_names.get(s.get('event_type', ''),
+                                               s.get('event_type', '—')))}</td>"
+                f"<td>{s.get('pkts', 0)} 包</td>"
+                f"<td><a href='{href}'>{_esc_html(str(s.get('path', '')))}</a></td></tr>")
+        _full_html = ""
+        if cap.get("full_pcap"):
+            _fhref = cap.get("full_pcap_rel") or cap.get("full_pcap")
+            _full_html = (f"<tr><td>全程抓包</td><td colspan=3>"
+                          f"<a href='{_fhref}'>{_esc_html(str(cap['full_pcap']))}</a>"
+                          f" ({cap.get('packets_captured', 0)} 包)</td></tr>")
+        # v1.8.0 (PR-F4): 切片离线分析结论行
+        _ana = cap.get("analysis") or {}
+        _ana_rows = ""
+        if _ana:
+            _stalls = [s for s in (_ana.get("streams") or [])
+                       if s.get("fullsize_stall")]
+            _frag = _ana.get("icmp_frag_needed") or []
+            _sni = [s for s in (_ana.get("tls_sni") or []) if s != "sni_truncated"]
+            _trunc = sum(1 for s in (_ana.get("tls_sni") or [])
+                         if s == "sni_truncated")
+            _bits = []
+            if _ana.get("suspected_pmtud_blackhole"):
+                _bits.append("<b style='color:#b42318'>疑似 PMTU 黑洞 (三信号判定)</b>")
+            if _ana.get("suspected_tcp_loss_burst"):
+                _bits.append("<b style='color:#b26a00'>疑似链路丢包/拥塞</b>")
+            if _ana.get("suspected_dns_slow"):
+                _bits.append("<b style='color:#b26a00'>DNS 慢查询</b>")
+            _line1 = ("；".join(_bits) if _bits
+                      else "未见 PMTU 黑洞 / 链路丢包 / DNS 慢查询类证据")
+            _lines = [_line1,
+                      f"重传 {_ana.get('tcp_retransmit_count', 0)} 段 "
+                      f"(占比 {_ana.get('retrans_rate', 0) * 100:.1f}%) · "
+                      f"dup-ack {_ana.get('tcp_dup_ack_count', 0)} · "
+                      f"RST {_ana.get('tcp_rst_count', 0)} · "
+                      f"零窗口 {_ana.get('tcp_zero_window_n', 0)} · "
+                      f"大包停滞流 {len(_stalls)} 条"]
+            if _frag:
+                _mtus = sorted({m for _, m in _frag if m})
+                _lines.append(
+                    f"ICMP 需分片 {len(_frag)} 个"
+                    + (f" (下一跳 MTU {'/'.join(str(m) for m in _mtus)})"
+                       if _mtus else " (未携带 MTU 值)"))
+            if _sni:
+                _shown = ", ".join(_sni[:8]) + (" 等" if len(_sni) > 8 else "")
+                _lines.append(f"访问域名 (SNI/Host): {_esc_html(_shown)}"
+                              + (f" · 另有 {_trunc} 个域名超出 384B 截断窗口未提取"
+                                 if _trunc else ""))
+            _lines.append(
+                f"DNS 查询 {_ana.get('dns_query_count', 0)} 次 "
+                f"(慢查询 {len(_ana.get('dns_slow_queries') or [])}) · "
+                f"QUIC 包 {_ana.get('udp443_pkts', 0)} · "
+                f"分析切片 {cap.get('analysis_files', 0)} 个")
+            _ana_rows = ("<tr><td>证据分析</td><td colspan=3>"
+                         + "<br>".join(_lines) + "</td></tr>")
+        cap_panel = f"""
+<div class="panel"><h3>抓包取证 (v1.8.0)</h3>
+<table>
+<tr><th>落盘时间</th><th>触发事件</th><th>包数</th><th>文件 (Wireshark 可直接打开)</th></tr>
+{''.join(_slice_rows) if _slice_rows else "<tr><td colspan=4 class='empty'>监测期内无触发事件, 未落盘切片</td></tr>"}
+{_full_html}
+{_ana_rows}
+<tr><td>规格</td><td colspan=3>接口 {_esc_html(str(cap.get('iface', '—')))} · 缓冲 {cap.get('ring_bytes', 0) / 1048576:.1f}/{cap.get('ring_limit_mb', 0)}MB ·
+抓到 {cap.get('packets_captured', 0)} 包{f" · 超限挤出 {cap.get('dropped_old', 0)} 包" if cap.get('dropped_old') else ''} · 切片窗口 = 事件前后各 {cap.get('slice_before_s', 30)}s</td></tr>
+<tr><td>隐私声明</td><td colspan=3>仅保留包头与 80/443 每流首 2 包 384B (提取 Host/SNI), <b>不含任何应用内容</b>;
+下次运行 NetPulse 时自动清理超过 {cap.get('retention_days', 7)} 天的切片 (最多保留 {cap.get('max_slice_files', 10)} 个)</td></tr>
+</table></div>"""
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>NetPulse 盯障监测报告</title>
@@ -10850,6 +10953,7 @@ h1{{font-size:22px;margin:0 0 4px}}
 .metric .note{{font-size:11px;color:#94a3b8;margin-top:2px;line-height:1.4}}
 .banner{{background:#fff;border-left:5px solid {v_color};border-radius:8px;padding:14px 18px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.06)}}
 .banner .verdict{{font-size:16px;font-weight:700;color:{v_color};margin-bottom:6px}}
+.banner .conf{{font-size:12.5px;color:#4338ca;background:#eef2ff;display:inline-block;padding:3px 10px;border-radius:10px;margin-bottom:8px}}
 .banner .text{{font-size:14px;line-height:1.7}} .banner .advice{{font-size:13px;color:#1e293b;background:#f0f9ff;border-left:3px solid #0284c7;padding:8px 12px;border-radius:0 6px 6px 0;margin-top:10px;white-space:pre-line}}
 .panel{{background:#fff;border-radius:10px;padding:14px 18px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.06)}}
 .panel h3{{margin:0 0 10px;font-size:15px}}
@@ -10879,6 +10983,7 @@ canvas{{max-width:100%}}
 </div>
 <div class="banner">
 <div class="verdict">{_esc_html(v_name)}</div>
+{conf_html}
 <div class="text">{_esc_html(res.get('conclusion_text', ''))}</div>
 <div class="advice">💡 处置建议: {_esc_html(res.get('advice', ''))}</div>
 </div>
@@ -10897,6 +11002,7 @@ canvas{{max-width:100%}}
 <tr><td>重传采样</td><td>{len(tq_series)} 点 (30s 周期, 开机累计计数器差分)</td></tr>
 </table>
 <canvas id="retransChart" width="840" height="140"></canvas></div>
+{cap_panel}
 <div class="panel"><h3>监测详情</h3>
 <table>
 <tr><th>项目</th><th>值</th></tr>
@@ -10967,7 +11073,926 @@ chart('retransChart',
 </div></body></html>"""
 
 
-def run_monitor_mode(duration_s, ext_target=None, load_url=None):
+# ============================================================
+# SECTION 4a: 盯障抓包层 (阶段 F · v1.8.0 PR-F1/F2)
+# ============================================================
+# 设计 (方案 §5): BPF 内核态先滤一层 → prn 回调只做「剥 payload + 入队」
+# (零解析零格式化, 重传/SNI 分析全部后置到 PcapAnalyzer) → 字节记账环形
+# buffer → 事件触发切片落盘 (标准 pcap, Wireshark 可直接开)。
+# 隐私语义: 保护手段是「不存 payload」(80/443/8080 每流每方向前 2 包保留
+# 头 + 384B 以提取 Host/SNI, 其余一律截到传输层头), 不是「少抓协议」。
+
+# BPF: `ip and (...)` 显式排除 IPv6 (裸 `tcp` 在 libpcap 语义下同时匹配
+# v4/v6; 本期分析器只处理 v4)。tcp 已涵盖 tcp/53; udp 443 = QUIC 头部计数。
+CAPTURE_BPF_FILTER = "ip and (icmp or udp port 53 or tcp or udp port 443)"
+CAPTURE_PAYLOAD_KEEP = 384     # 80/443/8080 前 2 包保留的 payload 字节数
+CAPTURE_FIRST_PKTS = 2         # 每流每方向保留 payload 的包数 (提 Host/SNI)
+CAPTURE_DEFAULT_MB = 64        # ring buffer 上限 (MB)
+CAPTURE_SLICE_BEFORE_S = 30    # 事件切片: 事件开始前保留秒数
+CAPTURE_SLICE_AFTER_S = 30     # 事件切片: 事件结束后保留秒数
+CAPTURE_TRIGGER_TYPES = ("outage", "jitter_burst", "tcp_fail",
+                         "tcp_retrans_burst")
+# mtu_mismatch 是持续态不是时刻事件, 不触发切片 (只在报告建议里引导)
+CAPTURE_RETENTION_DAYS = 7     # 切片保留天数 (下次运行时清理)
+CAPTURE_MAX_FILES = 10         # 切片最大个数 (超删最旧)
+CAPTURE_WEB_PORTS = (80, 443, 8080)
+
+
+def _captures_dir():
+    """抓包切片目录: <reports>/captures/ (与日期报告目录同根)。"""
+    return os.path.join(os.path.dirname(_report_dir()), "captures")
+
+
+def _cap_relpath(path, report_dir):
+    """切片相对报告目录的链接路径; 跨盘符 (C:↔D:) 时 relpath 抛
+    ValueError, 用文件名兜底 (报告与 captures 生产上同根, 仅测试会跨盘)。"""
+    try:
+        return os.path.relpath(path, report_dir).replace("\\", "/")
+    except ValueError:
+        return os.path.basename(path)
+
+
+def _capture_ack_path():
+    """抓包首次确认标记: 与切片同目录 (reports/captures/.capture_ack)。"""
+    return os.path.join(_captures_dir(), ".capture_ack")
+
+
+def _capture_confirm_once(input_fn=None):
+    """首次 --capture 的隐私确认 (方案 §8.5): 只问一次, 确认后落标记文件。
+
+    非交互环境 (无 TTY) 不阻塞 — --capture 本身已是显式授权, 直接放行并落
+    标记。返回 True=继续抓包; False=用户拒绝 (降级为仅统计层)。"""
+    input_fn = input_fn or input
+    ack = _capture_ack_path()
+    try:
+        if os.path.exists(ack):
+            return True
+    except OSError:
+        return True                    # 检查失败不拦路
+    print(_c("\n  ⚠ 抓包取证首次使用确认", C_YELLOW))
+    for line in (
+            "     · 只保留包头: 80/443 每条连接的前 2 个包多留 384 字节 (提取访问的域名用)",
+            "     · 不保存任何账号、密码、聊天或页面内容",
+            "     · DNS 查询域名与访问域名会出现在报告里 (定位故障必需)",
+            f"     · 切片超过 {CAPTURE_RETENTION_DAYS} 天或 {CAPTURE_MAX_FILES} 个, 下次运行 NetPulse 时自动清理",
+            "     · 文件在本机 reports/captures/ 下, 可随时手动删除",
+    ):
+        print(_c(line, C_GRAY))
+    if not sys.stdin.isatty():
+        print(_c("  (非交互环境, 视为已确认 — --capture 即显式授权)", C_GRAY))
+        _write_capture_ack(ack)
+        return True
+    try:
+        ans = input_fn("  确认开启抓包取证? [y/N]: ").strip().lower()
+    except (EOFError, OSError):
+        return True                    # 输入流异常 (管道/重定向): 不拦显式授权
+    if ans in ("y", "yes"):
+        _write_capture_ack(ack)
+        return True
+    return False
+
+
+def _write_capture_ack(ack):
+    try:
+        os.makedirs(os.path.dirname(ack), exist_ok=True)
+        with open(ack, "w", encoding="utf-8") as f:
+            f.write(datetime.now().isoformat())
+    except OSError:
+        pass                           # 标记写不进 (只读目录): 下次再问一次
+
+
+def _cleanup_old_captures(cap_dir=None):
+    """启动时清理切片: 超过 CAPTURE_RETENTION_DAYS 天或总数超 CAPTURE_MAX_FILES
+    (删最旧)。返回删除的文件数; 失败静默 (清理不是主路径)。"""
+    cap_dir = cap_dir or _captures_dir()
+    try:
+        files = [os.path.join(cap_dir, f) for f in os.listdir(cap_dir)
+                 if f.endswith(".pcap")]
+        removed = 0
+        now = time.time()
+        for p in files:
+            try:
+                if now - os.path.getmtime(p) > CAPTURE_RETENTION_DAYS * 86400:
+                    os.remove(p)
+                    removed += 1
+            except OSError:
+                pass
+        files = [p for p in files if os.path.exists(p)]
+        if len(files) > CAPTURE_MAX_FILES:
+            files.sort(key=os.path.getmtime)
+            for p in files[:len(files) - CAPTURE_MAX_FILES]:
+                try:
+                    os.remove(p)
+                    removed += 1
+                except OSError:
+                    pass
+        return removed
+    except OSError:
+        return 0
+
+
+class _PcapRingBuffer:
+    """按字节记账的滚动 buffer (方案 §5.3): deque 只存引用, _bytes 累计
+    len(bytes(pkt))。v1 方案的 deque(maxlen=N) 数的是包不是字节 — 同样
+    条数下字节数差 3 个数量级, 会把 64MB 预算用成几十 GB。"""
+
+    def __init__(self, limit_bytes):
+        self.limit_bytes = limit_bytes
+        self._q = deque()
+        self._bytes = 0
+        self.dropped = 0        # 因超限被挤出的包数 (报告如实展示)
+
+    def push(self, pkt):
+        n = len(bytes(pkt))
+        self._q.append((pkt, n))
+        self._bytes += n
+        while self._bytes > self.limit_bytes and len(self._q) > 1:
+            self._bytes -= self._q.popleft()[1]
+            self.dropped += 1
+
+    def slice_window(self, t0, t1):
+        """按包时间戳取 [t0, t1] 窗口 (事件切片)。"""
+        return [p for p, _ in self._q if t0 <= float(p.time) <= t1]
+
+    def packets(self):
+        return [p for p, _ in self._q]
+
+    def __len__(self):
+        return len(self._q)
+
+    @property
+    def cur_bytes(self):
+        return self._bytes
+
+
+def _capture_default_iface():
+    """默认路由出口接口名。scapy 2.7 的 route() 返回 (iface, gw, dst) —
+    取 [2] 会拿到网关 IP 当接口名, 嗅探线程静默死掉一颗包都抓不到 (实机
+    踩过)。route[0] 不在接口清单里时回退 conf.iface; 全失败返回 None。"""
+    try:
+        ifc = conf.route.route("0.0.0.0")[0]
+        if ifc and ifc in (get_if_list() or []):
+            return ifc
+    except Exception:
+        pass
+    try:
+        return str(conf.iface) or None
+    except Exception:
+        return None
+
+
+def _capture_strip_packet(pkt, flow_state):
+    """剥 payload (PR-F1): 返回可入 ring 的包 (截断后重建, 保留原时间戳)。
+
+    - ICMP / UDP 53 (DNS): 整包 (小, 分析需要)
+    - UDP 443 (QUIC): 头 + 16B (仅计数/速率, 不解析)
+    - TCP 80/443/8080: 每流**每方向**前 CAPTURE_FIRST_PKTS 包保留头 +
+      CAPTURE_PAYLOAD_KEEP (提 Host/SNI); 之后截到 TCP 头
+    - 其他 TCP: 截到 TCP 头 (重传/dup-ack/zero-window 判定只需 seq/ack/win/flags)
+
+    flow_state: dict[(sport, dport)] -> 已见包数。key 含方向 (src→dst 的
+    (sport,dport) 与反方向 (dport,sport) 是两个 key), O(1)。
+    只做头长算术, 不触 scapy 字段访问 (prn 零工作原则)。
+    """
+    if not isinstance(pkt, Ether):
+        return pkt                     # 非 Ethernet 链路 (loopback 等): 原样保留
+    raw = bytes(pkt)
+    if len(raw) < 34:                  # Ether + 最小 IP 头都不够
+        return pkt
+    ethertype = (raw[12] << 8) | raw[13]
+    ip_off = 14
+    if ethertype == 0x8100:            # 单层 VLAN tag
+        if len(raw) < 38:
+            return pkt
+        ethertype = (raw[16] << 8) | raw[17]
+        ip_off = 18
+    if ethertype != 0x0800:            # 非 IPv4 (BPF 已滤, 防御)
+        return pkt
+    ihl = (raw[ip_off] & 0x0F) * 4
+    if ihl < 20 or len(raw) < ip_off + ihl:
+        return pkt
+    proto = raw[ip_off + 9]
+    l4_off = ip_off + ihl
+
+    if proto == 1:                     # ICMP: 整包
+        return pkt
+    if proto == 17:                    # UDP
+        if len(raw) < l4_off + 8:
+            return pkt
+        sport = (raw[l4_off] << 8) | raw[l4_off + 1]
+        dport = (raw[l4_off + 2] << 8) | raw[l4_off + 3]
+        if sport == 53 or dport == 53:
+            return pkt                 # DNS: 整包
+        if sport == 443 or dport == 443:
+            keep = l4_off + 8 + 16     # QUIC: 头 + 16B
+        else:
+            return pkt
+    elif proto == 6:                   # TCP
+        if len(raw) < l4_off + 20:
+            return pkt
+        thl = ((raw[l4_off + 12] >> 4) & 0x0F) * 4
+        sport = (raw[l4_off] << 8) | raw[l4_off + 1]
+        dport = (raw[l4_off + 2] << 8) | raw[l4_off + 3]
+        hdr_end = l4_off + thl
+        if sport in CAPTURE_WEB_PORTS or dport in CAPTURE_WEB_PORTS:
+            key = (sport, dport)
+            n = flow_state.get(key, 0)
+            flow_state[key] = n + 1
+            if n < CAPTURE_FIRST_PKTS:
+                keep = hdr_end + CAPTURE_PAYLOAD_KEEP
+            else:
+                keep = hdr_end
+        else:
+            keep = hdr_end
+    else:
+        return pkt                     # 其他协议 (BPF 已滤, 防御)
+
+    if keep >= len(raw):
+        return pkt
+    trimmed = Ether(raw[:keep])
+    trimmed.time = pkt.time            # 截断重建会丢时间戳, 手工带回
+    return trimmed
+
+
+class _PcapCaptureSession:
+    """盯障抓包会话 (PR-F1/F2)。检查链任一失败 → available=False 并给出
+    客户语言提示, 统计层照跑、退出码不变 (方案 §5.4)。
+
+    mode: "slice" (事件触发切片, 默认) / "full" (全程落一个 pcap)。
+    full 模式同样受 --capture-mb 字节上限约束 (超限挤最旧, 报告如实展示
+    dropped 数) — 无上限的「全程」在一台高流量机器上就是磁盘打爆。
+    """
+
+    def __init__(self, mode="slice", max_mb=CAPTURE_DEFAULT_MB):
+        self.mode = mode
+        self.max_mb = max(8, int(max_mb))
+        self.available = False
+        self.unavailable_reason = ""
+        self.iface = None
+        self._sniffer = None
+        self.ring = None
+        self.pkt_count = 0
+        self.dropped = 0
+        self.slices = []           # [{"event_id", "event_type", "ts", "path", "pkts"}]
+        self.full_pcap = None
+        self._flow_state = {}
+        self._lock = threading.Lock()
+        self._seen_events = set()  # {(type, stream, start_ts)}
+        self._pending = []         # [{"due", "ev"}] 待落盘切片
+        self._start_stamp = None
+
+    # ── 检查链: --no-scapy → scapy/Npcap → 管理员 → 出口接口 ──
+    def precheck(self):
+        if FORCE_NO_SCAPY or not SCAPY_AVAILABLE:
+            self.unavailable_reason = ("scapy 被禁用 (--no-scapy 或未安装 scapy), "
+                                       "抓包不可用 — 统计层不受影响")
+            return False
+        if not _npcap_installed():
+            self.unavailable_reason = ("未检测到 Npcap (抓包驱动)。安装: "
+                                       "https://npcap.com 勾选 WinPcap API 兼容模式, "
+                                       "或 netpulse --install; 统计层不受影响")
+            return False
+        if not _is_admin():
+            self.unavailable_reason = ("Npcap 默认只允许管理员抓包 — 请以管理员身份"
+                                       "重跑 (统计层不受影响)")
+            return False
+        try:
+            # 默认路由出口接口 (iface 在 route 3 元组第 0 位, 校验在接口清单内)
+            _iface = _capture_default_iface()
+            if not _iface:
+                raise ValueError("默认路由接口解析为空")
+            self.iface = _iface
+        except Exception as e:
+            self.unavailable_reason = f"解析默认路由接口失败 ({e}); 统计层不受影响"
+            return False
+        self.available = True
+        return True
+
+    def start(self):
+        if not self.available:
+            return False
+        from scapy.all import AsyncSniffer
+        self.ring = _PcapRingBuffer(self.max_mb * 1024 * 1024)
+        self._start_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _cleanup_old_captures()
+
+        def _prn(pkt):
+            # 零工作原则: 只截断 + 入队; 任何异常都不让 sniffer 线程死掉
+            try:
+                kept = _capture_strip_packet(pkt, self._flow_state)
+                with self._lock:
+                    self.ring.push(kept)
+                    self.pkt_count += 1
+            except Exception:
+                pass
+
+        self._sniffer = AsyncSniffer(iface=self.iface,
+                                     filter=CAPTURE_BPF_FILTER,
+                                     prn=_prn, store=False)
+        self._sniffer.start()
+        # 接口/驱动层错误只在嗅探线程内抛 (主线程看不到) — 静默死亡会让
+        # 「已启动」后面跟 0 包。等 1s 验活, 死了按启动失败降级。
+        time.sleep(1.0)
+        _thr = getattr(self._sniffer, "thread", None)
+        if _thr is not None and not _thr.is_alive():
+            self.stop()
+            self.unavailable_reason = ("抓包线程启动后立即退出 (接口或驱动异常), "
+                                       "已降级为仅统计层")
+            return False
+        return True
+
+    def stop(self):
+        if self._sniffer is not None:
+            try:
+                self._sniffer.stop()
+            except Exception:
+                pass
+            self._sniffer = None
+        with self._lock:
+            self.dropped = self.ring.dropped if self.ring else 0
+
+    # ── 事件触发切片 (PR-F2): 由 run_monitor_mode 的循环周期调用 ──
+    def poll_events(self, session, now=None):
+        """增量事件检测 (滚动口径): 检测到新的触发型事件 → 排定「事件结束
+        +30s」落盘。检测是后置的 (事件在快照里成型才看得见), 只能切已过去
+        的窗口, 恰好落在 ring 保留范围内。"""
+        if not self.available or self.mode != "slice":
+            return
+        now = now or time.time()
+        snap = session.snapshot()
+        # 补上会话差分口径, 让 tcp_retrans_burst 在增量检测里也可见
+        # (mtu_mismatch 是持续态, 不在触发集, 无需补 mtu 块)
+        snap["tcp_quality"] = session._tcpstat_quality()
+        for ev in _detect_monitor_events(snap, session._t0, now):
+            if ev["type"] not in CAPTURE_TRIGGER_TYPES:
+                continue
+            key = (ev["type"], ev.get("stream", ""), ev["start_ts"])
+            if key in self._seen_events:
+                continue
+            self._seen_events.add(key)
+            self._pending.append(
+                {"due": ev["end_ts"] + CAPTURE_SLICE_AFTER_S, "ev": dict(ev)})
+        self._flush_due_slices(now)
+
+    def _flush_due_slices(self, now, final=False):
+        remain = []
+        for ps in self._pending:
+            if not final and now < ps["due"]:
+                remain.append(ps)
+                continue
+            ev = ps["ev"]
+            t0 = ev["start_ts"] - CAPTURE_SLICE_BEFORE_S
+            t1 = min(ev["end_ts"] + CAPTURE_SLICE_AFTER_S, now)
+            pkts = self.ring.slice_window(t0, t1) if self.ring else []
+            if pkts:
+                path = self._write_pcap(
+                    pkts, f"{self._start_stamp}_slice_{ev['type']}")
+                if path:
+                    self.slices.append({
+                        "event_type": ev["type"], "event_stream": ev.get("stream", ""),
+                        "event_start": round(ev["start_ts"] - 0, 3),
+                        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "path": os.path.basename(path), "pkts": len(pkts),
+                        "rel": _cap_relpath(path, _report_dir())})
+        self._pending = remain
+
+    def _write_pcap(self, pkts, stem):
+        try:
+            from scapy.all import wrpcap
+            cap_dir = _captures_dir()
+            os.makedirs(cap_dir, exist_ok=True)
+            path = os.path.join(cap_dir, f"monitor_{stem}.pcap")
+            # 同一事件类型多次触发 (如多段抖动): start_ts 区分, 不覆盖
+            if os.path.exists(path):
+                path = path.replace(".pcap", f"_{int(time.time())}.pcap")
+            wrpcap(path, pkts)
+            return path
+        except Exception:
+            return None
+
+    def finish(self, result):
+        """会话收尾: 冲洗未到期切片 / full 模式整体落盘; 给权威事件挂切片
+        相对链接; 返回可序列化的 capture 摘要块 (挂 result["capture"])。"""
+        if not self.available:
+            return None
+        self._flush_due_slices(time.time(), final=True)
+        if self.mode == "full" and self.ring and len(self.ring):
+            path = self._write_pcap(self.ring.packets(),
+                                    f"{self._start_stamp}_full")
+            self.full_pcap = os.path.basename(path) if path else None
+        # 权威事件 (build_result 已编 id) ← 切片匹配: (type, stream, start_ts)
+        slice_index = {(s["event_type"], s["event_stream"],
+                        round(s["event_start"], 3)): s for s in self.slices}
+        report_dir = _report_dir()
+        for ev in result.get("events", []):
+            key = (ev.get("type", ""), ev.get("stream", ""),
+                   round(ev.get("start_ts", 0), 3))
+            s = slice_index.get(key)
+            if not s:
+                continue
+            cap_path = os.path.join(_captures_dir(), s["path"])
+            ev["pcap_slice"] = _cap_relpath(cap_path, report_dir)
+        return {
+            "mode": self.mode,
+            "available": True,
+            "iface": self.iface,
+            "filter": CAPTURE_BPF_FILTER,
+            "packets_captured": self.pkt_count,
+            "ring_bytes": self.ring.cur_bytes if self.ring else 0,
+            "ring_limit_mb": self.max_mb,
+            "dropped_old": self.dropped,
+            "slice_before_s": CAPTURE_SLICE_BEFORE_S,
+            "slice_after_s": CAPTURE_SLICE_AFTER_S,
+            "retention_days": CAPTURE_RETENTION_DAYS,
+            "max_slice_files": CAPTURE_MAX_FILES,
+            "slices": self.slices,
+            "full_pcap": self.full_pcap,
+            "full_pcap_rel": (_cap_relpath(
+                os.path.join(_captures_dir(), self.full_pcap), report_dir)
+                if self.full_pcap else None),
+        }
+
+
+# ============================================================
+# SECTION 4b: 抓包证据分析 (PR-F3) — PcapAnalyzer
+# 离线分析切片 pcap → 结构化结论。只依赖头部字段 + 首 2 包 384B,
+# 不依赖应用层内容 (隐私红线)。scapy 缺失时不可用 (调用方需降级)。
+# ============================================================
+
+@dataclass
+class CaptureDiagnostic:
+    """抓包切片分析结论; to_dict() 后可整体 JSON 序列化。"""
+    icmp_count: int = 0
+    # [(ts, next_hop_mtu)] — PMTUD 信号 A (ICMP 3/4) 的直接证据
+    icmp_frag_needed: list = field(default_factory=list)
+    # 每方向一条流摘要 (见 PcapAnalyzer._flow_state 的键)
+    streams: list = field(default_factory=list)
+    tcp_retransmit_count: int = 0
+    tcp_dup_ack_count: int = 0
+    tcp_rst_count: int = 0
+    tcp_zero_window_n: int = 0
+    dns_query_count: int = 0
+    dns_slow_queries: list = field(default_factory=list)  # [(q_ts, r_ts, name)]
+    http_hosts: list = field(default_factory=list)
+    tls_sni: list = field(default_factory=list)           # 含 "sni_truncated" 占位
+    udp443_pkts: int = 0
+    retrans_rate: float = 0.0
+    suspected_pmtud_blackhole: bool = False
+    suspected_tcp_loss_burst: bool = False
+    suspected_dns_slow: bool = False
+
+    def to_dict(self):
+        return {
+            "icmp_count": self.icmp_count,
+            "icmp_frag_needed": [list(t) for t in self.icmp_frag_needed],
+            "streams": self.streams,
+            "tcp_retransmit_count": self.tcp_retransmit_count,
+            "tcp_dup_ack_count": self.tcp_dup_ack_count,
+            "tcp_rst_count": self.tcp_rst_count,
+            "tcp_zero_window_n": self.tcp_zero_window_n,
+            "dns_query_count": self.dns_query_count,
+            "dns_slow_queries": [list(t) for t in self.dns_slow_queries],
+            "http_hosts": self.http_hosts,
+            "tls_sni": self.tls_sni,
+            "udp443_pkts": self.udp443_pkts,
+            "retrans_rate": self.retrans_rate,
+            "suspected_pmtud_blackhole": self.suspected_pmtud_blackhole,
+            "suspected_tcp_loss_burst": self.suspected_tcp_loss_burst,
+            "suspected_dns_slow": self.suspected_dns_slow,
+        }
+
+
+class PcapAnalyzer:
+    """三信号 PMTUD 判定 + 轻量流重组 (方案 §6.1/§6.3)。
+
+    - 信号 A: ICMP type3/code4 (frag-needed, 含 next-hop MTU);
+    - 信号 B: 握手成功 (双向 MSS≥1400) + full-size 段同 seq 停滞 (≥3 次)
+      且小包仍在流动;
+    - 信号 C: SYN MSS > path_mtu - 40 (path_mtu 来自 F0 统计层, 可缺省)。
+    判定: A 或 (B∧C) → suspected_pmtud_blackhole; 仅 B → tcp_loss 候选。
+    MSS<1460 本身不是判据 (PPPoE 正常 1452)。
+    """
+
+    DNS_SLOW_S = 1.0          # query→resp 超过该值记慢查询
+    RETRANS_GAP_S = 1.0       # 同 seq 间隔超此值视为新一轮首传 (慢速场景)
+    DUP_ACK_MIN = 3           # 连续重复 ack ≥3 才记 dup ack
+    FULLSIZE_BYTES = 1200     # payload 超此值算 full-size 段 (PMTUD 嫌疑段)
+    STALL_SEEN_MIN = 3        # 同 (seq,len) 出现 ≥3 次 (含首传) 判停滞
+    MSS_HANDSHAKE_MIN = 1400  # 握手 MSS 下限 — 低于此可能是隧道/PPPoE 正常小 MSS
+    MSS_OVER_PATH = 40        # 信号 C 裕量: IP+TCP 头
+    LOSS_RATE = 0.08          # 重传占比阈值 (拥塞丢包)
+    LOSS_MIN_SEGS = 50        # 样本不足不判 loss (防小样本误报)
+
+    _HTTP_STARTS = (b"GET ", b"POST ", b"PUT ", b"HEAD ", b"DELETE ",
+                    b"OPTIONS ", b"PATCH ", b"HTTP/1.")
+
+    def __init__(self, path_mtu=None):
+        self.path_mtu = path_mtu
+
+    # ---- 对外入口 --------------------------------------------------
+    def analyze(self, src) -> CaptureDiagnostic:
+        """src: scapy 包列表, 或 pcap 文件路径 (rdpcap 读取)。"""
+        if not SCAPY_AVAILABLE:
+            raise RuntimeError("scapy 不可用, 无法分析抓包")
+        pkts = src
+        if isinstance(src, str):
+            from scapy.all import rdpcap
+            pkts = rdpcap(src)
+        d = CaptureDiagnostic()
+        flows = {}
+        dns_pending = {}          # (client_port, dns_id) -> (q_ts, name)
+        small_ack_n = 0           # 全局纯 ACK/keepalive 包数 (小包仍在流动)
+        data_seg_n = 0
+        for pkt in pkts:
+            try:
+                ts = float(pkt.time)
+            except Exception:
+                ts = 0.0
+            ip = pkt.getlayer(IP)
+            if ip is None:
+                continue
+            l4 = ip.payload          # 只看外层 L4 — ICMP 引用的原包不算流
+            if isinstance(l4, TCP):
+                key = (ip.src, l4.sport, ip.dst, l4.dport)
+                st = self._flow_state(flows, key)
+                fl = str(l4.flags)
+                mss = self._tcp_mss(l4)
+                if fl == "S":
+                    st["syn_n"] += 1
+                    if st["syn_mss"] is None and mss:
+                        st["syn_mss"] = mss
+                elif fl == "SA":
+                    st["synack_seen"] = True
+                    if st["synack_mss"] is None and mss:
+                        st["synack_mss"] = mss
+                if "R" in fl:
+                    st["rst_n"] += 1
+                if l4.window == 0 and "S" not in fl:
+                    st["zero_win_n"] += 1
+                raw = bytes(l4.payload)
+                plen = len(raw)
+                if plen == 0:
+                    if "S" not in fl and "F" not in fl:
+                        small_ack_n += 1
+                        self._dup_ack(d, st, l4.ack)
+                else:
+                    data_seg_n += 1
+                    self._data_segment(d, st, ts, l4.seq, plen)
+                    self._l7_extract(d, key, raw)
+            elif isinstance(l4, UDP):
+                if l4.dport == 443 or l4.sport == 443:
+                    d.udp443_pkts += 1
+                elif l4.dport == 53 or l4.sport == 53:
+                    self._dns_track(d, dns_pending, ip, l4, ts)
+            elif isinstance(l4, ICMP):
+                d.icmp_count += 1
+                if int(l4.type) == 3 and int(l4.code) == 4:
+                    mtu = self._icmp_next_hop_mtu(l4)
+                    d.icmp_frag_needed.append((round(ts, 3), mtu))
+        # ---- 汇总流表 ----
+        for key, st in flows.items():
+            rev = flows.get((key[2], key[3], key[0], key[1]))
+            handshake_ok = st["synack_seen"] or bool(rev and rev["synack_mss"])
+            if st["syn_n"] >= 2 and not handshake_ok:
+                st["syn_retrans_n"] = st["syn_n"]   # SYN 反复无应答
+            d.tcp_rst_count += st["rst_n"]
+            d.tcp_zero_window_n += st["zero_win_n"]
+            d.streams.append({
+                "key": f"{key[0]}:{key[1]}>{key[2]}:{key[3]}",
+                "syn_mss": st["syn_mss"],
+                # SYN-ACK 在反方向流上 — 汇总进本条便于报告展示
+                "synack_mss": st["synack_mss"]
+                or ((rev or {}).get("synack_mss")),
+                "syn_retrans_n": st["syn_retrans_n"],
+                "rst_n": st["rst_n"], "zero_win_n": st["zero_win_n"],
+                "fullsize_stall": st["fullsize_stall"],
+            })
+        # ---- 三信号判定 ----
+        sig_a = bool(d.icmp_frag_needed)
+        sig_b = self._signal_b(flows, small_ack_n)
+        sig_c = self._signal_c(flows)
+        d.suspected_pmtud_blackhole = sig_a or (sig_b and sig_c)
+        rate = (d.tcp_retransmit_count / data_seg_n) if data_seg_n else 0.0
+        d.retrans_rate = round(rate, 4)
+        d.suspected_tcp_loss_burst = (
+            (sig_b and not d.suspected_pmtud_blackhole)
+            or (data_seg_n >= self.LOSS_MIN_SEGS and rate >= self.LOSS_RATE))
+        d.suspected_dns_slow = len(d.dns_slow_queries) >= 2
+        return d
+
+    # ---- 内部工具 --------------------------------------------------
+    @staticmethod
+    def _flow_state(flows, key):
+        st = flows.get(key)
+        if st is None:
+            st = {"syn_n": 0, "synack_seen": False, "syn_mss": None,
+                  "synack_mss": None, "syn_retrans_n": 0, "rst_n": 0,
+                  "zero_win_n": 0, "seg": {}, "last_ack": None,
+                  "ack_rep": 0, "ack_flagged": False, "fullsize_stall": False}
+            flows[key] = st
+        return st
+
+    @staticmethod
+    def _tcp_mss(t):
+        for name, val in (t.options or []):
+            if name == "MSS":
+                if isinstance(val, (bytes, bytearray)):
+                    return int.from_bytes(val, "big")
+                return int(val)
+        return None
+
+    @staticmethod
+    def _dup_ack(d, st, ack):
+        """连续重复 ack (无 payload) 达阈值记 1 次 dup-ack 突发。"""
+        if ack == st["last_ack"]:
+            st["ack_rep"] += 1
+            if st["ack_rep"] >= PcapAnalyzer.DUP_ACK_MIN and not st["ack_flagged"]:
+                d.tcp_dup_ack_count += 1
+                st["ack_flagged"] = True
+        else:
+            st["last_ack"] = ack
+            st["ack_rep"] = 0
+            st["ack_flagged"] = False
+
+    def _data_segment(self, d, st, ts, seq, plen):
+        """重传 = 同流同方向 payload>0 且 (seq,len) 相同, 间隔 ≤1s。"""
+        ent = st["seg"].get((seq, plen))
+        if ent is None:
+            st["seg"][(seq, plen)] = [ts, 1]
+            return
+        if ts - ent[0] <= self.RETRANS_GAP_S:
+            ent[1] += 1
+            d.tcp_retransmit_count += 1
+            if plen > self.FULLSIZE_BYTES and ent[1] >= self.STALL_SEEN_MIN:
+                st["fullsize_stall"] = True
+        else:
+            ent[1] = 1        # 间隔过久 — 视为应用层重发/新一轮首传
+        ent[0] = ts
+
+    def _l7_extract(self, d, key, raw):
+        """仅限首 2 包 384B 窗口内的 Host / SNI (方案 §5.2 隐私设计)。"""
+        dport = key[3]
+        head = raw[:CAPTURE_PAYLOAD_KEEP] if len(raw) > CAPTURE_PAYLOAD_KEEP else raw
+        if dport in CAPTURE_WEB_PORTS and head.startswith(self._HTTP_STARTS):
+            m = re.search(rb"(?im)^host:\s*([^\r\n]+)", head)
+            if m:
+                host = m.group(1).decode("ascii", "ignore").strip()
+                if host and host not in d.http_hosts:
+                    d.http_hosts.append(host)
+        elif dport == 443 and head[:1] == b"\x16":
+            sni = self._parse_sni(head)
+            if sni and sni not in d.tls_sni:
+                d.tls_sni.append(sni)
+
+    @classmethod
+    def _parse_sni(cls, buf):
+        """ClientHello 头部解析 SNI; 结构不完整 (截断) → "sni_truncated"。"""
+        try:
+            off = 5                                   # TLS record 头
+            if len(buf) < off or buf[0] != 0x16:
+                return None
+            if buf[off] != 0x01:                      # ClientHello
+                return None
+            off += 4                                  # handshake 头
+            off += 2 + 32                             # 版本 + random
+            if off >= len(buf):
+                return "sni_truncated"
+            off += 1 + buf[off]                       # session_id
+            if off + 2 > len(buf):
+                return "sni_truncated"
+            off += 2 + int.from_bytes(buf[off:off + 2], "big")   # cipher suites
+            if off >= len(buf):
+                return "sni_truncated"
+            off += 1 + buf[off]                       # compression
+            if off + 2 > len(buf):
+                return "sni_truncated"
+            exts_len = int.from_bytes(buf[off:off + 2], "big")
+            off += 2
+            end = min(off + exts_len, len(buf))
+            while off + 4 <= end:
+                etype = int.from_bytes(buf[off:off + 2], "big")
+                elen = int.from_bytes(buf[off + 2:off + 4], "big")
+                off += 4
+                if off + elen > len(buf):
+                    return "sni_truncated"
+                if etype == 0x0000:                   # server_name
+                    p = off + 2                       # 跳过 list 长度
+                    if p + 3 > len(buf):
+                        return "sni_truncated"
+                    if buf[p] == 0x00:                # host_name
+                        p += 1
+                        nl = int.from_bytes(buf[p:p + 2], "big")
+                        p += 2
+                        if p + nl > len(buf):
+                            return "sni_truncated"
+                        return buf[p:p + nl].decode("ascii", "ignore")
+                    return None
+                off += elen
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _dns_track(d, pending, ip, u, ts):
+        dns = u.payload
+        if not isinstance(dns, DNS):
+            return
+        try:
+            qid = int(dns.id)
+            if u.dport == 53:                         # 查询
+                name = ""
+                if dns.qd is not None:
+                    qn = dns.qd.qname
+                    name = (qn.decode("ascii", "ignore")
+                            if isinstance(qn, (bytes, bytearray)) else str(qn))
+                    name = name.rstrip(".")
+                d.dns_query_count += 1
+                pending[(u.sport, qid)] = (ts, name)
+            else:                                     # 响应
+                ent = pending.pop((u.dport, qid), None)
+                if ent and ts - ent[0] > PcapAnalyzer.DNS_SLOW_S:
+                    d.dns_slow_queries.append(
+                        (round(ent[0], 3), round(ts, 3), ent[1]))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _icmp_next_hop_mtu(ic):
+        """nexthopmtu 在 ICMP 头 4B 保留字段的低 2B (偏移 6..8)。
+        真实抓包 (dissect) 直接给 nexthopmtu 字段; 合成/未 build 的包
+        只能读 unused 原始字节 (bytes() 重建会把 unused 抹成 nexthopmtu=0)。"""
+        try:
+            mtu = int(getattr(ic, "nexthopmtu", 0) or 0)
+            if mtu:
+                return mtu
+            unused = getattr(ic, "unused", None)
+            if isinstance(unused, (bytes, bytearray)) and len(unused) >= 4:
+                return int.from_bytes(unused[2:4], "big")
+            return 0
+        except Exception:
+            return 0
+
+    def _signal_b(self, flows, small_ack_n):
+        """行为签名: 停滞流握手正常 (双向 MSS≥1400) 且小包仍在流动。"""
+        if small_ack_n < 3:
+            return False
+        for key, st in flows.items():
+            if not st["fullsize_stall"]:
+                continue
+            rev = flows.get((key[2], key[3], key[0], key[1]))
+            synack_mss = (rev or {}).get("synack_mss")
+            if ((st["syn_mss"] or 0) >= self.MSS_HANDSHAKE_MIN
+                    and (synack_mss or 0) >= self.MSS_HANDSHAKE_MIN):
+                return True
+        return False
+
+    def _signal_c(self, flows):
+        """SYN MSS 超过 path_mtu-40 (需 F0 统计层提供 path_mtu)。"""
+        if not self.path_mtu:
+            return False
+        limit = self.path_mtu - self.MSS_OVER_PATH
+        return any(st["syn_mss"] and st["syn_mss"] > limit
+                   for st in flows.values())
+
+
+def _merge_capture_diag(dst: CaptureDiagnostic, src: CaptureDiagnostic):
+    """多切片诊断合并 (计数累加 / 疑点取或 / 域名去重 / 重传率取最差)。"""
+    dst.icmp_count += src.icmp_count
+    dst.icmp_frag_needed += src.icmp_frag_needed
+    dst.tcp_retransmit_count += src.tcp_retransmit_count
+    dst.tcp_dup_ack_count += src.tcp_dup_ack_count
+    dst.tcp_rst_count += src.tcp_rst_count
+    dst.tcp_zero_window_n += src.tcp_zero_window_n
+    dst.dns_query_count += src.dns_query_count
+    dst.dns_slow_queries += src.dns_slow_queries
+    dst.udp443_pkts += src.udp443_pkts
+    for h in src.http_hosts:
+        if h not in dst.http_hosts:
+            dst.http_hosts.append(h)
+    for s in src.tls_sni:
+        if s not in dst.tls_sni:
+            dst.tls_sni.append(s)
+    dst.streams += src.streams
+    dst.retrans_rate = max(dst.retrans_rate, src.retrans_rate)
+    dst.suspected_pmtud_blackhole |= src.suspected_pmtud_blackhole
+    dst.suspected_tcp_loss_burst |= src.suspected_tcp_loss_burst
+    dst.suspected_dns_slow |= src.suspected_dns_slow
+
+
+def _apply_capture_evidence(result):
+    """PR-F4 (方案 §7.2): 抓包证据联动盯障结论 — finish() 之后调用。
+
+    - 对切片 (与全程 pcap) 离线跑 PcapAnalyzer; 信号 C 用统计层最小有效 path_mtu;
+    - suspected_* → 结论/建议追加 + verdict 升级 (stable→degraded) + 对应事件
+      根因标注 (报告里显示 "🔬 抓包佐证" 徽标);
+    - 置信度: 黑洞确认 92% / 其他佐证 85% — 无抓包证据时不出该字段;
+    - 抓包永远不是判定的前置条件: 本函数只追加佐证, 不推翻统计层结论。
+    单个切片分析失败跳过; 全部失败时不改 result 任何字段。"""
+    cap = result.get("capture") or {}
+    names = [s.get("path") or "" for s in (cap.get("slices") or [])]
+    if cap.get("full_pcap"):
+        names.append(cap["full_pcap"])
+    names = [n for n in names if n]
+    if not names:
+        return
+    # 信号 C 输入: 统计层 path_mtu 取最小有效值 (最受限通道)
+    path_mtu = None
+    for r in (result.get("mtu") or {}).get("path_mtus") or []:
+        v = r.get("path_mtu")
+        if v and not r.get("error") and (path_mtu is None or v < path_mtu):
+            path_mtu = v
+    cap_dir = _captures_dir()
+    merged = CaptureDiagnostic()
+    analyzed = 0
+    for name in names:
+        p = os.path.join(cap_dir, name)
+        if not os.path.exists(p):
+            continue
+        try:
+            _merge_capture_diag(
+                merged, PcapAnalyzer(path_mtu=path_mtu).analyze(p))
+            analyzed += 1
+        except Exception:
+            continue
+    if not analyzed:
+        return
+    cap["analysis"] = merged.to_dict()
+    cap["analysis_files"] = analyzed
+
+    events = result.get("events", [])
+
+    def _tag(evs, note):
+        for ev in evs:
+            ev["pcap_evidence"] = note
+            base = ev.get("root_cause", "")
+            if "抓包" not in base:
+                ev["root_cause"] = (base + "；" if base else "") \
+                    + f"抓包佐证: {note}"
+
+    text_bits, advice_bits, summary_bits = [], [], []
+    if merged.suspected_pmtud_blackhole:
+        if result.get("verdict") == "stable":
+            result["verdict"] = "degraded"
+        if merged.icmp_frag_needed:
+            mtus = sorted({m for _, m in merged.icmp_frag_needed if m})
+            ms = (f"下一跳 MTU {'/'.join(str(m) for m in mtus)}"
+                  if mtus else "未携带 MTU 值")
+            text_bits.append(
+                f"抓包证据: 捕获 ICMP 需分片指示 {len(merged.icmp_frag_needed)} 个"
+                f" ({ms}) — PMTU 黑洞确认")
+        else:
+            text_bits.append(
+                "抓包证据: 大包同序号反复重传 (停滞) 且小包正常流动, 结合握手 MSS "
+                "大于路径 MTU — 判 PMTU 黑洞 (分片指示 ICMP 被链路丢弃, 黑洞典型形态)")
+        advice_bits.append(
+            "处置后复跑 netpulse --monitor --capture slice 验证 — "
+            "切片会再次自动取证, 对比前后两份报告")
+        result["confidence"] = 92
+        result["confidence_basis"] = "抓包证据确认 (ICMP 分片指示/大包停滞直接佐证)"
+        summary_bits.append("抓包确认 PMTU 黑洞")
+        _tag([e for e in events if e["type"] == "mtu_mismatch"],
+             "PMTU 黑洞 (抓包确认)")
+        _tag([e for e in events if e["type"] == "tcp_retrans_burst"],
+             "重传源于 PMTU 黑洞 (抓包佐证)")
+    elif merged.suspected_tcp_loss_burst:
+        if result.get("verdict") == "stable":
+            result["verdict"] = "degraded"
+        text_bits.append(
+            f"抓包证据: 重传占比 {merged.retrans_rate * 100:.1f}% 分布于 "
+            f"{len(merged.streams)} 条流, 无大包停滞 — 链路丢包/拥塞佐证")
+        advice_bits.append(
+            "抓包佐证链路层丢包: 带上本报告与切片 pcap 向运营商报障 "
+            "(报告含重传时序, 切片含逐包证据)")
+        result["confidence"] = 85
+        result["confidence_basis"] = "抓包佐证 (重传分布形态)"
+        summary_bits.append("抓包佐证链路丢包")
+        _tag([e for e in events if e["type"] == "tcp_retrans_burst"],
+             "链路丢包/拥塞 (抓包佐证)")
+    if merged.suspected_dns_slow:
+        if result.get("verdict") == "stable" and not text_bits:
+            result["verdict"] = "degraded"
+        worst = max(r[1] - r[0] for r in merged.dns_slow_queries)
+        text_bits.append(
+            f"抓包证据: {len(merged.dns_slow_queries)} 次 DNS 解析超 1s "
+            f"(最长 {worst:.1f}s)")
+        if not result.get("confidence"):
+            result["confidence"] = 85
+            result["confidence_basis"] = "抓包佐证 (DNS 慢查询)"
+        _tag([e for e in events if e["type"] == "dns_fail"],
+             "DNS 解析慢 (抓包佐证)")
+    if text_bits:
+        result["conclusion_text"] = \
+            (result.get("conclusion_text") or "") + "；" + "；".join(text_bits)
+    if advice_bits:
+        prev = result.get("advice") or ""
+        result["advice"] = (prev + "\n" if prev else "") + "\n".join(advice_bits)
+    if summary_bits:
+        result["summary"] = \
+            (result.get("summary") or "") + ", " + ", ".join(summary_bits)
+
+
+def run_monitor_mode(duration_s, ext_target=None, load_url=None,
+                     capture_mode=None, capture_mb=CAPTURE_DEFAULT_MB):
     """盯障模式入口 (CLI --monitor 与菜单 m 共用)。
 
     全文件唯一在长循环外层捕获 KeyboardInterrupt 的地方: Ctrl+C 提前结束
@@ -10984,10 +12009,32 @@ def run_monitor_mode(duration_s, ext_target=None, load_url=None):
     print(_c("  统计层 (v1.7.0): 后台探测路径 MTU + TCP 重传统计 30s 采样"
              + ("; 已排定主动下载负载 (--monitor-load)" if load_url else ""),
              C_GRAY))
+    # 抓包层 (v1.8.0 PR-F1): 显式 --capture 才启用; 检查链失败 → 降级提示,
+    # 统计层照跑、退出码不变
+    cap = None
+    if capture_mode:
+        # 首次使用确认 (PR-F5): 拒绝 → 降级仅统计层, 盯障照常
+        if not _capture_confirm_once():
+            print(_c("  已跳过抓包 (未确认), 继续仅统计层监测", C_YELLOW))
+            capture_mode = None
+    if capture_mode:
+        cap = _PcapCaptureSession(capture_mode, capture_mb)
+        if cap.precheck():
+            if cap.start():
+                print(_c(f"  抓包层 (v1.8.0): 已启动 ({'事件触发切片' if capture_mode == 'slice' else '全程落盘'}, "
+                         f"{capture_mb}MB 上限, 接口 {cap.iface}; 仅保留包头/首 2 包 384B, 不存应用内容)",
+                         C_GRAY))
+            else:
+                print(_c("  ✗ 抓包启动失败, 继续仅统计层监测", C_YELLOW))
+                cap = None
+        else:
+            print(_c(f"  抓包不可用: {cap.unavailable_reason}", C_YELLOW))
+            cap = None
     early = False
     tty = sys.stdout.isatty()
     mono0 = time.monotonic()
     last_heartbeat = -61
+    last_poll = -6.0
     try:
         while True:
             elapsed = time.monotonic() - mono0
@@ -11001,6 +12048,14 @@ def run_monitor_mode(duration_s, ext_target=None, load_url=None):
                 print(line)
                 last_heartbeat = elapsed
             session.maybe_recheck_gateway(elapsed)
+            # 事件触发切片 (PR-F2): 每 5s 增量跑一次事件检测, 新触发型事件
+            # 排定切片落盘 (检测后置, 切的都是已过去窗口)
+            if cap and elapsed - last_poll >= 5:
+                last_poll = elapsed
+                try:
+                    cap.poll_events(session)
+                except Exception:
+                    pass       # 切片失败不影响盯障主路径
             time.sleep(1)
     except KeyboardInterrupt:
         early = True
@@ -11011,7 +12066,18 @@ def run_monitor_mode(duration_s, ext_target=None, load_url=None):
         print(_c("  收到 Ctrl+C, 提前结束监测..." if early else "  监测完成, 汇总数据...",
                  C_YELLOW if early else C_GREEN))
         session.stop()
+        if cap:
+            cap.stop()
     result = session.build_result(early_terminated=early)
+    if cap:
+        cap_block = cap.finish(result)
+        if cap_block:
+            result["capture"] = cap_block
+            # PR-F4: 切片离线分析 → 结论联动 (失败不影响报告落盘)
+            try:
+                _apply_capture_evidence(result)
+            except Exception:
+                pass
     paths = save_monitor_report(result)
     print(_c(f"  {result['summary']}", C_GREEN))
     if paths:
@@ -16637,6 +17703,16 @@ def main():
     parser.add_argument("--load-url", metavar="URL",
                         help="主动负载的下载地址 (默认微信安装包 CDN 大文件, "
                              "配合 --monitor-load 使用)")
+    parser.add_argument("--capture", nargs="?", const="slice",
+                        choices=["slice", "full"], default=None, metavar="MODE",
+                        help="盯障期间抓包取证 (需 Npcap + 管理员; 默认关闭): "
+                             "slice=事件触发落盘前后 30s 切片, full=全程落一个 "
+                             "pcap。仅保留包头 + 80/443 每流首 2 包 384B (提 "
+                             "Host/SNI), 不存应用内容; 配合 --monitor 使用")
+    parser.add_argument("--capture-mb", type=int, default=CAPTURE_DEFAULT_MB,
+                        metavar="N",
+                        help=f"抓包缓冲上限 MB (默认 {CAPTURE_DEFAULT_MB}, 最小 8); "
+                             "超限挤掉最旧包并如实报告; 配合 --capture 使用")
     args = parser.parse_args()
 
     # `netpulse diagnose <profile>` 子命令形式 (与 README/CHANGELOG 文档口径
@@ -16750,6 +17826,8 @@ def main():
         _exit_with_status()
         return
     # 盯障模式: 独立顶层运行模式 (与模块诊断互斥)
+    if args.capture and not args.monitor:
+        print(_c("  提示: --capture 仅在 --monitor 盯障模式下生效, 本次已忽略", C_YELLOW))
     if args.monitor:
         # v1.7.0 (PR-F0): 主动负载 opt-in — --monitor-load 用默认 CDN 大文件,
         # --load-url 可覆盖地址; 两者都没给则不制造流量
@@ -16758,7 +17836,8 @@ def main():
         else:
             load_url = None
         run_monitor_mode(args.monitor, ext_target=args.monitor_target,
-                         load_url=load_url)
+                         load_url=load_url, capture_mode=args.capture,
+                         capture_mb=args.capture_mb)
         return
     if args.modules:
         is_all_only = (args.modules == ["all"])

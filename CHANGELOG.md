@@ -7,6 +7,27 @@
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-09-01
+
+盯障抓包取证层（阶段 F 第二步 / PR-F1~F5）：统计层说「有病」，抓包层给「证据」。`--capture` 显式开启（默认关闭，需 Npcap + 管理员），事件触发自动落盘切片 pcap + 离线三信号分析，结论联动置信度。隐私红线：**只存包头，不存任何应用内容**。
+
+### 新增
+
+- **抓包核心（PR-F1）**：`_PcapCaptureSession`（AsyncSniffer + BPF `ip and (icmp or udp port 53 or tcp or udp port 443)`，显式 v4）；`_capture_strip_packet` 隐私剥离——80/443/8080 每流**前 2 包**保留头部 +384B（提取 Host/SNI 用），QUIC 头 +16B，DNS/ICMP 整包，其余 TCP 剥到头部；`_PcapRingBuffer` **字节记账**环形缓冲（默认 64MB，`--capture-mb` 8 下限），超限挤最旧并如实报告挤出数；prn 回调零工作原则（只截断入队，分析全部后置）。检查链四级降级（--no-scapy / scapy 缺失 / Npcap 缺失含 npcap.com 安装指引 / 非管理员），任一失败给客户语言原因、统计层照跑、退出码不变
+- **事件触发切片（PR-F2）**：outage / jitter_burst / tcp_fail / tcp_retrans_burst 事件结束后 30s 落盘**前后各 30s** 窗口切片（`monitor_时间戳_slice_类型.pcap`，Wireshark 直开；mtu_mismatch 是持续态不触发）；盯障主循环 5s 增量跑事件检测（复用 `_detect_monitor_events` + 抽取的 `MonitorSession._tcpstat_quality`）；报告事件表挂切片链接；`_cleanup_old_captures` 超 7 天或超 10 个，下次运行时自动清理（措辞如实）；`--capture full` 全程单文件模式
+- **离线证据分析（PR-F3）**：`PcapAnalyzer` + `CaptureDiagnostic`——按 (src,sport,dst,dport) 方向流重组：同 (seq,len) 间隔 ≤1s 计重传（>1s 视为应用层重发不计）、连续重复 ack ≥3 计 dup-ack、SYN 反复无应答单独计数（不算数据重传）、RST/零窗口、full-size(>1200B) 同序号 ≥3 次判**停滞**；DNS query→resp 配对计时（>1s 慢查询）；SNI/Host 从 384B 窗口解析（越界记 `sni_truncated` 不误报）。**三信号 PMTUD 判定**：A=ICMP 3/4（含下一跳 MTU）、B=握手 MSS≥1400 + full-size 停滞 + 小包正常流动、C=SYN MSS>路径 MTU−40（由统计层提供）——A 或 B∧C 判黑洞，仅 B 或重传率 ≥8%（≥50 段）判链路丢包；MSS<1460 本身不是判据（PPPoE 1452 正常）
+- **结论联动（PR-F4）**：`_apply_capture_evidence` 对全部切片离线分析合并——suspected_* 追加进盯障结论/建议/摘要（不推翻统计层判定，抓包永远不是规则前置）、verdict stable→degraded、对应事件根因标注 `🔬 抓包分析` 徽标、**置信度**：黑洞确认 92% / 链路丢包·DNS 佐证 85%（无证据不出该字段）；报告 banner 置信度徽标 + 抓包面板「证据分析」行（重传/dup-ack/RST/零窗口/ICMP/SNI 提取/DNS 汇总）+ JSON `capture.analysis` 块
+- **首次使用确认（PR-F5）**：`--capture` 首次运行弹隐私说明（只存包头/不存账号密码内容/域名会出现/自动清理策略）需确认，`reports/captures/.capture_ack` 记住选择只问一次；非交互环境不阻塞（--capture 即显式授权）；拒绝则降级仅统计层盯障照常
+
+### 变更
+
+- 版本 1.7.0 → 1.8.0；README 同步（特性/用法示例/参数表/盯障报告节/可选依赖表/目录结构）；captures 目录在 `reports/` 下，已被现有 .gitignore 规则覆盖无需新增
+- **实机修复：默认路由接口取错索引**——scapy 2.7 的 `route()` 返回 3 元组 `(iface, gw, dst)`，原取 `[2]` 把网关 IP 当接口名传给 AsyncSniffer，嗅探线程静默死亡而主流程仍报「已启动」（实测 0 包）。现 `_capture_default_iface()` 取 `[0]` 并校验在 `get_if_list()` 清单内（不符回退 `conf.iface`）；`start()` 加 1s 线程验活，死了按启动失败降级并给原因，杜绝「已启动 + 0 包」假成功
+
+### 验证
+
+`tests/` 190 → 256 项：新增 `tests/test_pcap_capture.py` 36 项（RingBuffer 字节记账/剥离矩阵数值验证/切片窗口与命名 rdpcap 回读/清理年龄+个数双策略/检查链降级/finish 挂链/首次确认 5 态/接口解析 4 态 + precheck 挂接/嗅探线程验活死活两态）、`tests/test_pcap_analyzer.py` 20 项（方案 §9.1 场景 1-8：三信号各分支/PPPoE 不误报/拥塞 vs 黑洞/SYN 重传口径/边界（>1s 不计、dup-ack<3 不计）/SNI 截断/DNS 慢查询/pcap 文件输入与 JSON 序列化）、`tests/test_pcap_evidence.py` 10 项（联动结论/verdict 升级/置信度 92·85/事件标注/C 信号来自统计层/坏文件缺文件兜底/无证据不改结论/HTML 徽标与证据行）。`_smoke_report.py` +9 项 v1.8.0 断言（真实调用验证：三信号判黑洞、RingBuffer 挤出、剥离矩阵、临时 pcap 走 `_apply_capture_evidence` 全链路、确认标记免问）、共 244 项全绿。**实机双轮走查**（Windows 11 + Npcap）：①非管理员 60s——检查链第 4 级拦截、客户语言降级、统计层照常出报告、无残留 capture 块；②管理员 240s `--monitor --capture full --monitor-load`——接口解析正确（NPF 设备名）、40,796 包入环形缓冲仅 2.5MB（隐私剥离实效，均值 ~62B/包）、full pcap 3.1MB 落盘、分析块提取真实 SNI（`sg.tgalileo.com`）与 HTTP Host（`szextshort.weixin.qq.com`，即负载下载流量）、128 次 DNS 查询配对 0 慢查询、466 条方向流重传率 0.018%、MSS 全 1460、健康网络三 suspicion 全 False 不出置信度字段、HTML 抓包面板/证据分析行/全程 pcap 链接齐全。
+
 ## [1.7.0] - 2026-09-01
 
 盯障模式统计层（阶段 F 第一步 / PR-F0）：给盯障装上 L4 眼睛——主动探测路径 MTU + TCP 重传差分采样，MTU 不匹配（PMTUD 黑洞）类故障从「盯障发现不了」变为自动出事件 + 给改法。零新依赖，无需 Npcap（抓包证据层是阶段 F 后续 PR-F1~F5，目标 v1.8.0）。
