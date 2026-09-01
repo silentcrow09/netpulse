@@ -2544,7 +2544,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -9567,6 +9567,56 @@ def _strip_gaps(stream, gap_s):
     return kept, gaps
 
 
+def _detect_jitter_segments(loss_times, all_times, window_s, step_s,
+                            min_loss, min_pct):
+    """滑动窗口扫描『窗口内丢包集中』段 (v1.6.0 盯障增强)。
+
+    偶发掉线的典型形态不是连续中断, 而是短窗口内反复丢包 — 纯『连续丢包段』
+    检测 (MIN_LOSS_BURST) 会漏掉。本函数以 window_s 宽、step_s 步进扫描:
+    窗口内丢包 ≥ min_loss 且丢包率 ≥ min_pct 记一个抖动窗口, 相邻(重叠)触发
+    窗口合并成段, 段界取段内最早/最晚丢包时刻, 使事件时长贴合实际抖动期。
+    返回 [{start, end, n_loss, n_total, loss_pct}] (绝对时间戳, 按 start 排序)。
+    """
+    if len(loss_times) < min_loss or not all_times:
+        return []
+    t_min, t_max = min(all_times), max(all_times)
+    hits = []
+    w = t_min
+    while w <= t_max:
+        w_end = w + window_s
+        n_loss = sum(1 for t in loss_times if w <= t < w_end)
+        n_total = sum(1 for t in all_times if w <= t < w_end)
+        # 尾部不完整窗口 (样本 < 窗口一半) 只按绝对次数判, 防 1/10=10% 边界误报
+        full = n_total >= window_s * 0.5
+        if n_total >= min_loss and (n_loss >= min_loss
+                                    or (full and n_loss / n_total * 100 >= min_pct)):
+            hits.append((w, w_end))
+        w += step_s
+    if not hits:
+        return []
+    # 相邻/重叠触发窗口合并 (间隔 ≤ step_s 视为连续抖动)
+    windows = []
+    cur_start, cur_end = hits[0]
+    for w0, w1 in hits[1:]:
+        if w0 <= cur_end + step_s:
+            cur_end = max(cur_end, w1)
+        else:
+            windows.append((cur_start, cur_end))
+            cur_start, cur_end = w0, w1
+    windows.append((cur_start, cur_end))
+    out = []
+    for s0, s1 in windows:
+        ls = [t for t in loss_times if s0 <= t <= s1]
+        if not ls:
+            continue
+        # 段界与统计取段内最早/最晚丢包时刻, 贴合实际抖动期
+        ns = [t for t in all_times if ls[0] <= t <= ls[-1]]
+        out.append({"start": ls[0], "end": ls[-1],
+                    "n_loss": len(ls), "n_total": len(ns),
+                    "loss_pct": round(len(ls) / len(ns) * 100, 1) if ns else 0.0})
+    return out
+
+
 def _detect_monitor_events(snap, t0, ended_at):
     """事件检测 (纯后处理): 输入采集快照, 输出事件列表 (按时间排序)。
 
@@ -9684,6 +9734,45 @@ def _detect_monitor_events(snap, t0, ended_at):
                  f"基线 {baseline:.0f}ms → 峰值 {peak:.0f}ms",
                  baseline=round(baseline, 1), peak=round(peak, 1))
 
+    # 抖动窗口 (v1.6.0): 60s 桶内丢包集中但未达连续中断 — 盯障最常遇到的形态
+    outage_ranges = [(e["start_ts"], e["end_ts"])
+                     for e in events if e["type"] == "outage"]
+    for name, stream in (("gw", gw), ("ext", ext)):
+        losses = [s[1] for s in stream if s[0] == "loss"]
+        all_t = [s[1] for s in stream]
+        for seg in _detect_jitter_segments(
+                losses, all_t, MonitorSession.JITTER_WINDOW_S,
+                MonitorSession.JITTER_STEP_S, MonitorSession.MIN_JITTER_LOSS,
+                MonitorSession.MIN_JITTER_PCT):
+            s0, s1 = seg["start"], seg["end"]
+            if any(so <= s1 and eo >= s0 for so, eo in outage_ranges):
+                continue          # 中断段已覆盖, 不重复报抖动
+            pct = seg["loss_pct"]
+            if name == "ext":
+                win0, win1 = s0 - 2, s1 + 2
+                gw_loss_n = sum(1 for s in gw if s[0] == "loss"
+                                and win0 <= s[1] <= win1)
+                gw_ok_n = sum(1 for s in gw if s[0] == "ok"
+                              and win0 <= s[1] <= win1)
+                if gw_loss_n >= 1:
+                    cls = "both_down"
+                    detail = (f"60s 窗口内反复丢包 {seg['n_loss']}/{seg['n_total']} "
+                              f"({pct}%), 网关同时丢包 {gw_loss_n} 次 — 链路/设备侧抖动")
+                elif gw_ok_n >= 3:
+                    cls = "carrier"
+                    detail = (f"60s 窗口内反复丢包 {seg['n_loss']}/{seg['n_total']} "
+                              f"({pct}%), 期间网关正常 — 运营商/上联侧抖动")
+                else:
+                    cls = "unknown"
+                    detail = (f"60s 窗口内反复丢包 {seg['n_loss']}/{seg['n_total']} "
+                              f"({pct}%), 窗口内网关数据不足")
+            else:
+                cls = "internal"
+                detail = (f"60s 窗口内网关反复丢包 {seg['n_loss']}/{seg['n_total']} "
+                          f"({pct}%) — 内网段抖动")
+            _add("jitter_burst", name, s0, s1, False, cls, detail,
+                 n_loss=seg["n_loss"], n_total=seg["n_total"], loss_pct=pct)
+
     events.sort(key=lambda e: e["start_ts"])
     for i, ev in enumerate(events, 1):
         ev["id"] = i
@@ -9739,6 +9828,32 @@ def _monitor_conclusion(events, stats, snap):
         text_bits.append(f"DNS 解析失败 {n} 次, 期间外网 ping 正常")
         advice_bits.append("解析侧问题: 本机/路由器 DNS 改 223.5.5.5 与 "
                            "119.29.29.29 复测; 仍失败带报告报障")
+    elif has("jitter_burst"):
+        # v1.6.0: 无连续中断但短窗口内反复丢包 — 偶发掉线最典型形态
+        verdict = "degraded"
+        jbs = has("jitter_burst")
+        ext_jb = [j for j in jbs if j["stream"] == "ext"]
+        gw_jb = [j for j in jbs if j["stream"] == "gw"]
+        pick = (max(ext_jb, key=lambda e: e.get("loss_pct", 0)) if ext_jb
+                else max(gw_jb, key=lambda e: e.get("loss_pct", 0)))
+        t0s = datetime.fromtimestamp(pick["start_ts"]).strftime("%H:%M:%S")
+        t1s = datetime.fromtimestamp(pick["end_ts"]).strftime("%H:%M:%S")
+        text_bits.append(
+            f"无中断但抖动集中 {t0s}~{t1s}: "
+            f"{'外网' if ext_jb else '网关'} {pick.get('n_loss')}/{pick.get('n_total')} 丢包 "
+            f"({pick.get('loss_pct')}%)")
+        if ext_jb and pick.get("cls") == "both_down":
+            advice_bits.append(f"内外同抖 ({t0s}~{t1s}): 网关与外网同时丢包, 查光猫光衰/LOS 告警、"
+                               "路由器日志; 将该时段与客户掉线记录对齐")
+        elif ext_jb and pick.get("cls") == "carrier":
+            advice_bits.append(f"上联/运营商侧抖动 ({t0s}~{t1s}): 网关正常但外网反复丢包, "
+                               "查光猫光衰/LOS, 带报告报障并指出该时段")
+        elif ext_jb:
+            advice_bits.append(f"外网抖动 ({t0s}~{t1s}): 窗口内网关数据不足, "
+                               "建议加长盯障 (如 --monitor 1800) 定位根因")
+        else:
+            advice_bits.append(f"内网段抖动 ({t0s}~{t1s}): 网关反复丢包, 查 WiFi 干扰/"
+                               "网线水晶头/路由器负载")
     elif has("latency_spike"):
         verdict = "degraded"
         spikes = has("latency_spike")
@@ -9769,6 +9884,10 @@ class MonitorSession:
     MIN_LOSS_BURST = 3        # 连续丢包 ≥3 (~3s) 判中断
     MIN_DNS_FAIL = 2          # DNS 连续失败 ≥2 (~10s) 判事件
     DNS_DOMAIN = "www.qq.com"
+    JITTER_WINDOW_S = 60      # 抖动窗口宽度 (秒)
+    JITTER_STEP_S = 10        # 抖动窗口扫描步进 (秒)
+    MIN_JITTER_LOSS = 3       # 窗口内丢包 ≥3 次判抖动 (与 MIN_LOSS_BURST 对齐)
+    MIN_JITTER_PCT = 10.0     # 窗口内丢包率 ≥10% 判抖动
 
     def __init__(self, duration_s, ext_target=None):
         self.duration_s = duration_s
@@ -10012,6 +10131,13 @@ class MonitorSession:
             cls = ev.get("cls", "")
             if ev.get("type") == "monitor_gap":
                 ev["root_cause"] = "采集间隙 (系统睡眠/进程阻塞?)"
+            elif ev.get("type") == "jitter_burst":
+                ev["root_cause"] = {
+                    "both_down": "内外同抖 (链路/设备侧)",
+                    "carrier": "运营商/上联侧抖动",
+                    "internal": "内网段抖动",
+                    "unknown": "抖动根因未知",
+                }.get(cls, "抖动集中")
             elif cls in _CLS_TO_ROOT_CAUSE:
                 ev["root_cause"] = _CLS_TO_ROOT_CAUSE[cls]
             else:
@@ -10036,13 +10162,18 @@ class MonitorSession:
                              1 if (val is not None) else 0, note_fn(s)])
         result["_csv_rows"] = rows
         outages = [e for e in events if e["type"] == "outage"]
-        result["summary"] = (
-            f"盯障 {duration_actual}s: 网关丢包 {stats['gw']['loss_pct']}%, "
-            f"外网丢包 {stats['ext']['loss_pct']}%, "
-            + (f"中断 {len(outages)} 起 (最长 "
-               f"{max(e['duration_s'] for e in outages):.0f}s), "
-               if outages else "无中断, ")
-            + f"DNS 失败 {stats['dns']['fail']} 次")
+        jitters = [e for e in events if e["type"] == "jitter_burst"]
+        summary_bits = [f"盯障 {duration_actual}s: 网关丢包 {stats['gw']['loss_pct']}%, "
+                        f"外网丢包 {stats['ext']['loss_pct']}%"]
+        if outages:
+            summary_bits.append(f"中断 {len(outages)} 起 (最长 "
+                                f"{max(e['duration_s'] for e in outages):.0f}s)")
+        else:
+            summary_bits.append("无中断")
+        if jitters:
+            summary_bits.append(f"抖动集中 {len(jitters)} 段")
+        summary_bits.append(f"DNS 失败 {stats['dns']['fail']} 次")
+        result["summary"] = ", ".join(summary_bits)
         return result
 
 
@@ -10154,7 +10285,8 @@ def _render_monitor_html(res):
 
     ev_rows = []
     type_names = {"outage": "中断", "dns_fail": "DNS 故障", "tcp_fail": "TCP 失败",
-                  "latency_spike": "延迟突增", "monitor_gap": "采集间隙"}
+                  "latency_spike": "延迟突增", "jitter_burst": "抖动集中",
+                  "monitor_gap": "采集间隙"}
     cls_names = {"internal": "内网侧", "carrier": "运营商侧", "both_down": "内外同断",
                  "dns": "解析侧", "with_outage": "随中断", "policy": "端口策略",
                  "target_unreachable": "目标不可达", "unknown": "无法定位", "": ""}

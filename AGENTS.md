@@ -56,10 +56,17 @@
 ## 验证
 
 ```bash
-python _smoke_report.py          # 170 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡
+python _smoke_report.py          # 185 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 7 项
 ```
 
 产物 `reports/_verify_latest.html` 用于人工核对（`reports/` 已 gitignore）。
+
+## 盯障模式 (v1.5.2)
+
+- **抖动窗口** `_detect_jitter_segments`：60s 宽 × 10s 步进滑动窗口，窗口内丢包 ≥3 次**或**丢包率 ≥10%（窗口样本 ≥ 窗口一半才算完整，防会话尾部 1/10 边界误报）→ `jitter_burst` 事件
+- 事件定位：网关段 `internal`；外网段按窗口内网关状态分 `both_down` / `carrier` / `unknown`；与 `outage` 段重叠不重复报
+- 结论矩阵：`jitter_burst` 优先级高于 `latency_spike`，verdict=`degraded`
+- 阈值常量在 `MonitorSession`：`JITTER_WINDOW_S=60 / JITTER_STEP_S=10 / MIN_JITTER_LOSS=3 / MIN_JITTER_PCT=10.0`
 
 ## 其它
 
