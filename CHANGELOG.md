@@ -7,6 +7,27 @@
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-09-01
+
+盯障模式统计层（阶段 F 第一步 / PR-F0）：给盯障装上 L4 眼睛——主动探测路径 MTU + TCP 重传差分采样，MTU 不匹配（PMTUD 黑洞）类故障从「盯障发现不了」变为自动出事件 + 给改法。零新依赖，无需 Npcap（抓包证据层是阶段 F 后续 PR-F1~F5，目标 v1.8.0）。
+
+### 新增
+
+- **盯障 MTU 探测**：MonitorSession 后台线程对网关/外网目标各跑一轮 `ping -f -l` 二分（576..1472，三态判读：太大/放行/无信号；连续 ≥4 次无信号如实报探测失败，不再把 ICMP 被滤当成假 MTU）；本机侧取默认路由出口接口 MTU（`Get-NetRoute` 最优 metric → `Get-NetIPInterface`，避免 VPN/环回口污染）。接口 − 路径差 ≥100 → `mtu_mismatch` 事件（PPPoE 的 1492 不误报），结论直接给管理员命令 `netsh interface ipv4 set subinterface "接口名" mtu=NNNN store=persistent`
+- **盯障 TCP 重传差分**：30s 周期采样系统 TCP 计数器（`Get-NetTCPStatistics` 主路 → `netstat -s` 中英文回退），差分出**会话口径**重传率（区别于 diagnose 的开机累计口径）；发送增量 ≥5000 才判率（分母保护），≥5% → `tcp_retrans_burst` 事件；与 MTU 事件同时出现时提示「大概率同源，先改 MTU 复测」
+- **主动负载 `--monitor-load` / `--load-url`**：盯障开始 60s 后流式读取 15s（默认微信安装包 CDN 大文件，可换地址），制造 full-size 下载流量——空闲网络没有大包可丢，重传统计需要真实负载才有分母；读即丢弃不落盘，报告记录实际读取量
+- **diagnose 新规则 ×2**：`mtu_blackhole`（路径 MTU 显著小于接口 MTU，HIGH；tcpstats 重传率 ≥5% 佐证时置信度 0.75 → 0.92）、`tcp_loss_burst`（开机累计重传率 ≥5%，MEDIUM，描述带口径警示并建议盯障复测确认）；PROFILE_RULES 的 web/gaming/slow 纳入，slow 场景补采 tcpstats 模块
+- **报告**：盯障 HTML 新增「MTU 与传输质量」面板（路径/接口 MTU 表 + 重传率时序图）与 TCP 重传率指标卡；CSV 新增逐区间 `tcp_retrans` 行；JSON 含完整 `mtu` / `tcp_quality` 块
+
+### 变更
+
+- `_probe_path_mtu` / `_tcp_stats_snapshot` 分别从 MTUDetector / TCPStatsTester 提取为模块级函数：diagnose 单次采样与盯障周期采样共用同一探测/解析逻辑（提取前已 grep 核对全部消费者）
+- `_monitor_conclusion` 改追加式：MTU/重传结论与任何 verdict 并存——stable 升级 degraded，carrier/internal/dns 定位保持不变（统计层不覆盖中断定位）
+
+### 验证
+
+`tests/` 141 → 190 项：新增 `tests/test_monitor_stats.py` 31 项（MTU 探测中英文输出二分收敛/三态判读/无信号放弃、快照双路采集与假零修正、`_default_route_if_mtu`、事件判据、结论矩阵、常量契约）；`tests/test_diagnosis.py` +18 项（新规则口径/置信度/不误报、场景过滤纳入）；规则数 6 → 8 的既有断言同步修正 16 处（三个测试/smoke 文件）。`_smoke_report.py` +20 项 v1.7.0 断言、共 234 项全绿。实机 90s `--monitor --monitor-load` 走查：MTU 双目标探测 1500/1500（正确不报事件）、会话重传率 0.14%（分母 12583、护栏生效）、负载 15s 读取 117.4 MB 未落盘、CSV/HTML/JSON 产物齐全。
+
 ## [1.6.1] - 2026-09-01
 
 代码审查修复 10 项（审查范围 v1.6.0 场景菜单提交）：2 项经真实构造数据实证的功能失效（导出报告绕过规则过滤、web 场景恒零根因），其余为交互兜底、健壮性与性能。

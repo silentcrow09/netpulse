@@ -1506,6 +1506,78 @@ def _rule_nat_restricted(results_dict):
 # 约束: 只读取规则函数里已经验证过的字段名; 字段缺失就跳过该条, 不伪造数字。
 
 
+def _rule_mtu_blackhole(results_dict):
+    """MTU 黑洞 (v1.7.0 PR-F0): 路径 MTU 显著小于本机接口 MTU。
+
+    PMTUD 黑洞类故障: 小包 (ping/握手) 正常, full-size 数据包被中间
+    设备静默丢弃 — 视频卡顿/大文件慢的典型根因, L3 探测看不出。
+    判据: 本机接口 MTU − 最小有效路径 MTU ≥ 100 (PPPoE 的 1492 不误报);
+    tcpstats 重传率 ≥5% 佐证时置信度上调 (0.75 → 0.92)。
+    """
+    mtu = results_dict.get("mtu", {})
+    if not mtu or mtu.get("error"):
+        return None
+    # MTUDetector.results 的键: path_mtus[].path_mtu / local_mtus[].mtu
+    paths = [r.get("path_mtu") for r in (mtu.get("path_mtus") or [])
+             if not r.get("error") and r.get("path_mtu")]
+    local = [lm.get("mtu") for lm in (mtu.get("local_mtus") or [])
+             if isinstance(lm.get("mtu"), int) and lm.get("mtu", 0) > 0]
+    if not paths or not local:
+        return None
+    path_min, if_max = min(paths), max(local)
+    diff = if_max - path_min
+    if diff < 100:
+        return None
+    ts = results_dict.get("tcpstats", {}) or {}
+    retrans_rate = ts.get("retrans_rate_pct")
+    corroborated = isinstance(retrans_rate, (int, float)) and retrans_rate >= 5
+    confidence = 0.92 if corroborated else 0.75
+    return RootCause(
+        id="mtu_blackhole", category="MTU", severity=Severity.HIGH,
+        title=f"MTU 不匹配 (路径 {path_min} < 接口 {if_max}, 差 {diff})",
+        description=("本机能发出的包大于通道实际能承载的 MTU, 大包被静默丢弃引发重传/卡顿; "
+                     "ping 与握手是小包不受影响, 常规探测看不出."),
+        confidence=confidence,
+        evidence_ids=["mtu.path_mtus", "mtu.local_mtus", "tcpstats.retrans_rate_pct"],
+        affected_modules=["mtu", "tcpstats"],
+        recommendations=[
+            f"1. 将电脑接口 MTU 改为 {path_min}: netsh interface ipv4 set subinterface "
+            f"\"接口名\" mtu={path_min} store=persistent (管理员), 改后复测",
+            "2. 检查路由器/中间设备的 MSS clamping (典型配置 ip tcp adjust-mss)",
+            "3. 物联网卡/专线场景联系运营商核对通道 MTU",
+        ],
+    )
+
+
+def _rule_tcp_loss_burst(results_dict):
+    """TCP 传输层丢包 (v1.7.0 PR-F0): 重传率超标。
+
+    注意口径: tcpstats 是开机以来的累计计数器 — 偏高可能包含历史时段,
+    建议盯障模式 (--monitor) 的会话差分口径复测确认后再报障。
+    """
+    ts = results_dict.get("tcpstats", {})
+    if not ts or ts.get("error"):
+        return None
+    rate = ts.get("retrans_rate_pct")
+    if not isinstance(rate, (int, float)) or rate < 5:
+        return None          # 1%~5% 已在模块 issues 里提示, 不升根因
+    return RootCause(
+        id="tcp_loss_burst", category="WAN", severity=Severity.MEDIUM,
+        title=f"TCP 重传率 {rate:g}% 偏高 (传输层丢包)",
+        description=("TCP 层大量重传, 应用表现为视频卡顿/下载慢; "
+                     "注意此为开机累计口径, 建议盯障复测确认是当前时段的问题."),
+        confidence=0.70,
+        evidence_ids=["tcpstats.retrans_rate_pct", "tcpstats.retransmitted",
+                      "tcpstats.segments_sent"],
+        affected_modules=["tcpstats"],
+        recommendations=[
+            "1. 复测确认口径: netpulse --monitor 600 (会话差分重传率, 报告含时序)",
+            "2. 结合 MTU 检测结果区分: MTU 不匹配 → 改 MTU; 否则链路质量/拥塞",
+            "3. MTU 正常仍高: 带报告向运营商报障 (查光衰/线路质量)",
+        ],
+    )
+
+
 def _ev(text, ok):
     """构造一条证据项。"""
     return {"text": text, "ok": bool(ok)}
@@ -1668,6 +1740,49 @@ def _ev_nat_restricted(results):
     return supports, excludes
 
 
+def _ev_mtu_blackhole(results):
+    mtu = _mod(results, "mtu") or {}
+    supports = []
+    for r in (mtu.get("path_mtus") or []):
+        if not r.get("error") and r.get("path_mtu"):
+            supports.append(_ev(
+                f"到 {r.get('target')} 的路径 MTU = {r['path_mtu']}", False))
+    for lm in (mtu.get("local_mtus") or []):
+        if isinstance(lm.get("mtu"), int) and lm.get("mtu", 0) > 0:
+            supports.append(_ev(
+                f"接口 {lm.get('interface')} MTU = {lm['mtu']}", False))
+    ts = _mod(results, "tcpstats") or {}
+    rate = ts.get("retrans_rate_pct")
+    if isinstance(rate, (int, float)) and rate >= 5:
+        supports.append(_ev(f"TCP 重传率 {rate:g}% 佐证 (大包在丢)", False))
+    excludes = []
+    for fn in (_ev_gateway_reachable, _ev_external_reachable):
+        item = fn(results)
+        if item:
+            excludes.append(item)
+    return supports, excludes
+
+
+def _ev_tcp_loss_burst(results):
+    ts = _mod(results, "tcpstats") or {}
+    supports = []
+    rate = ts.get("retrans_rate_pct")
+    if isinstance(rate, (int, float)):
+        supports.append(_ev(
+            f"TCP 重传率 {rate:g}% (重传 {ts.get('retransmitted', '—')} / "
+            f"发送 {ts.get('segments_sent', '—')}, 开机累计口径)", False))
+    excludes = []
+    mtu = _mod(results, "mtu") or {}
+    paths = [r.get("path_mtu") for r in (mtu.get("path_mtus") or [])
+             if not r.get("error") and r.get("path_mtu")]
+    local = [lm.get("mtu") for lm in (mtu.get("local_mtus") or [])
+             if isinstance(lm.get("mtu"), int) and lm.get("mtu", 0) > 0]
+    if paths and local and max(local) - min(paths) < 100:
+        excludes.append(_ev(
+            f"路径 MTU ({min(paths)}) 与接口 MTU ({max(local)}) 相符, 已排除 MTU 不匹配", True))
+    return supports, excludes
+
+
 # 规则 id → 证据生成函数
 _RC_EVIDENCE_BUILDERS = {
     "dns_failure": _ev_dns_failure,
@@ -1676,6 +1791,9 @@ _RC_EVIDENCE_BUILDERS = {
     "bufferbloat": _ev_bufferbloat,
     "gateway_loss": _ev_gateway_loss,
     "nat_restricted": _ev_nat_restricted,
+    # v1.7.0 (PR-F0): 统计层新规则的证据链
+    "mtu_blackhole": _ev_mtu_blackhole,
+    "tcp_loss_burst": _ev_tcp_loss_burst,
 }
 
 
@@ -1719,6 +1837,9 @@ _RULE_REGISTRY = [
     ("bufferbloat", _rule_bufferbloat),
     ("gateway_loss", _rule_gateway_loss),
     ("nat_restricted", _rule_nat_restricted),
+    # v1.7.0 (PR-F0): 统计层根因 — 不依赖抓包, mtu/tcpstats 模块数据即可判定
+    ("mtu_blackhole", _rule_mtu_blackhole),
+    ("tcp_loss_burst", _rule_tcp_loss_burst),
 ]
 ALL_RULES = [fn for _rid, fn in _RULE_REGISTRY]
 _RULE_BY_ID = dict(_RULE_REGISTRY)
@@ -1798,7 +1919,9 @@ def diagnose(results_dict, rule_filter=None):
 
 DIAGNOSE_PROFILES = {
     # 网速慢/卡顿: 链路 + 干扰 + 测速 + 缓冲膨胀 + TCP 质量 + DNS
-    "slow": ["gateway", "wifi", "speedtest", "bufferbloat", "tcp", "dns"],
+    # (v1.7.0: 补 tcpstats — tcp_loss_burst 规则需要重传率数据)
+    "slow": ["gateway", "wifi", "speedtest", "bufferbloat", "tcp", "dns",
+             "tcpstats"],
     # 频繁断网: 链路 + 外网 + DNS + TCP + 环路检测 (monitor 是 CLI 模式不是模块)
     "disconnect": ["gateway", "external", "dns", "tcp", "loop"],
     # 网页打不开/慢: 网关 + 外网 + DNS + TCP + HTTP + TCP 质量 + MTU + 路由
@@ -1818,10 +1941,13 @@ DIAGNOSE_PROFILES = {
 #   - gaming 必不含 wifi_weak: 游戏卡顿报 WiFi 弱 = 噪音 (用户拍板)
 #   - disconnect/web 聚焦连通性规则 (WAN 中断 / 网关丢包 / DNS)
 PROFILE_RULES = {
-    "slow": ["bufferbloat", "gateway_loss", "dns_failure", "wifi_weak"],
+    "slow": ["bufferbloat", "gateway_loss", "dns_failure", "wifi_weak",
+             "tcp_loss_burst"],
     "disconnect": ["wan_interruption", "gateway_loss", "dns_failure"],
-    "web": ["dns_failure", "wan_interruption", "gateway_loss"],
-    "gaming": ["gateway_loss", "bufferbloat", "nat_restricted"],
+    "web": ["dns_failure", "wan_interruption", "gateway_loss",
+            "mtu_blackhole", "tcp_loss_burst"],
+    "gaming": ["gateway_loss", "bufferbloat", "nat_restricted",
+               "mtu_blackhole", "tcp_loss_burst"],
     "wifi": ["wifi_weak", "gateway_loss"],
 }
 
@@ -2630,7 +2756,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.7.0"
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -6856,6 +6982,96 @@ class DNSTester:  # @deprecated v1.2.0 (B8): 已迁移到 probe_dns_v2 (SECTION 
         return self.results
 
 
+def _probe_path_mtu(target):
+    """二分查找 MTU (ICMP payload: MTU - 28)。
+
+    与原实现的区别:
+    - 区分「无信号」(超时/丢包) 与「太大」(DF 拒绝) 两种情形;
+      原实现把超时一律当「太大」, 在 ICMP 被防火墙过滤的环境下
+      会返回错误的 path_mtu (实际上是探测失败, 但被报告为正常)。
+    - 多次无信号直接放弃, 返回 error 而非假数据。
+    - 加入总探测次数上限, 防止边界死循环。
+
+    v1.7.0 (PR-F0): 从 MTUDetector._measure_mtu 闭包提取为模块级函数,
+    diagnose 的 MTUDetector 与盯障模式 (MonitorSession) 共用同一探测逻辑。
+    """
+    low, high = 576, 1472
+    best_mtu = None
+    ever_fits = False
+    last_fits = False
+    indeterminate_count = 0
+    total_count = 0
+    MAX_INDETERMINATE = 4
+    MAX_TOTAL = 15
+
+    while low <= high and total_count < MAX_TOTAL:
+        mid = (low + high) // 2
+        total_count += 1
+        code, out, _ = run_cmd(
+            f"ping -f -l {mid} -n 1 -w 2000 {target}", timeout=5)
+
+        too_big = ("需要拆分数据包但是设置 DF" in out or
+                   "Packet needs to be fragmented but DF set" in out or
+                   " Frag" in out)
+        fits = ("TTL=" in out or "回复" in out or "Reply" in out)
+        no_signal = (
+            "传输中过期" in out or "timed out" in out or
+            "100% 丢失" in out or "100% loss" in out or
+            "请求超时" in out or "Request timed out" in out or
+            not out.strip() or code != 0
+        )
+
+        if too_big:
+            high = mid - 1
+            last_fits = False
+        elif fits:
+            best_mtu = mid
+            ever_fits = True
+            last_fits = True
+            low = mid + 1
+        elif no_signal:
+            indeterminate_count += 1
+            if indeterminate_count >= MAX_INDETERMINATE:
+                break
+            # 范围略缩, 避免边界死循环; 保守假设: 之前若 fits 倾向 +
+            if last_fits:
+                low = mid + 1
+            else:
+                high = mid - 1
+        else:
+            # 未知输出: 也算无信号
+            indeterminate_count += 1
+            if indeterminate_count >= MAX_INDETERMINATE:
+                break
+            if last_fits:
+                low = mid + 1
+            else:
+                high = mid - 1
+
+    if not ever_fits:
+        return {
+            "target": target,
+            "error": (f"未收到任何 ICMP Echo Reply ({total_count} 次探测均无响应), "
+                      f"无法测量 MTU (可能是 ICMP 被防火墙/网关过滤)"),
+            "path_mtu": None,
+            "max_payload": None,
+            "fragmentation_risk": None,
+            "indeterminate": True,
+            "probes": total_count,
+        }
+
+    return {
+        "target": target,
+        "max_payload": best_mtu,
+        "path_mtu": best_mtu + 28,
+        "fragmentation_risk": best_mtu < 1472,
+        "indeterminate_pct": round(
+            indeterminate_count / total_count * 100, 1)
+            if total_count else 0,
+        "probes": total_count,
+    }
+
+
 class MTUDetector:
     """MTU 路径发现"""
 
@@ -6870,97 +7086,11 @@ class MTUDetector:
         targets = [gateway] if gateway else []
         targets.append("223.5.5.5")
 
-        def _measure_mtu(target):
-            """二分查找 MTU (ICMP payload: MTU - 28)。
-
-            与原实现的区别:
-            - 区分「无信号」(超时/丢包) 与「太大」(DF 拒绝) 两种情形;
-              原实现把超时一律当「太大」, 在 ICMP 被防火墙过滤的环境下
-              会返回错误的 path_mtu (实际上是探测失败, 但被报告为正常)。
-            - 多次无信号直接放弃, 返回 error 而非假数据。
-            - 加入总探测次数上限, 防止边界死循环。
-            """
-            low, high = 576, 1472
-            best_mtu = None
-            ever_fits = False
-            last_fits = False
-            indeterminate_count = 0
-            total_count = 0
-            MAX_INDETERMINATE = 4
-            MAX_TOTAL = 15
-
-            while low <= high and total_count < MAX_TOTAL:
-                mid = (low + high) // 2
-                total_count += 1
-                code, out, _ = run_cmd(
-                    f"ping -f -l {mid} -n 1 -w 2000 {target}", timeout=5)
-
-                too_big = ("需要拆分数据包但是设置 DF" in out or
-                           "Packet needs to be fragmented but DF set" in out or
-                           " Frag" in out)
-                fits = ("TTL=" in out or "回复" in out or "Reply" in out)
-                no_signal = (
-                    "传输中过期" in out or "timed out" in out or
-                    "100% 丢失" in out or "100% loss" in out or
-                    "请求超时" in out or "Request timed out" in out or
-                    not out.strip() or code != 0
-                )
-
-                if too_big:
-                    high = mid - 1
-                    last_fits = False
-                elif fits:
-                    best_mtu = mid
-                    ever_fits = True
-                    last_fits = True
-                    low = mid + 1
-                elif no_signal:
-                    indeterminate_count += 1
-                    if indeterminate_count >= MAX_INDETERMINATE:
-                        break
-                    # 范围略缩, 避免边界死循环; 保守假设: 之前若 fits 倾向 +
-                    if last_fits:
-                        low = mid + 1
-                    else:
-                        high = mid - 1
-                else:
-                    # 未知输出: 也算无信号
-                    indeterminate_count += 1
-                    if indeterminate_count >= MAX_INDETERMINATE:
-                        break
-                    if last_fits:
-                        low = mid + 1
-                    else:
-                        high = mid - 1
-
-            if not ever_fits:
-                return {
-                    "target": target,
-                    "error": (f"未收到任何 ICMP Echo Reply ({total_count} 次探测均无响应), "
-                              f"无法测量 MTU (可能是 ICMP 被防火墙/网关过滤)"),
-                    "path_mtu": None,
-                    "max_payload": None,
-                    "fragmentation_risk": None,
-                    "indeterminate": True,
-                    "probes": total_count,
-                }
-
-            return {
-                "target": target,
-                "max_payload": best_mtu,
-                "path_mtu": best_mtu + 28,
-                "fragmentation_risk": best_mtu < 1472,
-                "indeterminate_pct": round(
-                    indeterminate_count / total_count * 100, 1)
-                    if total_count else 0,
-                "probes": total_count,
-            }
-
         if callback:
             callback(f"MTU 检测 {len(targets)} 个目标 (并发)...")
         results = []
         with ThreadPoolExecutor(max_workers=min(4, len(targets))) as ex:
-            for r in ex.map(_measure_mtu, targets):
+            for r in ex.map(_probe_path_mtu, targets):
                 results.append(r)
 
         # 本地接口 MTU
@@ -8273,6 +8403,98 @@ class LANDeviceScanner:
         return self.results
 
 
+def _tcp_stats_snapshot():
+    """采集系统 TCP 传输统计 (开机以来的累计计数器)。
+
+    v1.7.0 (PR-F0): 从 TCPStatsTester.detect 提取为模块级函数 —
+    diagnose 单次采样与盯障模式 (MonitorSession) 的周期采样共用。
+    计数器是开机累计值, 会话口径由调用方做差分。
+    返回 dict; 两条采集路径都失败时返回空 dict。
+    """
+    # 优先 PowerShell Get-NetTCPStatistics (结构化), 回退 netstat -s
+    stats = {}
+    code, out, _ = run_ps(
+        "Get-NetTCPStatistics | Select-Object "
+        "SegmentSent, SegmentReceived, RetransmittedSegments, "
+        "Errors, FailureCounts, ConnectionsInitiated, "
+        "ConnectionsAccepted, CurrentConnections | ConvertTo-Json")
+    if out and out.strip():
+        try:
+            data = json.loads(out)
+            if not isinstance(data, list):
+                data = [data]
+            d = data[0] if data else {}
+            stats = {
+                "segments_sent": int(d.get("SegmentSent", 0) or 0),
+                "segments_received": int(d.get("SegmentReceived", 0) or 0),
+                "retransmitted": int(d.get("RetransmittedSegments", 0) or 0),
+                "error_segments": int(d.get("Errors", 0) or 0),
+                "conn_failures": int(d.get("FailureCounts", 0) or 0),
+                "connections_initiated": int(d.get("ConnectionsInitiated", 0) or 0),
+                "connections_accepted": int(d.get("ConnectionsAccepted", 0) or 0),
+                "current_connections": int(d.get("CurrentConnections", 0) or 0),
+            }
+        except Exception:
+            pass
+
+    if not stats or stats.get("segments_sent", 0) == 0:
+        # 回退: netstat -s 解析 (中英文)
+        code, out, _ = run_cmd("netstat -s")
+        if out:
+            parsed = TCPStatsTester._parse_netstat_s(out)
+            if parsed:
+                # 用 netstat 结果补齐/覆盖
+                for k, v in parsed.items():
+                    if v:
+                        stats[k] = v
+
+    # 当前连接数修正: Get-NetTCPStatistics 在多数 Windows 上不存在该 cmdlet
+    # (NetTCPIP 模块只提供 Get-NetTCPConnection), 之前 CurrentConnections 取不到时
+    # 静默落为 0, 与「TCP 连接数检测」模块 (netstat -ano) 矛盾, 属"假零"。
+    # 改为从 netstat -ano 计数 (与 TCPConnectionAnalyzer 口径一致);
+    # 计数失败/为 0 时回退 Get-NetTCPStatistics 原值, 都没有则置 None (报告渲染为 —)。
+    try:
+        cc_orig = stats.get("current_connections")
+        _code, _out, _ = run_cmd("netstat -ano", timeout=15)
+        tcp_cnt = 0
+        for _l in _out.split("\n"):
+            _ls = _l.strip()
+            if _ls.startswith("TCP") and len(_ls.split()) >= 5:
+                tcp_cnt += 1
+        stats["current_connections"] = (tcp_cnt if tcp_cnt > 0
+                                        else (cc_orig if cc_orig else None))
+    except Exception:
+        stats["current_connections"] = stats.get("current_connections")
+
+    return stats
+
+
+def _default_route_if_mtu():
+    """取默认路由出口接口的 MTU (v1.7.0 PR-F0)。
+
+    盯障的 MTU 不匹配判据要拿「本机出口接口 MTU」与「路径 MTU」对比 —
+    取默认路由接口 (Get-NetRoute 0.0.0.0/0 最优 metric) 而非全部已连接
+    接口的极值, 避免 VPN/环回口污染。失败返回 (None, "")。
+    """
+    code, out, _ = run_ps(
+        "$r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | "
+        "Sort-Object RouteMetric | Select-Object -First 1; "
+        "if ($r) { Get-NetIPInterface -AddressFamily IPv4 "
+        "-InterfaceIndex $r.InterfaceIndex | "
+        "Select-Object InterfaceAlias, NlMtu | ConvertTo-Json }")
+    if out and out.strip():
+        try:
+            data = json.loads(out)
+            if not isinstance(data, list):
+                data = [data]
+            if data:
+                mtu = int(data[0].get("NlMtu", 0) or 0)
+                return (mtu or None), data[0].get("InterfaceAlias", "") or ""
+        except Exception:
+            pass
+    return None, ""
+
+
 class TCPStatsTester:
     """TCP 传输质量统计 (重传率/错误段/失败连接), 基于 Get-NetTCPStatistics。"""
 
@@ -8283,60 +8505,7 @@ class TCPStatsTester:
     def detect(self, callback=None):
         if callback:
             callback("采集 TCP 传输统计...")
-        # 优先 PowerShell Get-NetTCPStatistics (结构化), 回退 netstat -s
-        stats = {}
-        code, out, _ = run_ps(
-            "Get-NetTCPStatistics | Select-Object "
-            "SegmentSent, SegmentReceived, RetransmittedSegments, "
-            "Errors, FailureCounts, ConnectionsInitiated, "
-            "ConnectionsAccepted, CurrentConnections | ConvertTo-Json")
-        if out and out.strip():
-            try:
-                data = json.loads(out)
-                if not isinstance(data, list):
-                    data = [data]
-                d = data[0] if data else {}
-                stats = {
-                    "segments_sent": int(d.get("SegmentSent", 0) or 0),
-                    "segments_received": int(d.get("SegmentReceived", 0) or 0),
-                    "retransmitted": int(d.get("RetransmittedSegments", 0) or 0),
-                    "error_segments": int(d.get("Errors", 0) or 0),
-                    "conn_failures": int(d.get("FailureCounts", 0) or 0),
-                    "connections_initiated": int(d.get("ConnectionsInitiated", 0) or 0),
-                    "connections_accepted": int(d.get("ConnectionsAccepted", 0) or 0),
-                    "current_connections": int(d.get("CurrentConnections", 0) or 0),
-                }
-            except Exception:
-                pass
-
-        if not stats or stats.get("segments_sent", 0) == 0:
-            # 回退: netstat -s 解析 (中英文)
-            code, out, _ = run_cmd("netstat -s")
-            if out:
-                parsed = self._parse_netstat_s(out)
-                if parsed:
-                    # 用 netstat 结果补齐/覆盖
-                    for k, v in parsed.items():
-                        if v:
-                            stats[k] = v
-
-        # 当前连接数修正: Get-NetTCPStatistics 在多数 Windows 上不存在该 cmdlet
-        # (NetTCPIP 模块只提供 Get-NetTCPConnection), 之前 CurrentConnections 取不到时
-        # 静默落为 0, 与「TCP 连接数检测」模块 (netstat -ano) 矛盾, 属"假零"。
-        # 改为从 netstat -ano 计数 (与 TCPConnectionAnalyzer 口径一致);
-        # 计数失败/为 0 时回退 Get-NetTCPStatistics 原值, 都没有则置 None (报告渲染为 —)。
-        try:
-            cc_orig = stats.get("current_connections")
-            _code, _out, _ = run_cmd("netstat -ano", timeout=15)
-            tcp_cnt = 0
-            for _l in _out.split("\n"):
-                _ls = _l.strip()
-                if _ls.startswith("TCP") and len(_ls.split()) >= 5:
-                    tcp_cnt += 1
-            stats["current_connections"] = (tcp_cnt if tcp_cnt > 0
-                                            else (cc_orig if cc_orig else None))
-        except Exception:
-            stats["current_connections"] = stats.get("current_connections")
+        stats = _tcp_stats_snapshot()
 
         sent = stats.get("segments_sent", 0)
         retrans = stats.get("retransmitted", 0)
@@ -9874,6 +10043,38 @@ def _detect_monitor_events(snap, t0, ended_at):
             _add("jitter_burst", name, s0, s1, False, cls, detail,
                  n_loss=seg["n_loss"], n_total=seg["n_total"], loss_pct=pct)
 
+    # v1.7.0 (PR-F0): MTU 不匹配 — 路径 MTU 显著小于本机出口接口 (PMTUD 黑洞类
+    # 故障的主动探测信号; ping 小包探测永远看不出, 这是盯障模式的关键补盲)。
+    # 键可能缺失 (旧快照/单测合成输入), 用 .get 防御。
+    mtu_info = snap.get("mtu") or {}
+    if_mtu = mtu_info.get("local_if_mtu")
+    worst = None       # 最受限通道: 所有有效 path_mtu 里的最小值
+    for r in (mtu_info.get("path_mtus") or []):
+        v = r.get("path_mtu")
+        if v and (worst is None or v < worst[0]):
+            worst = (v, r.get("target"))
+    if worst and if_mtu and if_mtu - worst[0] >= MonitorSession.MTU_MISMATCH_MIN_DIFF:
+        done_ts = mtu_info.get("done_ts") or ended_at
+        _add("mtu_mismatch", "mtu", done_ts, done_ts, False, "mtu",
+             f"路径 MTU {worst[0]} (到 {worst[1]}) < 本机接口 MTU {if_mtu} "
+             f"(差 {if_mtu - worst[0]}) — 通道 MTU 受限 (运营商/VPN/物联网卡), "
+             f"full-size 包可能被静默丢弃",
+             path_mtu=worst[0], if_mtu=if_mtu)
+
+    # v1.7.0 (PR-F0): TCP 重传爆发 — 会话差分口径 (区别于 diagnose 的开机累计),
+    # 分母保护在 build_result 已做 (retrans_rate_pct 非 None 即分母足够)
+    tq = snap.get("tcp_quality") or {}
+    if tq.get("retrans_rate_pct") is not None \
+            and tq["retrans_rate_pct"] >= MonitorSession.TCP_RETRANS_ERR_PCT:
+        series = tq.get("series") or []
+        s0 = series[0][0] if series else 0
+        s1 = series[-1][0] if series else 0
+        _add("tcp_retrans_burst", "tcpq", t0 + s0, t0 + s1, False, "l4_loss",
+             f"盯障期间 TCP 重传率 {tq['retrans_rate_pct']}% "
+             f"(重传 {tq.get('retrans_delta')} / 发送 {tq.get('sent_delta')}) — "
+             f"传输层在丢包 (拥塞 / 链路质量 / MTU 不匹配)",
+             retrans_rate_pct=tq["retrans_rate_pct"])
+
     events.sort(key=lambda e: e["start_ts"])
     for i, ev in enumerate(events, 1):
         ev["id"] = i
@@ -9974,6 +10175,32 @@ def _monitor_conclusion(events, stats, snap):
                          f"外网丢包 {ext_pct:.1f}%)")
         advice_bits.append("本次未复现: 建议在故障高发时段再盯 (如 --monitor 1800), "
                            "或请客户记录掉线时刻后与本报告时间轴对齐")
+    # v1.7.0 (PR-F0): MTU / 传输层追加式结论 — 与任何 verdict 并存, stable 时升级
+    mtu_evs = has("mtu_mismatch")
+    rt_evs = has("tcp_retrans_burst")
+    if mtu_evs:
+        pm = mtu_evs[0].get("path_mtu")
+        im = mtu_evs[0].get("if_mtu")
+        if verdict == "stable":
+            verdict = "degraded"
+        text_bits.append(
+            f"路径 MTU {pm} 小于本机接口 MTU {im} — 通道 MTU 受限, "
+            f"full-size 包可能被静默丢弃 (ping 小包看不出, 视频卡顿/大文件慢的典型根因)")
+        advice_bits.append(
+            f"MTU 不匹配: 将电脑接口 MTU 改为 {pm} 后复跑盯障验证 — 管理员命令: "
+            f"netsh interface ipv4 set subinterface \"接口名\" mtu={pm} store=persistent; "
+            f"或联系运营商/检查中间设备启用 MSS clamping")
+    if rt_evs:
+        rate = rt_evs[0].get("retrans_rate_pct")
+        if verdict == "stable":
+            verdict = "degraded"
+        text_bits.append(f"盯障期间 TCP 重传率 {rate}% — 传输层在丢包")
+        if mtu_evs:
+            advice_bits.append("重传与 MTU 不匹配同时出现: 大概率同源, 先按上方建议改 "
+                               "MTU 再复测; 仍高再查链路质量")
+        else:
+            advice_bits.append("MTU 正常而重传率超标: 运营商链路质量/拥塞问题, "
+                               "带上本报告 (含重传时序) 报障")
     return verdict, "；".join(text_bits), "\n".join(advice_bits)
 
 
@@ -9991,9 +10218,19 @@ class MonitorSession:
     MIN_JITTER_PCT = 10.0     # 窗口内丢包率 ≥10% 判抖动 (还需丢包 ≥2 次, 见下)
     MIN_JITTER_SAMPLES = 10   # 丢包率判据的最小窗口样本数 (分母更小只按次数判)
 
-    def __init__(self, duration_s, ext_target=None):
+    # v1.7.0 (PR-F0): 统计层常量 — 盯障模式的 L4 眼睛
+    TCPSTAT_INTERVAL_S = 30          # TCP 重传统计采样周期 (开机累计计数器, 差分出会话口径)
+    TCPSTAT_MIN_SENT_DELTA = 5000    # 分母保护: 会话发送增量低于此值不判重传率
+    MTU_MISMATCH_MIN_DIFF = 100      # 接口 MTU − 路径 MTU ≥ 此值才判不匹配 (PPPoE 1492 不误报)
+    TCP_RETRANS_ERR_PCT = 5.0        # 会话重传率阈值 (与 diagnose tcpstats err 档一致)
+    MONITOR_LOAD_URL = "https://dldir1.qq.com/weixin/Windows/WeChatSetup.exe"
+    LOAD_DELAY_S = 60                # 主动负载延迟启动 (先让盯障跑起来, 避开启动期噪声)
+    LOAD_DURATION_S = 15             # 主动负载读取时长 (读即丢弃, 不落盘)
+
+    def __init__(self, duration_s, ext_target=None, load_url=None):
         self.duration_s = duration_s
         self.ext_target = ext_target or "223.5.5.5"
+        self._load_url = load_url
         self._stop = threading.Event()
         self._gw_monitors = []        # [(ip, LatencyMonitor)] 支持漂移后多段
         self._ext_monitor = None
@@ -10006,6 +10243,11 @@ class MonitorSession:
         self._t0 = None
         self._notes = []
         self._last_gw_check = 0.0
+        self._mtu_thread = None       # 后台路径 MTU 探测 (PR-F0)
+        self._mtu_result = None       # {"path_mtus": [...], "local_if_mtu": N, ...}
+        self._mtu_done = threading.Event()
+        self._tcpstat_thread = None   # 周期 TCP 重传统计采样 (PR-F0)
+        self._tcpstat_samples = []    # [(t, sent, retrans)] 开机累计计数器
 
     def note(self, text):
         self._notes.append({"t": round(time.time() - self._t0, 1) if self._t0 else 0,
@@ -10039,6 +10281,22 @@ class MonitorSession:
             return False
         self._probe_thread = threading.Thread(target=self._probe_loop, daemon=True)
         self._probe_thread.start()
+        # v1.7.0 (PR-F0): 统计层 — 后台路径 MTU 探测 (网关 + 外网目标)。
+        # 二分探测最坏 ~30s, 放后台不阻塞盯障启动; build_result 时最多等 10s 取结果。
+        mtu_targets = []
+        if self._gw_ip:
+            mtu_targets.append(self._gw_ip)
+        if self._ext_ip_resolved and self._ext_ip_resolved not in mtu_targets:
+            mtu_targets.append(self._ext_ip_resolved)
+        if mtu_targets:
+            self._mtu_thread = threading.Thread(
+                target=self._mtu_probe_worker, args=(mtu_targets,), daemon=True)
+            self._mtu_thread.start()
+        # TCP 重传统计采样 (独立线程: PowerShell 冷启动 1-2s, 不拖累 DNS/TCP 探测节拍)
+        self._tcpstat_thread = threading.Thread(target=self._tcpstat_loop, daemon=True)
+        self._tcpstat_thread.start()
+        if self._load_url:
+            threading.Thread(target=self._load_worker, daemon=True).start()
         atexit.register(self.stop)          # 兜底: 进程被硬杀前尽量收 ping
         return True
 
@@ -10071,6 +10329,72 @@ class MonitorSession:
                 first = False
                 continue                      # 首轮后立即进入节拍
             self._stop.wait(max(0.0, self.PROBE_INTERVAL - (time.time() - t_iter)))
+
+    def _mtu_probe_worker(self, targets):
+        """后台路径 MTU 探测 (PR-F0): 复用 diagnose 的 _probe_path_mtu,
+        目标为网关 + 外网目标 (而非 diagnose 固定的 223.5.5.5)。"""
+        t_start = time.time()
+        err = None
+        path_mtus = []
+        try:
+            with ThreadPoolExecutor(max_workers=min(2, len(targets))) as ex:
+                for r in ex.map(_probe_path_mtu, targets):
+                    path_mtus.append(r)
+        except Exception as e:
+            err = f"MTU 探测线程异常: {e}"
+        local_if_mtu, local_if_name = None, ""
+        if not err:
+            try:
+                local_if_mtu, local_if_name = _default_route_if_mtu()
+            except Exception:
+                pass
+        self._mtu_result = {
+            "path_mtus": path_mtus,
+            "local_if_mtu": local_if_mtu,
+            "local_if_name": local_if_name,
+            "probe_s": round(time.time() - t_start, 1),
+            "done_ts": time.time(),
+            "error": err,
+        }
+        self._mtu_done.set()
+
+    def _tcpstat_loop(self):
+        """周期采样 TCP 重传统计 (PR-F0): 开机累计计数器, 会话口径由
+        build_result 做差分。首采立即执行 (baseline 越早, 差分窗口越长)。"""
+        while not self._stop.is_set():
+            t = time.time()
+            try:
+                s = _tcp_stats_snapshot()
+                sent, retrans = s.get("segments_sent"), s.get("retransmitted")
+                if sent is not None and retrans is not None:
+                    with self._probe_lock:
+                        self._tcpstat_samples.append((t, sent, retrans))
+            except Exception:
+                pass
+            self._stop.wait(self.TCPSTAT_INTERVAL_S)
+
+    def _load_worker(self):
+        """主动负载 (--monitor-load, PR-F0): 流式读大文件即丢弃, 制造
+        full-size 数据包让 TCP 重传统计有分子分母。仅内存中转, 不落盘。"""
+        import urllib.request
+        self._stop.wait(self.LOAD_DELAY_S)
+        if self._stop.is_set():
+            return
+        n_bytes, t0 = 0, time.time()
+        try:
+            req = urllib.request.Request(
+                self._load_url, headers={"User-Agent": "NetPulse-MonitorLoad"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                while (time.time() - t0 < self.LOAD_DURATION_S
+                       and not self._stop.is_set()):
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    n_bytes += len(chunk)
+            self.note(f"主动负载: {self.LOAD_DURATION_S}s 读取 "
+                      f"{n_bytes / 1048576:.1f} MB (仅制造流量, 未落盘)")
+        except Exception as e:
+            self.note(f"主动负载失败: {e}")
 
     def maybe_recheck_gateway(self, elapsed):
         """每 60s 复查网关 (用户切 WiFi/换路由时旧网关会永久假丢包)。"""
@@ -10142,6 +10466,10 @@ class MonitorSession:
             self._ext_monitor.stop()
         if self._probe_thread:
             self._probe_thread.join(timeout=2)
+        if self._tcpstat_thread:
+            self._tcpstat_thread.join(timeout=2)
+        # MTU 探测线程不 join: 二分探测最坏 ~30s, 提前结束时由 build_result
+        # 的 _mtu_done.wait(10) 决定等不等 (daemon, 不阻塞进程退出)
 
     @staticmethod
     def _stream_stats(stream):
@@ -10161,6 +10489,10 @@ class MonitorSession:
     def build_result(self, early_terminated=False):
         ended_at = time.time()
         duration_actual = round(ended_at - self._t0)
+        # v1.7.0 (PR-F0): MTU 探测仍在跑时最多等 10s (二分最坏 ~30s,
+        # 超时则报告标注未完成, 不无限拖住报告落盘)
+        if self._mtu_thread and self._mtu_thread.is_alive():
+            self._mtu_done.wait(10)
         snap = self.snapshot()
 
         def _probe_stats(samples):
@@ -10174,10 +10506,42 @@ class MonitorSession:
                  "ext": self._stream_stats(snap["ext_stream"]),
                  "tcp": _probe_stats(snap["tcp"]),
                  "dns": _probe_stats(snap["dns"])}
+        t0 = self._t0
+        # v1.7.0 (PR-F0): MTU 探测结果块 (probe_status: ok / error / timeout / skipped)
+        mtu_raw = self._mtu_result
+        if mtu_raw and not mtu_raw.get("error"):
+            mtu_status = "ok"
+        elif mtu_raw:
+            mtu_status = "error"
+        elif self._mtu_thread and self._mtu_thread.is_alive():
+            mtu_status = "timeout"
+        else:
+            mtu_status = "skipped"
+        mtu_block = dict(mtu_raw or {})
+        mtu_block["probe_status"] = mtu_status
+        # v1.7.0 (PR-F0): TCP 重传会话差分 (开机累计计数器 → 会话口径)。
+        # 分母保护: sent 增量 < TCPSTAT_MIN_SENT_DELTA 时机器空闲, 单个重传
+        # 就能把比率冲高, 只展示原始增量不判比率。
+        with self._probe_lock:
+            tcpstat_series = list(self._tcpstat_samples)
+        tq = {"series": [], "sent_delta": 0, "retrans_delta": 0,
+              "retrans_rate_pct": None, "samples": len(tcpstat_series)}
+        if len(tcpstat_series) >= 2:
+            sent_delta = tcpstat_series[-1][1] - tcpstat_series[0][1]
+            retrans_delta = tcpstat_series[-1][2] - tcpstat_series[0][2]
+            if sent_delta >= 0:
+                tq["sent_delta"] = sent_delta
+                tq["retrans_delta"] = retrans_delta
+                tq["series"] = [[round(t - t0, 1), s, r]
+                                for t, s, r in tcpstat_series]
+                if sent_delta >= self.TCPSTAT_MIN_SENT_DELTA:
+                    tq["retrans_rate_pct"] = round(
+                        retrans_delta / sent_delta * 100, 2)
+        snap["mtu"] = mtu_block
+        snap["tcp_quality"] = tq
         events = _detect_monitor_events(snap, self._t0, ended_at)
         verdict, conclusion, advice = _monitor_conclusion(events, stats, snap)
 
-        t0 = self._t0
         result = {
             "mode": "monitor",
             "timestamp": datetime.fromtimestamp(t0).isoformat(),
@@ -10209,6 +10573,8 @@ class MonitorSession:
                         for s in snap["dns"]],
             },
             "stats": stats,
+            "mtu": mtu_block,
+            "tcp_quality": tq,
             "events": events,
             "verdict": verdict,
             "conclusion_text": conclusion,
@@ -10228,6 +10594,9 @@ class MonitorSession:
             "target_unreachable": "外网目标不可达 (网关正常, 目标或出口链路问题)",
             "no_data":  "无有效采样 (外网 ping 无输出, 采集失败/系统睡眠?)",
             "with_outage": "异常随中断出现 (DNS/端口异常与掉线同时发生)",
+            # v1.7.0 (PR-F0): 统计层新事件的定位
+            "mtu":      "MTU 不匹配 (路径 MTU 小于本机接口, full-size 包可能被静默丢弃)",
+            "l4_loss":  "TCP 传输层丢包 (会话重传率超标)",
         }
         for ev in events:
             cls = ev.get("cls", "")
@@ -10262,6 +10631,15 @@ class MonitorSession:
                              probe, i,
                              round(val, 1) if isinstance(val, (int, float)) else "",
                              1 if (val is not None) else 0, note_fn(s)])
+        # v1.7.0 (PR-F0): TCP 重传采样行 (区间差分口径, 与 ping 类并列)
+        for i in range(1, len(tcpstat_series)):
+            _tp, _sp, _rp = tcpstat_series[i - 1]
+            _tc, _sc, _rc = tcpstat_series[i]
+            ds, dr = _sc - _sp, _rc - _rp
+            rows.append([datetime.fromtimestamp(_tc).strftime("%Y-%m-%d %H:%M:%S"),
+                         "tcp_retrans", i,
+                         round(dr / ds * 100, 2) if ds > 0 else "",
+                         1, f"retrans {dr}/{ds}"])
         result["_csv_rows"] = rows
         outages = [e for e in events if e["type"] == "outage"]
         jitters = [e for e in events if e["type"] == "jitter_burst"]
@@ -10275,6 +10653,10 @@ class MonitorSession:
         if jitters:
             summary_bits.append(f"抖动集中 {len(jitters)} 段")
         summary_bits.append(f"DNS 失败 {stats['dns']['fail']} 次")
+        if tq["retrans_rate_pct"] is not None:
+            summary_bits.append(f"TCP 重传率 {tq['retrans_rate_pct']}%")
+        if any(e["type"] == "mtu_mismatch" for e in events):
+            summary_bits.append("路径 MTU 受限")
         result["summary"] = ", ".join(summary_bits)
         return result
 
@@ -10356,11 +10738,48 @@ def _render_monitor_html(res):
 
     tcp_rate = _rate_series(samples.get("tcp") or [])
     dns_rate = _rate_series(samples.get("dns") or [])
+    # v1.7.0 (PR-F0): TCP 重传率时序 (相邻采样点差分, 与 CSV tcp_retrans 行同口径)
+    tq = res.get("tcp_quality") or {}
+    tq_series = tq.get("series") or []
+    retrans_rate_series = []
+    for i in range(1, len(tq_series)):
+        ds = tq_series[i][1] - tq_series[i - 1][1]
+        dr = tq_series[i][2] - tq_series[i - 1][2]
+        if ds > 0:
+            retrans_rate_series.append([tq_series[i][0], round(dr / ds * 100, 2)])
+    if tq.get("retrans_rate_pct") is not None:
+        tq_rate_html = (f"{tq['retrans_rate_pct']}% (重传 {tq.get('retrans_delta')} / "
+                        f"发送 {tq.get('sent_delta')})")
+    elif tq_series:
+        tq_rate_html = f"分母不足 (发送增量 {tq.get('sent_delta', 0)} 段), 不判比率"
+    else:
+        tq_rate_html = "无采样"
+    tq_rate_pct = tq.get("retrans_rate_pct")
+    # v1.7.0 (PR-F0): MTU 探测结果行 (path_mtus 每目标一行)
+    mtu = res.get("mtu") or {}
+    mtu_rows = []
+    for r in (mtu.get("path_mtus") or []):
+        tgt = _esc_html(str(r.get("target")))
+        if r.get("error"):
+            mtu_rows.append(f"<tr><td>路径 MTU (到 {tgt})</td>"
+                            f"<td>探测失败: {_esc_html(str(r.get('error')))}</td></tr>")
+        else:
+            mtu_rows.append(f"<tr><td>路径 MTU (到 {tgt})</td>"
+                            f"<td>{r.get('path_mtu', '—')} (探测 {r.get('probes', '—')} 次)</td></tr>")
+    if_mtu = mtu.get("local_if_mtu")
+    if if_mtu:
+        mtu_local_html = (f"<tr><td>本机出口接口 MTU</td><td>{if_mtu}"
+                          + (f" ({_esc_html(str(mtu.get('local_if_name')))})"
+                             if mtu.get("local_if_name") else "")
+                          + "</td></tr>")
+    else:
+        mtu_local_html = "<tr><td>本机出口接口 MTU</td><td>未获取</td></tr>"
     data_js = json.dumps({
         "gw": gw, "ext": ext,
         "gw_bands": _bands(samples.get("gw_loss") or []),
         "ext_bands": _bands(samples.get("ext_loss") or []),
         "tcp_rate": tcp_rate, "dns_rate": dns_rate,
+        "retrans_rate": retrans_rate_series,
     }, ensure_ascii=False)
 
     gw_pct = stats.get("gw", {}).get("loss_pct", 0)
@@ -10388,10 +10807,13 @@ def _render_monitor_html(res):
     ev_rows = []
     type_names = {"outage": "中断", "dns_fail": "DNS 故障", "tcp_fail": "TCP 失败",
                   "latency_spike": "延迟突增", "jitter_burst": "抖动集中",
-                  "monitor_gap": "采集间隙"}
+                  "monitor_gap": "采集间隙",
+                  # v1.7.0 (PR-F0): 统计层新事件
+                  "mtu_mismatch": "MTU 不匹配", "tcp_retrans_burst": "TCP 重传爆发"}
     cls_names = {"internal": "内网侧", "carrier": "运营商侧", "both_down": "内外同断",
                  "dns": "解析侧", "with_outage": "随中断", "policy": "端口策略",
-                 "target_unreachable": "目标不可达", "unknown": "无法定位", "": ""}
+                 "target_unreachable": "目标不可达", "unknown": "无法定位", "": "",
+                 "mtu": "MTU 受限", "l4_loss": "传输层丢包"}
     for e in events:
         if e["type"] == "monitor_gap":
             continue
@@ -10451,6 +10873,9 @@ canvas{{max-width:100%}}
 {_metric("外网丢包率", f"{ext_pct}%", "err" if ext_pct > 10 else "warn" if ext_pct > 2 else "ok")}
 {_metric("最长中断", f"{longest:.0f}s", "err" if longest >= 30 else "warn" if longest else "ok")}
 {_metric("DNS 成功率", f"{dns_ok}%", "err" if (dns_ok or 100) < 90 else "ok", f"服务器 {tg.get('dns_server', '')}")}
+{_metric("TCP 重传率", (f"{tq_rate_pct}%" if tq_rate_pct is not None else "—"),
+          "err" if (tq_rate_pct or 0) >= 5 else "warn" if (tq_rate_pct or 0) >= 1 else "ok",
+          "会话差分口径 (v1.7.0)")}
 </div>
 <div class="banner">
 <div class="verdict">{_esc_html(v_name)}</div>
@@ -10462,10 +10887,20 @@ canvas{{max-width:100%}}
 <canvas id="latChart" width="840" height="240"></canvas></div>
 <div class="panel"><h3>连通率 (TCP 53 / DNS, 30 秒桶)</h3>
 <canvas id="reachChart" width="840" height="160"></canvas></div>
+<div class="panel"><h3>MTU 与传输质量 (v1.7.0 统计层)</h3>
+<table>
+<tr><th>项目</th><th>值</th></tr>
+<tr><td>MTU 探测状态</td><td>{_esc_html(str(mtu.get('probe_status', '—')))}</td></tr>
+{mtu_local_html}
+{''.join(mtu_rows)}
+<tr><td>会话 TCP 重传率</td><td>{_esc_html(tq_rate_html)}</td></tr>
+<tr><td>重传采样</td><td>{len(tq_series)} 点 (30s 周期, 开机累计计数器差分)</td></tr>
+</table>
+<canvas id="retransChart" width="840" height="140"></canvas></div>
 <div class="panel"><h3>监测详情</h3>
 <table>
 <tr><th>项目</th><th>值</th></tr>
-<tr><td>采样规格</td><td>网关/外网 ping 1s × 2 路; TCP 53 / DNS 解析 5s</td></tr>
+<tr><td>采样规格</td><td>网关/外网 ping 1s × 2 路; TCP 53 / DNS 解析 5s; 路径 MTU 后台探测; TCP 重传统计 30s</td></tr>
 <tr><td>探测目标</td><td>外网 {_esc_html(str(tg.get('external')))} → {_esc_html(str(tg.get('external_resolved')))} ·
 DNS {_esc_html(str(tg.get('dns_server')))} / {_esc_html(str(tg.get('dns_domain')))}</td></tr>
 <tr><td>样本数</td><td>网关 {stats.get('gw', {}).get('ok', 0)} 成功 / {stats.get('gw', {}).get('loss', 0)} 丢包 ·
@@ -10526,17 +10961,19 @@ chart('latChart',
 chart('reachChart',
   [{{name: 'TCP 53', color: '#ea580c', data: DATA.tcp_rate}},
    {{name: 'DNS', color: '#0891b2', data: DATA.dns_rate}}]);
+chart('retransChart',
+  [{{name: 'TCP 重传率 %', color: '#b26a00', data: DATA.retrans_rate}}]);
 </script>
 </div></body></html>"""
 
 
-def run_monitor_mode(duration_s, ext_target=None):
+def run_monitor_mode(duration_s, ext_target=None, load_url=None):
     """盯障模式入口 (CLI --monitor 与菜单 m 共用)。
 
     全文件唯一在长循环外层捕获 KeyboardInterrupt 的地方: Ctrl+C 提前结束
     也必须走统一的报告落盘路径 (装维随时可停, 数据不丢)。"""
     duration_s = max(30, min(86400, int(duration_s or 600)))
-    session = MonitorSession(duration_s, ext_target)
+    session = MonitorSession(duration_s, ext_target, load_url=load_url)
     if not session.start():
         print(_c("  ✗ 外网 ping 启动失败, 无法开始监测 (检查 ping 命令可用性)", C_RED))
         return None
@@ -10544,6 +10981,9 @@ def run_monitor_mode(duration_s, ext_target=None):
     print(_c(f"  盯障开始: 时长 {duration_s}s · 网关 {session._gw_ip or '—'} · "
              f"外网 {session._ext_ip_resolved} · DNS {session._dns_server}", C_CYAN))
     print(_c("  期间可正常使用电脑; Ctrl+C 可提前结束并生成报告", C_GRAY))
+    print(_c("  统计层 (v1.7.0): 后台探测路径 MTU + TCP 重传统计 30s 采样"
+             + ("; 已排定主动下载负载 (--monitor-load)" if load_url else ""),
+             C_GRAY))
     early = False
     tty = sys.stdout.isatty()
     mono0 = time.monotonic()
@@ -16191,6 +16631,12 @@ def main():
     parser.add_argument("--monitor-target", metavar="HOST",
                         help="盯障外网 ping 目标 (默认 223.5.5.5, 同时对该目标 TCP 53 "
                              "建连; 可用域名)")
+    parser.add_argument("--monitor-load", action="store_true",
+                        help="盯障期间生成 15s 主动下载负载 (制造 full-size 包让 TCP "
+                             "重传统计有分母; 流式读即丢弃, 不落盘)")
+    parser.add_argument("--load-url", metavar="URL",
+                        help="主动负载的下载地址 (默认微信安装包 CDN 大文件, "
+                             "配合 --monitor-load 使用)")
     args = parser.parse_args()
 
     # `netpulse diagnose <profile>` 子命令形式 (与 README/CHANGELOG 文档口径
@@ -16305,7 +16751,14 @@ def main():
         return
     # 盯障模式: 独立顶层运行模式 (与模块诊断互斥)
     if args.monitor:
-        run_monitor_mode(args.monitor, ext_target=args.monitor_target)
+        # v1.7.0 (PR-F0): 主动负载 opt-in — --monitor-load 用默认 CDN 大文件,
+        # --load-url 可覆盖地址; 两者都没给则不制造流量
+        if args.monitor_load or args.load_url:
+            load_url = args.load_url or MonitorSession.MONITOR_LOAD_URL
+        else:
+            load_url = None
+        run_monitor_mode(args.monitor, ext_target=args.monitor_target,
+                         load_url=load_url)
         return
     if args.modules:
         is_all_only = (args.modules == ["all"])
