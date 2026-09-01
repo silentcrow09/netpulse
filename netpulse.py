@@ -1713,17 +1713,59 @@ ALL_RULES = [
     _rule_nat_restricted,
 ]
 
+# 规则 id → 规则函数 (PR-B · v1.6.0)。id 与 RootCause.id / _RC_EVIDENCE_BUILDERS 同源。
+_RULE_BY_ID = {
+    "dns_failure": _rule_dns_failure,
+    "wan_interruption": _rule_wan_interruption,
+    "wifi_weak": _rule_wifi_weak,
+    "bufferbloat": _rule_bufferbloat,
+    "gateway_loss": _rule_gateway_loss,
+    "nat_restricted": _rule_nat_restricted,
+}
+# 函数 → id 反向映射 (兜底评估时按 PROFILE_RULE_EXCLUDES 跳过)
+_RULE_ID_OF = {fn: rid for rid, fn in _RULE_BY_ID.items()}
 
-def diagnose(results_dict):
-    """根因分析主入口 (C1 + C2). 评估所有内置规则, 返回 DiagnosisReport.
+
+def diagnose(results_dict, rule_filter=None):
+    """根因分析主入口 (C1 + C2). 评估内置规则, 返回 DiagnosisReport.
 
     results_dict: run_diagnostics 输出的 full dict ({key: results_dict})
+    rule_filter: 场景 profile id (PR-B · v1.6.0)。只评估该场景相关规则
+                 (PROFILE_RULES), 避免 gaming 报 wifi 弱等无关根因。
+                 过滤后无命中时退回全规则评估 —— 不把异常藏起来,
+                 与 HTML 报告"无根因时所有问题模块都展开"同哲学。
+                 为 None 时评估全部规则 (v1.5.x 行为不变)。
     """
+    rules = ALL_RULES
+    excludes = set()
+    if rule_filter:
+        ids = PROFILE_RULES.get(rule_filter)
+        if ids:
+            filtered = [_RULE_BY_ID[i] for i in ids if i in _RULE_BY_ID]
+            if filtered:
+                rules = filtered
+        excludes = set(PROFILE_RULE_EXCLUDES.get(rule_filter) or [])
     root_causes = []
-    for rule in ALL_RULES:
+    rules_evaluated = 0
+    for rule in rules:
+        rules_evaluated += 1
         rc = rule(results_dict)
         if rc is not None:
             root_causes.append(rc)
+    # 场景规则过滤后无命中 → 退回全规则评估 (不能把异常藏起来)。
+    # 但场景明确排除的规则 (PROFILE_RULE_EXCLUDES) 即使兜底也禁止评估,
+    # 防止排除规则借兜底路径绕回 (gaming 报 wifi 弱)。
+    # 最终评估集合 = 全规则 - 排除集, rules_evaluated 按实际评估条数重算。
+    if rule_filter and not root_causes and rules is not ALL_RULES:
+        root_causes = []
+        rules_evaluated = 0
+        for rule in ALL_RULES:
+            if _RULE_ID_OF.get(rule) in excludes:
+                continue
+            rules_evaluated += 1
+            rc = rule(results_dict)
+            if rc is not None:
+                root_causes.append(rc)
     # v1.5.3: 按严重度降序 (同级保持注册表顺序)。root_causes[0] 会被 HTML 报告
     # 的模块折叠策略当作「首要根因」、CLI/报障工单按序展示 — 注册表顺序
     # (dns 在前) 会让 HIGH 的 dns_failure 压住 CRITICAL 的 wan_interruption,
@@ -1745,7 +1787,7 @@ def diagnose(results_dict):
         root_causes=root_causes,
         overall_confidence=overall_confidence,
         timestamp=datetime.now().isoformat(),
-        rules_evaluated=len(ALL_RULES),
+        rules_evaluated=rules_evaluated,
         rules_fired=len(root_causes),
     )
 
@@ -1767,6 +1809,43 @@ DIAGNOSE_PROFILES = {
     "gaming": ["gateway", "tcp", "nattype", "bufferbloat", "mtu", "tcpstats"],
     # WiFi 不稳/信号弱: WiFi + 网关 + LAN
     "wifi": ["wifi", "gateway", "lan"],
+}
+
+# 场景 profile → 参与根因评估的规则 id (PR-B · v1.6.0)
+# 只评估该场景相关规则, 避免无关根因 (如 gaming 场景报 "WiFi 信号弱" 噪音)。
+# 规则集取舍:
+#   - slow 含 wifi_weak: 装维现场 "网慢" 多数先看 WiFi 信号 (决策点 7.4 默认含)
+#   - gaming 必不含 wifi_weak: 游戏卡顿报 WiFi 弱 = 噪音 (用户拍板)
+#   - disconnect/web 聚焦连通性规则 (WAN 中断 / 网关丢包 / DNS)
+PROFILE_RULES = {
+    "slow": ["bufferbloat", "gateway_loss", "dns_failure", "wifi_weak"],
+    "disconnect": ["wan_interruption", "gateway_loss", "dns_failure"],
+    "web": ["dns_failure", "wan_interruption", "gateway_loss"],
+    "gaming": ["gateway_loss", "bufferbloat", "nat_restricted"],
+    "wifi": ["wifi_weak", "gateway_loss"],
+}
+
+# 场景明确排除的规则 id (PR-B · v1.6.0): 即使「无命中退回全规则」兜底
+# 触发也禁止评估。防止排除规则借兜底路径绕回 (如 gaming 场景报 wifi 弱)。
+PROFILE_RULE_EXCLUDES = {
+    "gaming": ["wifi_weak"],
+}
+
+# 场景中文标签 (PR-A · v1.6.0 主菜单 / 完成屏 / 报告文件名用)
+SCENE_LABELS = {
+    "slow": "网络很慢",
+    "disconnect": "经常断网",
+    "web": "网页打不开",
+    "gaming": "游戏卡顿",
+    "wifi": "WiFi 信号差",
+}
+# 主菜单数字键 → profile id
+SCENE_MENU_KEYS = {
+    "1": "slow",
+    "2": "disconnect",
+    "3": "web",
+    "4": "gaming",
+    "5": "wifi",
 }
 
 
@@ -2551,7 +2630,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.6.0"
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -15518,8 +15597,224 @@ def parse_choice(choice):
     return _parse_keys(choice.split(), strict=True)
 
 
+def _format_error_for_user(exc):
+    """把异常转成 (客户语言一句话, 工程师细节) 两段 (PR-C · v1.6.0)。
+
+    仅场景路径 try/except 包装用; CLI 全量输出不受影响。
+    """
+    name = type(exc).__name__
+    msg = str(exc) or name
+    detail = f"[{name}] {msg}"
+    if isinstance(exc, KeyboardInterrupt):
+        return ("已中断本次检测。", detail)
+    if isinstance(exc, PermissionError):
+        return ("权限不足：无法执行该检测（请以管理员身份重新运行）", detail)
+    if isinstance(exc, socket.gaierror):
+        return ("DNS 解析失败：无法解析域名（请检查 DNS 设置或联系运营商）", detail)
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return ("网络超时：请求响应太慢（可能是网络拥堵或运营商故障）", detail)
+    return ("检测过程中出错（请重试；连续失败请联系技术支持）", detail)
+
+
+def _desktop_netpulse_dir():
+    """桌面 NetPulse 目录 (OneDrive 重定向优先); 全不可用返回 None (PR-C)。
+
+    公司电脑桌面常被 OneDrive 重定向到 %USERPROFILE%\\OneDrive\\Desktop,
+    仅当该重定向真实存在 (OneDrive\\Desktop 目录已存在) 才优先使用,
+    避免在普通桌面环境误建 OneDrive 目录; 都不可写则返回 None,
+    由调用方退化到 reports/ 目录。
+    """
+    base = os.environ.get("USERPROFILE") or ""
+    if not base:
+        return None
+    cands = []
+    one_desktop = os.path.join(base, "OneDrive", "Desktop")
+    if os.path.isdir(one_desktop):
+        cands.append(os.path.join(one_desktop, "NetPulse"))
+    cands.append(os.path.join(base, "Desktop", "NetPulse"))
+    for d in cands:
+        try:
+            os.makedirs(d, exist_ok=True)
+            if os.access(d, os.W_OK):
+                return d
+        except Exception:
+            continue
+    return None
+
+
+def _export_scene_report(profile, title):
+    """场景完成后保存 HTML 报告到 桌面\\NetPulse\\, 返回 (path, err) (PR-C)。
+
+    不可写时退化 _report_dir() (原 reports/ 逻辑), 与 CLI --export 无关。
+    """
+    if not LAST_RUN:
+        return None, "尚无诊断数据"
+    base = _desktop_netpulse_dir()
+    if not base:
+        base = _report_dir()
+    name = f"{datetime.now():%Y-%m-%d}_{title}.html"
+    path = os.path.join(base, name)
+    err = export_report(path)
+    if err:
+        return path, err
+    return path, None
+
+
+def _scene_summary(profile, title, diagnosis):
+    """场景完成屏: 健康分 + 一句话根因结论 (复用 _print_diagnosis, PR-A/PR-C)。"""
+    print()
+    print(_c("=" * 60, C_BLUE))
+    print(_c(f"  {APP_NAME} > {title} > 检测完成", C_BOLD))
+    print(_c("-" * 60, C_GRAY))
+    try:
+        report = build_report()
+        health = report.get("health") or {}
+        score = health.get("score")
+        grade = health.get("grade")
+        if score is not None:
+            print(_c(f"  网络健康: {score} / 100" +
+                     (f" （{grade}）" if grade else ""), C_BOLD))
+            print()
+    except Exception:
+        pass
+    if diagnosis is not None:
+        _print_diagnosis(diagnosis)
+    else:
+        print(_c("  ⚠ 本次未能完成根因分析。", C_YELLOW))
+    print(_c("-" * 60, C_GRAY))
+
+
+def _run_scene_monitor(install=False, pip_mirror=None):
+    """[7] 持续盯障: 输入分钟数 (1-1440, 默认 10) → run_monitor_mode。"""
+    print(_c("  持续盯障: 持续监测外网连通性, 找偶发掉线/抖动。", C_WHITE))
+    try:
+        ans = input(_c("  盯障时长（分钟, 1-1440, 默认 10）: ", C_GREEN)).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    minutes = 10
+    if ans:
+        try:
+            minutes = int(ans)
+        except ValueError:
+            minutes = 10
+    minutes = max(1, min(1440, minutes))
+    print(_c(f"  开始盯障 {minutes} 分钟（{minutes*60} 秒）... Ctrl+C 可提前结束", C_BOLD))
+    try:
+        run_monitor_mode(minutes * 60)
+    except Exception as e:
+        user_msg, detail = _format_error_for_user(e)
+        print(_c(f"  ✗ {user_msg}", C_RED))
+        if sys.stdout.isatty():
+            print(_c(f"    {detail}", C_GRAY))
+    try:
+        input(_c("  按 Enter 返回主菜单...", C_GRAY))
+    except (EOFError, KeyboardInterrupt):
+        print()
+
+
+def _run_scene(profile, install=False, pip_mirror=None):
+    """执行一个场景: 跑模块 → 根因 (规则过滤) → 完成屏 → 报告存桌面。
+
+    PR-A + PR-B + PR-C 集成点。CLI --diagnose 路径不受影响。
+    """
+    title = SCENE_LABELS.get(profile, profile)
+    keys = DIAGNOSE_PROFILES[profile]
+    names = [MODULE_MAP[k][0] for k in keys if k in MODULE_MAP]
+    print(_c(f"  场景「{title}」: 将检测 {len(keys)} 项 — ", C_BOLD) + "、".join(names))
+    print(_c("  预计 1-3 分钟, 请稍候...", C_GRAY))
+    try:
+        run_diagnostics(keys, banner=False, parallel=True, max_workers=4,
+                        install=install, pip_mirror=pip_mirror)
+    except Exception as e:
+        user_msg, detail = _format_error_for_user(e)
+        print(_c(f"  ✗ {user_msg}", C_RED))
+        if sys.stdout.isatty():
+            print(_c(f"    {detail}", C_GRAY))
+        return
+    # 根因分析 (PR-B: 按场景规则集评估, 避免 gaming 报 wifi 弱等无关根因)
+    diagnosis = None
+    try:
+        if LAST_RUN and LAST_RUN.get("results"):
+            diagnosis = _enrich_diagnosis_evidence(
+                diagnose(LAST_RUN["results"], rule_filter=profile),
+                LAST_RUN["results"])
+    except Exception:
+        diagnosis = None
+    _scene_summary(profile, title, diagnosis)
+    # 报告存桌面 (PR-C)
+    path, err = _export_scene_report(profile, title)
+    if err:
+        print(_c(f"  ✗ 报告保存失败: {err}", C_RED))
+    else:
+        print(_c(f"  📄 报告已保存: {path}", C_GREEN))
+
+
+def _menu_clear():
+    """清屏 (ANSI VT 已在 _cli_enable_vt 启用; 退化 cls/clear)。"""
+    if not _clear_screen():
+        if os.name == "nt":
+            try:
+                subprocess.run(["cls"], shell=True, timeout=2)
+            except Exception:
+                pass
+        else:
+            try:
+                subprocess.run(["clear"], timeout=2)
+            except Exception:
+                pass
+
+
+def _scene_menu(install=False, pip_mirror=None):
+    """场景层首页 (PR-A · v1.6.0): 中文场景标签 + 数字回车。
+
+    返回 False = 退出程序 ([0] 退出 / [9] 高级页里退出 / Ctrl+C)。
+    """
+    while True:
+        _menu_clear()
+        bar = "=" * 60
+        print(_c(bar, C_BLUE))
+        print(_c(f"  {APP_NAME} v{APP_VERSION}    网络诊断（场景模式）", C_BOLD))
+        print(_c(bar, C_BLUE))
+        print(_c("  请选择场景（输入数字回车）：", C_WHITE))
+        print()
+        print(f"    {_c('[1]', C_CYAN)} 网络很慢        {_c('[2]', C_CYAN)} 经常断网      {_c('[3]', C_CYAN)} 网页打不开")
+        print(f"    {_c('[4]', C_CYAN)} 游戏卡顿        {_c('[5]', C_CYAN)} WiFi 信号差")
+        print()
+        print(f"    {_c('[7]', C_CYAN)} 持续盯障（输入分钟数）")
+        print(f"    {_c('[9]', C_CYAN)} 高级选项（工程师用）   {_c('[0]', C_CYAN)} 退出")
+        print(_c("-" * 60, C_GRAY))
+        try:
+            choice = input(_c("  选择 [0-9]: ", C_GREEN)).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        if choice in ("0", "q", "quit", "exit"):
+            return False
+        if choice == "9":
+            # 高级页 (原模块清单菜单) 里退出 → 整个程序退出
+            if not _module_menu(install=install, pip_mirror=pip_mirror):
+                return False
+            continue
+        if choice == "7":
+            _run_scene_monitor(install=install, pip_mirror=pip_mirror)
+            continue
+        if choice in SCENE_MENU_KEYS:
+            _run_scene(SCENE_MENU_KEYS[choice], install=install,
+                       pip_mirror=pip_mirror)
+            continue
+        print(_c("  无效选择, 请重新输入。", C_YELLOW))
+        try:
+            input(_c("  按 Enter 继续...", C_GRAY))
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+
 def interactive_menu(install=False, pip_mirror=None):
-    """交互式数字选择菜单 (cmd 窗口)。
+    """交互式场景菜单 (cmd 窗口, v1.6.0)。
+
+    无参数启动 → 场景层 (中文场景标签 + 数字回车);
+    [9] 高级选项 = 原模块清单菜单 (工程师用), 行为与 v1.5.x 一致。
 
     install: 是否允许在交互过程中自动安装缺失依赖
              (与 CLI --install 联动)。
@@ -15539,7 +15834,16 @@ def interactive_menu(install=False, pip_mirror=None):
     SPEEDTEST_CONFIG["use_speedtest_net"] = True
     if not SPEEDTEST_CONFIG.get("ookla_server_id"):
         SPEEDTEST_CONFIG["ookla_server_id"] = OOKLA_DEFAULT_SERVER_ID
+    if not _scene_menu(install=install, pip_mirror=pip_mirror):
+        return
 
+
+def _module_menu(install=False, pip_mirror=None):
+    """原模块清单菜单 (v1.6.0 起为场景层 [9] 高级选项)。
+
+    行为与 v1.5.x 完全一致 (模块编号 / 分类 / 0 全部 / m 盯障 / e 导出 / q 退出);
+    退出 (q / Ctrl+C) 返回 False, 通知场景层结束整个程序。
+    """
     while True:
         # 清屏: 用 ANSI 转义 (VT 已在 _cli_enable_vt 启用) 替代 os.system('cls'),
         # 避免 cmd.exe 解析 + 子进程阻塞。VT 未启用时退回到 subprocess 直调 cls。
@@ -15697,6 +16001,8 @@ def interactive_menu(install=False, pip_mirror=None):
             input(_c("\n  按 Enter 返回菜单...", C_GRAY))
         except (EOFError, KeyboardInterrupt):
             break
+    # q / Ctrl+C / EOF 退出模块清单菜单 → 通知场景层结束整个程序
+    return False
 
 
 def main():
@@ -15902,8 +16208,9 @@ def main():
                         parallel=args.parallel, max_workers=args.max_workers,
                         pip_mirror=args.pip_mirror)
         # 根因分析 (基于 run_diagnostics 写入的 LAST_RUN["results"])
+        # v1.6.0 (PR-B): 按场景规则集评估, 避免 gaming 报 wifi 弱等无关根因
         if LAST_RUN and LAST_RUN.get("results"):
-            diagnosis = diagnose(LAST_RUN["results"])
+            diagnosis = diagnose(LAST_RUN["results"], rule_filter=profile)
             print(_c("─" * 60, C_BLUE))
             _print_diagnosis(diagnosis)
         # 与 modules 路径同权: --export / --json-schema 等后续动作不再被吞
