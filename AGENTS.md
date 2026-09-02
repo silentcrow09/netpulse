@@ -82,8 +82,8 @@
 
 ```bash
 for f in tests/test_*.py; do python "$f"; done
-#   单元/回归套件 (v1.8.1 起入仓, 13 文件 / 324 用例): parsers/diagnosis/
-#   诊断矩阵/丢包口径/XSS 转义/pcap 分析与取证/probes/redaction/场景菜单/盯障统计
+#   单元/回归套件 (v1.8.1 起入仓, 14 文件 / 330 用例): parsers/diagnosis/
+#   诊断矩阵/丢包口径/XSS 转义/pcap 分析与取证/probes/redaction/场景菜单/盯障统计/v1.9.4 排版同类修复
 python _smoke_report.py          # 192 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项
 ```
 

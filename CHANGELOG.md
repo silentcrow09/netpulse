@@ -7,6 +7,36 @@
 
 ## [Unreleased]
 
+## [1.9.4] - 2026-09-02
+
+系统性排查报告 HTML 中「标题行 + 下方留白 = 两行空白观感」类排版问题
+（继 v1.9.3 修健康卡居中后，同类的其余容器一并收口）。
+
+### 修复
+
+- **健康卡 `.diagnosis.healthy` 仍偏空**：v1.9.3 已整句居中、去掉底部
+  12px 空距，但 padding 14px + row-gap 6px 让卡片仍像「两行」。现收紧为
+  padding 9px 20px、row-gap 4px、line-height 1.4、badge padding 5px 14px，
+  呈紧凑按钮状，单行即满
+- **`.hero .sub` 长文字被 gauge 挤换行成两行**：verdict + 生成时间戳一行
+  超宽时被 132px 圆形 gauge + 36px gap 挤成两行。现 `white-space: nowrap`
+  + `overflow: hidden` + `text-overflow: ellipsis` + `min-width: 0`，
+  次要时间戳截断保留 verdict
+- **「所有核心检测通过」分支 `.todo.ok .impact` 无背景样式**：该分支的
+  impact 直接挂在 `.todo.ok` 内（不经 `.issue`），旧 `.issue .impact`
+  规则匹配不到 → 绿勾标题下挂一行无样式的灰字，观感像第二行空白。
+  现补 `.todo.ok .impact` 绿字 + 浅绿底（与 `.issue.ok .impact` 同风格）
+- **回归保护**：问题诊断卡（`.diagnosis .dhead` 左对齐、margin-bottom
+  12px）与 `.diagnosis .rcard` 基线未受健康卡紧凑化误伤
+
+### 测试
+
+- 新增 `tests/test_v194_layout.py`（6 项）：健康卡紧凑化 CSS、hero .sub
+  nowrap/ellipsis、todo ok .impact 绿底样式、问题卡 dhead 基线未回退、
+  全绿场景渲染 `.todo ok` 分支含 `.impact` 行、有问题场景走 `.diagnosis`
+  （非 healthy）。套件累计 14 文件 / 330 用例全绿 + `_smoke_report.py`
+  192 项断言通过
+
 ## [1.9.3] - 2026-09-02
 
 现场实测反馈修复（场景模式易用性 + MTU 误报 + 报告展示口径，三处均来自

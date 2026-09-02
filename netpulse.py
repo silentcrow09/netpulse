@@ -2653,9 +2653,9 @@ _DIAGNOSIS_CSS = """
 .diagnosis .dhead { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 /* v1.9.3: 无故障卡片整句居中单行 — 旧布局 dhead 贴左上且下方留 12px 空距,
    卡片内呈现"第一行有字、第二行空白"的两行错觉 */
-.diagnosis.healthy { padding: 14px 20px; }
-.diagnosis.healthy .dhead { justify-content: center; margin-bottom: 0; flex-wrap: wrap; row-gap: 6px; }
-.diagnosis.healthy .dbadge.ok { font-size: 14px; padding: 6px 14px; }
+.diagnosis.healthy { padding: 9px 20px; }
+.diagnosis.healthy .dhead { justify-content: center; margin-bottom: 0; flex-wrap: wrap; row-gap: 4px; line-height: 1.4; }
+.diagnosis.healthy .dbadge.ok { font-size: 14px; padding: 5px 14px; }
 .diagnosis .dbadge { padding: 4px 10px; border-radius: 4px; font-weight: 600; font-size: 13px; }
 .diagnosis .dbadge.ok { background: #dcfce7; color: #166534; }
 .diagnosis .dbadge.warn { background: #fee2e2; color: #991b1b; }
@@ -3249,7 +3249,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.9.3"
+APP_VERSION = "1.9.4"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -17263,7 +17263,10 @@ body{background:#eef1f6;color:#1e293b;font:14px/1.65 -apple-system,BlinkMacSyste
 .hero .app .mark::after{content:'';position:absolute;inset:8px;border:2px solid #fff;border-radius:4px}
 .hero .app b{font-size:16px}
 .hero .ver{font-size:11px;color:#3b82f6;background:#dbeafe;padding:1px 9px;border-radius:999px;font-weight:600}
-.hero .sub{font-size:12.5px;color:#64748b;margin-top:2px}
+.hero .sub{font-size:12.5px;color:#64748b;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+/* v1.9.4: 健康分数描述(verdict) + 生成时间一行过长会在 hero 卡片右侧
+   强制换行成两行(被 gauge 132px+gap 36px 挤到宽度 < 文字), 与健康卡
+   "两行观感"同类 — 用 nowrap + ellipsis 截断次要时间戳, 保留 verdict */
 .hero .meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
 .hero .meta span{font-size:12px;color:#64748b;background:#f4f6fa;border:1px solid #e6e9f0;border-radius:999px;padding:2.5px 11px;font-family:Cascadia Mono,Consolas,monospace}
 .hero .meta span b{color:#1e293b;font-weight:600}
@@ -17291,6 +17294,9 @@ body{background:#eef1f6;color:#1e293b;font:14px/1.65 -apple-system,BlinkMacSyste
 .todo.ok{background:linear-gradient(180deg,#f0fdf4,#f7fee7);border-color:#bbf7d0}
 .todo-head{font-size:15px;font-weight:700;color:#991b1b;margin-bottom:12px}
 .todo.ok .todo-head{color:#166534}
+/* v1.9.4: "所有核心检测通过" 分支的 .impact 在 .todo 内(非 .issue 内), 旧
+   .issue .impact 规则匹配不到, 文字无绿底样式显得"第二行无样式像空白" */
+.todo.ok .impact{color:#166534;background:#f0fdf4;padding:8px 12px;border-radius:6px;font-size:12.5px;line-height:1.7;margin-top:4px}
 .issue{padding:13px 0;border-top:1px dashed #fecaca}
 .issue:first-of-type{border-top:none;padding-top:14px}
 .issue.ok{border-top-color:#bbf7d0}
