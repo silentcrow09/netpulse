@@ -348,8 +348,10 @@ class TestProbesB8B11Registered(unittest.TestCase):
         self.assertIs(N._V2_PROBES["wifi"], N.probe_wifi_v2)
 
     def test_total_5_probes(self):
-        """A 阶段后 B7-B11 共 5 个 probe (gateway/dns/route/arp/wifi)."""
-        self.assertEqual(len(N._V2_PROBES), 5)
+        """v1.8.2 (P0-03 第一批): 9 个 probe (B7-B11 + external/tcpstats/mtu/web)."""
+        self.assertEqual(set(N._V2_PROBES),
+                         {"gateway", "dns", "route", "arp", "wifi",
+                          "external", "tcpstats", "mtu", "web"})
 
     def test_dns_old_tester_still_exists(self):
         """DNSTester 保留 (双轨), 等 B13 删除."""
@@ -435,6 +437,185 @@ class TestProbesB8B11StubRun(unittest.TestCase):
         self.assertEqual(result.issues[0].severity, N.Severity.CRITICAL)
         self.assertEqual(result.issues[0].title, "严重问题")
         self.assertEqual(result.issues[0].recommendations, ["修复"])
+
+
+class TestEvidenceBuilders(unittest.TestCase):
+    """P0-03 第一批 Evidence builders (v1.8.2): 字段与 _rule_* 同源."""
+
+    def test_external(self):
+        res = {"tcp_ok": 4, "tcp_total": 4, "unreachable_count": 0,
+               "avg_loss_pct": 0.0, "avg_rtt_ms": 23.5}
+        eids = {e.id for e in N._evidence_external(res)}
+        self.assertIn("external.tcp.tcp_ok", eids)
+        self.assertIn("external.tcp.unreachable_count", eids)
+        self.assertIn("external.ping.avg_loss_pct", eids)
+        self.assertIn("external.ping.avg_rtt_ms", eids)
+        ok = next(e for e in N._evidence_external(res)
+                  if e.id == "external.tcp.tcp_ok")
+        self.assertEqual(4, ok.metadata["tcp_total"])
+
+    def test_external_no_tcp_data_skips_tcp_fields(self):
+        res = {"tcp_ok": 0, "tcp_total": 0, "avg_loss_pct": 3.0}
+        eids = {e.id for e in N._evidence_external(res)}
+        self.assertNotIn("external.tcp.tcp_ok", eids)
+        self.assertIn("external.ping.avg_loss_pct", eids)
+
+    def test_dns(self):
+        ev = N._evidence_dns({"success_count": 2, "total_count": 10})
+        self.assertEqual(1, len(ev))
+        self.assertEqual("dns.resolve.success_count", ev[0].id)
+        self.assertEqual(10, ev[0].metadata["total_count"])
+        self.assertEqual([], N._evidence_dns({"success_count": None,
+                                              "total_count": 0}))
+
+    def test_wifi_and_tcpstats(self):
+        wf = N._evidence_wifi({"overall_interference": "干扰较高"})
+        self.assertEqual("wifi.spectrum.overall_interference", wf[0].id)
+        self.assertEqual([], N._evidence_wifi({"overall_interference": None}))
+        ts = N._evidence_tcpstats({"retrans_rate_pct": 6.0,
+                                   "segments_sent": 1000,
+                                   "retransmitted": 60})
+        self.assertEqual("tcpstats.retrans.retrans_rate_pct", ts[0].id)
+        self.assertEqual(1000, ts[0].metadata["segments_sent"])
+        self.assertEqual([], N._evidence_tcpstats({"retrans_rate_pct": None}))
+
+    def test_mtu(self):
+        res = {"path_mtus": [{"target": "223.5.5.5", "path_mtu": 1500},
+                             {"target": "x", "error": "超时", "path_mtu": None}],
+               "local_mtus": [{"name": "以太网", "mtu": 1500},
+                              {"name": "bad", "mtu": 0}]}
+        ev = N._evidence_mtu(res)
+        paths = [e for e in ev if e.id == "mtu.probe.path_mtu"]
+        ifaces = [e for e in ev if e.id == "mtu.iface.mtu"]
+        self.assertEqual(1, len(paths))
+        self.assertEqual("223.5.5.5", paths[0].metadata["target"])
+        self.assertEqual(1, len(ifaces))
+        self.assertEqual("以太网", ifaces[0].metadata["name"])
+
+    def test_web_none_fields_skipped(self):
+        ev = N._evidence_web({"ok_count": 3, "total_count": 4,
+                              "avg_ttfb_ms": 120, "min_cert_days": None})
+        eids = {e.id for e in ev}
+        self.assertIn("web.http.ok_count", eids)
+        self.assertIn("web.timing.avg_ttfb_ms", eids)
+        self.assertNotIn("web.cert.min_cert_days", eids)
+
+    def test_error_or_non_dict_returns_empty(self):
+        for builder in (N._evidence_external, N._evidence_dns,
+                        N._evidence_wifi, N._evidence_tcpstats,
+                        N._evidence_mtu, N._evidence_web):
+            self.assertEqual([], builder({"error": "超时"}), msg=builder.__name__)
+            self.assertEqual([], builder(None), msg=builder.__name__)
+
+
+class TestWrapEvidenceFn(unittest.TestCase):
+    """wrap helper 的 evidence_fn 参数 (v1.8.2)."""
+
+    def test_evidence_attached(self):
+        r = N._wrap_as_diagnostic_result(
+            {"ok": 1}, "external", "2026-09-02T00:00:00", 10,
+            evidence_fn=lambda res: [N._ev_item("external", "tcp", "tcp_ok", 4)])
+        self.assertEqual(1, len(r.evidence))
+        self.assertEqual("external.tcp.tcp_ok", r.evidence[0].id)
+
+    def test_evidence_fn_exception_is_swallowed(self):
+        def _boom(res):
+            raise RuntimeError("证据生成失败")
+        r = N._wrap_as_diagnostic_result(
+            {"ok": 1}, "external", "2026-09-02T00:00:00", 10,
+            evidence_fn=_boom)
+        self.assertEqual([], r.evidence)   # 证据丢弃但主流程不受影响
+
+    def test_non_evidence_items_filtered(self):
+        r = N._wrap_as_diagnostic_result(
+            {"ok": 1}, "dns", "2026-09-02T00:00:00", 5,
+            evidence_fn=lambda res: ["not-evidence", None])
+        self.assertEqual([], r.evidence)
+
+
+class TestP0MigratedProbes(unittest.TestCase):
+    """P0-03 第一批 (v1.8.2): external/tcpstats/mtu/web 注册进 V2 双轨."""
+
+    def test_registry_contains_batch(self):
+        for key in ("external", "tcpstats", "mtu", "web", "dns", "wifi",
+                    "gateway"):
+            self.assertIn(key, N._V2_PROBES, msg=key)
+
+    @staticmethod
+    def _patch_detect(cls, results):
+        def _fake_detect(self, callback=None, **kwargs):
+            self.results = results
+        return patch.object(cls, "detect", _fake_detect)
+
+    def test_probe_external_v2(self):
+        canned = {"targets": [], "tcp_ok": 4, "tcp_total": 4,
+                  "unreachable_count": 0, "avg_loss_pct": 0.0,
+                  "avg_rtt_ms": 20.0, "issues": []}
+        with self._patch_detect(N.ExternalNetworkTester, canned):
+            result = N.probe_external_v2(callback=lambda m: None)
+        self.assertIsInstance(result, N.DiagnosticResult)
+        self.assertEqual("external", result.module_id)
+        self.assertEqual(N.Status.OK, result.status)
+        self.assertIn("external.tcp.tcp_ok", {e.id for e in result.evidence})
+        # 旧口径兼容: metrics 原样保留
+        self.assertEqual(4, result.metrics["tcp_ok"])
+
+    def test_probe_tcpstats_v2(self):
+        canned = {"segments_sent": 100000, "retransmitted": 9000,
+                  "retrans_rate_pct": 9.0, "issues": []}
+        with self._patch_detect(N.TCPStatsTester, canned):
+            result = N.probe_tcpstats_v2(callback=lambda m: None)
+        self.assertEqual("tcpstats", result.module_id)
+        self.assertIn("tcpstats.retrans.retrans_rate_pct",
+                      {e.id for e in result.evidence})
+
+    def test_probe_mtu_v2(self):
+        canned = {"path_mtus": [{"target": "223.5.5.5", "path_mtu": 1492}],
+                  "local_mtus": [{"name": "以太网", "mtu": 1500}], "issues": []}
+        with self._patch_detect(N.MTUDetector, canned):
+            result = N.probe_mtu_v2(callback=lambda m: None)
+        self.assertEqual("mtu", result.module_id)
+        self.assertIn("mtu.probe.path_mtu", {e.id for e in result.evidence})
+
+    def test_probe_web_v2(self):
+        canned = {"ok_count": 3, "total_count": 4, "avg_ttfb_ms": 200,
+                  "avg_dns_ms": 30, "avg_tls_ms": 80, "min_cert_days": 45,
+                  "issues": []}
+        with self._patch_detect(N.WebPageTester, canned), \
+             patch.dict(N.WEB_CONFIG, {"targets": []}, deep=True):
+            result = N.probe_web_v2(callback=lambda m: None)
+        self.assertEqual("web", result.module_id)
+        self.assertIn("web.http.ok_count", {e.id for e in result.evidence})
+
+    def test_probe_error_path_yields_error_result(self):
+        """Tester.detect 抛异常 → probe 冒泡 (由 run 路径转「错误」)."""
+        def _boom(self, callback=None, **kwargs):
+            raise RuntimeError("netsh 失败")
+        with patch.object(N.ExternalNetworkTester, "detect", _boom):
+            with self.assertRaises(RuntimeError):
+                N.probe_external_v2(callback=lambda m: None)
+
+    def test_run_module_timeout_persists_evidence(self):
+        """v2 分支: result.evidence → res["_evidence"] (过渡键, v1.8.2)."""
+        fake = N.DiagnosticResult(
+            module_id="external", status=N.Status.OK,
+            evidence=[N.Evidence(id="external.ping.avg_loss_pct",
+                                 source="external", metric="avg_loss_pct",
+                                 value=0.0, unit="%")],
+            metrics={"tcp_ok": 4, "tcp_total": 4})
+        with patch.dict(N._V2_PROBES, {"external": lambda callback=None: fake}):
+            status, res = N._run_module_with_timeout("external",
+                                                     lambda m: None)
+        self.assertEqual("完成", status)
+        self.assertEqual(1, len(res["_evidence"]))
+        self.assertEqual(4, res["tcp_ok"])   # metrics 不丢
+
+    def test_run_module_timeout_no_evidence_no_key(self):
+        fake = N.DiagnosticResult(module_id="mtu", status=N.Status.OK,
+                                  metrics={"x": 1})
+        with patch.dict(N._V2_PROBES, {"mtu": lambda callback=None: fake}):
+            _, res = N._run_module_with_timeout("mtu", lambda m: None)
+        self.assertNotIn("_evidence", res)
 
 
 if __name__ == "__main__":

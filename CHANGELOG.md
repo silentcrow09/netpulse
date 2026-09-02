@@ -7,6 +7,21 @@
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-09-02
+
+V2 模型收口第一批（审计 P0-03）：`external` / `dns` / `wifi` / `tcpstats` / `mtu` / `web` 六个模块进入 V2 双轨并产出结构化 Evidence（`gateway` 此前已原生）。状态/指标口径与旧 Tester 路径零差异（同一 `determine_status`，metrics 全保留）。
+
+### 新增
+
+- **Evidence builders**：`_evidence_external / _evidence_dns / _evidence_wifi / _evidence_tcpstats / _evidence_mtu / _evidence_web`——只记录根因规则实际读取的字段（与 `_rule_*` 同源），模块 error/数据缺失 → 空列表（证据缺失 ≠ 证据为 0）
+- **4 个新 v2 probe**：`probe_external_v2 / probe_tcpstats_v2 / probe_mtu_v2 / probe_web_v2`（web 的 `extra_targets` 与旧路径 `_module_detect_kwargs` 同源）；`_V2_PROBES` 达 9 个
+- `_wrap_as_diagnostic_result(evidence_fn=...)`：迁移期旧 results → Evidence 的统一通道，生成失败不阻断主结果
+
+### 变更
+
+- **Evidence 持久化（过渡）**：v2 分支成功路径把 `result.evidence` 以保留键 `_evidence` 随 res 进入 `LAST_RUN.results`，JSON 导出 `tech.raw_results` 可见（实测 `tcpstats --json` 含完整证据块）；报告层直接消费 Evidence 后移除该过渡键
+- 版本 1.8.1 → 1.8.2
+
 ## [1.8.1] - 2026-09-02
 
 质量收口批次：专家审计整改——判定口径/隐私文案/压测分级修正 + 测试入仓。不新增任何 Probe。

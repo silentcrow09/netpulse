@@ -1109,12 +1109,121 @@ def _classify_module_error(message):
     return "COMMAND_FAILED", "command", True, Severity.MEDIUM, "RuntimeError"
 
 
-def _wrap_as_diagnostic_result(results, module_id, started_at, duration_ms):
+# ────────────────────────────────────────────────────────────────────────────
+# P0-03 第一批 Evidence builders (v1.8.2): 旧 Tester.results → 结构化 Evidence。
+# 原则: 只记录根因规则 (_rule_*) 实际读取的字段, 数值照抄 results dict 不做
+# 二次加工; 模块 error / 数据缺失 → 空列表 (证据缺失 ≠ 证据为 0)。
+# gateway 已是原生 probe (probe_gateway_v2 自建 Evidence), 不走此层。
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _ev_item(module, step, metric, value, unit=None, confidence=1.0, **metadata):
+    """Evidence 快捷构造 (id 惯例: <module>.<step>.<metric>)."""
+    return Evidence(id=f"{module}.{step}.{metric}", source=module, metric=metric,
+                    value=value, unit=unit, confidence=confidence,
+                    metadata=metadata)
+
+
+def _evidence_external(res):
+    """external: wan_interruption 规则同源字段 (tcp_ok/tcp_total/不可达数) + ping."""
+    if not isinstance(res, dict) or res.get("error"):
+        return []
+    out = []
+    tcp_total = res.get("tcp_total")
+    if tcp_total:
+        out.append(_ev_item("external", "tcp", "tcp_ok", res.get("tcp_ok"),
+                            confidence=0.98, tcp_total=tcp_total))
+        out.append(_ev_item("external", "tcp", "unreachable_count",
+                            res.get("unreachable_count", 0), confidence=0.98))
+    if res.get("avg_loss_pct") is not None:
+        out.append(_ev_item("external", "ping", "avg_loss_pct",
+                            res["avg_loss_pct"], "%", 0.9))
+    if res.get("avg_rtt_ms") is not None:
+        out.append(_ev_item("external", "ping", "avg_rtt_ms",
+                            res["avg_rtt_ms"], "ms", 0.9))
+    return out
+
+
+def _evidence_dns(res):
+    """dns: dns_failure 规则同源字段 (success_count/total_count)."""
+    if not isinstance(res, dict) or res.get("error"):
+        return []
+    total = res.get("total_count")
+    if not total:
+        return []
+    return [_ev_item("dns", "resolve", "success_count", res.get("success_count"),
+                     confidence=0.95, total_count=total)]
+
+
+def _evidence_wifi(res):
+    """wifi: wifi_weak 规则同源字段 (overall_interference)."""
+    if not isinstance(res, dict) or res.get("error"):
+        return []
+    interference = res.get("overall_interference")
+    if interference is None:
+        return []
+    return [_ev_item("wifi", "spectrum", "overall_interference", interference,
+                     confidence=0.9)]
+
+
+def _evidence_tcpstats(res):
+    """tcpstats: tcp_loss_burst 规则同源字段 (retrans_rate_pct + 分子分母)."""
+    if not isinstance(res, dict) or res.get("error"):
+        return []
+    rate = res.get("retrans_rate_pct")
+    if not isinstance(rate, (int, float)):
+        return []
+    return [_ev_item("tcpstats", "retrans", "retrans_rate_pct", rate, "%", 0.9,
+                     segments_sent=res.get("segments_sent"),
+                     retransmitted=res.get("retransmitted"))]
+
+
+def _evidence_mtu(res):
+    """mtu: mtu_blackhole 规则同源字段 (path_mtus[].path_mtu + local_mtus[].mtu)."""
+    if not isinstance(res, dict) or res.get("error"):
+        return []
+    out = []
+    for r in res.get("path_mtus") or []:
+        if r.get("error") or not r.get("path_mtu"):
+            continue
+        out.append(_ev_item("mtu", "probe", "path_mtu", r["path_mtu"], "B", 0.95,
+                            target=r.get("target", "")))
+    for lm in res.get("local_mtus") or []:
+        v = lm.get("mtu")
+        if isinstance(v, int) and v > 0:
+            out.append(_ev_item("mtu", "iface", "mtu", v, "B", 0.95,
+                                name=lm.get("name", "")))
+    return out
+
+
+def _evidence_web(res):
+    """web: L7 分层耗时 (无根因规则, 供报告/排障追溯)."""
+    if not isinstance(res, dict) or res.get("error"):
+        return []
+    out = []
+    total = res.get("total_count")
+    if total:
+        out.append(_ev_item("web", "http", "ok_count", res.get("ok_count", 0),
+                            confidence=0.95, total_count=total))
+    for metric, step, unit in (("avg_ttfb_ms", "timing", "ms"),
+                               ("avg_dns_ms", "dns", "ms"),
+                               ("avg_tls_ms", "tls", "ms"),
+                               ("min_cert_days", "cert", "天")):
+        v = res.get(metric)
+        if v is not None:
+            out.append(_ev_item("web", step, metric, v, unit, 0.9))
+    return out
+
+
+def _wrap_as_diagnostic_result(results, module_id, started_at, duration_ms,
+                               evidence_fn=None):
     """通用: Tester.results dict → DiagnosticResult (B8-B11 共享 helper).
 
     复用 determine_status() 推中文状态 → Status 枚举, 不破坏现有 verdict_fn /
     metrics_fn / _print_result / 报告渲染的语义.
     metrics 字段完整保留旧 results dict (兼容 _verdict_xxx / _metrics_xxx).
+    evidence_fn: (results) -> list[Evidence] (P0-03 迁移期, v1.8.2)。
+                 生成抛异常只丢弃证据, 不阻断主结果。
     """
     if not results:
         return DiagnosticResult(
@@ -1157,11 +1266,18 @@ def _wrap_as_diagnostic_result(results, module_id, started_at, duration_ms):
             recommendations=recommendations,
         ))
 
+    evidence = []
+    if evidence_fn is not None:
+        try:
+            evidence = [e for e in (evidence_fn(results) or [])
+                        if isinstance(e, Evidence)]
+        except Exception:
+            evidence = []      # 证据生成失败不阻断主结果
     return DiagnosticResult(
         module_id=module_id, status=diag_status,
         started_at=started_at, duration_ms=duration_ms,
         metrics=results,      # 完整保留旧 dict, 供 verdict_fn / 报告渲染
-        issues=issues, error=error)
+        evidence=evidence, issues=issues, error=error)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1171,7 +1287,7 @@ def _wrap_as_diagnostic_result(results, module_id, started_at, duration_ms):
 
 @_register_probe("dns")
 def probe_dns_v2(callback=None):
-    """B8 DNS 诊断 Probe 契约. 调用 DNSTester.detect() + wrap helper."""
+    """B8 DNS 诊断 Probe 契约. 调用 DNSTester.detect() + wrap helper (P0-03 接入证据)."""
     started_mono = time.monotonic()
     started_at = datetime.now().isoformat()
     t = DNSTester()
@@ -1179,7 +1295,8 @@ def probe_dns_v2(callback=None):
     return _wrap_as_diagnostic_result(
         t.results, module_id="dns",
         started_at=started_at,
-        duration_ms=int((time.monotonic() - started_mono) * 1000))
+        duration_ms=int((time.monotonic() - started_mono) * 1000),
+        evidence_fn=_evidence_dns)
 
 
 @_register_probe("route")
@@ -1210,7 +1327,7 @@ def probe_arp_v2(callback=None):
 
 @_register_probe("wifi")
 def probe_wifi_v2(callback=None):
-    """B11 WiFi 干扰分析 Probe 契约. 调用 WiFiAnalyzer.detect() + wrap helper."""
+    """B11 WiFi 干扰分析 Probe 契约. 调用 WiFiAnalyzer.detect() + wrap helper (P0-03 接入证据)."""
     started_mono = time.monotonic()
     started_at = datetime.now().isoformat()
     t = WiFiAnalyzer()
@@ -1218,7 +1335,72 @@ def probe_wifi_v2(callback=None):
     return _wrap_as_diagnostic_result(
         t.results, module_id="wifi",
         started_at=started_at,
-        duration_ms=int((time.monotonic() - started_mono) * 1000))
+        duration_ms=int((time.monotonic() - started_mono) * 1000),
+        evidence_fn=_evidence_wifi)
+
+
+# ── P0-03 第一批迁移 (v1.8.2): external / tcpstats / mtu / web 进入 V2 双轨 ──
+# 模式与 B8-B11 相同: Tester.detect() → wrap helper + 模块专属 Evidence builder。
+# 状态/指标口径与旧 Tester 路径零差异 (同一 determine_status, metrics 全保留)。
+
+
+@_register_probe("external")
+def probe_external_v2(callback=None):
+    """外网检测 Probe (P0-03 第一批). ExternalNetworkTester + 原生 Evidence."""
+    started_mono = time.monotonic()
+    started_at = datetime.now().isoformat()
+    t = ExternalNetworkTester()
+    t.detect(callback=callback)
+    return _wrap_as_diagnostic_result(
+        t.results, module_id="external",
+        started_at=started_at,
+        duration_ms=int((time.monotonic() - started_mono) * 1000),
+        evidence_fn=_evidence_external)
+
+
+@_register_probe("tcpstats")
+def probe_tcpstats_v2(callback=None):
+    """TCP 传输质量 Probe (P0-03 第一批). TCPStatsTester + 原生 Evidence."""
+    started_mono = time.monotonic()
+    started_at = datetime.now().isoformat()
+    t = TCPStatsTester()
+    t.detect(callback=callback)
+    return _wrap_as_diagnostic_result(
+        t.results, module_id="tcpstats",
+        started_at=started_at,
+        duration_ms=int((time.monotonic() - started_mono) * 1000),
+        evidence_fn=_evidence_tcpstats)
+
+
+@_register_probe("mtu")
+def probe_mtu_v2(callback=None):
+    """MTU 检测 Probe (P0-03 第一批). MTUDetector + 原生 Evidence."""
+    started_mono = time.monotonic()
+    started_at = datetime.now().isoformat()
+    t = MTUDetector()
+    t.detect(callback=callback)
+    return _wrap_as_diagnostic_result(
+        t.results, module_id="mtu",
+        started_at=started_at,
+        duration_ms=int((time.monotonic() - started_mono) * 1000),
+        evidence_fn=_evidence_mtu)
+
+
+@_register_probe("web")
+def probe_web_v2(callback=None):
+    """网页体检 Probe (P0-03 第一批). WebPageTester + 原生 Evidence.
+
+    extra_targets 与旧路径 _module_detect_kwargs 同源 (WEB_CONFIG)。"""
+    started_mono = time.monotonic()
+    started_at = datetime.now().isoformat()
+    t = WebPageTester()
+    t.detect(callback=callback,
+             extra_targets=WEB_CONFIG.get("targets") or [])
+    return _wrap_as_diagnostic_result(
+        t.results, module_id="web",
+        started_at=started_at,
+        duration_ms=int((time.monotonic() - started_mono) * 1000),
+        evidence_fn=_evidence_web)
 
 
 # ============================================================
@@ -2806,7 +2988,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.8.2"
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -12850,7 +13032,14 @@ def _run_module_with_timeout(key, callback):
             res["error"] = result.error.message
             return "错误", res
         # DiagnosticResult.metrics 兼容旧 res_dict 接口 (verdict_fn / metrics_fn / 报告)
-        return result.status.zh_label, result.metrics
+        res = result.metrics
+        if result.evidence:
+            # P0-03 迁移期 (v1.8.2): Evidence 以保留键 _evidence 随 res 进入
+            # LAST_RUN.results (JSON tech.raw_results 可见)。报告层直接消费
+            # Evidence 后此过渡键移除。
+            res = dict(res or {})
+            res["_evidence"] = [e.to_dict() for e in result.evidence]
+        return result.status.zh_label, res
 
     # ── 旧 Tester 路径 (向后兼容) ──
     name, cls = MODULE_MAP[key]
