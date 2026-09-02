@@ -1034,7 +1034,9 @@ def probe_gateway_v2(count=20, callback=None):
 
     # --- metrics 字段: 兼容 GatewayTester.results 格式, 现有 verdict_fn /
     # metrics_fn / 报告渲染全部继续用 .metrics["ping"] / .metrics["issues"] 等 ---
-    summary_text = (f"网关 {gateway}: 平均 {ping_result['avg_ms']}ms, "
+    _avg0 = ping_result['avg_ms']
+    _avg_txt = "<1" if (_avg0 < 1 and ping_result.get("rtts")) else f"{_avg0:g}"
+    summary_text = (f"网关 {gateway}: 平均 {_avg_txt}ms, "
                     f"丢包 {ping_result['loss_pct']}%, 抖动 {ping_result['jitter_ms']}ms")
     metrics = {
         "gateway": gateway,
@@ -1192,12 +1194,10 @@ def _evidence_mtu(res):
             continue
         out.append(_ev_item("mtu", "probe", "path_mtu", r["path_mtu"], "B", 0.95,
                             target=r.get("target", "")))
-    for lm in res.get("local_mtus") or []:
-        v = lm.get("mtu")
-        if isinstance(v, int) and v > 0:
-            # 键名以生产者 MTUDetector 为准: local_mtus[].interface (v1.9.2 修正)
-            out.append(_ev_item("mtu", "iface", "mtu", v, "B", 0.95,
-                                interface=lm.get("interface", "")))
+    for lm in _clean_local_mtus(res.get("local_mtus")):
+        # 键名以生产者 MTUDetector 为准: local_mtus[].interface (v1.9.2 修正)
+        out.append(_ev_item("mtu", "iface", "mtu", lm["mtu"], "B", 0.95,
+                            interface=lm.get("interface", "")))
     return out
 
 
@@ -1795,6 +1795,37 @@ def _rule_nat_restricted(results_dict):
 #   excludes — 已经排除的方向 (全部 ok=True)
 # 约束: 只读取规则函数里已经验证过的字段名; 字段缺失就跳过该条, 不伪造数字。
 
+# IPv4 MTU 有效区间: 68(最小) ~ 65535(理论最大)。Windows 回环口
+# (Loopback Pseudo-Interface 1) 的 NlMtu 是 4294967295 (0xFFFFFFFF, -1 的
+# 无符号形式), 属设计值, 不代表真实链路 MTU —— 若不剔除, 规则/证据会把
+# "接口 4294967295" 当成本机最大 MTU, 伪判 MTU 黑洞并给出无意义的修复建议
+# (v1.9.3 修复, 报告曾出现 "路径 1500 < 接口 4294967295, 差 4294965795")。
+_MTU_VALID_MIN = 68
+_MTU_VALID_MAX = 65535
+
+
+def _clean_local_mtus(local_mtus):
+    """过滤本地接口 MTU 列表中的无效项 (探测侧与规则侧共用, 双保险)。
+
+    剔除: 数值非 [68, 65535] (覆盖回环口 4294967295 等)、接口名含
+    "Loopback" 的项。返回保留原字段结构的 dict 列表; 空输入 → []。
+    """
+    out = []
+    for lm in local_mtus or []:
+        if not isinstance(lm, dict):
+            continue
+        try:
+            v = int(lm.get("mtu") or 0)
+        except (TypeError, ValueError):
+            continue
+        name = str(lm.get("interface") or lm.get("name") or "")
+        if v < _MTU_VALID_MIN or v > _MTU_VALID_MAX:
+            continue
+        if "loopback" in name.lower():
+            continue
+        out.append(dict(lm))
+    return out
+
 
 def _rule_mtu_blackhole(results_dict):
     """MTU 黑洞 (v1.7.0 PR-F0): 路径 MTU 显著小于本机接口 MTU。
@@ -1810,11 +1841,21 @@ def _rule_mtu_blackhole(results_dict):
     # MTUDetector.results 的键: path_mtus[].path_mtu / local_mtus[].mtu
     paths = [r.get("path_mtu") for r in (mtu.get("path_mtus") or [])
              if not r.get("error") and r.get("path_mtu")]
-    local = [lm.get("mtu") for lm in (mtu.get("local_mtus") or [])
-             if isinstance(lm.get("mtu"), int) and lm.get("mtu", 0) > 0]
-    if not paths or not local:
+    local_items = _clean_local_mtus(mtu.get("local_mtus"))
+    if not paths or not local_items:
         return None
-    path_min, if_max = min(paths), max(local)
+    path_min = min(paths)
+    # 对比对象应是"真实承载流量的出口接口", 不是全列表极值:
+    # 回环口 4294967295 / 未承载路由的 VPN 虚拟口 (如 ZeroTier 2800) 若
+    # 混入 max(), 会把正常链路伪判成 MTU 黑洞 (v1.9.3)。探测侧已标记
+    # egress (默认路由出口), 此处优先取它; 标记缺失时退回清洗后最大值。
+    eg = next((lm for lm in local_items if lm.get("egress")), None)
+    if eg is not None:
+        if_max, if_name = eg["mtu"], eg.get("interface") or ""
+    else:
+        if_max = max(lm["mtu"] for lm in local_items)
+        if_name = next((lm.get("interface", "") or "" for lm in local_items
+                        if lm["mtu"] == if_max), "")
     diff = if_max - path_min
     if diff < 100:
         return None
@@ -1822,6 +1863,9 @@ def _rule_mtu_blackhole(results_dict):
     retrans_rate = ts.get("retrans_rate_pct")
     corroborated = isinstance(retrans_rate, (int, float)) and retrans_rate >= 5
     confidence = 0.92 if corroborated else 0.75
+    # 建议里的"接口名"程序已能拿到 (egress/最大 MTU 项), 直接填真实名字,
+    # 不再让用户自己对着 netsh 帮助找接口名 (v1.9.3)。
+    if_name_part = f"\"{if_name}\"" if if_name else "\"接口名\""
     return RootCause(
         id="mtu_blackhole", category="MTU", severity=Severity.HIGH,
         title=f"MTU 不匹配 (路径 {path_min} < 接口 {if_max}, 差 {diff})",
@@ -1831,8 +1875,8 @@ def _rule_mtu_blackhole(results_dict):
         evidence_ids=["mtu.path_mtus", "mtu.local_mtus", "tcpstats.retrans_rate_pct"],
         affected_modules=["mtu", "tcpstats"],
         recommendations=[
-            f"1. 将电脑接口 MTU 改为 {path_min}: netsh interface ipv4 set subinterface "
-            f"\"接口名\" mtu={path_min} store=persistent (管理员), 改后复测",
+            f"1. 将电脑接口 {if_name or 'MTU'} 改为 {path_min}: netsh interface ipv4 set "
+            f"subinterface {if_name_part} mtu={path_min} store=persistent (管理员), 改后复测",
             "2. 检查路由器/中间设备的 MSS clamping (典型配置 ip tcp adjust-mss)",
             "3. 物联网卡/专线场景联系运营商核对通道 MTU",
         ],
@@ -1909,7 +1953,8 @@ def _ev_gateway_reachable(results, evd=None, suffix=""):
         return None
     txt = f"网关可达，丢包 {loss:g}%"
     if isinstance(avg, (int, float)):
-        txt += f"，平均 {avg:g}ms"
+        # 局域网 <1ms 时 ping 输出整数 0, 按 <1ms 表达避免"平均 0ms"误解
+        txt += f"，平均 {'<1' if avg < 1 else f'{avg:g}'}ms"
     return _ev(txt + suffix, True)
 
 
@@ -2137,18 +2182,20 @@ def _ev_mtu_blackhole(results, evd=None):
                 supports.append(_ev(
                     f"到 {meta.get('target')} 的路径 MTU = {e.get('value')}", False))
             elif e.get("id") == "mtu.iface.mtu":
-                supports.append(_ev(
-                    f"接口 {meta.get('interface')} MTU = {e.get('value')}", False))
+                v = e.get("value")
+                # 老 exe 快照里可能残留回环口 4294967295, 防御性过滤
+                if isinstance(v, (int, float)) and _MTU_VALID_MIN <= v <= _MTU_VALID_MAX:
+                    supports.append(_ev(
+                        f"接口 {meta.get('interface')} MTU = {v}", False))
     else:
         for r in (mtu.get("path_mtus") or []):
             if not r.get("error") and r.get("path_mtu"):
                 supports.append(_ev(
                     f"到 {r.get('target')} 的路径 MTU = {r['path_mtu']}", False))
-        for lm in (mtu.get("local_mtus") or []):
-            if isinstance(lm.get("mtu"), int) and lm.get("mtu", 0) > 0:
-                # 生产者 MTUDetector 发的键是 interface (v1.9.2 修正, 勿改回 name)
-                supports.append(_ev(
-                    f"接口 {lm.get('interface')} MTU = {lm['mtu']}", False))
+        for lm in _clean_local_mtus(mtu.get("local_mtus")):
+            # 生产者 MTUDetector 发的键是 interface (v1.9.2 修正, 勿改回 name)
+            supports.append(_ev(
+                f"接口 {lm.get('interface')} MTU = {lm['mtu']}", False))
     ts = _mod(results, "tcpstats") or {}
     item = _evd_find(_module_evidence(evd, "tcpstats"),
                      "tcpstats.retrans.retrans_rate_pct")
@@ -2195,8 +2242,7 @@ def _ev_tcp_loss_burst(results, evd=None):
         mtu = _mod(results, "mtu") or {}
         paths = [r.get("path_mtu") for r in (mtu.get("path_mtus") or [])
                  if not r.get("error") and r.get("path_mtu")]
-        local = [lm.get("mtu") for lm in (mtu.get("local_mtus") or [])
-                 if isinstance(lm.get("mtu"), int) and lm.get("mtu", 0) > 0]
+        local = [lm["mtu"] for lm in _clean_local_mtus(mtu.get("local_mtus"))]
     if paths and local and max(local) - min(paths) < 100:
         excludes.append(_ev(
             f"路径 MTU ({min(paths)}) 与接口 MTU ({max(local)}) 相符, 已排除 MTU 不匹配", True))
@@ -2605,6 +2651,11 @@ _DIAGNOSIS_CSS = """
 .diagnosis { padding: 16px 20px; margin: 16px 0; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
 .diagnosis h2 { margin: 0 0 12px; font-size: 18px; color: #1e293b; }
 .diagnosis .dhead { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+/* v1.9.3: 无故障卡片整句居中单行 — 旧布局 dhead 贴左上且下方留 12px 空距,
+   卡片内呈现"第一行有字、第二行空白"的两行错觉 */
+.diagnosis.healthy { padding: 14px 20px; }
+.diagnosis.healthy .dhead { justify-content: center; margin-bottom: 0; flex-wrap: wrap; row-gap: 6px; }
+.diagnosis.healthy .dbadge.ok { font-size: 14px; padding: 6px 14px; }
 .diagnosis .dbadge { padding: 4px 10px; border-radius: 4px; font-weight: 600; font-size: 13px; }
 .diagnosis .dbadge.ok { background: #dcfce7; color: #166534; }
 .diagnosis .dbadge.warn { background: #fee2e2; color: #991b1b; }
@@ -3198,7 +3249,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.9.3"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -4836,9 +4887,13 @@ class GatewayTester:  # @deprecated v1.2.0 (B7): 已迁移到 probe_gateway_v2 (
             "assessment": assessment,
             "issues": issues,
             "timestamp": datetime.now().isoformat(),
-            "summary": f"网关 {gateway}: 平均 {ping_result['avg_ms']}ms, "
-                       f"丢包 {ping_result['loss_pct']}%, 抖动 {ping_result['jitter_ms']}ms",
         }
+        # <1ms 时 ping 输出整数 0, 显示 "平均 <1ms" 而非误导性的 0ms (v1.9.3)
+        _a = ping_result["avg_ms"]
+        _at = "<1" if (_a < 1 and ping_result.get("rtts")) else f"{_a:g}"
+        self.results["summary"] = (
+            f"网关 {gateway}: 平均 {_at}ms, "
+            f"丢包 {ping_result['loss_pct']}%, 抖动 {ping_result['jitter_ms']}ms")
         if callback:
             callback(self.results["summary"])
         return self.results
@@ -7548,11 +7603,20 @@ class MTUDetector:
                 results.append(r)
 
         # 本地接口 MTU
+        # 注意: 过滤回环口与无效值 (v1.9.3) — Windows 回环口 NlMtu=4294967295
+        # 是设计值 (-1 无符号), 混进 local_mtus 会把规则 max()/证据链/指标卡
+        # 全部带偏 (报告曾出现 "接口 4294967295")。同时标记默认路由出口接口
+        # (egress), 供规则层用"真实承载流量的接口"对比路径 MTU。
         code, out, _ = run_ps(
             "Get-NetIPInterface -AddressFamily IPv4 | "
             "Where-Object {$_.ConnectionState -eq 'Connected'} | "
             "Select-Object InterfaceAlias, NlMtu | ConvertTo-Json"
         )
+        egress_alias = ""
+        try:
+            _eg_mtu, egress_alias = _default_route_if_mtu()
+        except Exception:
+            pass
         local_mtus = []
         if out and out.strip():
             try:
@@ -7560,12 +7624,25 @@ class MTUDetector:
                 if not isinstance(data, list):
                     data = [data]
                 for item in data:
+                    alias = item.get("InterfaceAlias", "") or ""
+                    try:
+                        v = int(item.get("NlMtu", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if v < _MTU_VALID_MIN or v > _MTU_VALID_MAX:
+                        continue
+                    if "loopback" in alias.lower():
+                        continue
                     local_mtus.append({
-                        "interface": item.get("InterfaceAlias", ""),
-                        "mtu": item.get("NlMtu", 0),
+                        "interface": alias,
+                        "mtu": v,
+                        "egress": bool(egress_alias)
+                                  and alias.lower() == egress_alias.lower(),
                     })
             except Exception:
                 pass
+        # 出口接口排最前 (指标卡/摘要默认取 local[0] 展示"本机 MTU")
+        local_mtus.sort(key=lambda lm: (not lm.get("egress"),))
 
         # 评估
         issues = []
@@ -13490,7 +13567,10 @@ def _verdict_gateway(res):
         return res.get("error", "检测失败")
     p = res.get("ping", {})
     gw = res.get("gateway", "")
-    return (f"网关 {gw}: 平均 {p.get('avg_ms', '?')}ms, "
+    # <1ms 时 ping 输出整数 0, 显示 "平均 <1ms" 而非误导性的 0ms (v1.9.3)
+    a = p.get("avg_ms", "?")
+    at = "<1" if (isinstance(a, (int, float)) and a < 1 and p.get("rtts")) else a
+    return (f"网关 {gw}: 平均 {at}ms, "
             f"丢包 {p.get('loss_pct', '?')}%, 抖动 {p.get('jitter_ms', '?')}ms")
 
 
@@ -16232,7 +16312,11 @@ def _svg_ping_line(rtts):
     """网关逐次 ping 延迟折线图。成功样本 <3 时返回空串。
 
     注意: 丢包时刻无法从 ping 输出精确还原 (rtts 只含成功样本),
-    故折线只画成功样本, 峰值用红点标注。
+    故折线只画成功样本。Windows ping 对局域网 (<1ms) 一律输出
+    "<1ms" → 解析为 0, 因此网关折线常整条贴 0 基线, 属正常现象。
+
+    峰值标注 (v1.9.3): 仅当峰值 ≥50ms (图上已值得关注) 才用红点,
+    否则不画点 — 网关 1ms 的峰值画红点会被误读成"故障点"。
     """
     vals = [float(x) for x in (rtts or [])
             if isinstance(x, (int, float)) and x >= 0]
@@ -16249,9 +16333,15 @@ def _svg_ping_line(rtts):
     step = W / (len(vals) - 1)
     pts = " ".join(f"{i * step:.1f},{_y(v):.1f}"
                    for i, v in enumerate(vals))
-    max_i = vals.index(vmax)
     area = (f'<polygon points="{pts} {W},{H:.1f} 0,{H:.1f}" '
             f'fill="url(#np-grad)"/>')
+    # 峰值 ≥50ms 才标红点 (有实际参考意义); 数值可忽略的峰值不画,
+    # 避免一两个 1ms 的局域网样本在图上像"异常点"
+    peak_dot = ""
+    if vmax >= 50:
+        max_i = vals.index(vmax)
+        peak_dot = (f'<circle cx="{max_i * step:.1f}" cy="{_y(vmax):.1f}" '
+                    f'r="3.5" fill="#dc2626"><title>峰值 {vmax:.0f}ms</title></circle>')
     return (f'<svg width="100%" height="120" viewBox="0 0 {W} {H}" preserveAspectRatio="none">'
             f'<defs><linearGradient id="np-grad" x1="0" y1="0" x2="0" y2="1">'
             f'<stop offset="0" stop-color="#2563eb" stop-opacity=".25"/>'
@@ -16262,8 +16352,9 @@ def _svg_ping_line(rtts):
             f'stroke="#e6e9f0" stroke-width="1"/>'
             f'{area}'
             f'<polyline points="{pts}" fill="none" stroke="#2563eb" stroke-width="2"/>'
-            f'<circle cx="{max_i * step:.1f}" cy="{_y(vmax):.1f}" r="3.5" fill="#dc2626"/>'
+            f'{peak_dot}'
             f'<text x="4" y="{_y(ceil) - 4:.1f}" font-size="10" fill="#94a3b8">{ceil:.0f}ms</text>'
+            f'<text x="4" y="{H - 3:.1f}" font-size="10" fill="#94a3b8">0ms</text>'
             f'</svg>')
 
 
@@ -16855,7 +16946,14 @@ def render_report_html_customer(report):
     if ping_chart:
         cap_bits = [f"共 {len(ping_rtts)} 次成功样本"]
         if isinstance(ping_info.get("avg_ms"), (int, float)):
-            cap_bits.append(f"平均 {ping_info['avg_ms']}ms")
+            avg = ping_info["avg_ms"]
+            # Windows ping 对局域网 (<1ms) 输出整数粒度 0, 直写"平均 0ms"
+            # 会被误读成"数据有问题" — 有样本时按 <1ms 表达 (v1.9.3)
+            cap_bits.append("平均 <1ms" if (avg < 1 and ping_rtts)
+                            else f"平均 {avg:g}ms")
+        peak = max(ping_rtts) if ping_rtts else 0
+        if isinstance(peak, (int, float)) and peak > 0:
+            cap_bits.append(f"峰值 {peak:g}ms")
         if isinstance(ping_info.get("loss_pct"), (int, float)) \
                 and ping_info.get("loss_pct", 0) > 0:
             cap_bits.append(f"丢包 {ping_info['loss_pct']}%")
@@ -17967,8 +18065,9 @@ def interactive_menu(install=False, pip_mirror=None):
 def _module_menu(install=False, pip_mirror=None):
     """原模块清单菜单 (v1.6.0 起为场景层 [9] 高级选项)。
 
-    行为与 v1.5.x 完全一致 (模块编号 / 分类 / 0 全部 / m 盯障 / e 导出 / q 退出);
-    退出 (q / Ctrl+C) 返回 False, 通知场景层结束整个程序。
+    行为与 v1.5.x 一致 (模块编号 / 分类 / 0 全部 / m 盯障 / e 导出 / q 退出);
+    返回语义 (v1.9.3): r = 返回场景层主菜单 → True; q / Ctrl+C / EOF → False
+    (通知场景层结束整个程序)。
     """
     while True:
         _menu_clear()
@@ -17976,7 +18075,7 @@ def _module_menu(install=False, pip_mirror=None):
         print(_c(bar, C_BLUE))
         print(_c(f"  {APP_NAME} v{APP_VERSION}    命令行网络诊断", C_BOLD))
         print(_c(bar, C_BLUE))
-        print(_c("  请选择要执行的诊断 (输入数字 / 分类 a,b,c / 模块 key):", C_WHITE))
+        print(_c("  工程师模式 (模块级诊断)。运行完成后可返回场景模式主菜单。", C_WHITE))
         idx = 0
         # 全局模块名最大显示宽, 跨分类统一 (保证所有 cell 内的模块名
         # 右端对齐到同一显示列, 行内/行间都齐)
@@ -18017,8 +18116,9 @@ def _module_menu(install=False, pip_mirror=None):
         print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发, 含Ookla官方测速)', C_GRAY)}")
         print(f"    {_c(' m', C_CYAN)}. 盯障模式 {_c('(600秒找偶发掉线, Ctrl+C可提前停)', C_GRAY)}")
         print(f"    {_c(' e', C_CYAN)}. 导出上次诊断报告")
+        print(f"    {_c(' r', C_CYAN)}. 返回场景模式主菜单")
         print(f"    {_c(' q', C_CYAN)}. 退出")
-        print(_c("  快捷: 0=全部 a/b/c=按分类 m=盯障 e=导出 q=退出", C_GRAY))
+        print(_c("  快捷: 0=全部 a/b/c=按分类 m=盯障 e=导出 r=返回场景 q=退出", C_GRAY))
         print(_c("-" * 60, C_GRAY))
         try:
             choice = input(_c("  输入 > ", C_GREEN)).strip()
@@ -18027,6 +18127,10 @@ def _module_menu(install=False, pip_mirror=None):
             break
         if choice.lower() in ("q", "quit", "exit"):
             break
+        # r / return: 返回场景层主菜单 (v1.9.3)。r 不与分类字母 (a/b/c)、
+        # 模块 key 或命令 (m/e) 冲突; 置于 parse_choice 之前, 避免被当模块解析
+        if choice.lower() in ("r", "return", "back", "返回", "回场景", "场景"):
+            return True
         # m / monitor: 盯障模式 (独立运行模式, 不进模块注册表)
         # 默认 600 秒直接跑, 不再询问时长 (减少输入; Ctrl+C 可提前结束)
         if choice.lower() in ("m", "monitor", "盯障"):
@@ -18115,7 +18219,7 @@ def _module_menu(install=False, pip_mirror=None):
             input(_c("\n  按 Enter 返回菜单...", C_GRAY))
         except (EOFError, KeyboardInterrupt):
             break
-    # q / Ctrl+C / EOF 退出模块清单菜单 → 通知场景层结束整个程序
+    # q / Ctrl+C / EOF → False (退出整个程序); r → True (返回场景层) 已在上面提前 return
     return False
 
 
