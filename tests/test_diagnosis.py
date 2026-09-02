@@ -665,6 +665,26 @@ class TestEvidenceChainConsumption(unittest.TestCase):
         self.assertEqual([s["text"] for s in legacy],
                          [s["text"] for s in from_ev])
 
+    def test_dns_excludes_use_evidence_not_raw(self):
+        """v1.9.1 (审查修复): _ev_dns_failure 排除项循环必须透传 evd —
+        raw 说网关断 (loss=100) 而证据说网关通 (loss=0) 时, 以证据为准."""
+        r = _healthy_full()
+        r["dns"] = {"success_count": 2, "total_count": 10, "issues": []}
+        r["gateway"] = {"ping": {"loss_pct": 100, "avg_ms": 999}, "issues": []}
+        evd = {"gateway": [
+            N.Evidence(id="gateway.ping.loss_pct", source="gateway.ping",
+                       metric="packet_loss_pct", value=0, unit="%",
+                       confidence=0.98,
+                       metadata={"sent": 20, "received": 20}).to_dict(),
+            N.Evidence(id="gateway.ping.avg_ms", source="gateway.ping",
+                       metric="avg_latency_ms", value=5, unit="ms",
+                       confidence=0.95).to_dict(),
+        ]}
+        _, excludes = N._ev_dns_failure(r, evd)
+        self.assertTrue(any("网关可达，丢包 0%，平均 5ms" in s["text"]
+                            for s in excludes),
+                        msg=[s["text"] for s in excludes])
+
     def test_no_evidence_falls_back_legacy(self):
         """旧运行无证据映射: 走原地取值, 输出不变 (回归保护)."""
         r = _healthy_full()

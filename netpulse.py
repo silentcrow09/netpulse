@@ -1427,12 +1427,11 @@ def probe_mtu_v2(callback=None):
 def probe_web_v2(callback=None):
     """网页体检 Probe (P0-03 第一批). WebPageTester + 原生 Evidence.
 
-    extra_targets 与旧路径 _module_detect_kwargs 同源 (WEB_CONFIG)。"""
+    detect 参数统一走 _module_detect_kwargs — 与旧路径严格同源, 不手工拷贝。"""
     started_mono = time.monotonic()
     started_at = datetime.now().isoformat()
     t = WebPageTester()
-    t.detect(callback=callback,
-             extra_targets=WEB_CONFIG.get("targets") or [])
+    t.detect(callback=callback, **_module_detect_kwargs("web"))
     return _wrap_as_diagnostic_result(
         t.results, module_id="web",
         started_at=started_at,
@@ -1458,12 +1457,11 @@ def probe_bufferbloat_v2(callback=None):
 def probe_nattype_v2(callback=None):
     """NAT 类型 Probe (P0-03 第二批). NATTypeTester + 原生 Evidence.
 
-    servers 与旧路径 _module_detect_kwargs 同源 (NATTYPE_CONFIG)。"""
+    detect 参数统一走 _module_detect_kwargs — 与旧路径严格同源, 不手工拷贝。"""
     started_mono = time.monotonic()
     started_at = datetime.now().isoformat()
     t = NATTypeTester()
-    t.detect(callback=callback,
-             servers=NATTYPE_CONFIG.get("servers") or [])
+    t.detect(callback=callback, **_module_detect_kwargs("nattype"))
     return _wrap_as_diagnostic_result(
         t.results, module_id="nattype",
         started_at=started_at,
@@ -1962,7 +1960,7 @@ def _ev_dns_failure(results, evd=None):
             f"DNS 解析仅 {sc}/{tc} 成功，失败率 {(1 - sc / tc) * 100:.0f}%", False))
     excludes = []
     for fn in (_ev_gateway_reachable, _ev_external_reachable):
-        item = fn(results)
+        item = fn(results, evd)     # v1.9.1: 透传证据映射 (审查修复)
         if item:
             excludes.append(item)
     if excludes:
@@ -11253,7 +11251,9 @@ def _render_monitor_html(res):
     # v1.8.0 (PR-F4): 抓包证据置信度徽标 (无抓包佐证时不出该行)
     conf_html = ""
     if res.get("confidence"):
-        conf_html = (f"<div class='conf'>🎯 结论{_conf_band(res.get('confidence'))} — "
+        # v1.9.1: 抓包置信度是 0-100 百分数, 先归一到 0-1 再分档
+        # (审查修复: 原先 85/92 碰巧落"高", 但 1-74 区间会全部误判"高置信度")
+        conf_html = (f"<div class='conf'>🎯 结论{_conf_band(res.get('confidence') / 100)} — "
                      f"{_esc_html(str(res.get('confidence_basis', '')))}</div>")
 
     ev_rows = []

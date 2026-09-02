@@ -299,6 +299,15 @@ class TestEvidenceHtml(unittest.TestCase):
         self.assertNotIn("🔬 抓包分析", html)
         self.assertIn("抓包取证", html)          # 面板仍在 (规格+隐私声明)
 
+    def test_confidence_band_scale_is_percent_normalized(self):
+        """v1.9.1 (审查修复): 抓包置信度是百分数, 74% 须按 0.74 分档为中
+        (原先直接喂 0-1 阈值, 1-74 区间会全部误判"高置信度")."""
+        r = self._res()
+        r["confidence"] = 74
+        r["confidence_basis"] = "测试"
+        html = N._render_monitor_html(r)
+        self.assertIn("结论中置信度", html)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
