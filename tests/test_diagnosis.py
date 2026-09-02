@@ -538,26 +538,23 @@ class TestProfileRulesV17(unittest.TestCase):
 
 
 class TestEvidenceChainConsumption(unittest.TestCase):
-    """v1.8.3: 证据链 builder 优先消费模块自证 Evidence (_evidence).
+    """v1.8.3/v1.9.0: 证据链 builder 优先消费模块自证 Evidence.
 
-    核心断言: 同一份数据, 注入 _evidence (probe 认证路径) 与不注入
-    (旧口径原地取值) 产出的证据项文本必须逐字一致 — 两条路径同源。
+    核心断言: 同一份数据, 走证据映射 (probe 认证路径) 与走旧口径
+    (原地取值) 产出的证据项文本必须逐字一致 — 两条路径同源。
+    v1.9.0 起证据走独立映射 (LAST_RUN["evidence"]), builder 以 evd 参数接收。
     """
 
     @staticmethod
-    def _injected(res, builder):
-        """把模块 builder 生成的 Evidence 注入 res['_evidence'] (模拟 run 路径)."""
-        ev = builder(res)
-        out = dict(res)
-        out["_evidence"] = [e.to_dict() for e in ev]
-        return out
+    def _evd(module, res, builder):
+        """模拟 run 路径: 模块 builder 生成的 Evidence → 独立映射片段."""
+        return {module: [e.to_dict() for e in builder(res)]}
 
     def _assert_same_primary_support(self, results, module, ev_builder,
                                      chain_builder, needle):
         legacy = chain_builder(results)[0]
-        injected = dict(results)
-        injected[module] = self._injected(results[module], ev_builder)
-        from_ev = chain_builder(injected)[0]
+        evd = self._evd(module, results[module], ev_builder)
+        from_ev = chain_builder(results, evd)[0]
         old_texts = [s["text"] for s in legacy if needle in s["text"]]
         new_texts = [s["text"] for s in from_ev if needle in s["text"]]
         self.assertEqual(1, len(old_texts), msg=f"旧行未含 {needle}: {old_texts}")
@@ -589,15 +586,12 @@ class TestEvidenceChainConsumption(unittest.TestCase):
                                  "sent": 20, "received": 16},
                         "issues": []}
         # gateway 无独立 builder (原生 probe 内联构造), 按 probe 同款手工合成
-        gw_ev = [N.Evidence(id="gateway.ping.loss_pct", source="gateway.ping",
-                            metric="packet_loss_pct", value=20, unit="%",
-                            confidence=0.98,
-                            metadata={"sent": 20, "received": 16})]
-        injected = dict(r)
-        injected["gateway"] = dict(r["gateway"])
-        injected["gateway"]["_evidence"] = [e.to_dict() for e in gw_ev]
+        evd = {"gateway": [N.Evidence(
+            id="gateway.ping.loss_pct", source="gateway.ping",
+            metric="packet_loss_pct", value=20, unit="%", confidence=0.98,
+            metadata={"sent": 20, "received": 16}).to_dict()]}
         legacy = N._ev_gateway_loss(r)[0]
-        from_ev = N._ev_gateway_loss(injected)[0]
+        from_ev = N._ev_gateway_loss(r, evd)[0]
         old = [s["text"] for s in legacy if "网关丢包" in s["text"]]
         new = [s["text"] for s in from_ev if "网关丢包" in s["text"]]
         self.assertEqual(1, len(old))
@@ -610,10 +604,10 @@ class TestEvidenceChainConsumption(unittest.TestCase):
         r["mtu"] = {"path_mtus": [{"target": "223.5.5.5", "path_mtu": 1492}],
                     "local_mtus": [{"name": "以太网", "mtu": 1500}],
                     "issues": []}
-        injected = dict(r)
-        injected["mtu"] = self._injected(r["mtu"], N._evidence_mtu)
-        for res in (r, injected):
-            texts = [s["text"] for s in N._ev_mtu_blackhole(res)[0]]
+        evd = self._evd("mtu", r["mtu"], N._evidence_mtu)
+        for texts in (N._ev_mtu_blackhole(r)[0],
+                      N._ev_mtu_blackhole(r, evd)[0]):
+            texts = [s["text"] for s in texts]
             self.assertTrue(any("接口 以太网 MTU = 1500" in t for t in texts),
                             msg=f" texts={texts}")
             self.assertFalse(any("None" in t for t in texts))
@@ -629,72 +623,64 @@ class TestEvidenceChainConsumption(unittest.TestCase):
         """v1.8.4: 排除项 (网关可达/外网可达/DNS 全正常) 同样与证据源一致."""
         r = _healthy_full()
         r["dns"] = {"success_count": 2, "total_count": 10, "issues": []}
-        injected = dict(r)
-        injected["dns"] = self._injected(r["dns"], N._evidence_dns)
         # gateway 用原生 probe 同款证据注入 (loss + avg)
-        gw_ev = [N.Evidence(id="gateway.ping.loss_pct", source="gateway.ping",
-                            metric="packet_loss_pct", value=0, unit="%",
-                            confidence=0.98, metadata={"sent": 20, "received": 20}),
-                 N.Evidence(id="gateway.ping.avg_ms", source="gateway.ping",
-                            metric="avg_latency_ms", value=5, unit="ms",
-                            confidence=0.95)]
-        injected["gateway"] = dict(r["gateway"])
-        injected["gateway"]["_evidence"] = [e.to_dict() for e in gw_ev]
+        evd = self._evd("dns", r["dns"], N._evidence_dns)
+        evd["gateway"] = [
+            N.Evidence(id="gateway.ping.loss_pct", source="gateway.ping",
+                       metric="packet_loss_pct", value=0, unit="%",
+                       confidence=0.98,
+                       metadata={"sent": 20, "received": 20}).to_dict(),
+            N.Evidence(id="gateway.ping.avg_ms", source="gateway.ping",
+                       metric="avg_latency_ms", value=5, unit="ms",
+                       confidence=0.95).to_dict(),
+        ]
         legacy = N._ev_dns_failure(r)
-        from_ev = N._ev_dns_failure(injected)
+        from_ev = N._ev_dns_failure(r, evd)
         self.assertEqual([s["text"] for s in legacy[1]],
                          [s["text"] for s in from_ev[1]])
         self.assertTrue(any("网关可达，丢包 0%，平均 5ms" in s["text"]
                             for s in from_ev[1]))
 
     def test_bufferbloat_supports_from_evidence(self):
-        """bufferbloat 支持项取自 _evidence (bloat_ms + grade)."""
+        """bufferbloat 支持项取自证据映射 (bloat_ms + grade)."""
         r = _healthy_full()
         r["bufferbloat"] = {"idle_rtt_ms": 8, "loaded_rtt_ms": 208,
                             "bloat_ms": 200.0, "grade": "F (严重 Bufferbloat)",
                             "load_warning": False, "issues": []}
-        injected = dict(r)
-        injected["bufferbloat"] = self._injected(r["bufferbloat"],
-                                                 N._evidence_bufferbloat)
+        evd = self._evd("bufferbloat", r["bufferbloat"],
+                        N._evidence_bufferbloat)
         legacy = N._ev_bufferbloat(r)[0]
-        from_ev = N._ev_bufferbloat(injected)[0]
+        from_ev = N._ev_bufferbloat(r, evd)[0]
         self.assertEqual([s["text"] for s in legacy],
                          [s["text"] for s in from_ev])
 
     def test_nat_restricted_supports_from_evidence(self):
-        """nattype 支持项取自 _evidence (nat_behavior + cone_type)."""
+        """nattype 支持项取自证据映射 (nat_behavior + cone_type)."""
         r = _healthy_full()
         r["nattype"] = {"nat_behavior": "对称型", "cone_type": "未细分",
                         "issues": []}
-        injected = dict(r)
-        injected["nattype"] = self._injected(r["nattype"], N._evidence_nattype)
+        evd = self._evd("nattype", r["nattype"], N._evidence_nattype)
         legacy = N._ev_nat_restricted(r)[0]
-        from_ev = N._ev_nat_restricted(injected)[0]
+        from_ev = N._ev_nat_restricted(r, evd)[0]
         self.assertEqual([s["text"] for s in legacy],
                          [s["text"] for s in from_ev])
 
     def test_no_evidence_falls_back_legacy(self):
-        """旧运行无 _evidence: 走原地取值, 输出不变 (回归保护)."""
+        """旧运行无证据映射: 走原地取值, 输出不变 (回归保护)."""
         r = _healthy_full()
         r["dns"] = {"success_count": 2, "total_count": 10, "issues": []}
         supports, _ = N._ev_dns_failure(r)
         self.assertTrue(any("2/10" in s["text"] for s in supports))
 
     def test_malformed_evidence_falls_back(self):
-        """_evidence 结构损坏 (非列表/缺字段) 不得让证据链崩掉."""
+        """证据映射结构损坏 (非列表/缺字段) 不得让证据链崩掉."""
         r = _healthy_full()
         r["dns"] = {"success_count": 2, "total_count": 10, "issues": []}
-        bad = dict(r["dns"])
-        bad["_evidence"] = "garbage"
-        r2 = dict(r)
-        r2["dns"] = bad
-        supports, _ = N._ev_dns_failure(r2)
+        supports, _ = N._ev_dns_failure(r, {"dns": "garbage"})
         self.assertTrue(any("2/10" in s["text"] for s in supports))
-        bad2 = dict(r["dns"])
-        bad2["_evidence"] = [{"id": "dns.resolve.success_count"}]  # 缺 metadata
-        r3 = dict(r)
-        r3["dns"] = bad2
-        supports3, _ = N._ev_dns_failure(r3)
+        # 条目缺 metadata → 守卫不通过, 回落旧口径
+        supports3, _ = N._ev_dns_failure(
+            r, {"dns": [{"id": "dns.resolve.success_count"}]})
         self.assertTrue(any("失败率" in s["text"] for s in supports3))
 
 

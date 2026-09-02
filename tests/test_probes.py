@@ -636,7 +636,8 @@ class TestP0MigratedProbes(unittest.TestCase):
                 N.probe_external_v2(callback=lambda m: None)
 
     def test_run_module_timeout_persists_evidence(self):
-        """v2 分支: result.evidence → res["_evidence"] (过渡键, v1.8.2)."""
+        """v2 分支: result.evidence → res["_evidence"] (夹带传递, LAST_RUN
+        装配时由 _extract_evidence_map 摘出, 不随模块 results 落盘)."""
         fake = N.DiagnosticResult(
             module_id="external", status=N.Status.OK,
             evidence=[N.Evidence(id="external.ping.avg_loss_pct",
@@ -656,6 +657,20 @@ class TestP0MigratedProbes(unittest.TestCase):
         with patch.dict(N._V2_PROBES, {"mtu": lambda callback=None: fake}):
             _, res = N._run_module_with_timeout("mtu", lambda m: None)
         self.assertNotIn("_evidence", res)
+
+    def test_extract_evidence_map(self):
+        """v1.9.0: LAST_RUN 装配摘键 — results 纯净, 证据走独立映射."""
+        full = {
+            "external": {"tcp_ok": 4, "_evidence": [{"id": "e1"}]},
+            "mtu": {"x": 1},
+            "dns": {"a": 1, "_evidence": []},   # 空证据 → 键移除且不进映射
+        }
+        results, evidence = N._extract_evidence_map(full)
+        self.assertEqual({"tcp_ok": 4}, results["external"])
+        self.assertEqual({"a": 1}, results["dns"])
+        self.assertEqual({"e1"}, {e["id"] for e in evidence["external"]})
+        self.assertNotIn("dns", evidence)
+        self.assertNotIn("mtu", evidence)
 
 
 if __name__ == "__main__":

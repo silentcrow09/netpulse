@@ -1,0 +1,391 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/silentcrow09/netpulse/schema/netpulse-result-v1.2.json",
+  "title": "NetPulse Diagnostic Report (v1.2)",
+  "description": "NetPulse v1.3.0+ JSON 报告 schema (阶段 D · v1.4.0 引入). 旧解析器可忽略未知字段, 但 schema_version 字段必须检查 (跨版本演进标识).",
+  "type": "object",
+  "required": [
+    "app",
+    "version",
+    "schema_version",
+    "generated_at",
+    "system",
+    "health",
+    "counts",
+    "summary",
+    "diagnosis",
+    "modules"
+  ],
+  "properties": {
+    "app": {
+      "type": "string",
+      "const": "NetPulse",
+      "description": "应用名固定为 NetPulse"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "NetPulse 版本号 (semver)"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "1.2.0",
+      "description": "JSON Schema 版本. v1.9.0 起为 1.2.0: 模块自证证据 (evidence) 升为一等结构 (tech.evidence), 不再随模块 results 落盘. 旧解析器可忽略未知字段, 跨版本演进用此字段判定"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "报告生成时间 (ISO 8601)"
+    },
+    "system": {
+      "type": "object",
+      "description": "系统快照 (local_ip / gateway / public_ip / dns / asn / geo / ipv6_public_ip)",
+      "properties": {
+        "local_ip": {
+          "type": "string"
+        },
+        "gateway": {
+          "type": "string"
+        },
+        "public_ip": {
+          "type": "string"
+        },
+        "dns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "asn": {
+          "type": "string"
+        },
+        "geo": {
+          "type": "string"
+        },
+        "ipv6_public_ip": {
+          "type": "string"
+        }
+      }
+    },
+    "health": {
+      "type": "object",
+      "description": "健康分 (阶段 v1.0 引入)",
+      "properties": {
+        "score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "grade": {
+          "type": "string",
+          "enum": [
+            "A",
+            "B",
+            "C",
+            "D",
+            "F"
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "verdict": {
+          "type": "string"
+        },
+        "counts": {
+          "type": "object"
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "description": "状态计数 (扣分口径, 不含 iperf3/ipv6/proxy/nattype 豁免模块)"
+    },
+    "exempt_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "评分豁免的模块数"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "v1.5.0 引入: 本次检测耗时 (毫秒). 仅跑部分模块时 Hero 显示, 避免健康分 100 被误读为全量正常"
+    },
+    "selected_modules": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "v1.5.0 引入: 本次实际运行的模块数"
+    },
+    "total_modules": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "v1.5.0 引入: 系统可用的总模块数 (MODULE_REGISTRY 条数)"
+    },
+    "summary": {
+      "type": "object",
+      "description": "{module_key: status_zh} 映射, 兼容 v1.0.0 旧格式"
+    },
+    "diagnosis": {
+      "type": "object",
+      "description": "根因分析报告 (阶段 C · v1.3.0 引入). 6 条内置规则跨模块证据聚合",
+      "required": [
+        "root_causes",
+        "overall_confidence",
+        "rules_evaluated",
+        "rules_fired"
+      ],
+      "properties": {
+        "root_causes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "category",
+              "severity",
+              "title",
+              "confidence"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "enum": [
+                  "dns_failure",
+                  "wan_interruption",
+                  "wifi_weak",
+                  "bufferbloat",
+                  "gateway_loss",
+                  "nat_restricted"
+                ],
+                "description": "根因 ID (固定 6 种, 新规则需更新此 enum)"
+              },
+              "category": {
+                "type": "string",
+                "enum": [
+                  "DNS",
+                  "WAN",
+                  "WiFi",
+                  "Bufferbloat",
+                  "LAN",
+                  "NAT"
+                ]
+              },
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "critical",
+                  "high",
+                  "medium",
+                  "low",
+                  "info"
+                ]
+              },
+              "title": {
+                "type": "string",
+                "description": "一句话根因描述 (客户可见)"
+              },
+              "description": {
+                "type": "string",
+                "description": "影响范围说明"
+              },
+              "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "evidence_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "affected_modules": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "recommendations": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "supports": {
+                "type": "array",
+                "description": "v1.5.0 引入: 支持本结论的事实 (ok=false: 问题就在这; ok=true: 佐证). 由 _RC_EVIDENCE_BUILDERS 生成",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "text",
+                    "ok"
+                  ],
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    },
+                    "ok": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              },
+              "excludes": {
+                "type": "array",
+                "description": "v1.5.0 引入: 已经排除的方向 (全部 ok=true). 由 _RC_EVIDENCE_BUILDERS 生成",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "text",
+                    "ok"
+                  ],
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    },
+                    "ok": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "overall_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "rules_evaluated": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6
+        },
+        "rules_fired": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "modules": {
+      "type": "array",
+      "description": "客户视图模块列表 (23 项)",
+      "items": {
+        "type": "object",
+        "required": [
+          "key",
+          "name",
+          "status"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "完成",
+              "警告",
+              "异常",
+              "错误",
+              "超时",
+              "未检测"
+            ]
+          },
+          "verdict": {
+            "type": "string"
+          },
+          "key_metrics": {
+            "type": "array"
+          },
+          "issues": {
+            "type": "array"
+          },
+          "has_tech_details": {
+            "type": "boolean"
+          },
+          "raw": {
+            "type": "object",
+            "description": "模块原始结果 (供技术员展开)"
+          }
+        }
+      }
+    },
+    "tech": {
+      "type": "object",
+      "description": "技术视图 (raw_results / module_keys / thresholds), 仅 JSON 报告含, HTML 报告不含",
+      "properties": {
+        "raw_results": {
+          "type": "object"
+        },
+        "module_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "thresholds": {
+          "type": "object"
+        },
+        "module_presentation": {
+          "type": "object"
+        },
+        "evidence": {
+          "type": "object",
+          "description": "模块自证证据 (v1.9.0 / Schema 1.2.0 起一等结构): module key → 该模块在 probe 阶段认证的 Evidence 列表. 根因证据链 (diagnosis.root_causes[].supports/excludes) 的数值与此处同源",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "source",
+                "metric",
+                "value"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "全局唯一惯例: <module>.<step>.<metric>"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "metric": {
+                  "type": "string"
+                },
+                "value": {},
+                "unit": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "timestamp": {
+                  "type": "string"
+                },
+                "confidence": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "metadata": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

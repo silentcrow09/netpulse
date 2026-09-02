@@ -7,6 +7,27 @@
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-02
+
+V2 模型收口收官（审计 P0-03）：JSON Schema v1.2——**evidence 升为一等结构**，`_evidence` 过渡键移除。
+
+### 新增
+
+- **`LAST_RUN["evidence"]` 独立映射**：`{module: [Evidence...]}`，v2 分支夹带在模块 res 里的过渡键 `_evidence` 由 `_extract_evidence_map` 在 LAST_RUN 装配时摘出——模块 results 恢复纯净，证据不再混进模块数据落盘
+- **Schema v1.2**（`schema/netpulse-result-v1.2.json`，v1.1 留档）：`schema_version` 固定 `1.2.0`；`tech.evidence` 定义为一等结构（module → Evidence 列表，字段 id/source/metric/value/unit/timestamp/confidence/metadata）；`--json-schema` 输出同步
+- **调试包**：zip 新增脱敏 `evidence.json`（system + diagnostic + evidence + log）
+- 证据链 builder 以 `evd` 参数接收证据映射（`_enrich_diagnosis_evidence` / `_build_diagnosis_with_evidence` 透传，build_report 与场景路径均接入）；模块无证据/映射损坏时回落旧口径，文案不变
+
+### 变更
+
+- build_report：`schema_version` 1.1.0 → 1.2.0，`tech.evidence` 进入 JSON 导出（与 `tech.raw_results` 平级）
+- 版本 1.8.4 → 1.9.0（导出结构演进，minor）
+
+### 验证
+
+- 端到端：LAST_RUN（独立 evidence 映射）→ build_report → `tech.evidence` 含两模块证据 + `raw_results` 无 `_evidence` 残留 + HTML/JSON 证据链文本同源
+- 测试：全套件 12 文件全绿（diagnosis 68 / probes 67），新增 `_extract_evidence_map` 摘键/空证据/纯净 results 断言
+
 ## [1.8.4] - 2026-09-02
 
 V2 模型收口第三步（审计 P0-03）：8 条根因规则的证据链（支持项 + 排除项）全部与模块自证 Evidence 同源。

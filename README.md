@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.8.4
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.9.0
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -23,7 +23,7 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 - **根因分析引擎**：8 条内置规则（DNS / WAN / WiFi / Bufferbloat / 网关丢包 / NAT / **MTU 黑洞** / **TCP 传输层丢包**）跨模块聚合证据，按严重度排序输出根因 + 置信度 + 建议；HTML 报告每条根因带「为什么这样判断 / 已基本排除」证据链和**一句话报障卡**（可直接复制发给客服）。
 - **场景化诊断 Profile**：无参数启动（双击 exe）进**场景菜单** — `[1] 网络很慢 / [2] 经常断网 / [3] 网页打不开 / [4] 游戏卡顿 / [5] WiFi 信号差 / [7] 持续盯障 / [9] 高级选项`，选完自动跑对应模块组合并给出根因结论，报告存到 `桌面\NetPulse\`（文件名含时分秒，同日复测不覆盖）；CLI 同步支持 `--diagnose slow|disconnect|web|gaming|wifi`，按场景过滤规则评估（gaming 不误报「WiFi 信号弱」），导出报告与屏幕结论同源。
 - **并行执行**：`--parallel` 多模块并发跑（`--max-workers N` 控制并发数），交互菜单多模块默认并发。
-- **JSON Schema + 调试包**：结果文件遵循 `schema/netpulse-result-v1.1.json`（`--json-schema` 离线查询版本与字段，供 AI Agent / RMM introspect）；`--debug-bundle DIR` 一键导出脱敏调试包（system + diagnostic + log 的 zip）。
+- **JSON Schema + 调试包**：结果文件遵循 `schema/netpulse-result-v1.2.json`（`--json-schema` 离线查询版本与字段，供 AI Agent / RMM introspect；v1.2.0 起 `tech.evidence` 为一等结构——每模块 probe 认证证据，与根因证据链同源）；`--debug-bundle DIR` 一键导出脱敏调试包（system + diagnostic + evidence + log 的 zip）。
 - **TCP 并发能力压测**：阶梯并发连接测试（累计保持），判定网络路径（光猫/路由器 NAT）最大可持续并发；同跑本机回环对照，自动区分「本机瓶颈 vs 网络/NAT 瓶颈」，零依赖、无需自建服务器。
 - **盯障模式 `--monitor`**：分钟级持续监测网关/外网 ping + TCP + DNS，抓偶发掉线（普通模块全是快照抓不到）；自动事件检测 + 分段定位（内网侧/运营商侧/解析侧/内外同抖），含**抖动窗口**检测（60s 窗口内反复丢包但未达连续中断 → 抖动集中段，偶发掉线最典型形态）；v1.7.0 起叠加**统计层**——后台二分探测路径 MTU（识别 MTU 不匹配/PMTUD 黑洞类故障，ping 小包看不出的盲区）+ TCP 重传率 30s 差分采样（开机累计计数器差出会话口径，含分母保护），`--monitor-load` 可在盯障中段制造 15s 下载负载让 full-size 包真正跑起来；输出带时间轴的 HTML 报告 + Excel 直开的 CSV + 完整 JSON。
 - **抓包取证层 `--capture`（v1.8.0）**：盯障时叠加**证据级**抓包（需 Npcap + 管理员，默认关闭，首次使用有隐私确认）——中断/抖动/TCP 失败/重传爆发等事件触发时自动落盘**前后各 30s 切片 pcap**（Wireshark 直开），结束后离线分析三信号判定 **PMTU 黑洞**（ICMP 分片指示 / full-size 段同序号停滞重传 / 握手 MSS 大于路径 MTU）、链路丢包形态、DNS 慢查询，结论联动盯障报告并给**置信度徽标**（黑洞确认为「高置信度」档）；**隐私边界**：默认仅保存诊断所需的网络元数据——80/443 每流仅前 2 包多留 384B（提取 Host/SNI 定位访问的域名），DNS/ICMP 整包保留（**DNS 查询域名 QNAME / HTTP Host / TLS SNI 可能被记录**），其余一律剥到头部，**不保存普通 TCP/HTTP 应用载荷**（账号/密码/页面内容不落盘）；抓包分析当前仅覆盖 IPv4；切片超 7 天或超 10 个自动清理。
@@ -422,7 +422,8 @@ requirements.txt    依赖说明
 tests/              单元/回归测试 (unittest 风格, 逐文件 python tests/test_x.py 运行)
 └── fixtures/       脱敏 Windows 命令输出 fixture (MAC/IPv6/hostname 均为伪造值)
 schema/
-└── netpulse-result-v1.1.json   JSON 结果 Schema (--json-schema 查询)
+├── netpulse-result-v1.1.json   旧版 JSON Schema (1.1.0, 留档)
+└── netpulse-result-v1.2.json   JSON 结果 Schema (--json-schema 查询; evidence 一等结构)
 deploy/
 └── install.ps1     客户端引导脚本 (上传到 OSS, 客户用 irm | iex 拉取)
 CHANGELOG.md        更新日志

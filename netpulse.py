@@ -1887,14 +1887,14 @@ def _ping(results, key):
     return ping if isinstance(ping, dict) else None
 
 
-def _ev_gateway_reachable(results, suffix=""):
+def _ev_gateway_reachable(results, evd=None, suffix=""):
     """通用的「网关可达」排除项 (v1.8.4: 优先取 gateway 自证 Evidence)。"""
-    item = _evd_find(_module_evidence(results, "gateway"),
+    item = _evd_find(_module_evidence(evd, "gateway"),
                      "gateway.ping.loss_pct")
     ping = _ping(results, "gateway")
     if item is not None and isinstance(item.get("value"), (int, float)):
         loss = item["value"]
-        i_avg = _evd_find(_module_evidence(results, "gateway"),
+        i_avg = _evd_find(_module_evidence(evd, "gateway"),
                           "gateway.ping.avg_ms")
         avg = i_avg.get("value") if i_avg is not None else None
     elif ping:
@@ -1910,10 +1910,10 @@ def _ev_gateway_reachable(results, suffix=""):
     return _ev(txt + suffix, True)
 
 
-def _ev_external_reachable(results, suffix="（不是外网全断）"):
+def _ev_external_reachable(results, evd=None, suffix="（不是外网全断）"):
     """通用的「外网 TCP 可达」排除项 (v1.8.4: 优先取 external 自证 Evidence)。"""
     ext = _mod(results, "external")
-    item = _evd_find(_module_evidence(results, "external"),
+    item = _evd_find(_module_evidence(evd, "external"),
                      "external.tcp.tcp_ok")
     if item is not None and (item.get("metadata") or {}).get("tcp_total"):
         tcp_ok = item.get("value") or 0
@@ -1927,10 +1927,12 @@ def _ev_external_reachable(results, suffix="（不是外网全断）"):
     return _ev(f"外网 TCP 可达 {tcp_ok}/{tcp_total}{suffix}", True)
 
 
-def _module_evidence(results, module):
-    """模块自证 Evidence (v1.8.2 过渡键 _evidence); 无/非列表时返回 []。"""
-    mod = _mod(results, module) or {}
-    ev = mod.get("_evidence")
+def _module_evidence(evd, module):
+    """模块自证 Evidence (v1.9.0 起来自独立映射 LAST_RUN["evidence"])。
+
+    evd: {module_key: [Evidence.to_dict(), ...]}; None/缺失/损坏 → []。
+    """
+    ev = (evd or {}).get(module)
     return [e for e in ev if isinstance(e, dict)] if isinstance(ev, list) else []
 
 
@@ -1942,12 +1944,12 @@ def _evd_find(evidence, ev_id):
     return None
 
 
-def _ev_dns_failure(results):
+def _ev_dns_failure(results, evd=None):
     dns = _mod(results, "dns") or {}
     supports = []
     # 支持项优先取模块自证 Evidence (v1.8.3, 与 probe 认证数值同源);
     # 旧运行/无证据时回落原地取值, 文案不变。
-    item = _evd_find(_module_evidence(results, "dns"),
+    item = _evd_find(_module_evidence(evd, "dns"),
                      "dns.resolve.success_count")
     meta = (item or {}).get("metadata") or {}
     if item is not None and isinstance(item.get("value"), (int, float)) \
@@ -1968,10 +1970,10 @@ def _ev_dns_failure(results):
     return supports, excludes
 
 
-def _ev_wan_interruption(results):
+def _ev_wan_interruption(results, evd=None):
     ext = _mod(results, "external") or {}
     supports = []
-    item = _evd_find(_module_evidence(results, "external"),
+    item = _evd_find(_module_evidence(evd, "external"),
                      "external.tcp.tcp_ok")
     meta = (item or {}).get("metadata") or {}
     if item is not None and meta.get("tcp_total"):
@@ -1981,10 +1983,10 @@ def _ev_wan_interruption(results):
     if tcp_total:
         supports.append(_ev(f"外网 TCP 全部失败 {tcp_ok}/{tcp_total}", False))
     excludes = []
-    item = _ev_gateway_reachable(results, "（内网到网关这一段没问题）")
+    item = _ev_gateway_reachable(results, evd, suffix="（内网到网关这一段没问题）")
     if item:
         excludes.append(item)
-    i_loss = _evd_find(_module_evidence(results, "gateway"),
+    i_loss = _evd_find(_module_evidence(evd, "gateway"),
                        "gateway.ping.loss_pct")
     if i_loss is not None and isinstance(i_loss.get("value"), (int, float)):
         gw_loss = i_loss["value"]
@@ -1996,10 +1998,10 @@ def _ev_wan_interruption(results):
     return supports, excludes
 
 
-def _ev_wifi_weak(results):
+def _ev_wifi_weak(results, evd=None):
     wifi = _mod(results, "wifi") or {}
     supports = []
-    item = _evd_find(_module_evidence(results, "wifi"),
+    item = _evd_find(_module_evidence(evd, "wifi"),
                      "wifi.spectrum.overall_interference")
     if item is not None and item.get("value") is not None:
         interference = item.get("value")
@@ -2011,19 +2013,19 @@ def _ev_wifi_weak(results):
     if isinstance(nets, list) and nets:
         supports.append(_ev(f"周边扫描到 {len(nets)} 个无线网络", True))
     excludes = []
-    item = _ev_gateway_reachable(results, "（到网关的有线/链路层未受影响）")
+    item = _ev_gateway_reachable(results, evd, suffix="（到网关的有线/链路层未受影响）")
     if item:
         excludes.append(item)
-    item = _ev_external_reachable(results, "（运营商侧链路正常）")
+    item = _ev_external_reachable(results, evd, suffix="（运营商侧链路正常）")
     if item:
         excludes.append(item)
     return supports, excludes
 
 
-def _ev_bufferbloat(results):
+def _ev_bufferbloat(results, evd=None):
     bb = _mod(results, "bufferbloat") or {}
     supports = []
-    ev = _module_evidence(results, "bufferbloat")
+    ev = _module_evidence(evd, "bufferbloat")
     item = _evd_find(ev, "bufferbloat.load.bloat_ms")
     if item is not None and isinstance(item.get("value"), (int, float)):
         meta = item.get("metadata") or {}
@@ -2045,9 +2047,9 @@ def _ev_bufferbloat(results):
         supports.append(_ev(f"Bufferbloat 等级 {grade}", False))
     excludes = []
     ping = _ping(results, "gateway")
-    i_avg = _evd_find(_module_evidence(results, "gateway"),
+    i_avg = _evd_find(_module_evidence(evd, "gateway"),
                       "gateway.ping.avg_ms")
-    i_loss = _evd_find(_module_evidence(results, "gateway"),
+    i_loss = _evd_find(_module_evidence(evd, "gateway"),
                        "gateway.ping.loss_pct")
     if i_avg is not None and i_loss is not None \
             and isinstance(i_avg.get("value"), (int, float)) \
@@ -2064,10 +2066,10 @@ def _ev_bufferbloat(results):
     return supports, excludes
 
 
-def _ev_gateway_loss(results):
+def _ev_gateway_loss(results, evd=None):
     ping = _ping(results, "gateway") or {}
     supports = []
-    item = _evd_find(_module_evidence(results, "gateway"),
+    item = _evd_find(_module_evidence(evd, "gateway"),
                      "gateway.ping.loss_pct")
     meta = (item or {}).get("metadata") or {}
     if item is not None and isinstance(item.get("value"), (int, float)):
@@ -2084,10 +2086,10 @@ def _ev_gateway_loss(results):
     if isinstance(ping.get("max_ms"), (int, float)):
         supports.append(_ev(f"网关最大延迟 {ping['max_ms']:g}ms", False))
     excludes = []
-    item = _ev_external_reachable(results, "（不是运营商外网中断）")
+    item = _ev_external_reachable(results, evd, suffix="（不是运营商外网中断）")
     if item:
         excludes.append(item)
-    i_dns = _evd_find(_module_evidence(results, "dns"),
+    i_dns = _evd_find(_module_evidence(evd, "dns"),
                       "dns.resolve.success_count")
     if i_dns is not None and (i_dns.get("metadata") or {}).get("total_count"):
         sc = i_dns.get("value") or 0
@@ -2100,10 +2102,10 @@ def _ev_gateway_loss(results):
     return supports, excludes
 
 
-def _ev_nat_restricted(results):
+def _ev_nat_restricted(results, evd=None):
     nat = _mod(results, "nattype") or {}
     supports = []
-    ev = _module_evidence(results, "nattype")
+    ev = _module_evidence(evd, "nattype")
     i_behavior = _evd_find(ev, "nattype.stun.nat_behavior")
     behavior = i_behavior.get("value") if i_behavior is not None \
         else nat.get("nat_behavior")
@@ -2114,16 +2116,16 @@ def _ev_nat_restricted(results):
     if cone:
         supports.append(_ev(f"锥形类型：{cone}", True))
     excludes = []
-    item = _ev_external_reachable(results, "（普通上网 / 网页访问不受影响）")
+    item = _ev_external_reachable(results, evd, suffix="（普通上网 / 网页访问不受影响）")
     if item:
         excludes.append(item)
     return supports, excludes
 
 
-def _ev_mtu_blackhole(results):
+def _ev_mtu_blackhole(results, evd=None):
     mtu = _mod(results, "mtu") or {}
     supports = []
-    ev = _module_evidence(results, "mtu")
+    ev = _module_evidence(evd, "mtu")
     if ev:
         # 证据优先: probe 阶段已认证的 path_mtu / iface mtu 逐条转写
         for e in ev:
@@ -2144,7 +2146,7 @@ def _ev_mtu_blackhole(results):
                 supports.append(_ev(
                     f"接口 {lm.get('name')} MTU = {lm['mtu']}", False))
     ts = _mod(results, "tcpstats") or {}
-    item = _evd_find(_module_evidence(results, "tcpstats"),
+    item = _evd_find(_module_evidence(evd, "tcpstats"),
                      "tcpstats.retrans.retrans_rate_pct")
     if item is not None:
         rate = item.get("value")
@@ -2160,10 +2162,10 @@ def _ev_mtu_blackhole(results):
     return supports, excludes
 
 
-def _ev_tcp_loss_burst(results):
+def _ev_tcp_loss_burst(results, evd=None):
     ts = _mod(results, "tcpstats") or {}
     supports = []
-    item = _evd_find(_module_evidence(results, "tcpstats"),
+    item = _evd_find(_module_evidence(evd, "tcpstats"),
                      "tcpstats.retrans.retrans_rate_pct")
     if item is not None and isinstance(item.get("value"), (int, float)):
         rate = item["value"]
@@ -2179,7 +2181,7 @@ def _ev_tcp_loss_burst(results):
             f"TCP 重传率 {rate:g}% (重传 {retrans} / "
             f"发送 {sent}, 开机累计口径)", False))
     excludes = []
-    ev_m = _module_evidence(results, "mtu")
+    ev_m = _module_evidence(evd, "mtu")
     if ev_m:
         paths = [e["value"] for e in ev_m if e.get("id") == "mtu.probe.path_mtu"
                  and isinstance(e.get("value"), (int, float))]
@@ -2211,9 +2213,11 @@ _RC_EVIDENCE_BUILDERS = {
 }
 
 
-def _enrich_diagnosis_evidence(report, results_dict):
+def _enrich_diagnosis_evidence(report, results_dict, evidence_by_module=None):
     """给 DiagnosisReport 里每个 RootCause 补 supports / excludes。
 
+    evidence_by_module: 模块自证证据映射 (LAST_RUN["evidence"], v1.9.0) —
+    builder 的支持/排除项优先取此处的 probe 认证数值。
     单条规则生成失败不影响整份报告 (吞异常后该根因退化为无证据链,
     与 v1.4.x 渲染行为一致)。
     """
@@ -2222,7 +2226,7 @@ def _enrich_diagnosis_evidence(report, results_dict):
         if not fn:
             continue
         try:
-            supports, excludes = fn(results_dict)
+            supports, excludes = fn(results_dict, evidence_by_module)
         except Exception:
             continue
         rc.supports = [s for s in (supports or []) if s and s.get("text")]
@@ -2230,14 +2234,17 @@ def _enrich_diagnosis_evidence(report, results_dict):
     return report
 
 
-def _build_diagnosis_with_evidence(results_dict, rule_filter=None):
+def _build_diagnosis_with_evidence(results_dict, rule_filter=None,
+                                   evidence_by_module=None):
     """diagnose() + 证据链增强 (报告渲染入口)。
 
     rule_filter: 透传 diagnose() 的场景规则过滤 — 保证导出报告里的根因
                  与完成屏一致 (gaming 报告不再夹带屏幕上已隐藏的 wifi_weak)。
+    evidence_by_module: 模块自证证据映射 (v1.9.0), 透传给各证据链 builder。
     """
     return _enrich_diagnosis_evidence(
-        diagnose(results_dict, rule_filter=rule_filter), results_dict)
+        diagnose(results_dict, rule_filter=rule_filter), results_dict,
+        evidence_by_module)
 
 
 # 规则注册表 (C1 · v1.6.1 收敛为单一有序注册表): ALL_RULES / _RULE_BY_ID /
@@ -2762,7 +2769,7 @@ def _export_debug_bundle(out_dir):
     流程:
       1. 跑一次全诊断 (若 LAST_RUN 不存在)
       2. 脱敏 (SSID / MAC / 公网 IP / hostname)
-      3. 写 system.json + diagnostic.json + netpulse.log
+      3. 写 system.json + diagnostic.json + evidence.json + netpulse.log
       4. 打包 zip, 输出到 out_dir
     """
     # 1. 确保有诊断数据
@@ -2778,6 +2785,7 @@ def _export_debug_bundle(out_dir):
         sys_info_redacted = _redact_dict(dict(LAST_RUN.get("system", {})))
         diag_redacted = {k: _redact_dict(v) if isinstance(v, dict)
                          else v for k, v in LAST_RUN.get("results", {}).items()}
+        ev_redacted = _redact_dict(dict(LAST_RUN.get("evidence") or {}))
     except Exception as e:
         print(_c(f"  ✗ 脱敏失败: {e}", C_RED))
         return
@@ -2788,6 +2796,7 @@ def _export_debug_bundle(out_dir):
     base = f"netpulse-debug-{timestamp}"
     system_path = os.path.join(out_dir_abs, f"{base}-system.json")
     diag_path = os.path.join(out_dir_abs, f"{base}-diagnostic.json")
+    ev_path = os.path.join(out_dir_abs, f"{base}-evidence.json")
     log_path = os.path.join(out_dir_abs, f"{base}-netpulse.log")
     zip_path = os.path.join(out_dir_abs, f"{base}.zip")
     # 4. 写 JSON 文件
@@ -2795,12 +2804,14 @@ def _export_debug_bundle(out_dir):
         json.dump(sys_info_redacted, f, ensure_ascii=False, indent=2, default=str)
     with open(diag_path, "w", encoding="utf-8") as f:
         json.dump(diag_redacted, f, ensure_ascii=False, indent=2, default=str)
+    with open(ev_path, "w", encoding="utf-8") as f:
+        json.dump(ev_redacted, f, ensure_ascii=False, indent=2, default=str)
     # log: 运行概要 (模块状态 + 模块级 error; 阶段 E 可接 Python logging 模块)
     with open(log_path, "w", encoding="utf-8") as f:
         f.write(f"NetPulse v{APP_VERSION} debug bundle\n")
         f.write(f"Generated at: {datetime.now().isoformat()}\n")
         f.write("Redacted: SSID / MAC / 公网 IPv4+IPv6 / STUN 映射地址 / hostname\n")
-        f.write(f"Schema version: 1.1.0\n")
+        f.write(f"Schema version: 1.2.0\n")
         f.write("-" * 60 + "\n")
         f.write("模块运行状态:\n")
         for k, st in (LAST_RUN.get("status") or {}).items():
@@ -2815,19 +2826,20 @@ def _export_debug_bundle(out_dir):
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(system_path, os.path.basename(system_path))
             zf.write(diag_path, os.path.basename(diag_path))
+            zf.write(ev_path, os.path.basename(ev_path))
             zf.write(log_path, os.path.basename(log_path))
     except Exception as e:
         print(_c(f"  ✗ zip 打包失败: {e}", C_RED))
         return
     # 6. 清理临时文件
-    for p in (system_path, diag_path, log_path):
+    for p in (system_path, diag_path, ev_path, log_path):
         try:
             os.remove(p)
         except OSError:
             pass
     print(_c(f"  ✓ 调试包已生成: {os.path.abspath(zip_path)}", C_GREEN))
-    print(_c(f"  含 {os.path.basename(zip_path)} (zip: system.json + diagnostic.json + netpulse.log)",
-             C_GRAY))
+    print(_c(f"  含 {os.path.basename(zip_path)} (zip: system.json + diagnostic.json"
+             f" + evidence.json + netpulse.log)", C_GRAY))
 
 
 # ============================================================
@@ -3183,7 +3195,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.8.4"
+APP_VERSION = "1.9.0"
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -13106,6 +13118,9 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
     print(_c("=" * 60, C_BLUE))
 
     # 记录本次运行的完整数据, 供报告生成使用
+    # v1.9.0: Evidence 升为一等结构 — v2 分支夹带在 res 里的过渡键 _evidence
+    # 在此摘出, results 保持纯净, 证据走独立的 LAST_RUN["evidence"] 映射。
+    full, evidence_map = _extract_evidence_map(full)
     LAST_RUN = {
         "app": APP_NAME,
         "version": APP_VERSION,
@@ -13113,6 +13128,7 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
         "system": sys_info,
         "status": dict(results),
         "results": full,
+        "evidence": evidence_map,
         "keys": list(keys),
         # v1.5.0: 检测耗时与检测范围 — 只跑 3 个模块时健康分 100 容易被
         # 误读成"23 项全正常", Hero 必须显示覆盖了多少项
@@ -13263,6 +13279,24 @@ def _run_module_with_timeout(key, callback):
     if "err" in box:
         return "错误", {"error": str(box["err"])}
     return determine_status(box["res"]), box["res"]
+
+
+def _extract_evidence_map(full):
+    """把 v2 分支夹带在 res 里的过渡键 _evidence 摘出 (v1.9.0)。
+
+    Evidence 是一等结构, 不随模块 results 落盘/导出 — 返回 (results, evidence):
+      results   去掉 _evidence 后的模块结果 dict (原 full 语义)
+      evidence  {module_key: [Evidence.to_dict(), ...]} (无证据的模块不出现)
+    """
+    results, evidence = {}, {}
+    for k, v in (full or {}).items():
+        if isinstance(v, dict) and "_evidence" in v:
+            ev = v.get("_evidence")
+            v = {kk: vv for kk, vv in v.items() if kk != "_evidence"}
+            if isinstance(ev, list) and ev:
+                evidence[k] = ev
+        results[k] = v
+    return results, evidence
 
 
 def _run_diagnostics_sequential(keys, is_tty):
@@ -15299,12 +15333,13 @@ def build_report(rule_filter=None, diagnosis=None):
     # v1.6.1: 优先复用调用方传入的诊断 (场景路径同源), 否则内部构建
     if diagnosis is None:
         diagnosis = _build_diagnosis_with_evidence(
-            run["results"], rule_filter=rule_filter).to_dict()
+            run["results"], rule_filter=rule_filter,
+            evidence_by_module=run.get("evidence")).to_dict()
 
     return {
         "app": run["app"],
         "version": run["version"],
-        "schema_version": "1.1.0",          # 阶段 C · v1.3.0 新增 (C6): JSON 演进版本号
+        "schema_version": "1.2.0",          # v1.9.0: evidence 升一等结构 (Schema v1.2)
         "generated_at": run["generated_at"],
         "system": run["system"],
         "health": health,
@@ -15327,6 +15362,8 @@ def build_report(rule_filter=None, diagnosis=None):
         "tech": {
             "raw_results": run["results"],
             "module_keys": run["keys"],
+            # v1.9.0 (Schema 1.2.0): 模块自证证据升为一等结构
+            "evidence": dict(run.get("evidence") or {}),
             "thresholds": THRESHOLDS,
             "module_presentation": {k: list(v.keys()) for k, v in MODULE_PRESENTATION.items()},
         },
@@ -17788,7 +17825,7 @@ def _run_scene(profile, install=False, pip_mirror=None):
         try:
             diagnosis = _enrich_diagnosis_evidence(
                 diagnose(LAST_RUN["results"], rule_filter=profile),
-                LAST_RUN["results"])
+                LAST_RUN["results"], LAST_RUN.get("evidence"))
         except Exception:
             diagnosis = None
         try:
@@ -18084,7 +18121,7 @@ def main():
                              "无需跑诊断即可查询 schema_version 与字段定义文件位置.")
     parser.add_argument("--debug-bundle", metavar="DIR",
                         help="生成调试包 (阶段 D · v1.4.0 引入). "
-                             "zip 含 system.json + diagnostic.json + netpulse.log, "
+                             "zip 含 system.json + diagnostic.json + evidence.json + netpulse.log, "
                              "默认脱敏 (SSID / MAC / 公网 IP / hostname). "
                              "用于上报 bug 或远端排障. 例: --debug-bundle ./out")
     parser.add_argument("--install", action="store_true",
@@ -18254,9 +18291,9 @@ def main():
         schema_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "schema")
         print(json.dumps({
-            "schema_version": "1.1.0",
+            "schema_version": "1.2.0",
             "schema_dir": schema_dir if os.path.isdir(schema_dir)
-                          else "(未生成 — 见 schema/netpulse-result-v1.1.json)",
+                          else "(未生成 — 见 schema/netpulse-result-v1.2.json)",
             "app": APP_NAME,
             "version": APP_VERSION,
         }, ensure_ascii=False, indent=2))

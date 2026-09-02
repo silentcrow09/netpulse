@@ -65,11 +65,13 @@
   `@_register_probe` + wrap helper + 模块专属 `_evidence_*` builder（字段与
   `_rule_*` 同源，error → 空列表），gateway 原生。Evidence 以保留键
   `_evidence` 随 res 进入 LAST_RUN（JSON tech.raw_results 可见）。
-  **报告层已消费 (v1.8.3/1.8.4)**：8 条规则的证据链 builder 支持**与排除项**
-  全部优先读模块 `_evidence`（缺证据/损坏回落旧口径，文案逐字不变）；
-  gateway 可达 / 外网可达两个共享排除项 helper 同样证据优先。
-  `_evidence` 过渡键在 JSON Schema v1.2 把 evidence 迁为独立结构后才移除。
-  下一批候选：剩余模块补证据（proxy/nattype 已完成的除外）/ Schema v1.2。
+  **报告层已消费并转正 (v1.8.3–v1.9.0)**：8 条规则的证据链 builder 支持**与
+  排除项**全部优先读模块自证 Evidence（缺证据/损坏回落旧口径，文案逐字不变）。
+  v1.9.0 起 evidence 为一等结构：`LAST_RUN["evidence"]` 独立映射
+  （`_extract_evidence_map` 在装配时摘除过渡键），导出 JSON 的
+  `tech.evidence`（Schema v1.2）与 debug-bundle 的 evidence.json 为正式出口。
+  builder 一律以 `evd` 参数接证据映射，不要再往模块 results 里塞保留键。
+  P0-03 收尾余项（低优）：剩余非根因模块 (proxy/loop/route/arp/dhcp) 补证据。
 - **压力级模块**（`STRESS_MODULE_KEYS`，现为 tcpcc）不随 `all` / 交互菜单 0-all-* /
   debug-bundle 静默执行，必须显式点名（展开口径统一走 `all_module_keys()`）。
 - **置信度显示走 `_conf_band()` 三档**（高/中/低）：内部 0-1 数值是规则设计值不是统计
