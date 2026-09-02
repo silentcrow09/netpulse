@@ -1217,6 +1217,41 @@ def _evidence_web(res):
     return out
 
 
+def _evidence_bufferbloat(res):
+    """bufferbloat: 规则同源字段 (bloat_ms + grade + load_warning 有效性标志)."""
+    if not isinstance(res, dict) or res.get("error"):
+        return []
+    out = []
+    idle, loaded = res.get("idle_rtt_ms"), res.get("loaded_rtt_ms")
+    if isinstance(idle, (int, float)) and isinstance(loaded, (int, float)):
+        bloat = res.get("bloat_ms")
+        if not isinstance(bloat, (int, float)):
+            bloat = loaded - idle
+        out.append(_ev_item("bufferbloat", "load", "bloat_ms", bloat, "ms", 0.9,
+                            idle_rtt_ms=idle, loaded_rtt_ms=loaded))
+    if res.get("grade"):
+        out.append(_ev_item("bufferbloat", "grade", "grade", res["grade"],
+                            confidence=0.9))
+    if res.get("load_warning") is not None:
+        out.append(_ev_item("bufferbloat", "load", "load_warning",
+                            bool(res["load_warning"]), confidence=0.95))
+    return out
+
+
+def _evidence_nattype(res):
+    """nattype: nat_restricted 规则同源字段 (nat_behavior + cone_type)."""
+    if not isinstance(res, dict) or res.get("error"):
+        return []
+    out = []
+    if res.get("nat_behavior"):
+        out.append(_ev_item("nattype", "stun", "nat_behavior",
+                            res["nat_behavior"], confidence=0.9))
+    if res.get("cone_type"):
+        out.append(_ev_item("nattype", "stun", "cone_type",
+                            res["cone_type"], confidence=0.85))
+    return out
+
+
 def _wrap_as_diagnostic_result(results, module_id, started_at, duration_ms,
                                evidence_fn=None):
     """通用: Tester.results dict → DiagnosticResult (B8-B11 共享 helper).
@@ -1403,6 +1438,37 @@ def probe_web_v2(callback=None):
         started_at=started_at,
         duration_ms=int((time.monotonic() - started_mono) * 1000),
         evidence_fn=_evidence_web)
+
+
+@_register_probe("bufferbloat")
+def probe_bufferbloat_v2(callback=None):
+    """Bufferbloat Probe (P0-03 第二批). BufferbloatTester + 原生 Evidence."""
+    started_mono = time.monotonic()
+    started_at = datetime.now().isoformat()
+    t = BufferbloatTester()
+    t.detect(callback=callback)
+    return _wrap_as_diagnostic_result(
+        t.results, module_id="bufferbloat",
+        started_at=started_at,
+        duration_ms=int((time.monotonic() - started_mono) * 1000),
+        evidence_fn=_evidence_bufferbloat)
+
+
+@_register_probe("nattype")
+def probe_nattype_v2(callback=None):
+    """NAT 类型 Probe (P0-03 第二批). NATTypeTester + 原生 Evidence.
+
+    servers 与旧路径 _module_detect_kwargs 同源 (NATTYPE_CONFIG)。"""
+    started_mono = time.monotonic()
+    started_at = datetime.now().isoformat()
+    t = NATTypeTester()
+    t.detect(callback=callback,
+             servers=NATTYPE_CONFIG.get("servers") or [])
+    return _wrap_as_diagnostic_result(
+        t.results, module_id="nattype",
+        started_at=started_at,
+        duration_ms=int((time.monotonic() - started_mono) * 1000),
+        evidence_fn=_evidence_nattype)
 
 
 # ============================================================
@@ -1822,26 +1888,40 @@ def _ping(results, key):
 
 
 def _ev_gateway_reachable(results, suffix=""):
-    """通用的「网关可达」排除项。"""
+    """通用的「网关可达」排除项 (v1.8.4: 优先取 gateway 自证 Evidence)。"""
+    item = _evd_find(_module_evidence(results, "gateway"),
+                     "gateway.ping.loss_pct")
     ping = _ping(results, "gateway")
-    if not ping:
+    if item is not None and isinstance(item.get("value"), (int, float)):
+        loss = item["value"]
+        i_avg = _evd_find(_module_evidence(results, "gateway"),
+                          "gateway.ping.avg_ms")
+        avg = i_avg.get("value") if i_avg is not None else None
+    elif ping:
+        loss = ping.get("loss_pct", 0)
+        avg = ping.get("avg_ms")
+    else:
         return None
-    loss = ping.get("loss_pct", 0)
     if not isinstance(loss, (int, float)) or loss >= 50:
         return None
     txt = f"网关可达，丢包 {loss:g}%"
-    avg = ping.get("avg_ms")
     if isinstance(avg, (int, float)):
         txt += f"，平均 {avg:g}ms"
     return _ev(txt + suffix, True)
 
 
 def _ev_external_reachable(results, suffix="（不是外网全断）"):
-    """通用的「外网 TCP 可达」排除项。"""
+    """通用的「外网 TCP 可达」排除项 (v1.8.4: 优先取 external 自证 Evidence)。"""
     ext = _mod(results, "external")
-    if not ext:
+    item = _evd_find(_module_evidence(results, "external"),
+                     "external.tcp.tcp_ok")
+    if item is not None and (item.get("metadata") or {}).get("tcp_total"):
+        tcp_ok = item.get("value") or 0
+        tcp_total = item["metadata"]["tcp_total"]
+    elif ext:
+        tcp_ok, tcp_total = ext.get("tcp_ok", 0) or 0, ext.get("tcp_total", 0) or 0
+    else:
         return None
-    tcp_ok, tcp_total = ext.get("tcp_ok", 0) or 0, ext.get("tcp_total", 0) or 0
     if not tcp_total or tcp_ok <= 0:
         return None
     return _ev(f"外网 TCP 可达 {tcp_ok}/{tcp_total}{suffix}", True)
@@ -1904,9 +1984,14 @@ def _ev_wan_interruption(results):
     item = _ev_gateway_reachable(results, "（内网到网关这一段没问题）")
     if item:
         excludes.append(item)
-    ping = _ping(results, "gateway")
-    if ping and isinstance(ping.get("loss_pct"), (int, float)) \
-            and ping["loss_pct"] < 5:
+    i_loss = _evd_find(_module_evidence(results, "gateway"),
+                       "gateway.ping.loss_pct")
+    if i_loss is not None and isinstance(i_loss.get("value"), (int, float)):
+        gw_loss = i_loss["value"]
+    else:
+        ping = _ping(results, "gateway")
+        gw_loss = ping.get("loss_pct") if ping else None
+    if isinstance(gw_loss, (int, float)) and gw_loss < 5:
         excludes.append(_ev("本机网卡与网线 / WiFi 链路无丢包", True))
     return supports, excludes
 
@@ -1938,22 +2023,44 @@ def _ev_wifi_weak(results):
 def _ev_bufferbloat(results):
     bb = _mod(results, "bufferbloat") or {}
     supports = []
-    idle, loaded = bb.get("idle_rtt_ms"), bb.get("loaded_rtt_ms")
-    if isinstance(idle, (int, float)) and isinstance(loaded, (int, float)):
-        bloat = bb.get("bloat_ms")
-        bloat = bloat if isinstance(bloat, (int, float)) else loaded - idle
-        supports.append(_ev(
-            f"空载延迟 {idle:g}ms → 满载 {loaded:g}ms（升高 {bloat:g}ms）", False))
-    grade = bb.get("grade")
+    ev = _module_evidence(results, "bufferbloat")
+    item = _evd_find(ev, "bufferbloat.load.bloat_ms")
+    if item is not None and isinstance(item.get("value"), (int, float)):
+        meta = item.get("metadata") or {}
+        idle, loaded = meta.get("idle_rtt_ms"), meta.get("loaded_rtt_ms")
+        if isinstance(idle, (int, float)) and isinstance(loaded, (int, float)):
+            supports.append(_ev(
+                f"空载延迟 {idle:g}ms → 满载 {loaded:g}ms（升高 {item['value']:g}ms）",
+                False))
+    else:
+        idle, loaded = bb.get("idle_rtt_ms"), bb.get("loaded_rtt_ms")
+        if isinstance(idle, (int, float)) and isinstance(loaded, (int, float)):
+            bloat = bb.get("bloat_ms")
+            bloat = bloat if isinstance(bloat, (int, float)) else loaded - idle
+            supports.append(_ev(
+                f"空载延迟 {idle:g}ms → 满载 {loaded:g}ms（升高 {bloat:g}ms）", False))
+    i_grade = _evd_find(ev, "bufferbloat.grade.grade")
+    grade = i_grade.get("value") if i_grade is not None else bb.get("grade")
     if grade:
         supports.append(_ev(f"Bufferbloat 等级 {grade}", False))
     excludes = []
     ping = _ping(results, "gateway")
-    if ping and isinstance(ping.get("avg_ms"), (int, float)) \
-            and isinstance(ping.get("loss_pct"), (int, float)) \
-            and ping["loss_pct"] < 5:
+    i_avg = _evd_find(_module_evidence(results, "gateway"),
+                      "gateway.ping.avg_ms")
+    i_loss = _evd_find(_module_evidence(results, "gateway"),
+                       "gateway.ping.loss_pct")
+    if i_avg is not None and i_loss is not None \
+            and isinstance(i_avg.get("value"), (int, float)) \
+            and isinstance(i_loss.get("value"), (int, float)):
+        g_avg, g_loss = i_avg["value"], i_loss["value"]
+    elif ping:
+        g_avg, g_loss = ping.get("avg_ms"), ping.get("loss_pct")
+    else:
+        g_avg = g_loss = None
+    if isinstance(g_avg, (int, float)) and isinstance(g_loss, (int, float)) \
+            and g_loss < 5:
         excludes.append(_ev(
-            f"网关空闲延迟 {ping['avg_ms']:g}ms 且无丢包（不是链路质量问题）", True))
+            f"网关空闲延迟 {g_avg:g}ms 且无丢包（不是链路质量问题）", True))
     return supports, excludes
 
 
@@ -1980,8 +2087,14 @@ def _ev_gateway_loss(results):
     item = _ev_external_reachable(results, "（不是运营商外网中断）")
     if item:
         excludes.append(item)
-    dns = _mod(results, "dns") or {}
-    sc, tc = dns.get("success_count", 0) or 0, dns.get("total_count", 0) or 0
+    i_dns = _evd_find(_module_evidence(results, "dns"),
+                      "dns.resolve.success_count")
+    if i_dns is not None and (i_dns.get("metadata") or {}).get("total_count"):
+        sc = i_dns.get("value") or 0
+        tc = i_dns["metadata"]["total_count"]
+    else:
+        dns = _mod(results, "dns") or {}
+        sc, tc = dns.get("success_count", 0) or 0, dns.get("total_count", 0) or 0
     if tc and sc == tc:
         excludes.append(_ev(f"DNS 解析 {sc}/{tc} 全部正常", True))
     return supports, excludes
@@ -1990,10 +2103,14 @@ def _ev_gateway_loss(results):
 def _ev_nat_restricted(results):
     nat = _mod(results, "nattype") or {}
     supports = []
-    behavior = nat.get("nat_behavior")
+    ev = _module_evidence(results, "nattype")
+    i_behavior = _evd_find(ev, "nattype.stun.nat_behavior")
+    behavior = i_behavior.get("value") if i_behavior is not None \
+        else nat.get("nat_behavior")
     if behavior:
         supports.append(_ev(f"NAT 行为：{behavior}", False))
-    cone = nat.get("cone_type")
+    i_cone = _evd_find(ev, "nattype.stun.cone_type")
+    cone = i_cone.get("value") if i_cone is not None else nat.get("cone_type")
     if cone:
         supports.append(_ev(f"锥形类型：{cone}", True))
     excludes = []
@@ -2062,11 +2179,18 @@ def _ev_tcp_loss_burst(results):
             f"TCP 重传率 {rate:g}% (重传 {retrans} / "
             f"发送 {sent}, 开机累计口径)", False))
     excludes = []
-    mtu = _mod(results, "mtu") or {}
-    paths = [r.get("path_mtu") for r in (mtu.get("path_mtus") or [])
-             if not r.get("error") and r.get("path_mtu")]
-    local = [lm.get("mtu") for lm in (mtu.get("local_mtus") or [])
-             if isinstance(lm.get("mtu"), int) and lm.get("mtu", 0) > 0]
+    ev_m = _module_evidence(results, "mtu")
+    if ev_m:
+        paths = [e["value"] for e in ev_m if e.get("id") == "mtu.probe.path_mtu"
+                 and isinstance(e.get("value"), (int, float))]
+        local = [e["value"] for e in ev_m if e.get("id") == "mtu.iface.mtu"
+                 and isinstance(e.get("value"), (int, float))]
+    else:
+        mtu = _mod(results, "mtu") or {}
+        paths = [r.get("path_mtu") for r in (mtu.get("path_mtus") or [])
+                 if not r.get("error") and r.get("path_mtu")]
+        local = [lm.get("mtu") for lm in (mtu.get("local_mtus") or [])
+                 if isinstance(lm.get("mtu"), int) and lm.get("mtu", 0) > 0]
     if paths and local and max(local) - min(paths) < 100:
         excludes.append(_ev(
             f"路径 MTU ({min(paths)}) 与接口 MTU ({max(local)}) 相符, 已排除 MTU 不匹配", True))
@@ -3059,7 +3183,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.8.3"
+APP_VERSION = "1.8.4"
 
 
 # 常用外网测试目标 (国内网络环境)

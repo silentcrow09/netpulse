@@ -65,10 +65,11 @@
   `@_register_probe` + wrap helper + 模块专属 `_evidence_*` builder（字段与
   `_rule_*` 同源，error → 空列表），gateway 原生。Evidence 以保留键
   `_evidence` 随 res 进入 LAST_RUN（JSON tech.raw_results 可见）。
-  **报告层已消费 (v1.8.3)**：6 个证据链 builder 的支持项优先读模块
-  `_evidence`（缺证据/损坏回落旧口径，文案逐字不变），排除项仍读原始 dict。
+  **报告层已消费 (v1.8.3/1.8.4)**：8 条规则的证据链 builder 支持**与排除项**
+  全部优先读模块 `_evidence`（缺证据/损坏回落旧口径，文案逐字不变）；
+  gateway 可达 / 外网可达两个共享排除项 helper 同样证据优先。
   `_evidence` 过渡键在 JSON Schema v1.2 把 evidence 迁为独立结构后才移除。
-  下一批候选：排除项迁移 / bufferbloat+nattype 补证据 / proxy / nattype / loop。
+  下一批候选：剩余模块补证据（proxy/nattype 已完成的除外）/ Schema v1.2。
 - **压力级模块**（`STRESS_MODULE_KEYS`，现为 tcpcc）不随 `all` / 交互菜单 0-all-* /
   debug-bundle 静默执行，必须显式点名（展开口径统一走 `all_module_keys()`）。
 - **置信度显示走 `_conf_band()` 三档**（高/中/低）：内部 0-1 数值是规则设计值不是统计

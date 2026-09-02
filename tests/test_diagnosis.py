@@ -625,6 +625,54 @@ class TestEvidenceChainConsumption(unittest.TestCase):
         self._assert_same_primary_support(r, "tcpstats", N._evidence_tcpstats,
                                           N._ev_tcp_loss_burst, "TCP 重传率")
 
+    def test_excludes_same_from_evidence(self):
+        """v1.8.4: 排除项 (网关可达/外网可达/DNS 全正常) 同样与证据源一致."""
+        r = _healthy_full()
+        r["dns"] = {"success_count": 2, "total_count": 10, "issues": []}
+        injected = dict(r)
+        injected["dns"] = self._injected(r["dns"], N._evidence_dns)
+        # gateway 用原生 probe 同款证据注入 (loss + avg)
+        gw_ev = [N.Evidence(id="gateway.ping.loss_pct", source="gateway.ping",
+                            metric="packet_loss_pct", value=0, unit="%",
+                            confidence=0.98, metadata={"sent": 20, "received": 20}),
+                 N.Evidence(id="gateway.ping.avg_ms", source="gateway.ping",
+                            metric="avg_latency_ms", value=5, unit="ms",
+                            confidence=0.95)]
+        injected["gateway"] = dict(r["gateway"])
+        injected["gateway"]["_evidence"] = [e.to_dict() for e in gw_ev]
+        legacy = N._ev_dns_failure(r)
+        from_ev = N._ev_dns_failure(injected)
+        self.assertEqual([s["text"] for s in legacy[1]],
+                         [s["text"] for s in from_ev[1]])
+        self.assertTrue(any("网关可达，丢包 0%，平均 5ms" in s["text"]
+                            for s in from_ev[1]))
+
+    def test_bufferbloat_supports_from_evidence(self):
+        """bufferbloat 支持项取自 _evidence (bloat_ms + grade)."""
+        r = _healthy_full()
+        r["bufferbloat"] = {"idle_rtt_ms": 8, "loaded_rtt_ms": 208,
+                            "bloat_ms": 200.0, "grade": "F (严重 Bufferbloat)",
+                            "load_warning": False, "issues": []}
+        injected = dict(r)
+        injected["bufferbloat"] = self._injected(r["bufferbloat"],
+                                                 N._evidence_bufferbloat)
+        legacy = N._ev_bufferbloat(r)[0]
+        from_ev = N._ev_bufferbloat(injected)[0]
+        self.assertEqual([s["text"] for s in legacy],
+                         [s["text"] for s in from_ev])
+
+    def test_nat_restricted_supports_from_evidence(self):
+        """nattype 支持项取自 _evidence (nat_behavior + cone_type)."""
+        r = _healthy_full()
+        r["nattype"] = {"nat_behavior": "对称型", "cone_type": "未细分",
+                        "issues": []}
+        injected = dict(r)
+        injected["nattype"] = self._injected(r["nattype"], N._evidence_nattype)
+        legacy = N._ev_nat_restricted(r)[0]
+        from_ev = N._ev_nat_restricted(injected)[0]
+        self.assertEqual([s["text"] for s in legacy],
+                         [s["text"] for s in from_ev])
+
     def test_no_evidence_falls_back_legacy(self):
         """旧运行无 _evidence: 走原地取值, 输出不变 (回归保护)."""
         r = _healthy_full()

@@ -348,10 +348,12 @@ class TestProbesB8B11Registered(unittest.TestCase):
         self.assertIs(N._V2_PROBES["wifi"], N.probe_wifi_v2)
 
     def test_total_5_probes(self):
-        """v1.8.2 (P0-03 第一批): 9 个 probe (B7-B11 + external/tcpstats/mtu/web)."""
+        """v1.8.4 (P0-03): 11 个 probe (B7-B11 + external/tcpstats/mtu/web/
+        bufferbloat/nattype)."""
         self.assertEqual(set(N._V2_PROBES),
                          {"gateway", "dns", "route", "arp", "wifi",
-                          "external", "tcpstats", "mtu", "web"})
+                          "external", "tcpstats", "mtu", "web",
+                          "bufferbloat", "nattype"})
 
     def test_dns_old_tester_still_exists(self):
         """DNSTester 保留 (双轨), 等 B13 删除."""
@@ -503,9 +505,27 @@ class TestEvidenceBuilders(unittest.TestCase):
     def test_error_or_non_dict_returns_empty(self):
         for builder in (N._evidence_external, N._evidence_dns,
                         N._evidence_wifi, N._evidence_tcpstats,
-                        N._evidence_mtu, N._evidence_web):
+                        N._evidence_mtu, N._evidence_web,
+                        N._evidence_bufferbloat, N._evidence_nattype):
             self.assertEqual([], builder({"error": "超时"}), msg=builder.__name__)
             self.assertEqual([], builder(None), msg=builder.__name__)
+
+    def test_bufferbloat_and_nattype(self):
+        """v1.8.4 (P0-03 第二批): 两条新证据源的键与缺失跳过."""
+        bb = N._evidence_bufferbloat({"idle_rtt_ms": 8, "loaded_rtt_ms": 208,
+                                      "grade": "F (严重)", "issues": []})
+        eids = {e.id for e in bb}
+        self.assertIn("bufferbloat.load.bloat_ms", eids)     # 缺 bloat_ms → 推导 200
+        self.assertIn("bufferbloat.grade.grade", eids)
+        self.assertNotIn("bufferbloat.load.load_warning", eids)  # 键缺失跳过
+        bloat = next(e for e in bb if e.id == "bufferbloat.load.bloat_ms")
+        self.assertEqual(200, bloat.value)
+        self.assertEqual(8, bloat.metadata["idle_rtt_ms"])
+
+        nat = N._evidence_nattype({"nat_behavior": "对称型",
+                                   "cone_type": "未细分"})
+        self.assertEqual({"nattype.stun.nat_behavior", "nattype.stun.cone_type"},
+                         {e.id for e in nat})
 
 
 class TestWrapEvidenceFn(unittest.TestCase):
@@ -586,6 +606,26 @@ class TestP0MigratedProbes(unittest.TestCase):
             result = N.probe_web_v2(callback=lambda m: None)
         self.assertEqual("web", result.module_id)
         self.assertIn("web.http.ok_count", {e.id for e in result.evidence})
+
+    def test_probe_bufferbloat_v2(self):
+        canned = {"idle_rtt_ms": 8, "loaded_rtt_ms": 208, "bloat_ms": 200.0,
+                  "grade": "F (严重 Bufferbloat)", "load_warning": False,
+                  "issues": []}
+        with self._patch_detect(N.BufferbloatTester, canned):
+            result = N.probe_bufferbloat_v2(callback=lambda m: None)
+        self.assertEqual("bufferbloat", result.module_id)
+        self.assertIn("bufferbloat.load.bloat_ms",
+                      {e.id for e in result.evidence})
+
+    def test_probe_nattype_v2(self):
+        canned = {"nat_behavior": "对称型", "cone_type": "未细分",
+                  "issues": []}
+        with self._patch_detect(N.NATTypeTester, canned), \
+             patch.dict(N.NATTYPE_CONFIG, {"servers": []}, deep=True):
+            result = N.probe_nattype_v2(callback=lambda m: None)
+        self.assertEqual("nattype", result.module_id)
+        self.assertIn("nattype.stun.nat_behavior",
+                      {e.id for e in result.evidence})
 
     def test_probe_error_path_yields_error_result(self):
         """Tester.detect 抛异常 → probe 冒泡 (由 run 路径转「错误」)."""

@@ -7,6 +7,21 @@
 
 ## [Unreleased]
 
+## [1.8.4] - 2026-09-02
+
+V2 模型收口第三步（审计 P0-03）：8 条根因规则的证据链（支持项 + 排除项）全部与模块自证 Evidence 同源。
+
+### 新增
+
+- **bufferbloat / nattype 补证据**：`_evidence_bufferbloat`（bloat_ms + idle/loaded metadata + grade + load_warning）与 `_evidence_nattype`（nat_behavior + cone_type）；`probe_bufferbloat_v2` / `probe_nattype_v2` 注册（nattype 的 `servers` 与旧路径 `_module_detect_kwargs` 同源），`_V2_PROBES` 达 11
+- **排除项同源**：`_ev_gateway_reachable` / `_ev_external_reachable` 两个共享排除项 helper 优先读 gateway/external 自证 Evidence；`_ev_wan_interruption`（网关无丢包）、`_ev_gateway_loss`（DNS 全正常）、`_ev_tcp_loss_burst`（MTU 相符）、`_ev_bufferbloat`（网关空闲延迟）的 builder 级排除项同步迁移——全部带旧口径回落
+
+### 测试
+
+- `test_probes.py` +5（66 用例）：两个新 probe 冒烟 + 新证据源键断言 + 注册表 11 个
+- `test_diagnosis.py` +3（68 用例）：排除项同源断言（注入 `_evidence` 与旧口径文本逐字一致）+ bufferbloat/nattype 支持项同源
+- 版本 1.8.3 → 1.8.4
+
 ## [1.8.3] - 2026-09-02
 
 V2 模型收口第二步（审计 P0-03）：报告层证据链开始**消费**模块自证 Evidence，不再只从原始 dict 二次解析。
