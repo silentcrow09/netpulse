@@ -1092,7 +1092,9 @@ _ERROR_PATTERNS = [
     ("permission", "PERMISSION_DENIED", "permission", False, Severity.HIGH, "PermissionError"),
     ("未找到", "UNAVAILABLE", "dependency", False, Severity.MEDIUM, "FileNotFoundError"),
     ("未安装", "UNAVAILABLE", "dependency", False, Severity.MEDIUM, "FileNotFoundError"),
-    ("无法获取", "UNAVAILABLE", "dependency", False, Severity.MEDIUM, "FileNotFoundError"),
+    # v1.9.2 (审查修复): "无法获取网关地址" 是链路状态错误 (插回网线重测即恢复),
+    # 不是缺依赖 — 归 NETWORK_ERROR 可重试, 不再误标 UNAVAILABLE/retryable=False
+    ("无法获取", "NETWORK_ERROR", "network", True, Severity.MEDIUM, "ConnectionError"),
     ("not found", "UNAVAILABLE", "dependency", False, Severity.MEDIUM, "FileNotFoundError"),
     ("no such", "UNAVAILABLE", "dependency", False, Severity.MEDIUM, "FileNotFoundError"),
     ("连接失败", "NETWORK_ERROR", "network", True, Severity.MEDIUM, "ConnectionError"),
@@ -1193,8 +1195,9 @@ def _evidence_mtu(res):
     for lm in res.get("local_mtus") or []:
         v = lm.get("mtu")
         if isinstance(v, int) and v > 0:
+            # 键名以生产者 MTUDetector 为准: local_mtus[].interface (v1.9.2 修正)
             out.append(_ev_item("mtu", "iface", "mtu", v, "B", 0.95,
-                                name=lm.get("name", "")))
+                                interface=lm.get("interface", "")))
     return out
 
 
@@ -1263,8 +1266,10 @@ def _wrap_as_diagnostic_result(results, module_id, started_at, duration_ms,
                  生成抛异常只丢弃证据, 不阻断主结果。
     """
     if not results:
+        # v1.9.2 (审查修复): 空 results 旧路径映射 determine_status({})="未检测",
+        # wrapper 此前给 UNKNOWN("未知") — 不在 schema 状态枚举里且不计入健康分
         return DiagnosticResult(
-            module_id=module_id, status=Status.UNKNOWN,
+            module_id=module_id, status=Status.IDLE,
             started_at=started_at, duration_ms=duration_ms)
 
     status_zh = determine_status(results)
@@ -2133,7 +2138,7 @@ def _ev_mtu_blackhole(results, evd=None):
                     f"到 {meta.get('target')} 的路径 MTU = {e.get('value')}", False))
             elif e.get("id") == "mtu.iface.mtu":
                 supports.append(_ev(
-                    f"接口 {meta.get('name')} MTU = {e.get('value')}", False))
+                    f"接口 {meta.get('interface')} MTU = {e.get('value')}", False))
     else:
         for r in (mtu.get("path_mtus") or []):
             if not r.get("error") and r.get("path_mtu"):
@@ -2141,8 +2146,9 @@ def _ev_mtu_blackhole(results, evd=None):
                     f"到 {r.get('target')} 的路径 MTU = {r['path_mtu']}", False))
         for lm in (mtu.get("local_mtus") or []):
             if isinstance(lm.get("mtu"), int) and lm.get("mtu", 0) > 0:
+                # 生产者 MTUDetector 发的键是 interface (v1.9.2 修正, 勿改回 name)
                 supports.append(_ev(
-                    f"接口 {lm.get('name')} MTU = {lm['mtu']}", False))
+                    f"接口 {lm.get('interface')} MTU = {lm['mtu']}", False))
     ts = _mod(results, "tcpstats") or {}
     item = _evd_find(_module_evidence(evd, "tcpstats"),
                      "tcpstats.retrans.retrans_rate_pct")
@@ -2154,7 +2160,7 @@ def _ev_mtu_blackhole(results, evd=None):
         supports.append(_ev(f"TCP 重传率 {rate:g}% 佐证 (大包在丢)", False))
     excludes = []
     for fn in (_ev_gateway_reachable, _ev_external_reachable):
-        item = fn(results)
+        item = fn(results, evd)     # v1.9.2 (审查修复): 与 dns_failure 对齐
         if item:
             excludes.append(item)
     return supports, excludes
@@ -2515,8 +2521,7 @@ def _render_diagnosis_section_html(diagnosis_dict, report=None):
         return ('<section class="diagnosis healthy" id="diagnosis">'
                 '<div class="dhead">'
                 '<span class="dbadge ok">✓ 无故障</span>'
-                f'<span class="dconf">整体置信度 '
-                f'{diagnosis_dict.get("overall_confidence", 1.0)*100:.0f}%, '
+                f'<span class="dconf">整体{_conf_band(diagnosis_dict.get("overall_confidence", 1.0))}, '
                 f'评估 {diagnosis_dict.get("rules_evaluated", 0)} 条规则'
                 '</span></div>'
                 '</section>')
@@ -2809,7 +2814,7 @@ def _export_debug_bundle(out_dir):
         f.write(f"NetPulse v{APP_VERSION} debug bundle\n")
         f.write(f"Generated at: {datetime.now().isoformat()}\n")
         f.write("Redacted: SSID / MAC / 公网 IPv4+IPv6 / STUN 映射地址 / hostname\n")
-        f.write(f"Schema version: 1.2.0\n")
+        f.write(f"Schema version: {SCHEMA_VERSION}\n")
         f.write("-" * 60 + "\n")
         f.write("模块运行状态:\n")
         for k, st in (LAST_RUN.get("status") or {}).items():
@@ -3193,7 +3198,11 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.2"
+# JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
+# 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
+SCHEMA_VERSION = "1.2.0"
+SCHEMA_FILENAME = f"netpulse-result-v{SCHEMA_VERSION.rsplit('.', 1)[0]}.json"
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -5140,13 +5149,21 @@ class ExternalNetworkTester:
                 "detail": "部分目标不通, 可能是目标站自身问题或链路单侧劣化",
                 "action": "看技术细节里的路径追踪, 确定从哪一跳开始不通; 仅个别目标不通多为对端问题",
             })
-        # 丢包告警: 只在 TCP 不可达时触发 (TCP 可达但 ping 丢 = ICMP 限速, 不是真丢包)
-        if avg_loss >= 5:
+        # 丢包告警: 与 _issues_external 同一口径 (v1.9.2 审查修复) — 仅当 TCP
+        # 同步劣化 (有目标建连失败) 时升 critical; TCP 全通视为 ICMP 限速降 warning
+        if avg_loss >= 5 and unreachable_count:
             issues.append({
                 "type": "external_high_loss", "severity": "critical",
                 "message": f"外网平均丢包 {avg_loss:.1f}%",
                 "detail": "明显丢包: 网页卡顿、游戏掉线、视频花屏",
-                "action": "网关正常而此处丢包 → 问题在运营商侧, 保留报告 (含逐跳路径) 带回报障",
+                "action": "网关正常而此处丢包 → 问题更可能在运营商侧, 保留报告 (含逐跳路径) 带回报障",
+            })
+        elif avg_loss >= 5:
+            issues.append({
+                "type": "external_high_loss", "severity": "warning",
+                "message": f"外网平均丢包 {avg_loss:.1f}% (TCP 建连正常)",
+                "detail": "TCP 可达但 ping 丢, 多为中间设备 ICMP 限速, 不一定是真实丢包",
+                "action": "以实际应用体验为准; 若确有卡顿, 结合网关模块丢包判断段位",
             })
         elif avg_loss >= 1:
             issues.append({
@@ -12796,7 +12813,9 @@ def _cli_print_result(res, verbose=False, as_json=False, key=None):
     --verbose 打印全部原始字段 (调试用); --json 输出完整 JSON。
     """
     if as_json:
-        out = {k: v for k, v in res.items() if k != "callback"}
+        # v1.9.2 (审查修复): _evidence 是 runner 内部过渡键, 不进机器可读输出
+        # (LAST_RUN 装配时才摘出, 打印发生在此之前)
+        out = {k: v for k, v in res.items() if k not in ("callback", "_evidence")}
         print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
         return
     # 1. 一句话结论 (客户视图 verdict 优先, 兜底 summary)
@@ -14558,8 +14577,14 @@ def _issues_external(res):
                     "impact": "明显丢包: 网页卡顿、游戏掉线、视频花屏",
                     "action": "网关正常而此处丢包 → 问题更可能在运营商侧, 保留报告 (含逐跳路径) 带回报障"})
     elif loss >= 5:
-        out.append({"severity": "警告", "text": f"ICMP 平均丢包 {loss}% (TCP 建连正常)",
-                    "impact": "TCP 可达但 ping 丢, 多为中间设备 ICMP 限速, 不一定是真实丢包",
+        # v1.9.2 (审查修复): tcp_total=0 时不得伪造"TCP 建连正常"的表述
+        if tcp_total:
+            text = f"ICMP 平均丢包 {loss}% (TCP 建连正常)"
+            impact = "TCP 可达但 ping 丢, 多为中间设备 ICMP 限速, 不一定是真实丢包"
+        else:
+            text = f"外网平均丢包 {loss}% (TCP 佐证缺失)"
+            impact = "TCP 探测无数据, 可能是真实丢包也可能是 ICMP 限速, 结论存疑"
+        out.append({"severity": "警告", "text": text, "impact": impact,
                     "action": "以实际应用体验为准; 若确有卡顿, 结合网关模块丢包判断段位"})
     elif loss >= 1:
         out.append({"severity": "警告", "text": f"外网平均丢包 {loss}%",
@@ -15271,7 +15296,7 @@ def build_report(rule_filter=None, diagnosis=None):
     返回结构 (供 render_report_html_customer / render_report_json 使用):
       {
         "app": ..., "version": ..., "generated_at": ...,
-        "schema_version": "1.1.0",  # 阶段 C · v1.3.0 新增 (C6)
+        "schema_version": SCHEMA_VERSION,  # 阶段 C · v1.3.0 新增 (C6); v1.9.0 起 1.2.0
         "system": {local_ip, gateway, dns, public_ip, asn, geo, ipv6_public_ip},
         "health": {score, grade, label, verdict, counts},
         "summary": {key: status},  # 各模块状态 (老格式, 兼容)
@@ -15339,7 +15364,7 @@ def build_report(rule_filter=None, diagnosis=None):
     return {
         "app": run["app"],
         "version": run["version"],
-        "schema_version": "1.2.0",          # v1.9.0: evidence 升一等结构 (Schema v1.2)
+        "schema_version": SCHEMA_VERSION,   # v1.9.0: evidence 升一等结构 (Schema v1.2)
         "generated_at": run["generated_at"],
         "system": run["system"],
         "health": health,
@@ -18291,9 +18316,9 @@ def main():
         schema_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "schema")
         print(json.dumps({
-            "schema_version": "1.2.0",
+            "schema_version": SCHEMA_VERSION,
             "schema_dir": schema_dir if os.path.isdir(schema_dir)
-                          else "(未生成 — 见 schema/netpulse-result-v1.2.json)",
+                          else f"(未生成 — 见 schema/{SCHEMA_FILENAME})",
             "app": APP_NAME,
             "version": APP_VERSION,
         }, ensure_ascii=False, indent=2))

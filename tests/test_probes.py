@@ -254,8 +254,11 @@ class TestWrapAsDiagnosticResultHelper(unittest.TestCase):
     """B8-B11 共享 helper: Tester.results dict → DiagnosticResult."""
 
     def test_empty_results_returns_unknown(self):
+        """v1.9.2 (审查修复): 空 results → 未检测 (与旧路径 determine_status({})
+        一致; 原 UNKNOWN("未知") 不在 schema 状态枚举且不计入健康分)."""
         r = N._wrap_as_diagnostic_result({}, "x", "2026-08-31T00:00:00", 0)
-        self.assertEqual(r.status, N.Status.UNKNOWN)
+        self.assertEqual(r.status, N.Status.IDLE)
+        self.assertEqual(r.status.zh_label, "未检测")
         self.assertEqual(r.module_id, "x")
         self.assertEqual(r.duration_ms, 0)
 
@@ -275,6 +278,8 @@ class TestWrapAsDiagnosticResultHelper(unittest.TestCase):
             ({"error": "权限不足 (需要管理员)"}, "PERMISSION_DENIED", False),
             ({"error": "iperf3.exe 未找到"}, "UNAVAILABLE", False),
             ({"error": "TCP 连接失败"}, "NETWORK_ERROR", True),
+            # v1.9.2 (审查修复): 网关地址拿不到是链路状态问题, 可重试, 非缺依赖
+            ({"error": "无法获取网关地址"}, "NETWORK_ERROR", True),
         ]
         for res, code, retryable in cases:
             r = N._wrap_as_diagnostic_result(
@@ -484,7 +489,7 @@ class TestEvidenceBuilders(unittest.TestCase):
     def test_mtu(self):
         res = {"path_mtus": [{"target": "223.5.5.5", "path_mtu": 1500},
                              {"target": "x", "error": "超时", "path_mtu": None}],
-               "local_mtus": [{"name": "以太网", "mtu": 1500},
+               "local_mtus": [{"interface": "以太网", "mtu": 1500},
                               {"name": "bad", "mtu": 0}]}
         ev = N._evidence_mtu(res)
         paths = [e for e in ev if e.id == "mtu.probe.path_mtu"]
@@ -492,7 +497,7 @@ class TestEvidenceBuilders(unittest.TestCase):
         self.assertEqual(1, len(paths))
         self.assertEqual("223.5.5.5", paths[0].metadata["target"])
         self.assertEqual(1, len(ifaces))
-        self.assertEqual("以太网", ifaces[0].metadata["name"])
+        self.assertEqual("以太网", ifaces[0].metadata["interface"])
 
     def test_web_none_fields_skipped(self):
         ev = N._evidence_web({"ok_count": 3, "total_count": 4,
@@ -591,7 +596,7 @@ class TestP0MigratedProbes(unittest.TestCase):
 
     def test_probe_mtu_v2(self):
         canned = {"path_mtus": [{"target": "223.5.5.5", "path_mtu": 1492}],
-                  "local_mtus": [{"name": "以太网", "mtu": 1500}], "issues": []}
+                  "local_mtus": [{"interface": "以太网", "mtu": 1500}], "issues": []}
         with self._patch_detect(N.MTUDetector, canned):
             result = N.probe_mtu_v2(callback=lambda m: None)
         self.assertEqual("mtu", result.module_id)

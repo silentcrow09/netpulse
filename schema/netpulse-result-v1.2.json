@@ -155,9 +155,11 @@
                   "wifi_weak",
                   "bufferbloat",
                   "gateway_loss",
-                  "nat_restricted"
+                  "nat_restricted",
+                  "mtu_blackhole",
+                  "tcp_loss_burst"
                 ],
-                "description": "根因 ID (固定 6 种, 新规则需更新此 enum)"
+                "description": "根因 ID (当前 8 种, 新规则需更新此 enum)"
               },
               "category": {
                 "type": "string",
@@ -167,7 +169,8 @@
                   "WiFi",
                   "Bufferbloat",
                   "LAN",
-                  "NAT"
+                  "NAT",
+                  "MTU"
                 ]
               },
               "severity": {
@@ -260,12 +263,12 @@
         "rules_evaluated": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 6
+          "maximum": 8
         },
         "rules_fired": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 6
+          "maximum": 8
         },
         "timestamp": {
           "type": "string",

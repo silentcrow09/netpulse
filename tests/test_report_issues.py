@@ -45,9 +45,14 @@ class TestExternalLossGate(unittest.TestCase):
         self.assertEqual(1, len(critical))
 
     def test_icmp10_no_tcp_evidence_no_critical(self):
-        """ICMP loss 10% + TCP 证据缺失 (tcp_total=0) → 不给故障级结论."""
+        """ICMP loss 10% + TCP 证据缺失 (tcp_total=0) → 不给故障级结论,
+        且文案不得伪造"TCP 建连正常" (v1.9.2 审查修复)."""
         issues = N._issues_external(_ext_res(10, tcp_ok=0, tcp_total=0))
         self.assertNotIn("异常", [i["severity"] for i in issues])
+        loss_issues = [i for i in issues if "丢包" in i["text"]]
+        self.assertEqual(1, len(loss_issues))
+        self.assertIn("TCP 佐证缺失", loss_issues[0]["text"])
+        self.assertNotIn("TCP 建连正常", loss_issues[0]["text"])
 
     def test_mild_loss_warns(self):
         """1% ≤ loss < 5% → 警告级 (原有口径保留)."""

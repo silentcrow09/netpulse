@@ -7,6 +7,27 @@
 
 ## [Unreleased]
 
+## [1.9.2] - 2026-09-02
+
+代码审查第二批修复（逐行扫描 + 移除行为审计两个角度交叉确认）。
+
+### 修复
+
+- **MTU 接口名键反转（更正 v1.8.3 的错误修复）**：生产者 `MTUDetector` 发的键一直是 `interface`（`InterfaceAlias`），v1.8.3 按测试 fixture 误改为读 `name`——真实运行里证据链接口名自 v1.8.2 起一直是空。现消费端（`_evidence_mtu` + builder 回落）统一读 `interface`，测试 fixture 全部对齐生产者真实键形
+- **丢包误判修复补全到生产者侧**：P0-05 只修了展示层 `_issues_external`，`ExternalNetworkTester.detect()` 自产的 `external_high_loss` issue 仍无条件 critical（徽章/健康分路径继续误判）——现同样按 TCP 劣化门控，TCP 全通降 warning
+- **空 results 状态逃逸**：wrapper 对空 results 给 `UNKNOWN("未知")`，不在 schema 状态枚举且不计入健康分；旧路径映射为「未检测」——现改回 IDLE，覆盖 v1.8.2 新迁的 6 个模块
+- **`--json`/`--verbose` 泄漏 `_evidence` 过渡键**：模块打印发生在 LAST_RUN 装配摘键之前，机器可读输出含 schema 外的私有键——`_cli_print_result` 现过滤
+- **`_ev_mtu_blackhole` 排除项漏传 `evd`**（v1.9.1 修了 dns_failure 的同款，漏了这对孪生）
+- **Schema v1.2 枚举过期**：根因 id 枚举只有 6 条（缺 mtu_blackhole/tcp_loss_burst）、category 缺 "MTU"、rules 计数 maximum=6——用 8 规则引擎的合法报告会被自家 schema 拒绝；已全部对齐
+- **`_classify_module_error`：「无法获取网关地址」误归类** UNAVAILABLE/dependency/retryable=False——这是链路状态错误（插回网线重测即恢复），改 NETWORK_ERROR/retryable=True
+- **`_issues_external` TCP 证据缺失时伪造「TCP 建连正常」表述**：tcp_total=0 分支现如实写「TCP 佐证缺失」
+
+### 变更
+
+- `SCHEMA_VERSION` 常量收编三处散落的 "1.2.0" 字面量（build_report / --json-schema / debug-bundle）
+- 健康报告分支残留的「整体置信度 100%」改分档显示（P1-04 漏网点）
+- 版本 1.9.1 → 1.9.2
+
 ## [1.9.1] - 2026-09-02
 
 代码审查修复（对 v1.8.1–v1.9.0 五个提交的复查）。

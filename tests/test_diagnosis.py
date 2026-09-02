@@ -44,7 +44,7 @@ def _ok_nattype():
 def _ok_mtu():
     """键名/取值与 MTUDetector.results 一致 (路径=接口 → 无不匹配)."""
     return {"path_mtus": [{"target": "223.5.5.5", "path_mtu": 1500}],
-            "local_mtus": [{"name": "以太网", "mtu": 1500}],
+            "local_mtus": [{"interface": "以太网", "mtu": 1500}],
             "issues": []}
 
 
@@ -329,7 +329,7 @@ class TestRuleMtuBlackhole(unittest.TestCase):
 
     def _mtu(self, path, local=1500):
         return {"path_mtus": [{"target": "223.5.5.5", "path_mtu": path}],
-                "local_mtus": [{"name": "以太网", "mtu": local}],
+                "local_mtus": [{"interface": "以太网", "mtu": local}],
                 "issues": []}
 
     def test_path_1280_fires_confidence_075(self):
@@ -370,7 +370,7 @@ class TestRuleMtuBlackhole(unittest.TestCase):
         r = _healthy_full()
         r["mtu"] = {"path_mtus": [{"target": "x", "error": "ICMP 被过滤",
                                    "path_mtu": None}],
-                    "local_mtus": [{"name": "以太网", "mtu": 1500}],
+                    "local_mtus": [{"interface": "以太网", "mtu": 1500}],
                     "issues": []}
         report = N.diagnose(r)
         self.assertNotIn("mtu_blackhole", [x.id for x in report.root_causes])
@@ -602,7 +602,7 @@ class TestEvidenceChainConsumption(unittest.TestCase):
         """修复: 本地接口字段是 name (旧代码读 interface 会打出 None)."""
         r = _healthy_full()
         r["mtu"] = {"path_mtus": [{"target": "223.5.5.5", "path_mtu": 1492}],
-                    "local_mtus": [{"name": "以太网", "mtu": 1500}],
+                    "local_mtus": [{"interface": "以太网", "mtu": 1500}],
                     "issues": []}
         evd = self._evd("mtu", r["mtu"], N._evidence_mtu)
         for texts in (N._ev_mtu_blackhole(r)[0],
