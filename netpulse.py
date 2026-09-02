@@ -502,7 +502,9 @@ class Issue:
     title: str
     description: str = ""
     evidence_ids: list[str] = field(default_factory=list)
-    confidence: float = 1.0
+    # None = 无可靠依据不下结论 (审计 P1-02): 旧模块结果没有真实置信度,
+    # 不再包装成统一的伪精确数字; 原生规则引擎给出的数值保持不变。
+    confidence: float | None = None
     recommendations: list[str] = field(default_factory=list)
 
     def to_dict(self):
@@ -607,7 +609,7 @@ class NetworkAdapter:
     """ipconfig /all 一个网络适配器 (含 VPN 虚拟适配器)"""
     name: str                          # e.g. "WLAN", "本地连接", "VirtualBox Host-Only Network"
     desc: str                          # e.g. "Realtek 8822CE Wireless LAN 802.11ac PCI-E NIC"
-    mac: str = ""                      # e.g. "D8-80-83-B7-2F-A9"
+    mac: str = ""                      # e.g. "02-4E-5A-B7-2F-A9"
     ipv4: str | None = None
     prefix_len: int | None = None      # ipconfig 不输出 prefix_len, 调用方用 PowerShell 补
     ipv6: str | None = None
@@ -1074,6 +1076,39 @@ _SEVERITY_FROM_ZH = {
 }
 
 
+# 模块错误文案 → 语义化错误码 (审计 P1-01): wrapper 不再把所有错误统一成
+# MODULE_ERROR/retryable=True。顺序敏感, 先匹配更具体的特征 (中英都认,
+# 兼容 box["err"] 回填的原始异常文本)。
+_ERROR_PATTERNS = [
+    # (特征子串小写, code, category, retryable, severity, exception_type)
+    ("超时", "TIMEOUT", "timeout", True, Severity.MEDIUM, "TimeoutError"),
+    ("timed out", "TIMEOUT", "timeout", True, Severity.MEDIUM, "TimeoutError"),
+    ("timeout", "TIMEOUT", "timeout", True, Severity.MEDIUM, "TimeoutError"),
+    ("权限", "PERMISSION_DENIED", "permission", False, Severity.HIGH, "PermissionError"),
+    ("管理员", "PERMISSION_DENIED", "permission", False, Severity.HIGH, "PermissionError"),
+    ("access is denied", "PERMISSION_DENIED", "permission", False, Severity.HIGH, "PermissionError"),
+    ("permission", "PERMISSION_DENIED", "permission", False, Severity.HIGH, "PermissionError"),
+    ("未找到", "UNAVAILABLE", "dependency", False, Severity.MEDIUM, "FileNotFoundError"),
+    ("未安装", "UNAVAILABLE", "dependency", False, Severity.MEDIUM, "FileNotFoundError"),
+    ("无法获取", "UNAVAILABLE", "dependency", False, Severity.MEDIUM, "FileNotFoundError"),
+    ("not found", "UNAVAILABLE", "dependency", False, Severity.MEDIUM, "FileNotFoundError"),
+    ("no such", "UNAVAILABLE", "dependency", False, Severity.MEDIUM, "FileNotFoundError"),
+    ("连接失败", "NETWORK_ERROR", "network", True, Severity.MEDIUM, "ConnectionError"),
+    ("unreachable", "NETWORK_ERROR", "network", True, Severity.MEDIUM, "ConnectionError"),
+]
+
+
+def _classify_module_error(message):
+    """错误文案 → (code, category, retryable, severity, exception_type)。
+
+    无特征命中时按 COMMAND_FAILED 兜底 (可重试, 与旧行为一致)。"""
+    msg = str(message).lower()
+    for pat, code, category, retryable, severity, exc in _ERROR_PATTERNS:
+        if pat in msg:
+            return code, category, retryable, severity, exc
+    return "COMMAND_FAILED", "command", True, Severity.MEDIUM, "RuntimeError"
+
+
 def _wrap_as_diagnostic_result(results, module_id, started_at, duration_ms):
     """通用: Tester.results dict → DiagnosticResult (B8-B11 共享 helper).
 
@@ -1091,11 +1126,13 @@ def _wrap_as_diagnostic_result(results, module_id, started_at, duration_ms):
 
     error = None
     if "error" in results:
+        code, category, retryable, severity, exc_type = _classify_module_error(
+            results["error"])
         error = DiagnosticError(
-            code="MODULE_ERROR", category="module",
+            code=code, category=category,
             message=str(results["error"]),
-            retryable=True, severity=Severity.MEDIUM,
-            exception_type="Exception")
+            retryable=retryable, severity=severity,
+            exception_type=exc_type)
         # 模块级 error 标志: 若 determine_status 未升级到 ERROR, 这里强制升级
         if diag_status == Status.OK:
             diag_status = Status.ERROR
@@ -1116,7 +1153,7 @@ def _wrap_as_diagnostic_result(results, module_id, started_at, duration_ms):
             severity=severity,
             title=str(i.get("message", str(i))),
             description=str(i.get("detail", "")),
-            confidence=0.85,
+            # confidence 不填 (None): 旧结果没有真实置信度依据 (审计 P1-02)
             recommendations=recommendations,
         ))
 
@@ -1995,21 +2032,35 @@ def _severity_color(sev):
     }.get(sev, C_WHITE)
 
 
+def _conf_band(confidence):
+    """置信度分档显示 (审计 P1-04): 内部 0.0-1.0 数值是规则设计值而非统计
+    概率, UI 不再伪装成"xx%"伪精确数字, 呈现 高/中/低 三档;
+    JSON 里仍保留原始数值供程序消费。"""
+    try:
+        c = float(confidence)
+    except (TypeError, ValueError):
+        return "低置信度"
+    if c >= 0.75:
+        return "高置信度"
+    if c >= 0.5:
+        return "中置信度"
+    return "低置信度"
+
+
 def _print_diagnosis(diagnosis):
     """CLI: 格式化打印 DiagnosisReport (根因 + 置信度 + 建议)."""
     if not diagnosis.root_causes:
         print(_c(f"  ✓ 根因分析: 未发现故障 "
-                 f"(评估 {diagnosis.rules_evaluated} 条规则, 整体置信度 "
-                 f"{diagnosis.overall_confidence*100:.0f}%)", C_GREEN))
+                 f"(评估 {diagnosis.rules_evaluated} 条规则)", C_GREEN))
         return
     print(_c(f"  🔴 根因分析 ({diagnosis.rules_fired}/{diagnosis.rules_evaluated} "
-             f"条规则触发, 整体置信度 {diagnosis.overall_confidence*100:.0f}%)",
+             f"条规则触发, 整体{_conf_band(diagnosis.overall_confidence)})",
              C_BOLD))
     print()
     for i, rc in enumerate(diagnosis.root_causes, 1):
         color = _severity_color(rc.severity)
         print(_c(f"  [{i}] {rc.severity.value.upper()} · {rc.title}", color))
-        print(f"      类别: {rc.category} | 置信度: {rc.confidence*100:.0f}%")
+        print(f"      类别: {rc.category} | {_conf_band(rc.confidence)}")
         print(f"      {rc.description}")
         if rc.affected_modules:
             print(f"      影响模块: {', '.join(rc.affected_modules)}")
@@ -2050,8 +2101,7 @@ def _build_trouble_ticket_text(report, diagnosis_dict):
                  f"（{health.get('label', '')}）{scope}，检测到 "
                  f"{len(rcs)} 个主要问题：")
     for i, rc in enumerate(rcs, 1):
-        conf = (rc.get("confidence") or 0) * 100
-        lines.append(f"{i}. {rc.get('title', '')}（置信度 {conf:.0f}%）")
+        lines.append(f"{i}. {rc.get('title', '')}（{_conf_band(rc.get('confidence'))}）")
         desc = (rc.get("description") or "").strip()
         if desc:
             lines.append(f"   现象：{desc}")
@@ -2093,7 +2143,7 @@ def _render_diagnosis_section_html(diagnosis_dict, report=None):
         sev = rc.get("severity", "medium")
         sev_label = {"critical": "严重", "high": "高",
                      "medium": "中", "low": "低"}.get(sev, sev)
-        conf_pct = rc.get("confidence", 0) * 100
+        conf_band = _conf_band(rc.get("confidence", 0))
         recs = rc.get("recommendations") or []
         recs_html = "".join(f"<li>{_html.escape(str(r))}</li>" for r in recs)
         affected = ", ".join(rc.get("affected_modules") or []) or " - "
@@ -2130,7 +2180,7 @@ def _render_diagnosis_section_html(diagnosis_dict, report=None):
             f'<div class="rhead">'
             f'<span class="rbadge">{_html.escape(sev_label)}</span>'
             f'<strong>{_html.escape(rc.get("title", ""))}</strong>'
-            f'<span class="rconf">置信度 {conf_pct:.0f}%</span>'
+            f'<span class="rconf">{conf_band}</span>'
             f'</div>'
             f'<p class="rdesc">{_html.escape(rc.get("description", ""))}</p>'
             f'{evidence_html}'
@@ -2142,8 +2192,7 @@ def _render_diagnosis_section_html(diagnosis_dict, report=None):
     header = (
         f'<div class="dhead">'
         f'<span class="dbadge warn">🔴 {len(root_causes)} 个主要问题</span>'
-        f'<span class="dconf">整体置信度 '
-        f'{diagnosis_dict.get("overall_confidence", 0)*100:.0f}%, '
+        f'<span class="dconf">整体{_conf_band(diagnosis_dict.get("overall_confidence", 0))}, '
         f'触发 {diagnosis_dict.get("rules_fired", 0)}/{diagnosis_dict.get("rules_evaluated", 0)} 条规则'
         f'</span></div>')
     # v1.5.0 一句话报障: 客户不想看 P95 / TTFB / NAT Cone, 只想要一段能直接
@@ -2341,8 +2390,9 @@ def _export_debug_bundle(out_dir):
     """
     # 1. 确保有诊断数据
     if not LAST_RUN:
-        print(_c("  首次生成 debug-bundle, 跑全诊断 (约 30-120 秒)...", C_GRAY))
-        run_diagnostics([k for k, _, _ in MODULE_REGISTRY])
+        print(_c("  首次生成 debug-bundle, 跑全诊断 (不含压力级 tcpcc, 约 30-120 秒)...",
+                 C_GRAY))
+        run_diagnostics(all_module_keys())
     if not LAST_RUN:
         print(_c("  ✗ 跑诊断失败, 无法生成 debug-bundle", C_RED))
         return
@@ -2756,7 +2806,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -10814,7 +10864,7 @@ def _render_monitor_html(res):
     # v1.8.0 (PR-F4): 抓包证据置信度徽标 (无抓包佐证时不出该行)
     conf_html = ""
     if res.get("confidence"):
-        conf_html = (f"<div class='conf'>🎯 结论置信度 {res.get('confidence')}% — "
+        conf_html = (f"<div class='conf'>🎯 结论{_conf_band(res.get('confidence'))} — "
                      f"{_esc_html(str(res.get('confidence_basis', '')))}</div>")
 
     ev_rows = []
@@ -10933,7 +10983,7 @@ def _render_monitor_html(res):
 {_ana_rows}
 <tr><td>规格</td><td colspan=3>接口 {_esc_html(str(cap.get('iface', '—')))} · 缓冲 {cap.get('ring_bytes', 0) / 1048576:.1f}/{cap.get('ring_limit_mb', 0)}MB ·
 抓到 {cap.get('packets_captured', 0)} 包{f" · 超限挤出 {cap.get('dropped_old', 0)} 包" if cap.get('dropped_old') else ''} · 切片窗口 = 事件前后各 {cap.get('slice_before_s', 30)}s</td></tr>
-<tr><td>隐私声明</td><td colspan=3>仅保留包头与 80/443 每流首 2 包 384B (提取 Host/SNI), <b>不含任何应用内容</b>;
+<tr><td>隐私声明</td><td colspan=3>默认仅保存诊断所需的网络元数据: DNS 查询域名 (QNAME)、HTTP Host、TLS SNI 可能被记录 (80/443 每流首 2 包 384B 头部窗口), <b>不保存普通 TCP/HTTP 应用载荷</b>; 抓包分析当前仅覆盖 IPv4;
 下次运行 NetPulse 时自动清理超过 {cap.get('retention_days', 7)} 天的切片 (最多保留 {cap.get('max_slice_files', 10)} 个)</td></tr>
 </table></div>"""
     return f"""<!DOCTYPE html>
@@ -11131,9 +11181,10 @@ def _capture_confirm_once(input_fn=None):
         return True                    # 检查失败不拦路
     print(_c("\n  ⚠ 抓包取证首次使用确认", C_YELLOW))
     for line in (
-            "     · 只保留包头: 80/443 每条连接的前 2 个包多留 384 字节 (提取访问的域名用)",
-            "     · 不保存任何账号、密码、聊天或页面内容",
-            "     · DNS 查询域名与访问域名会出现在报告里 (定位故障必需)",
+            "     · 只保留诊断所需的网络元数据: 80/443 每条连接的前 2 个包多留 384 字节 (提取访问的域名用)",
+            "     · 不保存普通 TCP/HTTP 应用载荷 (账号、密码、聊天或页面内容不落盘)",
+            "     · DNS 查询域名与访问域名 (QNAME/Host/SNI) 会出现在报告里 (定位故障必需)",
+            "     · 抓包分析当前仅覆盖 IPv4",
             f"     · 切片超过 {CAPTURE_RETENTION_DAYS} 天或 {CAPTURE_MAX_FILES} 个, 下次运行 NetPulse 时自动清理",
             "     · 文件在本机 reports/captures/ 下, 可随时手动删除",
     ):
@@ -12135,6 +12186,22 @@ MODULE_REGISTRY = [
     ("nattype",    "NAT 类型",      NATTypeTester),
 ]
 MODULE_MAP = {k: (n, c) for k, n, c in MODULE_REGISTRY}
+
+# 压力级模块 (审计 §12): 对网络/NAT 表制造显著负载, 不随 all / debug-bundle
+# 静默执行 — 只在用户显式点名时运行。
+STRESS_MODULE_KEYS = ("tcpcc",)
+
+
+def all_module_keys():
+    """all 展开口径: 全部模块去掉压力级。CLI --modules all / 交互菜单
+    0-all-* / debug-bundle 三处共用, 保证口径一致。"""
+    return [k for k, _, _ in MODULE_REGISTRY if k not in STRESS_MODULE_KEYS]
+
+
+def _stress_excluded_hint():
+    excluded = [k for k, _, _ in MODULE_REGISTRY if k in STRESS_MODULE_KEYS]
+    return (f"  提示: 压力级模块 {', '.join(excluded)} 已排除, 不随 all 执行; "
+            f"需要时显式指定 (如 --modules {excluded[0]})")
 
 # 模块三大分类 (装维工作流: 先看 → 再测 → 后查)
 # 每项: (分类名, keys, 一句话定位); 顺序即展示顺序
@@ -14063,15 +14130,23 @@ def _issues_external(res):
         out.append({"severity": "警告", "text": f"{unreachable} 个外网目标不可达",
                     "impact": "部分目标不通, 可能是目标站自身问题或链路单侧劣化",
                     "action": "看技术细节里的路径追踪, 确定从哪一跳开始不通; 仅个别目标不通多为对端问题"})
-    # 丢包告警: 只在 TCP 不可达时触发 (TCP 可达但 ping 丢 = ICMP 限速, 不是真丢包)
-    if loss >= 5:
+    # 丢包告警口径: 与函数 docstring 一致 — 仅当 TCP 同步劣化 (有目标建连失败)
+    # 时才允许升级为"异常"; TCP 全通时 ping 丢包多为 ICMP 限速, 不得直接下
+    # "运营商侧故障"结论 (P0-05: 修复 loss>=5 无视 TCP 状态的误判)。
+    # TCP 证据缺失 (tcp_total=0, 模块部分失败) 同样不给故障级结论。
+    tcp_failed = tcp_total > 0 and tcp_ok < tcp_total
+    if loss >= 5 and tcp_failed:
         out.append({"severity": "异常", "text": f"外网平均丢包 {loss}%",
                     "impact": "明显丢包: 网页卡顿、游戏掉线、视频花屏",
-                    "action": "网关正常而此处丢包 → 问题在运营商侧, 保留报告 (含逐跳路径) 带回报障"})
+                    "action": "网关正常而此处丢包 → 问题更可能在运营商侧, 保留报告 (含逐跳路径) 带回报障"})
+    elif loss >= 5:
+        out.append({"severity": "警告", "text": f"ICMP 平均丢包 {loss}% (TCP 建连正常)",
+                    "impact": "TCP 可达但 ping 丢, 多为中间设备 ICMP 限速, 不一定是真实丢包",
+                    "action": "以实际应用体验为准; 若确有卡顿, 结合网关模块丢包判断段位"})
     elif loss >= 1:
         out.append({"severity": "警告", "text": f"外网平均丢包 {loss}%",
                     "impact": "轻度丢包会影响游戏/通话体验",
-                    "action": "结合网关模块丢包判断段位: 网关也丢=内网问题; 网关不丢=外线问题"})
+                    "action": "结合网关模块丢包判断段位: 网关也丢 → 更像内网问题; 网关不丢 → 更像外线问题"})
     # TCP RTT 异常告警 (TCP 握手 >500ms 说明 SYN 队列堆积或链路严重劣化)
     targets = res.get("targets") or []
     high_tcp_rtts = [t for t in targets
@@ -15022,7 +15097,9 @@ def render_report_text(report):
 
 
 def render_report_html(report):
-    """渲染 HTML 报告 (专业工程风: 深色渐变页眉 + 统计卡 + 模块卡片 + 可折叠明细)。"""
+    """[DEPRECATED · v1.8.1] 旧版 HTML 渲染器 — export_report 已不再调用
+    (主路径为 render_report_html_customer)。仅为外部脚本兼容临时保留,
+    不再接受新功能/样式改动, 稳定版本后删除。"""
     import html as _html
 
     if not report:
@@ -15520,7 +15597,7 @@ def _short_iface(name, max_len=32):
     旧版 max_len=22 偏短, "VirtualBox Host-Only Network" (27字符) 等常见名
     会被截成 "VirtualBox Host-Only …" 显示不全。改 32 后:
       - "VirtualBox Host-Only Network" 完整保留
-      - "ZeroTier One [9f77fc393e225015]" (31字符) 也完整保留
+      - "ZeroTier One [1a2b3c4d5e6f7788]" (31字符) 也完整保留
       - 极长的虚拟网卡名 (如 Hyper-V 桥接) 才走截断逻辑
     """
     if not name:
@@ -15974,7 +16051,7 @@ def _render_linkspeed_adapters_table(adapters):
       - 重复列 (链路速率原始值 / 速率 Mbps / 综合判定 含相同信息)
       - 冗余列 (4 个收发包错误列几乎都是 0/N/A)
       - 难懂列 (无线网卡 True/False、媒体类型 802.3/Native 802.11)
-      - 长名 (ZeroTier One [9f77fc393e225015] + Realtek 8822CE ...) 把表格撑爆
+      - 长名 (ZeroTier One [1a2b3c4d5e6f7788] + Realtek 8822CE ...) 把表格撑爆
     客户关心的是: 名字 + 描述 + 状态 + 是否WiFi + 速率(Mbps) + 档位判定。其他进 JSON。
     """
     # 选定的展示列 + 中文化表头
@@ -17117,7 +17194,7 @@ def prompt_export_report():
 
 def parse_choice(choice):
     """解析交互菜单输入 -> keys 列表; 无效返回 None。
-    支持: 数字 (空格分隔多选)、0/all/* (全部)、分类字母 a/b/c、
+    支持: 数字 (空格分隔多选)、0/all/* (全部, 压力级模块除外)、分类字母 a/b/c、
     模块 key、模块中文名。
     严格模式: 任一 token 非法即整体拒绝。
     """
@@ -17125,7 +17202,8 @@ def parse_choice(choice):
     if choice == "":
         return None
     if choice.lower() in ("0", "all", "*"):
-        return [k for k, _, _ in MODULE_REGISTRY]
+        print(_c(_stress_excluded_hint(), C_GRAY))
+        return all_module_keys()
     return _parse_keys(choice.split(), strict=True)
 
 
@@ -17842,7 +17920,9 @@ def main():
     if args.modules:
         is_all_only = (args.modules == ["all"])
         if is_all_only:
-            keys = [k for k, _, _ in MODULE_REGISTRY]
+            keys = all_module_keys()
+            if not args.json:      # JSON 输出不掺人读文本
+                print(_c(_stress_excluded_hint(), C_GRAY))
         else:
             keys = parse_module_names(args.modules)
         if not keys:

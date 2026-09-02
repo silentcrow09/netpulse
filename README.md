@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.8.0
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.8.1
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -26,7 +26,7 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 - **JSON Schema + 调试包**：结果文件遵循 `schema/netpulse-result-v1.1.json`（`--json-schema` 离线查询版本与字段，供 AI Agent / RMM introspect）；`--debug-bundle DIR` 一键导出脱敏调试包（system + diagnostic + log 的 zip）。
 - **TCP 并发能力压测**：阶梯并发连接测试（累计保持），判定网络路径（光猫/路由器 NAT）最大可持续并发；同跑本机回环对照，自动区分「本机瓶颈 vs 网络/NAT 瓶颈」，零依赖、无需自建服务器。
 - **盯障模式 `--monitor`**：分钟级持续监测网关/外网 ping + TCP + DNS，抓偶发掉线（普通模块全是快照抓不到）；自动事件检测 + 分段定位（内网侧/运营商侧/解析侧/内外同抖），含**抖动窗口**检测（60s 窗口内反复丢包但未达连续中断 → 抖动集中段，偶发掉线最典型形态）；v1.7.0 起叠加**统计层**——后台二分探测路径 MTU（识别 MTU 不匹配/PMTUD 黑洞类故障，ping 小包看不出的盲区）+ TCP 重传率 30s 差分采样（开机累计计数器差出会话口径，含分母保护），`--monitor-load` 可在盯障中段制造 15s 下载负载让 full-size 包真正跑起来；输出带时间轴的 HTML 报告 + Excel 直开的 CSV + 完整 JSON。
-- **抓包取证层 `--capture`（v1.8.0）**：盯障时叠加**证据级**抓包（需 Npcap + 管理员，默认关闭，首次使用有隐私确认）——中断/抖动/TCP 失败/重传爆发等事件触发时自动落盘**前后各 30s 切片 pcap**（Wireshark 直开），结束后离线分析三信号判定 **PMTU 黑洞**（ICMP 分片指示 / full-size 段同序号停滞重传 / 握手 MSS 大于路径 MTU）、链路丢包形态、DNS 慢查询，结论联动盯障报告并给**置信度徽标**（黑洞确认 92%）；**隐私红线：只存包头**——80/443 每流仅前 2 包多留 384B（提取 Host/SNI 定位访问的域名），DNS/ICMP 整包，其余一律剥到头部，**不存任何应用内容**；切片超 7 天或超 10 个自动清理。
+- **抓包取证层 `--capture`（v1.8.0）**：盯障时叠加**证据级**抓包（需 Npcap + 管理员，默认关闭，首次使用有隐私确认）——中断/抖动/TCP 失败/重传爆发等事件触发时自动落盘**前后各 30s 切片 pcap**（Wireshark 直开），结束后离线分析三信号判定 **PMTU 黑洞**（ICMP 分片指示 / full-size 段同序号停滞重传 / 握手 MSS 大于路径 MTU）、链路丢包形态、DNS 慢查询，结论联动盯障报告并给**置信度徽标**（黑洞确认为「高置信度」档）；**隐私边界**：默认仅保存诊断所需的网络元数据——80/443 每流仅前 2 包多留 384B（提取 Host/SNI 定位访问的域名），DNS/ICMP 整包保留（**DNS 查询域名 QNAME / HTTP Host / TLS SNI 可能被记录**），其余一律剥到头部，**不保存普通 TCP/HTTP 应用载荷**（账号/密码/页面内容不落盘）；抓包分析当前仅覆盖 IPv4；切片超 7 天或超 10 个自动清理。
 - **iperf3 UDP 模式**：`--iperf3-udp` 以 1 Mbps 发包率测点对点抖动/丢包 —— 语音/游戏质量的关键指标。
 - **宽带测速 = 带宽体检**：上下行测速 + 预估宽带 + Bufferbloat 评级一体化；
   交互菜单默认叠加 **Ookla 官方测速**（`speedtest.exe`，支持指定国内服务器），
@@ -163,7 +163,7 @@ python netpulse.py --install
 | `--monitor-target` | 盯障外网 ping 目标 (默认 223.5.5.5, 同时对该目标 TCP 53 建连; 可用域名) |
 | `--monitor-load` | 盯障期间生成 15s 主动下载负载 (开始后 60s 触发, 制造 full-size 包让 TCP 重传统计有分母; 读即丢弃不落盘; 配合 `--monitor` 使用) |
 | `--load-url URL` | 主动负载的下载地址 (默认微信安装包 CDN 大文件, 仅读取不执行; 配合 `--monitor-load`) |
-| `--capture [MODE]` | 盯障期间抓包取证 (需 Npcap + 管理员, 默认关闭; 仅 `--monitor` 下生效): `slice`=事件触发落盘前后 30s 切片 (默认), `full`=全程落一个 pcap。只保留包头 + 80/443 每流首 2 包 384B (提 Host/SNI), 不存应用内容; 首次使用有隐私确认 (确认一次后不再问) |
+| `--capture [MODE]` | 盯障期间抓包取证 (需 Npcap + 管理员, 默认关闭; 仅 `--monitor` 下生效): `slice`=事件触发落盘前后 30s 切片 (默认), `full`=全程落一个 pcap。仅保存诊断所需网络元数据 (DNS 查询域名 QNAME / HTTP Host / TLS SNI 可能被记录, 80/443 每流首 2 包 384B), 不存普通 TCP/HTTP 应用载荷; 分析当前仅覆盖 IPv4; 首次使用有隐私确认 (确认一次后不再问) |
 | `--capture-mb N` | 抓包环形缓冲上限 MB (默认 64, 最小 8); 超限挤掉最旧包并如实报告 |
 | `--speedtest-node` | 指定测速服务器 (可选): Ookla 服务器数字 ID (配合 `--speedtest-net`) 或上行节点 `host:port`; 默认自动选延迟最低的国内运营商节点 |
 | `--speedtest-net` | 启用 Ookla 官方测速 (CLI 默认关闭, 交互菜单默认启用; 结论优先采用 Ookla 结果) |
@@ -276,7 +276,7 @@ python netpulse.py all --port-target 223.5.5.5:53 --export report.html,report.js
 
 - **统计层（v1.7.0）— 盯障的 L4 眼睛**：后台线程对网关/外网目标各做一轮 `ping -f -l` 二分探测**路径 MTU**（中英文输出双解析，三态判读：太大/放行/无信号，全无信号如实报探测失败不编数），与本机出口接口 MTU 对比 → 差 ≥100 判 **MTU 不匹配事件**（PMTUD 黑洞类故障：小包全通、full-size 包被静默丢弃，视频卡顿/大文件慢的典型根因，常规 ping 探测的盲区），结论直接给 `netsh ... mtu=NNNN` 改法；同时 30s 周期采样 TCP 重传统计（开机累计计数器差分出**会话口径**，发送增量 ≥5000 才判率）→ 重传率 ≥5% 判**传输层丢包事件**；两者同时出现时提示「大概率同源，先改 MTU 复测」。报告新增「MTU 与传输质量」面板（路径/接口 MTU 表 + 重传率时序图），CSV 含逐区间重传行；探测失败（ICMP 被滤）如实标注不误报。
 - **主动负载 `--monitor-load`**：开始 60s 后从默认 CDN（微信安装包，可 `--load-url` 换）流式读取 15s 制造 full-size 下载流量——空闲网络没有大包可丢，重传统计需要真实负载才有分母；读即丢弃不落盘，报告中记录实际读取量。
-- **抓包取证层 `--capture`（v1.8.0，默认关闭）**：显式开启后盯障叠加证据级抓包（需 Npcap + 管理员；缺任一自动降级为仅统计层并说明原因，退出码不变）。**事件触发切片**：中断/抖动集中/TCP 失败/重传爆发事件结束后 30s，自动把环形缓冲里事件前后各 30s 的窗口写成独立 pcap（Wireshark 直开），报告事件表挂取证链接；也可 `--capture full` 全程落一个文件。**离线证据分析**：结束后对切片跑三信号 PMTUD 判定（A=ICMP 分片指示含下一跳 MTU；B=full-size 段同序号停滞重传且小包正常流动；C=握手 MSS 大于路径 MTU−40，C 由统计层探测结果提供）——A 或 B∧C 判 **PMTU 黑洞**（结论置信度 92%），仅 B 或重传占比 ≥8%（≥50 段样本）判**链路丢包佐证**（85%），另检测 DNS 慢查询（>1s）；分析结论并入盯障报告结论与根因标注（`🔬 抓包分析` 徽标），抓包面板展示重传/dup-ack/RST/零窗口/ICMP/SNI 提取汇总。**隐私红线**：只存包头——80/443 每流前 2 包多留 384B（仅为提取 Host/SNI 知道访问了哪个域名），DNS/ICMP 整包（定位必需），其余剥到 IP/TCP 头；环形缓冲默认 64MB（`--capture-mb` 调），切片超 7 天或超 10 个下次运行自动清理；首次使用弹隐私说明需确认（reports/captures/.capture_ack 记住选择）。
+- **抓包取证层 `--capture`（v1.8.0，默认关闭）**：显式开启后盯障叠加证据级抓包（需 Npcap + 管理员；缺任一自动降级为仅统计层并说明原因，退出码不变）。**事件触发切片**：中断/抖动集中/TCP 失败/重传爆发事件结束后 30s，自动把环形缓冲里事件前后各 30s 的窗口写成独立 pcap（Wireshark 直开），报告事件表挂取证链接；也可 `--capture full` 全程落一个文件。**离线证据分析**：结束后对切片跑三信号 PMTUD 判定（A=ICMP 分片指示含下一跳 MTU；B=full-size 段同序号停滞重传且小包正常流动；C=握手 MSS 大于路径 MTU−40，C 由统计层探测结果提供）——A 或 B∧C 判 **PMTU 黑洞**（内部置信度 92），仅 B 或重传占比 ≥8%（≥50 段样本）判**链路丢包佐证**（内部置信度 85；UI 按档显示「高置信度」，不做伪精确百分比），另检测 DNS 慢查询（>1s）；分析结论并入盯障报告结论与根因标注（`🔬 抓包分析` 徽标），抓包面板展示重传/dup-ack/RST/零窗口/ICMP/SNI 提取汇总。**隐私边界**：默认仅保存诊断所需网络元数据——80/443 每流前 2 包多留 384B（仅为提取 Host/SNI 知道访问了哪个域名），DNS/ICMP 整包（**QNAME/Host/SNI 可能被记录**），其余剥到 IP/TCP 头，不保存普通 TCP/HTTP 应用载荷；分析当前仅覆盖 IPv4；环形缓冲默认 64MB（`--capture-mb` 调），切片超 7 天或超 10 个下次运行自动清理；首次使用弹隐私说明需确认（reports/captures/.capture_ack 记住选择）。
 - **事件检测 + 分段定位**：连续丢包 ≥3s 判中断；外网中断且网关正常 → **运营商侧**（带 HTML 报告报障，分钟级时间轴可对齐客服记录）；与网关中断同时 → 内外同断；网关单独中断 → 内网侧；DNS 连续失败而 ping 正常 → 解析侧；另有延迟突增段检测（10s 桶 p95 对比基线）和**抖动窗口**检测（60s 窗口内丢包 ≥3 次或丢包率 ≥10% → 抖动集中段，按段实际时长描述，网关同时丢包 ≥2 次判内外同抖）。MTU/重传结论为追加式——与中断定位并存，不覆盖运营商/内网判定。
 - **HTML 报告**：结论 banner（含处置建议，服务"现场解决不了带回落诊"流程）+ 事件表（时刻/持续/定位/是否已恢复）+ 延迟时序双线图（红色区带标中断时段）+ TCP/DNS 连通率图。
 - **CSV 用 Excel 直接打开**（utf-8-sig），一列时间戳可精确对齐客户口述的掉线时刻；JSON 含全部原始样本。
@@ -419,6 +419,8 @@ irm https://<bucket>.oss-cn-hangzhou.aliyuncs.com/netpulse/v1-beta/install.ps1 |
 netpulse.py         单文件主程序 (~17900 行)
 build_exe.bat       PyInstaller 打包脚本
 requirements.txt    依赖说明
+tests/              单元/回归测试 (unittest 风格, 逐文件 python tests/test_x.py 运行)
+└── fixtures/       脱敏 Windows 命令输出 fixture (MAC/IPv6/hostname 均为伪造值)
 schema/
 └── netpulse-result-v1.1.json   JSON 结果 Schema (--json-schema 查询)
 deploy/

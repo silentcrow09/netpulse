@@ -53,11 +53,33 @@
   （规则没命中时不能把异常藏起来）
 - **诊断标准**（v1.5.0）已归入统一「技术附录」折叠区块，原章节文案移除
 
+## 收口阶段规则（v1.8.1 起，源自 2026-09 专家审计）
+
+- **冻结新增大 Probe**：除非同时满足 解决真实用户场景 + 有诊断价值 + 有测试 +
+  有报告展示 + 有退出/降级策略。优先修现有能力，不再用新 Probe 证明能力。
+- **停止新增 `LAST_RUN` 依赖**：数据流向 `runner → report → renderer`；
+  新代码（报告/Debug Bundle/Monitor）不得直接读写全局 `LAST_RUN`，存量引用只减不增。
+- **新 Probe 直接产出原生 `DiagnosticResult`**（Evidence/Issue），不走
+  `_wrap_as_diagnostic_result` 旧包装；旧 Probe 逐个迁移（第一批：gateway/external/dns/web/wifi/tcp/mtu）。
+- **压力级模块**（`STRESS_MODULE_KEYS`，现为 tcpcc）不随 `all` / 交互菜单 0-all-* /
+  debug-bundle 静默执行，必须显式点名（展开口径统一走 `all_module_keys()`）。
+- **置信度显示走 `_conf_band()` 三档**（高/中/低）：内部 0-1 数值是规则设计值不是统计
+  概率，UI 不做伪精确百分比；JSON 保留原始数值。旧结果包装的 `Issue.confidence=None`
+  （无依据不显示），不要回填统一数字。
+
 ## 验证
 
 ```bash
+for f in tests/test_*.py; do python "$f"; done
+#   单元/回归套件 (v1.8.1 起入仓, 12 文件 / 276 用例): parsers/diagnosis/
+#   诊断矩阵/丢包口径/XSS 转义/pcap 分析与取证/probes/redaction/场景菜单/盯障统计
 python _smoke_report.py          # 192 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项
 ```
+
+`tests/fixtures/windows/` 为**脱敏** fixture（MAC 用 02/06 本地管理前缀、IPv6 用
+RFC 3849 文档前缀、假 hostname/GUID）；真实抓包或含隐私的本地 fixture 放
+`tests/fixtures/private/`（gitignore）。新判定口径改动必须带回归测试
+（参考 `test_report_issues.py` / `test_diagnosis_matrix.py` / `test_html_escape.py`）。
 
 产物 `reports/_verify_latest.html` 用于人工核对（`reports/` 已 gitignore）。
 

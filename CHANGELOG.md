@@ -7,6 +7,31 @@
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-09-02
+
+质量收口批次：专家审计整改——判定口径/隐私文案/压测分级修正 + 测试入仓。不新增任何 Probe。
+
+### 修复
+
+- **外网丢包误判（审计 P0-05）**：`_issues_external` 曾用 `if loss >= 5` 无视 TCP 状态直接报「异常/问题在运营商侧」，与自身注释口径（只在 TCP 同步劣化时升级）矛盾——ICMP 限速场景被误报为真丢包。现仅 TCP 有目标建连失败时升级异常；TCP 全通降级为「ICMP 限速」警告；TCP 证据缺失（tcp_total=0）同样不给故障级结论。附 6 条回归测试
+- **抓包隐私文案校准（审计 P0-06）**：HTML 报告/首次确认/README 的「不含任何应用内容/只存包头」改为如实描述——DNS 查询域名 (QNAME)、HTTP Host、TLS SNI 可能被记录，不保存普通 TCP/HTTP 应用载荷；四处同步补充「抓包分析当前仅覆盖 IPv4」
+
+### 变更
+
+- **压力级模块不随 `all` 执行（审计 §12）**：`tcpcc`（1600 并发压测）从 `--modules all`、交互菜单 `0/all/*`、debug-bundle 全诊断中排除，运行时打印提示；展开口径统一走新增的 `all_module_keys()`
+- **置信度分档显示（审计 P1-04）**：CLI 根因输出/HTML 报告/一句话报障/盯障置信度徽标不再显示伪精确百分比，改「高/中/低置信度」三档（`_conf_band`，≥0.75/≥0.5）；JSON 保留原始数值
+- **模块错误语义化（审计 P1-01）**：`_wrap_as_diagnostic_result` 不再把所有模块错误统一为 `MODULE_ERROR/retryable=True`，按错误文案特征映射 TIMEOUT / PERMISSION_DENIED / UNAVAILABLE / NETWORK_ERROR（兜底 COMMAND_FAILED），retryable/severity/exception_type 随之设置
+- **旧 Issue 不再伪造置信度（审计 P1-02）**：旧结果包装的 `Issue.confidence=None`（此前统一 0.85）；`Issue.confidence` 类型放宽为 `float | None`
+- `render_report_html` 标记 DEPRECATED（零调用点死代码，稳定版后删除）
+- 版本 1.8.0 → 1.8.1；README 同步（版本/隐私边界/置信度描述/目录结构）
+
+### 新增
+
+- **测试入仓（审计 P0-01）**：`tests/`（12 个文件 / 276 用例）移出 `.gitignore`；fixtures 全面脱敏——真实设备 MAC/GUID/hostname/ZeroTier 网络 ID/全球 IPv6 前缀 → 02/06 本地管理 MAC、RFC 3849 文档前缀 (`2001:db8::/32`)、假 hostname；`tests/fixtures/private/` 本地忽略。clone 后即可逐文件跑 `python tests/test_xxx.py`
+- **诊断回归矩阵**（审计 P1-05）：`tests/test_diagnosis_matrix.py` 覆盖审计 §5 组合场景（全 OK/全 FAIL→LAN、网关 OK 其余 FAIL→WAN、仅 DNS→DNS、仅 TCP→传输层、高负载→Bufferbloat）+ 模块自身超时不得当网络证据的边界
+- **XSS 回归**（审计 §9）：`tests/test_html_escape.py` 恶意 SSID/hostname/DNS 名/URL 四类样本全链路（LAST_RUN → build_report → customer 渲染），断言无标签注入 + 属性通道（data-copy）引号转义
+- `CLAUDE.md`（AI 协作入口，指向 AGENTS.md + 收口硬规则）
+
 ## [1.8.0] - 2026-09-01
 
 盯障抓包取证层（阶段 F 第二步 / PR-F1~F5）：统计层说「有病」，抓包层给「证据」。`--capture` 显式开启（默认关闭，需 Npcap + 管理员），事件触发自动落盘切片 pcap + 离线三信号分析，结论联动置信度。隐私红线：**只存包头，不存任何应用内容**。

@@ -1,0 +1,84 @@
+
+Windows IP Configuration
+
+   Host Name . . . . . . . . . . . . : DESKTOP-TEST01
+   Primary Dns Suffix  . . . . . . . : 
+   Node Type . . . . . . . . . . . . : Hybrid
+   IP Routing Enabled. . . . . . . . : No
+   WINS Proxy Enabled. . . . . . . . : No
+
+Ethernet adapter VirtualBox Host-Only Network:
+
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : VirtualBox Host-Only Ethernet Adapter
+   Physical Address. . . . . . . . . : 0A-00-27-00-00-06
+   DHCP Enabled. . . . . . . . . . . : No
+   Autoconfiguration Enabled . . . . : Yes
+   Link-local IPv6 Address . . . . . : fe80::4d3e:111e:2b51:150d%6(Preferred) 
+   IPv4 Address. . . . . . . . . . . : 192.168.56.1(Preferred) 
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0
+   Default Gateway . . . . . . . . . : 
+   DHCPv6 IAID . . . . . . . . . . . : 185204775
+   DHCPv6 Client DUID. . . . . . . . : 00-01-00-01-2D-A6-13-29-02-71-8C-C1-4B-A4
+   NetBIOS over Tcpip. . . . . . . . : Enabled
+
+Wireless LAN adapter WLAN:
+
+   Media State . . . . . . . . . . . : Media disconnected
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : Realtek 8822CE Wireless LAN 802.11ac PCI-E NIC
+   Physical Address. . . . . . . . . : 02-4E-5A-B7-2F-A9
+   DHCP Enabled. . . . . . . . . . . : Yes
+   Autoconfiguration Enabled . . . . : Yes
+
+Wireless LAN adapter 鏈�鍦拌繛鎺�* 1:
+
+   Media State . . . . . . . . . . . : Media disconnected
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : Microsoft Wi-Fi Direct Virtual Adapter
+   Physical Address. . . . . . . . . : 0A-4E-5A-B7-2F-A9
+   DHCP Enabled. . . . . . . . . . . : Yes
+   Autoconfiguration Enabled . . . . : Yes
+
+Wireless LAN adapter 鏈�鍦拌繛鎺�* 10:
+
+   Media State . . . . . . . . . . . : Media disconnected
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : Microsoft Wi-Fi Direct Virtual Adapter #2
+   Physical Address. . . . . . . . . : 1A-4E-5A-B7-2F-A9
+   DHCP Enabled. . . . . . . . . . . : No
+   Autoconfiguration Enabled . . . . : Yes
+
+Ethernet adapter 浠ュお缃�:
+
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : Realtek PCIe GbE Family Controller
+   Physical Address. . . . . . . . . : 02-71-8C-C1-4B-A4
+   DHCP Enabled. . . . . . . . . . . : No
+   Autoconfiguration Enabled . . . . : Yes
+   IPv4 Address. . . . . . . . . . . : 172.25.131.131(Preferred) 
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0
+   IPv4 Address. . . . . . . . . . . : 192.168.133.5(Preferred) 
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0
+   Default Gateway . . . . . . . . . : 172.25.131.254
+   DNS Servers . . . . . . . . . . . : 223.5.5.5
+                                       8.8.8.8
+   NetBIOS over Tcpip. . . . . . . . : Enabled
+
+Ethernet adapter ZeroTier One [1a2b3c4d5e6f7788]:
+
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : ZeroTier Virtual Port
+   Physical Address. . . . . . . . . : 06-2b-9a-73-3e-5f
+   DHCP Enabled. . . . . . . . . . . : No
+   Autoconfiguration Enabled . . . . : Yes
+   IPv6 Address. . . . . . . . . . . : 2001:db8:1:2::9a08:415a(Preferred) 
+   IPv6 Address. . . . . . . . . . . : fd00:1a2b:3c4d:5e6f:1599:9340:8c4d:7a3(Preferred) 
+   Link-local IPv6 Address . . . . . : fe80::fd81:336b:2ffe:b809%20(Preferred) 
+   IPv4 Address. . . . . . . . . . . : 192.168.193.104(Preferred) 
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0
+   Default Gateway . . . . . . . . . : 25.255.255.254
+   DHCPv6 IAID . . . . . . . . . . . : 1142296750
+   DHCPv6 Client DUID. . . . . . . . : 00-01-00-01-2D-A6-13-29-02-71-8C-C1-4B-A4
+   DNS Servers . . . . . . . . . . . : 2001:4860:4860::8888
+   NetBIOS over Tcpip. . . . . . . . : Enabled

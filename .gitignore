@@ -43,6 +43,7 @@ ehthumbs.db
 /report_full_v2.*
 .codegraph/
 
-# ── 单元测试目录 (含真实 Windows 输出 fixture, MAC/SSID/IP/hostname 隐私) ──
-# 与 _smoke_*.py 模式一致: 本地跑测试不入仓
-/tests/
+# ── 测试入仓 (P0-01, v1.8.1): 脱敏 fixture 公开, 私有 fixture 本地忽略 ──
+# tests/fixtures/windows/ 里的 MAC/IP/hostname/GUID 均为伪造值
+# (02/06 本地管理 MAC, RFC 3849 文档 IPv6, DESKTOP-TEST01)
+/tests/fixtures/private/

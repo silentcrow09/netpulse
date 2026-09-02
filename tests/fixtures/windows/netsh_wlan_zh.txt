@@ -1,0 +1,12 @@
+
+There is 1 interface on the system: 
+
+    Name                   : WLAN
+    Description            : Realtek 8822CE Wireless LAN 802.11ac PCI-E NIC
+    GUID                   : f0e1d2c3-a4b5-4678-9abc-def012345678
+    Physical address       : 02:4e:5a:b7:2f:a9
+    Interface type         : Primary
+    State                  : disconnected
+    Radio status           : Hardware On
+                             Software Off
+
