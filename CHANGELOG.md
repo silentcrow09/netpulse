@@ -7,6 +7,22 @@
 
 ## [Unreleased]
 
+## [1.8.3] - 2026-09-02
+
+V2 模型收口第二步（审计 P0-03）：报告层证据链开始**消费**模块自证 Evidence，不再只从原始 dict 二次解析。
+
+### 变更
+
+- **证据链与模块证据同源**：`_ev_dns_failure / _ev_wan_interruption / _ev_wifi_weak / _ev_gateway_loss / _ev_mtu_blackhole / _ev_tcp_loss_burst` 六个 builder 的**支持项**优先取模块 `_evidence`（v1.8.2 probe 认证数值），缺证据/结构损坏时回落旧口径（原地取值），文案逐字不变；**排除项**本批仍读原始 dict（跨模块上下文，下一批迁移）
+- `probe_gateway_v2` 的丢包 Evidence 补 `sent/received` metadata（证据路径可生成「N 发 M 收」后缀）
+- **修复**：`_ev_mtu_blackhole` 旧口径读 `local_mtus[].interface`（字段实为 `name`），接口名一直显示 `None`；两条路径统一读 `name`
+- 版本 1.8.2 → 1.8.3
+
+### 测试
+
+- `test_diagnosis.py` +8（65 用例）：`TestEvidenceChainConsumption` 断言同一数据「注入 _evidence」与「旧口径」两条路径产出的证据项文本**逐字一致**（同源证明），覆盖 6 规则 + 无证据回落 + `_evidence` 结构损坏不崩
+- 端到端合成验证：失败 DNS + 健康 gateway → `dns_failure` 根因支持项来自证据路径，HTML 报告证据链同步
+
 ## [1.8.2] - 2026-09-02
 
 V2 模型收口第一批（审计 P0-03）：`external` / `dns` / `wifi` / `tcpstats` / `mtu` / `web` 六个模块进入 V2 双轨并产出结构化 Evidence（`gateway` 此前已原生）。状态/指标口径与旧 Tester 路径零差异（同一 `determine_status`，metrics 全保留）。

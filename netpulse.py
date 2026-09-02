@@ -1020,7 +1020,9 @@ def probe_gateway_v2(count=20, callback=None):
                  confidence=0.95, timestamp=started_at),
         Evidence(id="gateway.ping.loss_pct", source="gateway.ping",
                  metric="packet_loss_pct", value=loss, unit="%",
-                 confidence=0.98, timestamp=started_at),
+                 confidence=0.98, timestamp=started_at,
+                 metadata={"sent": ping_result.get("sent"),
+                           "received": ping_result.get("received")}),
         Evidence(id="gateway.ping.jitter_ms", source="gateway.ping",
                  metric="jitter_ms", value=jitter, unit="ms",
                  confidence=0.9, timestamp=started_at),
@@ -1845,10 +1847,34 @@ def _ev_external_reachable(results, suffix="（不是外网全断）"):
     return _ev(f"外网 TCP 可达 {tcp_ok}/{tcp_total}{suffix}", True)
 
 
+def _module_evidence(results, module):
+    """模块自证 Evidence (v1.8.2 过渡键 _evidence); 无/非列表时返回 []。"""
+    mod = _mod(results, module) or {}
+    ev = mod.get("_evidence")
+    return [e for e in ev if isinstance(e, dict)] if isinstance(ev, list) else []
+
+
+def _evd_find(evidence, ev_id):
+    """按 id 取第一条模块 Evidence; 无则 None。"""
+    for e in evidence:
+        if e.get("id") == ev_id:
+            return e
+    return None
+
+
 def _ev_dns_failure(results):
     dns = _mod(results, "dns") or {}
     supports = []
-    sc, tc = dns.get("success_count", 0) or 0, dns.get("total_count", 0) or 0
+    # 支持项优先取模块自证 Evidence (v1.8.3, 与 probe 认证数值同源);
+    # 旧运行/无证据时回落原地取值, 文案不变。
+    item = _evd_find(_module_evidence(results, "dns"),
+                     "dns.resolve.success_count")
+    meta = (item or {}).get("metadata") or {}
+    if item is not None and isinstance(item.get("value"), (int, float)) \
+            and meta.get("total_count"):
+        sc, tc = item["value"], meta["total_count"]
+    else:
+        sc, tc = dns.get("success_count", 0) or 0, dns.get("total_count", 0) or 0
     if tc:
         supports.append(_ev(
             f"DNS 解析仅 {sc}/{tc} 成功，失败率 {(1 - sc / tc) * 100:.0f}%", False))
@@ -1865,7 +1891,13 @@ def _ev_dns_failure(results):
 def _ev_wan_interruption(results):
     ext = _mod(results, "external") or {}
     supports = []
-    tcp_ok, tcp_total = ext.get("tcp_ok", 0) or 0, ext.get("tcp_total", 0) or 0
+    item = _evd_find(_module_evidence(results, "external"),
+                     "external.tcp.tcp_ok")
+    meta = (item or {}).get("metadata") or {}
+    if item is not None and meta.get("tcp_total"):
+        tcp_ok, tcp_total = item.get("value") or 0, meta["tcp_total"]
+    else:
+        tcp_ok, tcp_total = ext.get("tcp_ok", 0) or 0, ext.get("tcp_total", 0) or 0
     if tcp_total:
         supports.append(_ev(f"外网 TCP 全部失败 {tcp_ok}/{tcp_total}", False))
     excludes = []
@@ -1882,7 +1914,12 @@ def _ev_wan_interruption(results):
 def _ev_wifi_weak(results):
     wifi = _mod(results, "wifi") or {}
     supports = []
-    interference = wifi.get("overall_interference")
+    item = _evd_find(_module_evidence(results, "wifi"),
+                     "wifi.spectrum.overall_interference")
+    if item is not None and item.get("value") is not None:
+        interference = item.get("value")
+    else:
+        interference = wifi.get("overall_interference")
     if interference:
         supports.append(_ev(f"WiFi 干扰等级：{interference}", False))
     nets = wifi.get("networks")
@@ -1923,10 +1960,17 @@ def _ev_bufferbloat(results):
 def _ev_gateway_loss(results):
     ping = _ping(results, "gateway") or {}
     supports = []
-    loss = ping.get("loss_pct", 0)
+    item = _evd_find(_module_evidence(results, "gateway"),
+                     "gateway.ping.loss_pct")
+    meta = (item or {}).get("metadata") or {}
+    if item is not None and isinstance(item.get("value"), (int, float)):
+        loss = item["value"]
+        sent, recv = meta.get("sent"), meta.get("received")
+    else:
+        loss = ping.get("loss_pct", 0)
+        sent, recv = ping.get("sent"), ping.get("received")
     if isinstance(loss, (int, float)):
         txt = f"网关丢包 {loss:g}%"
-        sent, recv = ping.get("sent"), ping.get("received")
         if isinstance(sent, int) and isinstance(recv, int) and sent > 0:
             txt += f"（{sent} 发 {recv} 收）"
         supports.append(_ev(txt, False))
@@ -1962,16 +2006,33 @@ def _ev_nat_restricted(results):
 def _ev_mtu_blackhole(results):
     mtu = _mod(results, "mtu") or {}
     supports = []
-    for r in (mtu.get("path_mtus") or []):
-        if not r.get("error") and r.get("path_mtu"):
-            supports.append(_ev(
-                f"到 {r.get('target')} 的路径 MTU = {r['path_mtu']}", False))
-    for lm in (mtu.get("local_mtus") or []):
-        if isinstance(lm.get("mtu"), int) and lm.get("mtu", 0) > 0:
-            supports.append(_ev(
-                f"接口 {lm.get('interface')} MTU = {lm['mtu']}", False))
+    ev = _module_evidence(results, "mtu")
+    if ev:
+        # 证据优先: probe 阶段已认证的 path_mtu / iface mtu 逐条转写
+        for e in ev:
+            meta = e.get("metadata", {})
+            if e.get("id") == "mtu.probe.path_mtu":
+                supports.append(_ev(
+                    f"到 {meta.get('target')} 的路径 MTU = {e.get('value')}", False))
+            elif e.get("id") == "mtu.iface.mtu":
+                supports.append(_ev(
+                    f"接口 {meta.get('name')} MTU = {e.get('value')}", False))
+    else:
+        for r in (mtu.get("path_mtus") or []):
+            if not r.get("error") and r.get("path_mtu"):
+                supports.append(_ev(
+                    f"到 {r.get('target')} 的路径 MTU = {r['path_mtu']}", False))
+        for lm in (mtu.get("local_mtus") or []):
+            if isinstance(lm.get("mtu"), int) and lm.get("mtu", 0) > 0:
+                supports.append(_ev(
+                    f"接口 {lm.get('name')} MTU = {lm['mtu']}", False))
     ts = _mod(results, "tcpstats") or {}
-    rate = ts.get("retrans_rate_pct")
+    item = _evd_find(_module_evidence(results, "tcpstats"),
+                     "tcpstats.retrans.retrans_rate_pct")
+    if item is not None:
+        rate = item.get("value")
+    else:
+        rate = ts.get("retrans_rate_pct")
     if isinstance(rate, (int, float)) and rate >= 5:
         supports.append(_ev(f"TCP 重传率 {rate:g}% 佐证 (大包在丢)", False))
     excludes = []
@@ -1985,11 +2046,21 @@ def _ev_mtu_blackhole(results):
 def _ev_tcp_loss_burst(results):
     ts = _mod(results, "tcpstats") or {}
     supports = []
-    rate = ts.get("retrans_rate_pct")
+    item = _evd_find(_module_evidence(results, "tcpstats"),
+                     "tcpstats.retrans.retrans_rate_pct")
+    if item is not None and isinstance(item.get("value"), (int, float)):
+        rate = item["value"]
+        meta = item.get("metadata") or {}
+        retrans = meta.get("retransmitted", "—")
+        sent = meta.get("segments_sent", "—")
+    else:
+        rate = ts.get("retrans_rate_pct")
+        retrans = ts.get("retransmitted", "—")
+        sent = ts.get("segments_sent", "—")
     if isinstance(rate, (int, float)):
         supports.append(_ev(
-            f"TCP 重传率 {rate:g}% (重传 {ts.get('retransmitted', '—')} / "
-            f"发送 {ts.get('segments_sent', '—')}, 开机累计口径)", False))
+            f"TCP 重传率 {rate:g}% (重传 {retrans} / "
+            f"发送 {sent}, 开机累计口径)", False))
     excludes = []
     mtu = _mod(results, "mtu") or {}
     paths = [r.get("path_mtu") for r in (mtu.get("path_mtus") or [])
@@ -2988,7 +3059,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.8.2"
+APP_VERSION = "1.8.3"
 
 
 # 常用外网测试目标 (国内网络环境)

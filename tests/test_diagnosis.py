@@ -537,5 +537,118 @@ class TestProfileRulesV17(unittest.TestCase):
         self.assertIn("tcpstats", N.DIAGNOSE_PROFILES["slow"])
 
 
+class TestEvidenceChainConsumption(unittest.TestCase):
+    """v1.8.3: 证据链 builder 优先消费模块自证 Evidence (_evidence).
+
+    核心断言: 同一份数据, 注入 _evidence (probe 认证路径) 与不注入
+    (旧口径原地取值) 产出的证据项文本必须逐字一致 — 两条路径同源。
+    """
+
+    @staticmethod
+    def _injected(res, builder):
+        """把模块 builder 生成的 Evidence 注入 res['_evidence'] (模拟 run 路径)."""
+        ev = builder(res)
+        out = dict(res)
+        out["_evidence"] = [e.to_dict() for e in ev]
+        return out
+
+    def _assert_same_primary_support(self, results, module, ev_builder,
+                                     chain_builder, needle):
+        legacy = chain_builder(results)[0]
+        injected = dict(results)
+        injected[module] = self._injected(results[module], ev_builder)
+        from_ev = chain_builder(injected)[0]
+        old_texts = [s["text"] for s in legacy if needle in s["text"]]
+        new_texts = [s["text"] for s in from_ev if needle in s["text"]]
+        self.assertEqual(1, len(old_texts), msg=f"旧行未含 {needle}: {old_texts}")
+        self.assertEqual(old_texts, new_texts)
+
+    def test_dns_failure(self):
+        r = _healthy_full()
+        r["dns"] = {"success_count": 2, "total_count": 10, "issues": []}
+        self._assert_same_primary_support(r, "dns", N._evidence_dns,
+                                          N._ev_dns_failure, "DNS 解析仅")
+
+    def test_wan_interruption(self):
+        r = _healthy_full()
+        r["external"] = {"targets": [], "tcp_ok": 0, "tcp_total": 4,
+                         "unreachable_count": 4, "issues": []}
+        self._assert_same_primary_support(r, "external", N._evidence_external,
+                                          N._ev_wan_interruption, "外网 TCP")
+
+    def test_wifi_weak(self):
+        r = _healthy_full()
+        r["wifi"] = {"overall_interference": "干扰较高", "issues": []}
+        self._assert_same_primary_support(r, "wifi", N._evidence_wifi,
+                                          N._ev_wifi_weak, "WiFi 干扰等级")
+
+    def test_gateway_loss(self):
+        """gateway 原生 probe 的 evidence (含 sent/received metadata) 同源验证."""
+        r = _healthy_full()
+        r["gateway"] = {"ping": {"loss_pct": 20, "avg_ms": 8, "jitter_ms": 2,
+                                 "sent": 20, "received": 16},
+                        "issues": []}
+        # gateway 无独立 builder (原生 probe 内联构造), 按 probe 同款手工合成
+        gw_ev = [N.Evidence(id="gateway.ping.loss_pct", source="gateway.ping",
+                            metric="packet_loss_pct", value=20, unit="%",
+                            confidence=0.98,
+                            metadata={"sent": 20, "received": 16})]
+        injected = dict(r)
+        injected["gateway"] = dict(r["gateway"])
+        injected["gateway"]["_evidence"] = [e.to_dict() for e in gw_ev]
+        legacy = N._ev_gateway_loss(r)[0]
+        from_ev = N._ev_gateway_loss(injected)[0]
+        old = [s["text"] for s in legacy if "网关丢包" in s["text"]]
+        new = [s["text"] for s in from_ev if "网关丢包" in s["text"]]
+        self.assertEqual(1, len(old))
+        self.assertEqual(old, new)
+        self.assertIn("（20 发 16 收）", new[0])
+
+    def test_mtu_blackhole_iface_name_not_none(self):
+        """修复: 本地接口字段是 name (旧代码读 interface 会打出 None)."""
+        r = _healthy_full()
+        r["mtu"] = {"path_mtus": [{"target": "223.5.5.5", "path_mtu": 1492}],
+                    "local_mtus": [{"name": "以太网", "mtu": 1500}],
+                    "issues": []}
+        injected = dict(r)
+        injected["mtu"] = self._injected(r["mtu"], N._evidence_mtu)
+        for res in (r, injected):
+            texts = [s["text"] for s in N._ev_mtu_blackhole(res)[0]]
+            self.assertTrue(any("接口 以太网 MTU = 1500" in t for t in texts),
+                            msg=f" texts={texts}")
+            self.assertFalse(any("None" in t for t in texts))
+
+    def test_tcp_loss_burst(self):
+        r = _healthy_full()
+        r["tcpstats"] = {"segments_sent": 100000, "retransmitted": 9000,
+                         "retrans_rate_pct": 9.0, "issues": []}
+        self._assert_same_primary_support(r, "tcpstats", N._evidence_tcpstats,
+                                          N._ev_tcp_loss_burst, "TCP 重传率")
+
+    def test_no_evidence_falls_back_legacy(self):
+        """旧运行无 _evidence: 走原地取值, 输出不变 (回归保护)."""
+        r = _healthy_full()
+        r["dns"] = {"success_count": 2, "total_count": 10, "issues": []}
+        supports, _ = N._ev_dns_failure(r)
+        self.assertTrue(any("2/10" in s["text"] for s in supports))
+
+    def test_malformed_evidence_falls_back(self):
+        """_evidence 结构损坏 (非列表/缺字段) 不得让证据链崩掉."""
+        r = _healthy_full()
+        r["dns"] = {"success_count": 2, "total_count": 10, "issues": []}
+        bad = dict(r["dns"])
+        bad["_evidence"] = "garbage"
+        r2 = dict(r)
+        r2["dns"] = bad
+        supports, _ = N._ev_dns_failure(r2)
+        self.assertTrue(any("2/10" in s["text"] for s in supports))
+        bad2 = dict(r["dns"])
+        bad2["_evidence"] = [{"id": "dns.resolve.success_count"}]  # 缺 metadata
+        r3 = dict(r)
+        r3["dns"] = bad2
+        supports3, _ = N._ev_dns_failure(r3)
+        self.assertTrue(any("失败率" in s["text"] for s in supports3))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

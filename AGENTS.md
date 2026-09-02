@@ -61,11 +61,14 @@
   新代码（报告/Debug Bundle/Monitor）不得直接读写全局 `LAST_RUN`，存量引用只减不增。
 - **新 Probe 直接产出原生 `DiagnosticResult`**（Evidence/Issue），不走
   `_wrap_as_diagnostic_result` 旧包装；旧 Probe 逐个迁移。
-  **进度 (v1.8.2)**：第一批完成——external/dns/wifi/tcpstats/mtu/web 已走
+  **进度 (v1.8.3)**：第一批完成——external/dns/wifi/tcpstats/mtu/web 已走
   `@_register_probe` + wrap helper + 模块专属 `_evidence_*` builder（字段与
   `_rule_*` 同源，error → 空列表），gateway 原生。Evidence 以保留键
-  `_evidence` 随 res 进入 LAST_RUN（JSON tech.raw_results 可见）——**过渡键**，
-  报告层直接消费 Evidence 后移除。下一批候选：web 深度证据 / proxy / nattype / loop。
+  `_evidence` 随 res 进入 LAST_RUN（JSON tech.raw_results 可见）。
+  **报告层已消费 (v1.8.3)**：6 个证据链 builder 的支持项优先读模块
+  `_evidence`（缺证据/损坏回落旧口径，文案逐字不变），排除项仍读原始 dict。
+  `_evidence` 过渡键在 JSON Schema v1.2 把 evidence 迁为独立结构后才移除。
+  下一批候选：排除项迁移 / bufferbloat+nattype 补证据 / proxy / nattype / loop。
 - **压力级模块**（`STRESS_MODULE_KEYS`，现为 tcpcc）不随 `all` / 交互菜单 0-all-* /
   debug-bundle 静默执行，必须显式点名（展开口径统一走 `all_module_keys()`）。
 - **置信度显示走 `_conf_band()` 三档**（高/中/低）：内部 0-1 数值是规则设计值不是统计
