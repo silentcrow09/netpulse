@@ -7,6 +7,29 @@
 
 ## [Unreleased]
 
+## [1.9.5] - 2026-09-02
+
+健康结论卡对齐习惯优化（继 v1.9.4 紧凑化后，按用户目检反馈调整）。
+
+### 修复
+
+- **健康卡 `.diagnosis.healthy` 内容居中改为左对齐**：v1.9.4 把健康卡整句
+  水平居中并去掉 `margin-bottom: 12px`，卡片呈"按钮状"。但与问题诊断卡
+  的 dhead 左对齐基线不一致，阅读时眼神要在卡片中央移动，与全仓报告
+  "标题/内容左对齐"风格不符。现去掉 `justify-content: center` 覆写，
+  回到 flex 默认 `flex-start` 左对齐；保留 `align-items: center` 让内容
+  在卡内垂直居中；v1.9.4 的紧凑参数（padding 9px / row-gap 4px /
+  line-height 1.4 / 底部空距 0）全部保留，避免"两行空白"观感回退。
+  健康卡与问题诊断卡的 dhead 现在共享同一对齐基线
+
+### 测试
+
+- `tests/test_v194_layout.py`（6 项）：dhead 居中改为"无 justify-content
+  覆写 → 左对齐"断言；其余 5 项（紧凑参数、hero .sub 截断、todo ok
+  绿底、问题卡基线、全绿/有问题两场景分支）保持不变
+- Chrome 无头目检（cards.html，5.5k）：健康卡 dhead 与问题卡 dhead 左对齐
+  基线一致、内容垂直居中、紧凑高度保留
+
 ## [1.9.4] - 2026-09-02
 
 系统性排查报告 HTML 中「标题行 + 下方留白 = 两行空白观感」类排版问题

@@ -2651,10 +2651,11 @@ _DIAGNOSIS_CSS = """
 .diagnosis { padding: 16px 20px; margin: 16px 0; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
 .diagnosis h2 { margin: 0 0 12px; font-size: 18px; color: #1e293b; }
 .diagnosis .dhead { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-/* v1.9.3: 无故障卡片整句居中单行 — 旧布局 dhead 贴左上且下方留 12px 空距,
-   卡片内呈现"第一行有字、第二行空白"的两行错觉 */
+/* v1.9.5: 无故障卡片左对齐单行 — 整句水平居中不符合阅读习惯(中文用户习惯
+   结论靠左一眼扫过), 恢复 flex-start 左对齐; 保留 v1.9.4 紧凑高度
+   (padding 9px / row-gap 4px / line-height 1.4) 消除"第二行空白"观感 */
 .diagnosis.healthy { padding: 9px 20px; }
-.diagnosis.healthy .dhead { justify-content: center; margin-bottom: 0; flex-wrap: wrap; row-gap: 4px; line-height: 1.4; }
+.diagnosis.healthy .dhead { margin-bottom: 0; flex-wrap: wrap; row-gap: 4px; line-height: 1.4; }
 .diagnosis.healthy .dbadge.ok { font-size: 14px; padding: 5px 14px; }
 .diagnosis .dbadge { padding: 4px 10px; border-radius: 4px; font-weight: 600; font-size: 13px; }
 .diagnosis .dbadge.ok { background: #dcfce7; color: #166534; }
@@ -3249,7 +3250,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.9.4"
+APP_VERSION = "1.9.5"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"

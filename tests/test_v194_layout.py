@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""v1.9.4: 报告排版同类问题修复回归测试
+"""v1.9.4/v1.9.5: 报告排版"两行空白观感"修复回归测试
 
-覆盖 _DIAGNOSIS_CSS 与主 CSS 报告层的"两行观感"修复:
+覆盖 _DIAGNOSIS_CSS 与主 CSS 报告层的排版修复:
   1. 健康卡 .diagnosis.healthy 紧凑化 (padding 14→9, row-gap 6→4, line-height 1.4)
+     + v1.9.5 内容改回左对齐 (flex-start, 无 justify-content 覆写 — 用户
+       反馈整句居中不符合阅读习惯)
   2. .hero .sub 长文字单行 + ellipsis (避免被 gauge 挤换行成两行)
   3. .todo.ok .impact 补绿底样式 ("所有核心检测通过" 分支无样式 → 现继承 issue.ok 风格)
 
@@ -48,8 +50,12 @@ dbadge_body = m1c.group(1)
 assert "padding: 9px 20px" in healthy_body, (
     f"健康卡 padding 应为 9px 20px, 实际: {healthy_body!r}")
 
-# dhead 居中 + margin-bottom:0 + flex-wrap + row-gap 4
-assert "justify-content: center" in dhead_body, "dhead 须居中"
+# dhead 左对齐 (v1.9.5 起, 用户反馈居中不符合阅读习惯) + margin-bottom:0
+# + flex-wrap + row-gap 4 + line-height 1.4
+assert "justify-content: center" not in dhead_body, (
+    f"健康卡 dhead 不应再居中 (v1.9.5 改回左对齐), 实际: {dhead_body!r}")
+assert "justify-content" not in dhead_body, (
+    f"健康卡 dhead 不应含 justify-content 覆写 (默认 flex-start 左对齐), 实际: {dhead_body!r}")
 assert "margin-bottom: 0" in dhead_body, "dhead margin-bottom 须为 0 (无第二行空白)"
 assert "row-gap: 4px" in dhead_body, f"dhead row-gap 应为 4px, 实际: {dhead_body!r}"
 assert "line-height: 1.4" in dhead_body, "dhead 须 line-height: 1.4 紧凑"
@@ -166,10 +172,10 @@ assert 'class="diagnosis healthy"' not in html, (
 assert "主要问题" in html, "问题诊断卡标题保留"
 
 
-print("OK v1.9.4 排版同类问题修复 6 项")
+print("OK v1.9.4/v1.9.5 排版修复 6 项")
 print("  - 健康卡 .diagnosis.healthy 紧凑化 (padding 14→9, row-gap 6→4, line-height 1.4)")
+print("  - 健康卡 dhead 左对齐 (v1.9.5 去 justify-content 覆写, 默认 flex-start)")
 print("  - .hero .sub 长文字单行 + ellipsis (避免换行成两行)")
 print("  - .todo.ok .impact 补绿底 (消除 '所有核心检测通过' 空白观感)")
 print("  - 问题诊断卡 dhead 左对齐 (margin-bottom 12px) 未被误伤")
-print("  - 全绿场景渲染 .todo ok 分支含 .impact 行")
-print("  - 有问题场景走 .diagnosis (非 healthy) 基线正确")
+print("  - 全绿/有问题场景渲染分支 (todo ok / .diagnosis) 基线正确")
