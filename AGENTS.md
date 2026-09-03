@@ -82,9 +82,12 @@
 
 ```bash
 for f in tests/test_*.py; do python "$f"; done
-#   单元/回归套件 (v1.8.1 起入仓, 14 文件 / 330 用例): parsers/diagnosis/
-#   诊断矩阵/丢包口径/XSS 转义/pcap 分析与取证/probes/redaction/场景菜单/盯障统计/v1.9.4 排版同类修复
-python _smoke_report.py          # 192 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项
+#   单元/回归套件 (17 文件 / 364 用例): parsers/diagnosis/诊断矩阵/丢包口径/
+#   XSS 转义/pcap 分析与取证/probes/redaction/场景菜单/盯障统计/
+#   scapy 懒加载 (v1.9.7 PR-2)/自提权重启 (v1.9.7 PR-3)
+#   注意: 壳环境 `python` 可能指向未装 scapy 的解释器 → test_pcap_capture
+#   模块级 proto=TCP NameError; 用装了 scapy 的系统 Python 跑
+python _smoke_report.py          # 238 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项
 ```
 
 `tests/fixtures/windows/` 为**脱敏** fixture（MAC 用 02/06 本地管理前缀、IPv6 用
@@ -100,6 +103,16 @@ RFC 3849 文档前缀、假 hostname/GUID）；真实抓包或含隐私的本地
 - 事件定位：网关段 `internal`；外网段按段窗口内网关状态分 `both_down`（网关同时丢包 ≥2 次）/ `carrier` / `unknown`；与本**流** `outage` 段重叠不重复报（跨流是独立证据，不互相吞段）
 - 结论矩阵：`jitter_burst` 优先级高于 `latency_spike`，verdict=`degraded`
 - 阈值常量在 `MonitorSession`：`JITTER_WINDOW_S=60 / JITTER_STEP_S=10（触发窗口合并间隔）/ MIN_JITTER_LOSS=3 / MIN_JITTER_PCT=10.0 / MIN_JITTER_SAMPLES=10`
+
+## scapy 懒加载契约 (v1.9.7 PR-2)
+
+- 顶层 `import scapy` 已移除：模块级只有占位符（`Ether/TCP/conf/... = None`），
+  实际导入走 `_load_scapy()`（main() 开 daemon 线程预加载）
+- **任何直接引用 scapy 裸名的函数，入口必须先 `_ensure_scapy()`**，否则拿到
+  占位符 None；`SCAPY_AVAILABLE` 判定也要放在 `_ensure_scapy()` 之后
+- 测试里 mock `netpulse.conf` / `netpulse.get_if_list` 前必须先 `N._ensure_scapy()`
+  （否则函数入口触发的 `_load_scapy()` 会把真实对象写回 globals 覆盖 mock，
+  参考 `tests/test_pcap_capture.py` 头部注释）
 
 ## 其它
 

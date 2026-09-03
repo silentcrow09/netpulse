@@ -15,6 +15,11 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import netpulse as N  # noqa: E402
 
+# v1.9.7 PR-2 (scapy 懒加载) 契约: 任何 mock netpulse.conf / netpulse.get_if_list
+# 的测试必须在打补丁前先完成 scapy 绑定 — 否则函数入口 _ensure_scapy() 触发的
+# _load_scapy() 会把真实对象写回 globals, 覆盖 mock。
+N._ensure_scapy()
+
 try:
     from scapy.all import Ether, IP, TCP, UDP, ICMP, Raw, wrpcap, rdpcap
     SCAPY_OK = True

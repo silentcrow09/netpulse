@@ -47,14 +47,69 @@ import asyncio
 import webbrowser
 
 # 可选依赖 — 缺失时自动降级
-try:
-    from scapy.all import (
-        Ether, IP, UDP, TCP, DNS, DHCP, BOOTP, ICMP, ARP,
-        srp, sendp, sniff, conf, sr1, get_if_list, get_if_addr, get_if_hwaddr
-    )
-    SCAPY_AVAILABLE = True
-except Exception:
-    SCAPY_AVAILABLE = False
+#
+# v1.9.7 PR-2 (scapy 懒加载): scapy.all 导入在实机占 0.6-1.5s (含 cryptography
+# 缺失探测与 manufdb 解析), 是「双击启动到菜单 5-6s」的主要组成之一。改为
+# 占位符 + 后台预加载: main() 一进来就开 daemon 线程导 scapy, 菜单先渲染;
+# 任何用到 scapy 的函数入口先 _ensure_scapy() 等预加载收尾 (通常菜单渲染时
+# 已加载完, 用户选完模块零等待)。名字绑定用 _load_scapy() 统一写入模块
+# globals, 与 ensure_scapy() 安装后的 _reload_scapy() 复用同一条路径。
+# 注意: SCAPY_AVAILABLE 在预加载完成前为 False, 判定前必须先 _ensure_scapy()。
+SCAPY_AVAILABLE = False  # True = scapy 已导入并绑定到下方名字
+SCAPY_LOADED = threading.Event()  # 名字绑定完成信号 (成功或失败都会置位)
+
+Ether = IP = UDP = TCP = DNS = DHCP = BOOTP = ICMP = ARP = None
+srp = sendp = sniff = conf = sr1 = None
+get_if_list = get_if_addr = get_if_hwaddr = None
+
+_scapy_thread = None  # 后台预加载线程 (main() 启动; 测试可手动触发)
+
+
+def _load_scapy():
+    """导入 scapy.all 并把名字绑定到模块 globals。返回是否成功。
+
+    供后台预加载线程 / ensure_scapy 安装后的 _reload_scapy 复用。
+    成败都会置位 SCAPY_LOADED (Event), 让等待方不再空等。
+    """
+    global SCAPY_AVAILABLE, Ether, IP, UDP, TCP, DNS, DHCP, BOOTP, ICMP, ARP
+    global srp, sendp, sniff, conf, sr1, get_if_list, get_if_addr, get_if_hwaddr
+    try:
+        from scapy.all import (
+            Ether, IP, UDP, TCP, DNS, DHCP, BOOTP, ICMP, ARP,
+            srp, sendp, sniff, conf, sr1, get_if_list, get_if_addr, get_if_hwaddr
+        )
+        SCAPY_AVAILABLE = True
+    except Exception:
+        SCAPY_AVAILABLE = False
+    finally:
+        SCAPY_LOADED.set()
+    return SCAPY_AVAILABLE
+
+
+def _ensure_scapy(timeout=20):
+    """确保 scapy 已导入 (等后台预加载收尾, 未启动过则同步加载一次)。
+
+    返回 SCAPY_AVAILABLE。所有直接引用 scapy 裸名 (Ether/TCP/conf/...)
+    的函数入口必须先调用本函数, 否则会拿到占位符 None。
+    """
+    if not SCAPY_LOADED.is_set():
+        t = _scapy_thread
+        if t is not None and t.is_alive():
+            t.join(timeout)
+        if not SCAPY_LOADED.is_set():
+            _load_scapy()
+    return SCAPY_AVAILABLE
+
+
+def _start_scapy_preload():
+    """启动后台预加载线程 (main() 入口调用一次; 重复调用幂等)。"""
+    global _scapy_thread
+    if FORCE_NO_SCAPY or SCAPY_LOADED.is_set():
+        return
+    if _scapy_thread is None or not _scapy_thread.is_alive():
+        _scapy_thread = threading.Thread(
+            target=_load_scapy, name="scapy-preload", daemon=True)
+        _scapy_thread.start()
 
 # 强制禁用 scapy 二层抓包 (某些机器 Npcap 不稳定会段错误): 置 True 后 DHCP 走 ipconfig 降级
 FORCE_NO_SCAPY = False
@@ -140,6 +195,113 @@ def _is_admin():
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
     except Exception:
         return False
+
+
+# ============================================================
+# 自提权重启 (v1.9.7 PR-3)
+# ============================================================
+# 解决「普通权限启动 → 发现需要管理员 → 手动关闭 → 右键管理员运行」的断档。
+# 设计取舍:
+#  - manifest 保持 asInvoker (双击不弹 UAC): 大多数诊断不需要管理员,
+#    每次启动都提权是 UAC 疲劳 + 普通用户会吓到。
+#  - 需要管理员的功能点 (Npcap 安装 / 抓包取证 / 菜单 [A]) 一键自提权:
+#    ShellExecuteW("runas") 弹 UAC, 新窗口以管理员运行并接续当前意图,
+#    旧窗口 sys.exit(0) 退出。
+#  - 提权重启优先经 Windows Terminal 启动: 提权后默认开的是新 conhost
+#    实例 (黑底默认样式), 与用户配好的 WT 主题不一致; 显式走 wt.exe
+#    可让两种权限下窗口样式统一。wt 不可用时回退直接启动 exe。
+
+
+def _find_windows_terminal():
+    """定位 Windows Terminal (wt.exe)。返回路径或 None。
+
+    wt.exe 是 Store 应用执行别名, 在 PATH (%LOCALAPPDATA%\\Microsoft\\
+    WindowsApps) 里; shutil.which 覆盖该目录。
+    """
+    try:
+        return shutil.which("wt.exe") or shutil.which("wt")
+    except Exception:
+        return None
+
+
+def _self_exe_path():
+    """本程序可执行文件绝对路径 (frozen: sys.executable; 源码跑: python + 脚本)。"""
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    return sys.argv[0] if os.path.isabs(sys.argv[0]) else \
+        os.path.abspath(sys.argv[0])
+
+
+def _build_elevated_launch(args_tail=None, workdir=None):
+    """构造提权启动参数 (纯函数, 便于测试)。返回 (lp_file, lp_params)。
+
+    直接对应 ShellExecuteW(None, "runas", lp_file, lp_params, ...):
+      - wt 可用: lp_file=wt.exe, lp_params='-d "<workdir>" "<exe>" <tail>'
+        (WT 会用用户默认 profile 渲染, 样式与普通权限一致)
+      - 无 wt: frozen 时 lp_file=本 exe; 源码运行 lp_file=python.exe
+    - args_tail 里含空格的项自动加引号 (路径类参数)
+    - 源码运行 (非 frozen): 用 python.exe 启动脚本, 不依赖文件关联
+    """
+    args_tail = [str(a) for a in (args_tail or [])]
+    tail = " ".join(f'"{a}"' if (" " in a and not (a.startswith('"') and a.endswith('"')))
+                    else a for a in args_tail)
+    exe = _self_exe_path()
+    if getattr(sys, "frozen", False):
+        lp_file, lp_params = exe, tail
+    else:
+        lp_file = sys.executable
+        lp_params = f'"{exe}"' + (f" {tail}" if tail else "")
+    wt = _find_windows_terminal()
+    if wt:
+        wd = workdir or os.getcwd()
+        inner = lp_params if not getattr(sys, "frozen", False) \
+            else f'"{lp_file}"' + (f" {lp_params}" if lp_params else "")
+        return wt, f'-d "{wd}" {inner}'
+    return lp_file, lp_params
+
+
+def _relaunch_elevated(args_tail=None):
+    """以管理员身份重启本程序 (UAC 由 ShellExecuteW 弹出)。
+
+    返回 (ok, msg): ok=True 表示已成功发起提权启动, 调用方应尽快
+    sys.exit(0) 让位; ok=False 表示用户取消或系统拒绝, msg 给提示文案。
+    """
+    try:
+        lp_file, lp_params = _build_elevated_launch(args_tail)
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", lp_file, lp_params, None, 1)  # SW_SHOWNORMAL
+        if ret > 32:
+            return True, "已发起管理员权限启动"
+        return False, (f"Windows 拒绝提权 (ShellExecuteW 返回 {ret}): "
+                       "用户取消 UAC 或策略禁止; 可右键\"以管理员身份运行\"重试")
+    except Exception as e:
+        return False, f"提权重启失败: {e} (可右键\"以管理员身份运行\"重试)"
+
+
+def _offer_elevation_relaunch(args_tail=None, reason="", input_fn=None):
+    """提示并 (确认后) 以管理员身份重启。成功重启 → sys.exit(0)。
+
+    reason: 一句话说明为什么要管理员 (会展示给用户)。
+    用户取消 / 提权失败: 打印降级提示后正常返回, 不打断当前流程。
+    """
+    if not sys.stdin.isatty():
+        return  # 非交互 (脚本/管道): 只静默跳过, CLI 用户自己控制提权
+    input_fn = input_fn or input
+    print()
+    print(_c(f"  ⚠ {reason}", C_YELLOW))
+    try:
+        ans = input_fn(_c("  以管理员身份重启 NetPulse 继续? [y/N] ", C_GREEN)).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if ans not in ("y", "yes"):
+        print(_c("  已跳过。当前窗口继续以普通权限运行。", C_GRAY))
+        return
+    ok, msg = _relaunch_elevated(args_tail)
+    if ok:
+        print(_c("  ✓ UAC 确认后将打开新的管理员窗口, 本窗口即将退出...", C_GREEN))
+        sys.exit(0)
+    print(_c(f"  ✘ {msg}", C_YELLOW))
 
 
 def _is_broadcast_or_reserved_ip(ip):
@@ -2991,7 +3153,11 @@ def _download_file(url, dest, timeout=180):
 
 
 def _install_npcap():
-    """下载并以静默方式安装 Npcap (需管理员权限)。返回 (ok, msg)。"""
+    """下载并以静默方式安装 Npcap (需管理员权限)。返回 (ok, msg)。
+
+    v1.9.7 PR-3: 保留管理员守卫 (函数语义不变)。交互路径的「一键提权重启」
+    在调用方 ensure_scapy 的失败分支里做 (_offer_elevation_relaunch)。
+    """
     if _npcap_installed():
         return True, "Npcap 已安装"
     if not _is_admin():
@@ -3009,6 +3175,27 @@ def _install_npcap():
         return True, "Npcap 安装完成 (可能需要重启后生效)"
     except Exception as e:
         return False, f"Npcap 安装异常: {e}"
+
+
+def _run_install_npcap_entry():
+    """--install-npcap CLI 入口 (v1.9.7 PR-3): 装驱动 → 回菜单。
+
+    自提权重启的落点: 管理员窗口里装完 Npcap 后不退出, 继续进交互菜单
+    (提权窗口保持可用)。非管理员调用只提示不安装 (正常路径不会走到 —
+    提议方会先 _offer_elevation_relaunch)。
+    """
+    if _npcap_installed():
+        print(_c("  ✓ Npcap 已安装, 无需重复安装", C_GREEN))
+        return
+    if not _is_admin():
+        print(_c("  ✘ --install-npcap 需要管理员权限 (请以管理员身份运行)", C_RED))
+        return
+    print(_c("  正在安装 Npcap 抓包驱动...", C_GRAY))
+    ok, msg = _install_npcap()
+    if ok:
+        print(_c(f"  ✓ {msg}", C_GREEN))
+    else:
+        print(_c(f"  ✗ Npcap 安装失败: {msg.splitlines()[0]}", C_RED))
 
 
 def _download_iperf3(target_dir=None):
@@ -3148,19 +3335,12 @@ def _find_ookla_speedtest():
 
 
 def _reload_scapy():
-    """运行时重新导入 scapy 并绑定到模块命名空间。返回是否成功。"""
-    global SCAPY_AVAILABLE, Ether, IP, UDP, DHCP, BOOTP, ICMP, ARP
-    global srp, sendp, sniff, conf, sr1, get_if_list, get_if_addr, get_if_hwaddr
-    try:
-        from scapy.all import (
-            Ether, IP, UDP, DHCP, BOOTP, ICMP, ARP,
-            srp, sendp, sniff, conf, sr1, get_if_list, get_if_addr, get_if_hwaddr
-        )
-        SCAPY_AVAILABLE = True
-        return True
-    except Exception:
-        SCAPY_AVAILABLE = False
-        return False
+    """运行时重新导入 scapy 并绑定到模块命名空间。返回是否成功。
+
+    v1.9.7 PR-2: 与启动预加载共用 _load_scapy (名字清单含 TCP/DNS,
+    旧版手工列 globals 漏了这两个 — 安装重载路径与启动路径必须同源)。
+    """
+    return _load_scapy()
 
 
 def ensure_scapy(auto_yes=False, mirror=None):
@@ -3176,6 +3356,9 @@ def ensure_scapy(auto_yes=False, mirror=None):
       --install 总是能覆盖拒绝状态。
     """
     global SCAPY_OFFER_STATE
+    # v1.9.7 PR-2: 先等后台预加载收尾 — 否则加载中途 SCAPY_AVAILABLE 仍为
+    # False, 会被误判成「未安装」而走进安装询问
+    _ensure_scapy()
     if FORCE_NO_SCAPY:
         return False
     if SCAPY_AVAILABLE:
@@ -3241,6 +3424,12 @@ def ensure_scapy(auto_yes=False, mirror=None):
             else:
                 print(_c("  ⚠ Npcap: " + msg2, C_YELLOW))
                 print(_c("    scapy 已装好，但二层收发仍需 Npcap 才能做完整 DHCP 检测。", C_GRAY))
+                # v1.9.7 PR-3: 非管理员时提供一键提权重启 (装完 Npcap 回菜单),
+                # 替代旧的「关闭 → 右键管理员运行」手工断档
+                if not _is_admin():
+                    _offer_elevation_relaunch(
+                        ["--install-npcap"],
+                        reason="安装 Npcap 抓包驱动需要管理员权限")
 
     return SCAPY_AVAILABLE
 
@@ -3250,7 +3439,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.9.6"
+APP_VERSION = "1.9.7"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -4628,6 +4817,7 @@ class DHCPDetector:
     def detect_scapy(self, timeout=10):
         """使用 scapy 发送 DHCP Discover 并捕获 Offer"""
         servers = []
+        _ensure_scapy()
         if not SCAPY_AVAILABLE:
             return servers, "scapy 未安装 (需要 Npcap)"
 
@@ -11765,12 +11955,16 @@ def _write_capture_ack(ack):
         pass                           # 标记写不进 (只读目录): 下次再问一次
 
 
-def _prompt_for_capture(input_fn=None):
+def _prompt_for_capture(input_fn=None, resume_tail=None):
     """盯障前的抓包取证询问 (v1.9.6 菜单入口, 设计稿 §4 图 A/B)。
 
     装维不加参数原则: --capture 的菜单入口。先跑 precheck 亮状态 —
     可用 → 出 y/f/s 选择 (Enter=不开启, 与 CLI 默认关闭一致);
     不可用 → 只显客户语言原因 + 回车继续, 不出「选了也白选」的选择题。
+
+    v1.9.7 PR-3: 不可用若仅因缺管理员权限 (Npcap 已就绪), 先出
+    「以管理员身份重启并继续盯障」一键提议 — resume_tail 是重启后接续
+    盯障的 CLI 参数 (如 ["--monitor", "10"]), 提权成功 → sys.exit(0)。
 
     返回 (capture_mode, capture_mb): mode 为 None / "slice" / "full"。
     非 TTY (脚本/管道) 直接返回 (None, 默认), 不打断 — 与 _capture_confirm_once
@@ -11783,6 +11977,10 @@ def _prompt_for_capture(input_fn=None):
     cap = _PcapCaptureSession("slice", CAPTURE_DEFAULT_MB)
     if not cap.precheck():
         print(_c(f"  ✘ 抓包暂不可用: {cap.unavailable_reason}", C_YELLOW))
+        # v1.9.7 PR-3: 只缺管理员权限时, 别让用户手动关闭重开 — 一键提权接续
+        if not _is_admin() and _npcap_installed():
+            _offer_elevation_relaunch(
+                resume_tail, reason="抓包取证需要管理员权限 (Npcap 已就绪)")
         print(_c("     本次仅统计层盯障 (掉线/抖动统计不受影响)。", C_GRAY))
         try:
             input_fn(_c("  按 Enter 继续...", C_GRAY))
@@ -11881,6 +12079,7 @@ def _capture_default_iface():
     """默认路由出口接口名。scapy 2.7 的 route() 返回 (iface, gw, dst) —
     取 [2] 会拿到网关 IP 当接口名, 嗅探线程静默死掉一颗包都抓不到 (实机
     踩过)。route[0] 不在接口清单里时回退 conf.iface; 全失败返回 None。"""
+    _ensure_scapy()
     try:
         ifc = conf.route.route("0.0.0.0")[0]
         if ifc and ifc in (get_if_list() or []):
@@ -11906,6 +12105,7 @@ def _capture_strip_packet(pkt, flow_state):
     (sport,dport) 与反方向 (dport,sport) 是两个 key), O(1)。
     只做头长算术, 不触 scapy 字段访问 (prn 零工作原则)。
     """
+    _ensure_scapy()
     if not isinstance(pkt, Ether):
         return pkt                     # 非 Ethernet 链路 (loopback 等): 原样保留
     raw = bytes(pkt)
@@ -11995,6 +12195,7 @@ class _PcapCaptureSession:
 
     # ── 检查链: --no-scapy → scapy/Npcap → 管理员 → 出口接口 ──
     def precheck(self):
+        _ensure_scapy()
         if FORCE_NO_SCAPY or not SCAPY_AVAILABLE:
             self.unavailable_reason = ("scapy 被禁用 (--no-scapy 或未安装 scapy), "
                                        "抓包不可用 — 统计层不受影响")
@@ -12244,6 +12445,7 @@ class PcapAnalyzer:
     # ---- 对外入口 --------------------------------------------------
     def analyze(self, src) -> CaptureDiagnostic:
         """src: scapy 包列表, 或 pcap 文件路径 (rdpcap 读取)。"""
+        _ensure_scapy()
         if not SCAPY_AVAILABLE:
             raise RuntimeError("scapy 不可用, 无法分析抓包")
         pkts = src
@@ -12446,6 +12648,7 @@ class PcapAnalyzer:
 
     @staticmethod
     def _dns_track(d, pending, ip, u, ts):
+        _ensure_scapy()
         dns = u.payload
         if not isinstance(dns, DNS):
             return
@@ -18030,7 +18233,9 @@ def _run_scene_monitor(install=False, pip_mirror=None):
     minutes = max(1, min(1440, minutes))
     # 抓包取证菜单入口 (v1.9.6): 时长问完问一次, Enter=不开启 (与 CLI 默认一致)。
     # 不可用 (非管理员/无 Npcap) 时函数内部亮原因后直接返回 None, 不出选择题。
-    capture_mode, capture_mb = _prompt_for_capture()
+    # v1.9.7 PR-3: 传盯障接续参数 — 仅缺管理员权限时可一键提权重启并直接续盯
+    capture_mode, capture_mb = _prompt_for_capture(
+        resume_tail=["--monitor", str(minutes)])
     print(_c(f"  开始盯障 {minutes} 分钟（{minutes*60} 秒）... Ctrl+C 可提前结束", C_BOLD))
     try:
         run_monitor_mode(minutes * 60, capture_mode=capture_mode,
@@ -18117,16 +18322,23 @@ def _menu_clear():
             pass
 
 
+def _perm_badge():
+    """菜单标题权限徽标 (v1.9.7 PR-3): 让用户开屏就知道当前权限状态。"""
+    return _c("    [管理员模式]" if _is_admin() else "    [普通权限]", C_GRAY)
+
+
 def _scene_menu(install=False, pip_mirror=None):
     """场景层首页 (PR-A · v1.6.0): 中文场景标签 + 数字回车。
 
     返回 False = 退出程序 ([0] 退出 / [9] 高级页里退出 / Ctrl+C)。
+    v1.9.7 PR-3: 标题权限徽标 + [A] 一键以管理员身份重启。
     """
     while True:
         _menu_clear()
         bar = "=" * 60
         print(_c(bar, C_BLUE))
-        print(_c(f"  {APP_NAME} v{APP_VERSION}    网络诊断（场景模式）", C_BOLD))
+        print(_c(f"  {APP_NAME} v{APP_VERSION}    网络诊断（场景模式）", C_BOLD)
+              + _perm_badge())
         print(_c(bar, C_BLUE))
         print(_c("  请选择场景（输入数字回车）：", C_WHITE))
         print()
@@ -18134,15 +18346,23 @@ def _scene_menu(install=False, pip_mirror=None):
         print(f"    {_c('[4]', C_CYAN)} 游戏卡顿        {_c('[5]', C_CYAN)} WiFi 信号差")
         print()
         print(f"    {_c('[7]', C_CYAN)} 持续盯障（输入分钟数）")
-        print(f"    {_c('[9]', C_CYAN)} 高级选项（工程师用）   {_c('[0]', C_CYAN)} 退出")
+        print(f"    {_c('[9]', C_CYAN)} 高级选项（工程师用）   "
+              f"{_c('[A]', C_CYAN)} 管理员模式   {_c('[0]', C_CYAN)} 退出")
+        print(_c("     (管理员模式 = 以管理员身份重启, 抓包取证/Npcap 安装需要)", C_GRAY))
         print(_c("-" * 60, C_GRAY))
         try:
-            choice = input(_c("  选择 [0-9]: ", C_GREEN)).strip().lower()
+            choice = input(_c("  选择 [0-9A]: ", C_GREEN)).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return False
         if choice in ("0", "q", "quit", "exit"):
             return False
+        if choice == "a":
+            # 一键提权重启: 提权成功 → sys.exit(0) (不会走到这里); 失败/取消
+            # → 落回菜单继续 (不藏退路)
+            _offer_elevation_relaunch(
+                reason="抓包取证、Npcap 安装等功能需要管理员权限")
+            continue
         if choice == "9":
             # 高级页 (原模块清单菜单) 里退出 → 整个程序退出
             if not _module_menu(install=install, pip_mirror=pip_mirror):
@@ -18201,7 +18421,8 @@ def _module_menu(install=False, pip_mirror=None):
         _menu_clear()
         bar = "=" * 60
         print(_c(bar, C_BLUE))
-        print(_c(f"  {APP_NAME} v{APP_VERSION}    命令行网络诊断", C_BOLD))
+        print(_c(f"  {APP_NAME} v{APP_VERSION}    命令行网络诊断", C_BOLD)
+              + _perm_badge())
         print(_c(bar, C_BLUE))
         print(_c("  工程师模式 (模块级诊断)。运行完成后可返回场景模式主菜单。", C_WHITE))
         idx = 0
@@ -18400,6 +18621,8 @@ def _module_menu(install=False, pip_mirror=None):
 
 
 def main():
+    # v1.9.7 PR-2: scapy 后台预加载 — 越早开线程, 菜单渲染完时越可能已加载完
+    _start_scapy_preload()
     parser = argparse.ArgumentParser(
         prog="netpulse.py",
         description=f"{APP_NAME} v{APP_VERSION} — Windows 网络诊断工具 (命令行)")
@@ -18431,6 +18654,9 @@ def main():
                              "用于上报 bug 或远端排障. 例: --debug-bundle ./out")
     parser.add_argument("--install", action="store_true",
                         help="自动安装缺失依赖 (scapy/Npcap), 无需交互确认")
+    parser.add_argument("--install-npcap", action="store_true",
+                        help="仅安装 Npcap 抓包驱动后进入菜单 (v1.9.7 PR-3; "
+                             "自提权重启的落点 — 需管理员权限, 普通权限下仅提示)")
     parser.add_argument("--no-scapy", action="store_true",
                         help="禁用 scapy 二层抓包 (部分机器 Npcap 不稳定会崩溃), "
                              "DHCP 检测降级为仅读取当前 DHCP 服务器")
@@ -18607,6 +18833,11 @@ def main():
     if args.debug_bundle:
         _export_debug_bundle(args.debug_bundle)
         return
+    # v1.9.7 PR-3: --install-npcap 自提权重启的落点 — 装完不退出,
+    # 直接进菜单 (提权窗口保持可用, 用户接着做需要管理员的事)
+    if args.install_npcap:
+        _run_install_npcap_entry()
+        # 不 return: 继续走到底部的交互菜单
     # 按场景 Profile 诊断 (阶段 C · v1.3.0 引入): 跑 profile 模块后追加根因分析
     if args.diagnose:
         profile = args.diagnose

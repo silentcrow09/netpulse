@@ -151,14 +151,19 @@ Step-Start 4 6 "打包 EXE (单文件, 通常 30-90 秒)"
 
 # 关键: --log-level WARN 把 INFO 压到日志, 详细输出走 build_last.log, 失败时回显
 # --noconfirm 避免覆盖 dist 时询问
+# v1.9.7 PR-1 打包瘦身 (与 NetPulse.spec 同步):
+#  - 不再 --add-data netpulse.py (源码已冻结进 PYZ, 此前重复 ~0.7MB)
+#  - 删 tkinter hiddenimport (零使用)
+#  - --exclude-module cryptography + tkinter (scapy TLS 自动降级, 已实测)
+#  - 不启用 UPX (解压反向拖慢启动 + 杀软误报)
 $piArgs = @(
     '--onefile', '--console', '--noconfirm',
     '--name', 'NetPulse',
-    '--add-data', 'netpulse.py;.',
     '--add-data', 'speedtest/speedtest.exe;speedtest',
-    '--hidden-import', 'tkinter',
     '--hidden-import', 'scapy.all',
     '--collect-all', 'scapy',
+    '--exclude-module', 'cryptography',
+    '--exclude-module', 'tkinter',
     '--log-level', 'WARN',
     'netpulse.py'
 )

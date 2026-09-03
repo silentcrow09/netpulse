@@ -7,6 +7,57 @@
 
 ## [Unreleased]
 
+## [1.9.7] - 2026-09-03
+
+启动性能与提权体验专项。双击启动到菜单 5-6s → 实测 warm 2.6-3.2s（瘦身后
+exe 25.9→18.6MB，scapy 延迟到菜单渲染后加载）；「发现需要管理员 → 手动关闭 →
+右键管理员运行」的手工断档改为一键自提权重启。诊断逻辑零变更。
+
+### 新增（PR-2 · scapy 懒加载）
+
+- 顶层 `import scapy` 改为占位符 + `_load_scapy()`：`main()` 一进来就开 daemon
+  线程预加载，菜单先渲染；5 个直接使用 scapy 裸名的函数（`DHCPDetector.detect_scapy`
+  / `_capture_default_iface` / `_capture_strip_packet` / `PcapAnalyzer.analyze`
+  / `_dns_track`）入口统一 `_ensure_scapy()` 收尾——选到二层模块时通常已加载完，
+  零等待
+- `ensure_scapy()` 入口先等预加载收尾（防加载中途被误判「未安装」走进安装询问）；
+  `_reload_scapy()` 与启动路径同源（旧版手工列 globals 漏绑 TCP/DNS，顺手修复）
+- 长期约定入 AGENTS.md：引用 scapy 裸名的函数入口必须先 `_ensure_scapy()`；
+  测试 mock `netpulse.conf` 前先完成绑定
+
+### 新增（PR-3 · 自提权重启）
+
+- `_relaunch_elevated()` / `_offer_elevation_relaunch()`：`ShellExecuteW("runas")`
+  自提权，UAC 确认后新管理员窗口接续当前意图，旧窗口退出；提权失败/用户取消
+  打印降级提示后继续原流程（不藏退路）
+- **提权窗口优先经 Windows Terminal 启动**（`wt.exe -d <目录>`）：提权后默认
+  conhost 的黑底默认样式与用户配好的 WT 主题不一致，显式走 wt 可让两种权限
+  下窗口样式统一；wt 不可用回退直接启动
+- 三个提权入口：场景菜单新增 `[A] 管理员模式`；Npcap 安装失败分支
+  （提权重启后走新 `--install-npcap` 落点，装完不退出直接回菜单）；盯障抓包
+  不可用且仅缺管理员权限时（`_prompt_for_capture` 传 `--monitor N` 接续参数，
+  提权窗口直接续盯）
+- 两个菜单标题加权限徽标（`[管理员模式]` / `[普通权限]`），开屏即可见
+
+### 变更（PR-1 · 打包瘦身）
+
+- `NetPulse.spec` / `build_exe.ps1`：
+  - `excludes = ['cryptography', 'tkinter']`——cryptography 仅 scapy TLS 层需要
+    （NetPulse 只用 ARP/DHCP/DNS/ICMP/TCP，scapy 对缺失自动降级，frozen 实测
+    `scapy.all` 导入 1.11s→0.64s）；tkinter 此前在 hiddenimports 白拖 ~3MB
+  - datas 移除重复打包的 `netpulse.py` 源码（Analysis 已冻结进 PYZ）
+  - 关闭 UPX（解压发生在每次启动反向拖慢 onefile；且是 Defender/SmartScreen
+    误报大户，拉长冷启动扫描）
+- 效果：exe 25.9→18.6MB；warm 启动实测 3.4s→2.6-3.2s（PR-2 后菜单渲染更早）
+
+### 测试
+
+- 新增 `tests/test_scapy_lazy.py`（8 例）：懒加载语义/幂等/占位符约定/
+  `_reload_scapy` 同源
+- 新增 `tests/test_elevation.py`（13 例）：提权启动参数构造（wt 有无/引号）/
+  ShellExecuteW 分支/确认交互/`--install-npcap` 落点/场景菜单 `[A]` 键
+- 全套 17 文件 364 用例全绿；`_smoke_report.py` 238 项断言全绿
+
 ## [1.9.6] - 2026-09-03
 
 交互菜单补口（设计稿 `design/menu-entry-plan.html`，审计结论：34 个 CLI 参数位中
