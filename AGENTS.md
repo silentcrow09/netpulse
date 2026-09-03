@@ -82,9 +82,10 @@
 
 ```bash
 for f in tests/test_*.py; do python "$f"; done
-#   单元/回归套件 (17 文件 / 364 用例): parsers/diagnosis/诊断矩阵/丢包口径/
+#   单元/回归套件 (17 文件 / 378 用例): parsers/diagnosis/诊断矩阵/丢包口径/
 #   XSS 转义/pcap 分析与取证/probes/redaction/场景菜单/盯障统计/
-#   scapy 懒加载 (v1.9.7 PR-2)/自提权重启 (v1.9.7 PR-3)
+#   scapy 懒加载 (v1.9.7 PR-2)/自提权重启 (v1.9.7 PR-3)/管理员修复命令一键执行
+#   (v1.9.8)
 #   注意: 壳环境 `python` 可能指向未装 scapy 的解释器 → test_pcap_capture
 #   模块级 proto=TCP NameError; 用装了 scapy 的系统 Python 跑
 python _smoke_report.py          # 238 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项

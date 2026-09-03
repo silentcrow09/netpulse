@@ -304,6 +304,88 @@ def _offer_elevation_relaunch(args_tail=None, reason="", input_fn=None):
     print(_c(f"  ✘ {msg}", C_YELLOW))
 
 
+# ============================================================
+# 修复命令一键执行 (v1.9.8 · 遗留项 1)
+# ============================================================
+# 根因建议里带 "(管理员)" 标记的命令 (目前唯一生产者: MTU 黑洞规则的
+# netsh 接口 MTU 修复)。交互式诊断打印完后提供一键执行: UAC 确认后在
+# 独立管理员 cmd 窗口运行 (cmd /k 保持窗口), NetPulse 本身不动系统配置。
+# 只提取、不代写命令 — 命令文本仍来自规则建议, 与报告显示逐字一致。
+
+
+_ADMIN_FIX_RE = re.compile(r"netsh\s+(.+?)\s*\(管理员\)")
+
+
+def _extract_admin_fix_commands(root_causes):
+    """从根因建议里提取带 "(管理员)" 标记的 netsh 命令 (去重保序)。
+
+    只认 "(管理员)" 尾标的命令段 — 这是规则建议的既定格式
+    (参考 _rule_mtu_blackhole), 不做猜测式提取, 避免误执行。
+    返回命令体列表 (不含 "netsh " 前缀, 展示/执行时统一补)。
+    """
+    cmds, seen = [], set()
+    for rc in (root_causes or []):
+        for rec in (getattr(rc, "recommendations", None) or []):
+            m = _ADMIN_FIX_RE.search(str(rec))
+            if not m:
+                continue
+            cmd = m.group(1).strip().rstrip("，,;；")
+            if cmd and cmd not in seen:
+                seen.add(cmd)
+                cmds.append(cmd)
+    return cmds
+
+
+def _offer_admin_fix_shell(commands, input_fn=None):
+    """交互式提议以管理员身份执行修复命令 (cmd /k, 窗口保持可核对)。
+
+    commands: _extract_admin_fix_commands 的结果 (命令体, 无 netsh 前缀)。
+    返回实际发起执行的命令数 (用户跳过/取消 → 0)。
+    非 TTY 直接跳过 (脚本/管道不打断)。
+    """
+    if not commands or not sys.stdin.isatty():
+        return 0
+    input_fn = input_fn or input
+    print()
+    print(_c(f"  ⚠ 发现 {len(commands)} 条管理员修复命令 "
+             f"(将以管理员权限修改系统配置, 改完可复测验证):", C_YELLOW))
+    for i, cmd in enumerate(commands, 1):
+        print(_c(f"    [{i}] netsh {cmd}", C_WHITE))
+    hint = "  输入要执行的序号 (逗号分隔, Enter=跳过): "
+    try:
+        ans = input_fn(_c(hint, C_GREEN)).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    if not ans:
+        return 0
+    picked = []
+    for tok in ans.replace("，", ",").split(","):
+        tok = tok.strip()
+        if tok.isdigit() and 1 <= int(tok) <= len(commands):
+            c = commands[int(tok) - 1]
+            if c not in picked:
+                picked.append(c)
+    launched = 0
+    for cmd in picked:
+        try:
+            # cmd /k: 执行后窗口保持打开, 用户能核对结果/错误码再关闭;
+            # runas: 已是管理员时 UAC 不弹窗, 静默放行
+            ret = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", "cmd.exe", f"/k netsh {cmd}", None, 1)
+            if ret > 32:
+                launched += 1
+            else:
+                print(_c(f"  ✘ [{launched + 1}] Windows 拒绝提权 "
+                         f"(ShellExecuteW 返回 {ret})", C_YELLOW))
+        except Exception as e:
+            print(_c(f"  ✘ 执行发起失败: {e}", C_YELLOW))
+    if launched:
+        print(_c(f"  ✓ 已发起 {launched} 个管理员命令窗口 "
+                 f"(执行完请回到 NetPulse 复测验证)", C_GREEN))
+    return launched
+
+
 def _is_broadcast_or_reserved_ip(ip):
     """判断 IP 是否是广播/组播/保留 (用于 ARP 表多 IP 同 MAC 场景)。
 
@@ -2644,7 +2726,12 @@ def _conf_band(confidence):
 
 
 def _print_diagnosis(diagnosis):
-    """CLI: 格式化打印 DiagnosisReport (根因 + 置信度 + 建议)."""
+    """CLI: 格式化打印 DiagnosisReport (根因 + 置信度 + 建议).
+
+    v1.9.8: 交互 TTY 下, 建议里带 "(管理员)" 标记的修复命令 (如 MTU netsh)
+    打印完提供一键以管理员身份执行 (cmd /k 独立窗口, 可核对结果再关);
+    非 TTY / 用户跳过时零打扰。
+    """
     if not diagnosis.root_causes:
         print(_c(f"  ✓ 根因分析: 未发现故障 "
                  f"(评估 {diagnosis.rules_evaluated} 条规则)", C_GREEN))
@@ -2665,6 +2752,8 @@ def _print_diagnosis(diagnosis):
             for r in rc.recommendations:
                 print(f"        {r}")
         print()
+    # v1.9.8 遗留项 1: 工程师向修复命令不再要求用户手动开管理员窗口
+    _offer_admin_fix_shell(_extract_admin_fix_commands(diagnosis.root_causes))
 
 
 def _build_trouble_ticket_text(report, diagnosis_dict):
@@ -3439,7 +3528,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.9.7"
+APP_VERSION = "1.9.8"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"

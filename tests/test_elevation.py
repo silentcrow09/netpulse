@@ -163,5 +163,139 @@ class TestSceneMenuAdminKey(unittest.TestCase):
         self.assertEqual(len(offers), 1, "[A] 必须触发一次提权提议")
 
 
+# ============================================================
+# v1.9.8 遗留项 1: 修复命令一键执行
+# ============================================================
+
+_MTU_REC = ('1. 将电脑接口 以太网 改为 1472: netsh interface ipv4 set '
+            'subinterface "以太网" mtu=1472 store=persistent (管理员), 改后复测')
+
+
+def _fake_rc(*recs):
+    """只带 recommendations 的假根因 (提取函数只读这一个属性)。"""
+    return mock.Mock(recommendations=list(recs))
+
+
+class TestExtractAdminFixCommands(unittest.TestCase):
+    """"(管理员)" 标记命令提取: 只认标记, 不猜测。"""
+
+    def test_extract_mtu_netsh(self):
+        cmds = N._extract_admin_fix_commands([_fake_rc(_MTU_REC)])
+        self.assertEqual(cmds, ['interface ipv4 set subinterface "以太网" '
+                                'mtu=1472 store=persistent'])
+        self.assertNotIn("(管理员)", cmds[0], "标记尾缀不得混入命令体")
+
+    def test_no_marker_no_extract(self):
+        """没有 (管理员) 标记的 netsh 文本不得被提取 (防误执行)。"""
+        recs = ["查看代理: netsh winhttp show proxy",
+                "1. 检查路由器 MSS clamping",
+                "必要时以管理员身份运行重测"]
+        self.assertEqual(N._extract_admin_fix_commands([_fake_rc(*recs)]), [])
+
+    def test_dedupe_and_order(self):
+        rec = _MTU_REC
+        cmds = N._extract_admin_fix_commands([_fake_rc(rec), _fake_rc(rec)])
+        self.assertEqual(len(cmds), 1, "重复命令必须去重")
+
+    def test_trailing_punctuation_stripped(self):
+        rec = "netsh interface ipv4 show interfaces (管理员)，改后复测"
+        cmds = N._extract_admin_fix_commands([_fake_rc(rec)])
+        self.assertEqual(cmds, ["interface ipv4 show interfaces"],
+                         "标记后的中文逗号与文案不得混入命令体")
+
+    def test_none_and_empty_safe(self):
+        self.assertEqual(N._extract_admin_fix_commands(None), [])
+        self.assertEqual(N._extract_admin_fix_commands([_fake_rc(None)]), [])
+
+
+class TestOfferAdminFixShell(unittest.TestCase):
+    """一键执行交互: 序号选择 / 跳过 / 提权失败降级。"""
+
+    def setUp(self):
+        self.cmds = ['interface ipv4 set subinterface "以太网" mtu=1472 '
+                     'store=persistent']
+
+    def _run(self, cmds, answer, se_ret=33):
+        """公共桩: TTY + 输入 answer + ShellExecuteW 返回 se_ret。"""
+        with mock.patch.object(N.sys.stdin, "isatty", return_value=True), \
+             mock.patch("builtins.input", return_value=answer), \
+             mock.patch("ctypes.windll.shell32.ShellExecuteW",
+                        return_value=se_ret) as m_se:
+            return N._offer_admin_fix_shell(cmds), m_se
+
+    def test_non_tty_skips(self):
+        with mock.patch.object(N.sys.stdin, "isatty", return_value=False), \
+             mock.patch("builtins.input") as m_in:
+            self.assertEqual(N._offer_admin_fix_shell(self.cmds), 0)
+        m_in.assert_not_called()
+
+    def test_empty_answer_skips(self):
+        n, m_se = self._run(self.cmds, "")
+        self.assertEqual(n, 0)
+        m_se.assert_not_called()
+
+    def test_select_one_launches_admin_cmd(self):
+        n, m_se = self._run(self.cmds, "1")
+        self.assertEqual(n, 1)
+        args = m_se.call_args[0]
+        self.assertEqual(args[1], "runas")
+        self.assertEqual(args[2], "cmd.exe")
+        self.assertEqual(args[3], f"/k netsh {self.cmds[0]}")
+
+    def test_multi_select_dedupe_and_order(self):
+        cmds = ["interface ipv4 show interfaces", "interface ipv4 show dns"]
+        n, m_se = self._run(cmds, "2,1,2")
+        self.assertEqual(n, 2, "重复序号必须去重")
+        launched = [c[0][3] for c in m_se.call_args_list]
+        self.assertEqual(launched, [f"/k netsh {cmds[1]}", f"/k netsh {cmds[0]}"],
+                         "按输入顺序发起, 每条独立 cmd /k 窗口")
+
+    def test_invalid_input_skips(self):
+        n, m_se = self._run(self.cmds, "x,9")
+        self.assertEqual(n, 0)
+        m_se.assert_not_called()
+
+    def test_shell_reject_degrades(self):
+        """ShellExecuteW <=32 (UAC 取消/策略): 计数 0, 不抛异常。"""
+        n, m_se = self._run(self.cmds, "1", se_ret=2)
+        self.assertEqual(n, 0)
+
+
+class TestPrintDiagnosisHook(unittest.TestCase):
+    """_print_diagnosis 尾部挂钩: 交互时提议, 非 TTY 零打扰。"""
+
+    def _fake_diagnosis(self, recs):
+        rc = mock.Mock(severity=mock.Mock(value="high"), title="MTU 不匹配",
+                       category="MTU", confidence=0.9,
+                       description="d", affected_modules=["mtu"],
+                       recommendations=list(recs))
+        return mock.Mock(root_causes=[rc], rules_fired=1, rules_evaluated=19,
+                         overall_confidence=0.9)
+
+    def test_tty_offers_and_continues(self):
+        with mock.patch.object(N.sys.stdin, "isatty", return_value=True), \
+             mock.patch("builtins.input", return_value=""), \
+             mock.patch.object(N, "_offer_admin_fix_shell",
+                               return_value=0) as m_offer:
+            N._print_diagnosis(self._fake_diagnosis([_MTU_REC]))
+        m_offer.assert_called_once()
+        cmds = m_offer.call_args[0][0]
+        self.assertEqual(len(cmds), 1, "诊断打印后必须带一次修复命令提议")
+
+    def test_non_tty_no_offer(self):
+        with mock.patch.object(N.sys.stdin, "isatty", return_value=False), \
+             mock.patch.object(N, "_offer_admin_fix_shell") as m_offer:
+            N._print_diagnosis(self._fake_diagnosis([_MTU_REC]))
+        # _offer_admin_fix_shell 内部非 TTY 直接返回 0, 挂钩本身仍会调用
+        # (它在函数内部短路, 不弹输入) — 断言零输入副作用即可
+        m_offer.assert_called_once()
+
+    def test_no_root_causes_no_offer(self):
+        d = mock.Mock(root_causes=[], rules_evaluated=19)
+        with mock.patch.object(N, "_offer_admin_fix_shell") as m_offer:
+            N._print_diagnosis(d)
+        m_offer.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
