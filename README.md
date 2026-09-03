@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.9.8
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.9.9
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -418,6 +418,7 @@ irm https://<bucket>.oss-cn-hangzhou.aliyuncs.com/netpulse/v1-beta/install.ps1 |
 
 ```
 netpulse.py         单文件主程序 (~18900 行)
+_migrate_pcap.py    v1.9.9 旧抓包迁移工具: 修正截断 pcap 的 IP 长度 (Wireshark 复核用)
 build_exe.bat       PyInstaller 打包脚本
 requirements.txt    依赖说明
 tests/              单元/回归测试 (unittest 风格, 逐文件 python tests/test_x.py 运行)

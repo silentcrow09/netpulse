@@ -3528,7 +3528,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.9.8"
+APP_VERSION = "1.9.9"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -12181,6 +12181,40 @@ def _capture_default_iface():
         return None
 
 
+def _patch_ip_lengths(buf, ip_off, ihl, l4_off, proto):
+    """就地修正截断包的 L3/L4 长度字段 + 重算 IPv4 头校验和 (v1.9.9)。
+
+    buf: bytearray, 截断后的完整以太帧字节。
+    修复点:
+      - IP Total Length = len(buf) - ip_off (以太/VLAN 头之外的长度)
+      - UDP 截断 (QUIC): UDP length = len(buf) - l4_off, checksum 置 0
+        (载荷已剥, RFC 768 0 = 未计算, 避免残留伪校验和误导 Wireshark)
+      - IPv4 头校验和: 原 checksum 先清零再 16-bit 反码累加取反
+        (长度字段变了, 原校验和必然失效)
+    不修 TCP checksum (载荷剥除后必不符, Wireshark 默认不校验 TCP CS)。
+    调用方保证 ihl/l4_off 由同一 buf 解析 (纯头算术, 不触 scapy 字段)。
+    """
+    ip_total = len(buf) - ip_off
+    buf[ip_off + 2] = (ip_total >> 8) & 0xFF
+    buf[ip_off + 3] = ip_total & 0xFF
+    if proto == 17:                                # UDP 截断 (QUIC 443)
+        udp_len = len(buf) - l4_off
+        buf[l4_off + 4] = (udp_len >> 8) & 0xFF
+        buf[l4_off + 5] = udp_len & 0xFF
+        buf[l4_off + 6] = 0
+        buf[l4_off + 7] = 0
+    buf[ip_off + 10] = 0
+    buf[ip_off + 11] = 0
+    csum = 0
+    for i in range(ip_off, ip_off + ihl, 2):
+        csum += (buf[i] << 8) | buf[i + 1]
+    while csum >> 16:
+        csum = (csum & 0xFFFF) + (csum >> 16)
+    csum = (~csum) & 0xFFFF
+    buf[ip_off + 10] = (csum >> 8) & 0xFF
+    buf[ip_off + 11] = csum & 0xFF
+
+
 def _capture_strip_packet(pkt, flow_state):
     """剥 payload (PR-F1): 返回可入 ring 的包 (截断后重建, 保留原时间戳)。
 
@@ -12193,6 +12227,8 @@ def _capture_strip_packet(pkt, flow_state):
     flow_state: dict[(sport, dport)] -> 已见包数。key 含方向 (src→dst 的
     (sport,dport) 与反方向 (dport,sport) 是两个 key), O(1)。
     只做头长算术, 不触 scapy 字段访问 (prn 零工作原则)。
+    v1.9.9: 截断后同步改写 IP Total Length / UDP length 并重算 IPv4 校验和,
+    保证落盘 pcap 在 Wireshark 里不产生「长度虚高」类专家误报。
     """
     _ensure_scapy()
     if not isinstance(pkt, Ether):
@@ -12250,7 +12286,14 @@ def _capture_strip_packet(pkt, flow_state):
 
     if keep >= len(raw):
         return pkt
-    trimmed = Ether(raw[:keep])
+    # v1.9.9 (抓包复核 P0): 截断重建后必须同步修正 L3/L4 长度字段, 否则
+    # Wireshark 按「IP 头总长 − 实际字节数」推算每段负载 → 序列空间不连续,
+    # 对成百上千个被截断的包误报 "TCP ACKed lost segment" / "Dup ACK" 等
+    # 专家提示 (实测旧 pcap 61.8% 的包 IP.len 虚高)。
+    # 纯字节操作, 延续本函数「不触 scapy 字段访问」的零工作原则。
+    buf = bytearray(raw[:keep])
+    _patch_ip_lengths(buf, ip_off, ihl, l4_off, proto)
+    trimmed = Ether(bytes(buf))
     trimmed.time = pkt.time            # 截断重建会丢时间戳, 手工带回
     return trimmed
 

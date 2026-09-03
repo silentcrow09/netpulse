@@ -7,6 +7,32 @@
 
 ## [Unreleased]
 
+## [1.9.9] - 2026-09-03
+
+抓包复核 P0：截断 pcap 的 IP 长度字段修正（用户 Wireshark 打开抓包文件满屏
+红底——`TCP ACKed lost segment` / `Dup ACK` 满屏，实测旧文件 61.8% 的包
+IP Total Length 虚高，是截断存储未同步长度字段所致，非网络故障）。
+
+### 修复
+
+- **`_capture_strip_packet` 截断重建时同步修正长度字段**：新抽
+  `_patch_ip_lengths()`——IP Total Length = 实际字节数、UDP 截断（QUIC 443）
+  顺带修正 UDP length 并把校验和置 0（载荷已剥，RFC 768 0=未计算）、重算
+  IPv4 头校验和（长度字段变更后原校验和失效）。纯字节操作，延续零工作原则；
+  不碰 TCP checksum（载荷剥除后必不符，Wireshark 默认不校验）
+- 效果：新抓包在 Wireshark 打开不再有「长度虚高」类专家误报，协议分析
+  红底只剩真实信号（dup-ack / zero-window 等本机后台应用流量）
+- **新增 `_migrate_pcap.py` 旧文件迁移工具**：对 v1.9.8 及更早版本落盘的 pcap
+  就地修正（字节级，不重截断不丢包），输出 `*_fixed.pcap` 供 Wireshark 对照。
+  用法 `python _migrate_pcap.py <输入.pcap> [输出.pcap]`
+
+### 测试
+
+- `tests/test_pcap_capture.py` 36 → 41 例：IP.len 与实际一致 / IP 校验和重算
+  有效 / web 前 2 包 384B 路径同修 / QUIC UDP length+checksum / 写盘重读稳定
+- 迁移工具实测：用户 2026-09-03 的 41154 包 pcap，修正 25427 包后虚高归零
+- 全套 17 文件 383 用例全绿；`_smoke_report.py` 238 项断言全绿
+
 ## [1.9.8] - 2026-09-03
 
 提权体验遗留项 1：工程师向修复命令一键执行（v1.9.7 只覆盖了 Npcap 安装与
