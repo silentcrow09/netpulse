@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>装维小哥工具箱 · 专辑封面</title>
+<style>
+@font-face { font-family: 'SimHei'; src: url('file:///C:/Windows/Fonts/simhei.ttf') format('truetype'); font-weight: 400 900; font-display: swap; }
+@font-face { font-family: 'NotoSC'; src: url('file:///C:/Windows/Fonts/NotoSansSC-VF.ttf') format('truetype'); font-weight: 100 900; font-display: swap; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { background: linear-gradient(135deg, #0a0e1a, #111827, #1a2332); width: 500px; height: 500px; }
+body {
+  width: 500px; height: 500px; overflow: hidden;
+  background: linear-gradient(135deg, #0a0e1a, #111827, #1a2332);
+  font-family: 'NotoSC', 'SimHei', 'Segoe UI', sans-serif;
+  color: #e6edf6;
+  position: relative;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 28px;
+}
+body::before {
+  content: ''; position: absolute; inset: 0;
+  background-image:
+    linear-gradient(rgba(59,130,246,0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(59,130,246,0.06) 1px, transparent 1px);
+  background-size: 50px 50px;
+  z-index: 0;
+}
+.ring-bg { position: absolute; top: -60px; right: -50px; width: 220px; height: 220px; border: 2px solid rgba(59,130,246,0.08); border-radius: 50%; z-index: 0; }
+.icon-card {
+  position: relative; z-index: 1;
+  width: 180px; height: 180px; border-radius: 36px;
+  background: linear-gradient(135deg, rgba(59,130,246,0.18), rgba(245,158,11,0.10));
+  border: 1px solid rgba(59,130,246,0.4);
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+}
+.icon-card svg {
+  width: 110px; height: 110px;
+  filter: drop-shadow(0 2px 8px rgba(96,165,250,0.4));
+}
+.title {
+  position: relative; z-index: 1;
+  font-family: 'SimHei', 'NotoSC', sans-serif;
+  font-size: 56px; font-weight: 900; letter-spacing: 4px;
+  background: linear-gradient(135deg, #60a5fa, #f59e0b);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  line-height: 1.2;
+  text-align: center;
+}
+</style>
+</head>
+<body>
+<div class="ring-bg"></div>
+<div class="icon-card">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><defs><linearGradient id="grad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#f59e0b"/></linearGradient></defs><path fill="url(#grad)" d="M15 20a1 1 0 0 0-1-1h-1v-2h4a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h4v2h-1a1 1 0 0 0-1 1H2v2h7a1 1 0 0 0 1 1h4a1 1 0 0 0 1-1h7v-2zm-8-5V5h10v10z"/></svg>
+</div>
+<div class="title">装维工具箱</div>
+</body>
+</html>

@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>NetPulse 装维工具箱 · E04 竖版</title>
+<style>
+@font-face { font-family: 'SimHei'; src: url('file:///C:/Windows/Fonts/simhei.ttf') format('truetype'); font-weight: 400 900; font-display: swap; }
+@font-face { font-family: 'NotoSC'; src: url('file:///C:/Windows/Fonts/NotoSansSC-VF.ttf') format('truetype'); font-weight: 100 900; font-display: swap; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { background: linear-gradient(135deg, #0a0e1a, #111827, #1a2332); width: 1080px; height: 1440px; }
+body {
+  width: 1080px; height: 1440px; overflow: hidden;
+  background: linear-gradient(135deg, #0a0e1a, #111827, #1a2332);
+  font-family: 'NotoSC', 'SimHei', 'Segoe UI', sans-serif;
+  color: #e6edf6;
+  position: relative;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  padding: 60px 60px;
+}
+body::before {
+  content: ''; position: absolute; inset: 0;
+  background-image:
+    linear-gradient(rgba(59,130,246,0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(59,130,246,0.06) 1px, transparent 1px);
+  background-size: 50px 50px;
+  z-index: 0;
+}
+.ring1 { position: absolute; top: -80px; right: -60px; width: 320px; height: 320px; border: 2px solid rgba(59,130,246,0.08); border-radius: 50%; z-index: 0; }
+.ring2 { position: absolute; bottom: -100px; left: -80px; width: 280px; height: 280px; border: 2px solid rgba(59,130,246,0.05); border-radius: 50%; z-index: 0; }
+.ring3 { position: absolute; top: 50%; right: -50px; width: 180px; height: 180px; border: 2px solid rgba(245,158,11,0.05); border-radius: 50%; z-index: 0; }
+.container { position: relative; z-index: 1; text-align: center; }
+.series-badge {
+  display: inline-block; padding: 14px 42px; border-radius: 30px;
+  background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+  color: #fff; font-size: 30px; font-weight: 600; letter-spacing: 5px;
+  margin-bottom: 48px;
+}
+.ep-num {
+  font-size: 36px; font-weight: 900; letter-spacing: 10px;
+  font-family: 'SimHei', 'NotoSC', sans-serif;
+  color: #60a5fa;
+  margin-bottom: 36px;
+}
+.main-title {
+  font-size: 88px; font-weight: 900; line-height: 1.18;
+  font-family: 'SimHei', 'NotoSC', sans-serif;
+  margin-bottom: 24px;
+  letter-spacing: 3px;
+}
+.main-title .grad {
+  background: linear-gradient(135deg, #60a5fa, #f59e0b);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+}
+.sub-title {
+  font-size: 60px; font-weight: 900; line-height: 1.18;
+  font-family: 'SimHei', 'NotoSC', sans-serif;
+  margin-bottom: 40px;
+  letter-spacing: 3px;
+  color: #e6edf6;
+}
+.ep-desc {
+  font-size: 32px; color: #94a3b8; line-height: 1.5;
+  font-weight: 500;
+  margin-bottom: 60px;
+  letter-spacing: 2px;
+}
+.ep-block {
+  display: inline-block;
+  padding: 24px 44px;
+  background: rgba(59,130,246,0.1);
+  border-radius: 24px;
+  border: 1px solid rgba(59,130,246,0.25);
+  box-shadow: 0 2px 18px rgba(0,0,0,0.25);
+  margin-bottom: 56px;
+}
+.ep-block-desc {
+  font-size: 28px; color: #93c5fd; font-weight: 600; letter-spacing: 1px;
+  line-height: 1.55;
+}
+.bottom-line {
+  width: 80px; height: 5px; border-radius: 2px;
+  background: linear-gradient(90deg, #3b82f6, #f59e0b);
+  margin: 0 auto;
+}
+</style>
+</head>
+<body>
+<div class="ring1"></div>
+<div class="ring2"></div>
+<div class="ring3"></div>
+<div class="container">
+  <div class="series-badge">装维小哥工具箱</div>
+  <div class="ep-num">EPISODE 04</div>
+  <div class="main-title"><span class="grad">25MB 一个 exe</span></div>
+  <div class="sub-title">装维现场就带它</div>
+  <div class="ep-desc">单文件 Windows 网络诊断工具<br/>一件就够</div>
+  <div class="ep-block">
+    <div class="ep-block-desc">零依赖 · 23 模块<br/>根因分析 · 盯障取证<br/>一句话报障卡</div>
+  </div>
+  <div class="bottom-line"></div>
+</div>
+</body>
+</html>

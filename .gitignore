@@ -47,3 +47,22 @@ ehthumbs.db
 # tests/fixtures/windows/ 里的 MAC/IP/hostname/GUID 均为伪造值
 # (02/06 本地管理 MAC, RFC 3849 文档 IPv6, DESKTOP-TEST01)
 /tests/fixtures/private/
+
+# ── 宣传视频工程 (v1.9.6): 只入仓脚本/HTML/文案源文件 (~365KB) ──
+# 音视频产物与预览图 (wav/mp3/mp4/png, 共 ~72MB) 不入库;
+# 注意: 目录级忽略会阻断白名单 negation, 故用 /* 逐层展开
+/video_promo/*
+!/video_promo/capture.mjs
+!/video_promo/encode.sh
+!/video_promo/narrate.py
+!/video_promo/index.html
+!/video_promo/poster-douyin.html
+!/video_promo/poster-portrait.html
+!/video_promo/album-cover.html
+!/video_promo/douyin_copy_netpulse.md
+!/video_promo/gsap.min.js
+!/video_promo/fonts/
+!/video_promo/narr1/
+/video_promo/narr1/*
+!/video_promo/narr1/narr_meta.json
+!/video_promo/narr1/list.txt
