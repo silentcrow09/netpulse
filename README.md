@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.9.2
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.9.6
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -25,7 +25,7 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 - **并行执行**：`--parallel` 多模块并发跑（`--max-workers N` 控制并发数），交互菜单多模块默认并发。
 - **JSON Schema + 调试包**：结果文件遵循 `schema/netpulse-result-v1.2.json`（`--json-schema` 离线查询版本与字段，供 AI Agent / RMM introspect；v1.2.0 起 `tech.evidence` 为一等结构——每模块 probe 认证证据，与根因证据链同源）；`--debug-bundle DIR` 一键导出脱敏调试包（system + diagnostic + evidence + log 的 zip）。
 - **TCP 并发能力压测**：阶梯并发连接测试（累计保持），判定网络路径（光猫/路由器 NAT）最大可持续并发；同跑本机回环对照，自动区分「本机瓶颈 vs 网络/NAT 瓶颈」，零依赖、无需自建服务器。
-- **盯障模式 `--monitor`**：分钟级持续监测网关/外网 ping + TCP + DNS，抓偶发掉线（普通模块全是快照抓不到）；自动事件检测 + 分段定位（内网侧/运营商侧/解析侧/内外同抖），含**抖动窗口**检测（60s 窗口内反复丢包但未达连续中断 → 抖动集中段，偶发掉线最典型形态）；v1.7.0 起叠加**统计层**——后台二分探测路径 MTU（识别 MTU 不匹配/PMTUD 黑洞类故障，ping 小包看不出的盲区）+ TCP 重传率 30s 差分采样（开机累计计数器差出会话口径，含分母保护），`--monitor-load` 可在盯障中段制造 15s 下载负载让 full-size 包真正跑起来；输出带时间轴的 HTML 报告 + Excel 直开的 CSV + 完整 JSON。
+- **盯障模式 `--monitor`**：分钟级持续监测网关/外网 ping + TCP + DNS，抓偶发掉线（普通模块全是快照抓不到）；自动事件检测 + 分段定位（内网侧/运营商侧/解析侧/内外同抖），含**抖动窗口**检测（60s 窗口内反复丢包但未达连续中断 → 抖动集中段，偶发掉线最典型形态）；v1.7.0 起叠加**统计层**——后台二分探测路径 MTU（识别 MTU 不匹配/PMTUD 黑洞类故障，ping 小包看不出的盲区）+ TCP 重传率 30s 差分采样（开机累计计数器差出会话口径，含分母保护），`--monitor-load` 在盯障启动 60s 后自动制造 15s 下载负载让 full-size 包真正跑起来；输出带时间轴的 HTML 报告 + Excel 直开的 CSV + 完整 JSON。
 - **抓包取证层 `--capture`（v1.8.0）**：盯障时叠加**证据级**抓包（需 Npcap + 管理员，默认关闭，首次使用有隐私确认）——中断/抖动/TCP 失败/重传爆发等事件触发时自动落盘**前后各 30s 切片 pcap**（Wireshark 直开），结束后离线分析三信号判定 **PMTU 黑洞**（ICMP 分片指示 / full-size 段同序号停滞重传 / 握手 MSS 大于路径 MTU）、链路丢包形态、DNS 慢查询，结论联动盯障报告并给**置信度徽标**（黑洞确认为「高置信度」档）；**隐私边界**：默认仅保存诊断所需的网络元数据——80/443 每流仅前 2 包多留 384B（提取 Host/SNI 定位访问的域名），DNS/ICMP 整包保留（**DNS 查询域名 QNAME / HTTP Host / TLS SNI 可能被记录**），其余一律剥到头部，**不保存普通 TCP/HTTP 应用载荷**（账号/密码/页面内容不落盘）；抓包分析当前仅覆盖 IPv4；切片超 7 天或超 10 个自动清理。
 - **iperf3 UDP 模式**：`--iperf3-udp` 以 1 Mbps 发包率测点对点抖动/丢包 —— 语音/游戏质量的关键指标。
 - **宽带测速 = 带宽体检**：上下行测速 + 预估宽带 + Bufferbloat 评级一体化；
@@ -124,11 +124,12 @@ python netpulse.py iperf3 --iperf3-server 192.168.1.10 --iperf3-udp
 python netpulse.py --monitor              # 默认 600 秒 (10 分钟)
 python netpulse.py --monitor 1800         # 30 分钟
 python netpulse.py --monitor 600 --monitor-target www.baidu.com
-python netpulse.py --monitor 600 --monitor-load   # 盯障中段加 15s 下载负载 (喂 TCP 重传统计)
+python netpulse.py --monitor 600 --monitor-load   # 盯障启动 60s 后自动加 15s 下载负载 (喂 TCP 重传统计)
 python netpulse.py --monitor 600 --capture         # 叠加抓包取证: 事件触发切片 (需 Npcap+管理员)
 python netpulse.py --monitor 600 --capture full    # 全程落一个 pcap (而非事件切片)
 python netpulse.py --monitor 600 --capture --capture-mb 128   # 抓包缓冲上限提到 128MB
-# 交互菜单里也有 m=盯障模式 入口; Ctrl+C 提前结束同样生成报告
+# 交互菜单入口: 场景 [7] 盯障问完时长会询问是否开启抓包 (Enter=不开启,
+# 不可用时显示原因后继续); 高级页 m=盯障 (600 秒零询问)。Ctrl+C 提前结束同样生成报告
 
 # 禁用 scapy 二层抓包 (Npcap 不稳定导致崩溃时使用, DHCP 降级)
 python netpulse.py dhcp --no-scapy
@@ -156,16 +157,16 @@ python netpulse.py --install
 | `--iperf3-duration` | iperf3 单方向测速时长秒数 (默认 10) |
 | `--tcpcc-target` | TCP 并发测试自定义目标 `HOST:PORT` (可选): 默认自动挑公网 anycast DNS 的 TCP 53 端点 (预检并发友好度) |
 | `--tcpcc-max` | TCP 并发阶梯上限 (默认 1600, 硬上限 8000)。高上限会短时建立大量连接, 勿短时间重复运行 |
-| `--web-target` | 网页体检追加目标 URL (可选, 可多次; 追加到默认 3 个国内大站后, 总数上限 8) |
+| `--web-target` | 网页体检追加目标 URL (可选, 可多次; 追加到默认 3 个国内大站后, 总数上限 8)。菜单入口: 单选网页体检时询问 |
 | `--nattype-server` | NAT 类型检测的 STUN 服务器 `HOST[:PORT]` (可选, 可指定两次提供两台; 缺省端口 3478); 默认内置国内服务器自动回退 |
-| `--iperf3-udp` | iperf3 改用 UDP 模式测抖动/丢包 (1 Mbps 发包率, 语音/游戏质量口径); 默认 TCP 测吞吐 |
+| `--iperf3-udp` | iperf3 改用 UDP 模式测抖动/丢包 (1 Mbps 发包率, 语音/游戏质量口径); 默认 TCP 测吞吐。菜单入口: 单选 iperf3 (已有服务器) 时询问 |
 | `--monitor` | 盯障模式: 持续监测 `SEC` 秒找偶发掉线, 结束生成 CSV/HTML/JSON 报告 (不带值 = 600 秒; 范围 30-86400; Ctrl+C 提前结束同样生成报告); 与其他模块互斥 |
 | `--monitor-target` | 盯障外网 ping 目标 (默认 223.5.5.5, 同时对该目标 TCP 53 建连; 可用域名) |
 | `--monitor-load` | 盯障期间生成 15s 主动下载负载 (开始后 60s 触发, 制造 full-size 包让 TCP 重传统计有分母; 读即丢弃不落盘; 配合 `--monitor` 使用) |
 | `--load-url URL` | 主动负载的下载地址 (默认微信安装包 CDN 大文件, 仅读取不执行; 配合 `--monitor-load`) |
-| `--capture [MODE]` | 盯障期间抓包取证 (需 Npcap + 管理员, 默认关闭; 仅 `--monitor` 下生效): `slice`=事件触发落盘前后 30s 切片 (默认), `full`=全程落一个 pcap。仅保存诊断所需网络元数据 (DNS 查询域名 QNAME / HTTP Host / TLS SNI 可能被记录, 80/443 每流首 2 包 384B), 不存普通 TCP/HTTP 应用载荷; 分析当前仅覆盖 IPv4; 首次使用有隐私确认 (确认一次后不再问) |
-| `--capture-mb N` | 抓包环形缓冲上限 MB (默认 64, 最小 8); 超限挤掉最旧包并如实报告 |
-| `--speedtest-node` | 指定测速服务器 (可选): Ookla 服务器数字 ID (配合 `--speedtest-net`) 或上行节点 `host:port`; 默认自动选延迟最低的国内运营商节点 |
+| `--capture [MODE]` | 盯障期间抓包取证 (需 Npcap + 管理员, 默认关闭; 仅 `--monitor` 下生效): `slice`=事件触发落盘前后 30s 切片 (默认), `full`=全程落一个 pcap。仅保存诊断所需网络元数据 (DNS 查询域名 QNAME / HTTP Host / TLS SNI 可能被记录, 80/443 每流首 2 包 384B), 不存普通 TCP/HTTP 应用载荷; 分析当前仅覆盖 IPv4; 首次使用有隐私确认 (确认一次后不再问)。菜单入口: 场景 `[7]` 盯障询问 (Enter=不开启) |
+| `--capture-mb N` | 抓包环形缓冲上限 MB (默认 64, 最小 8); 超限挤掉最旧包并如实报告。菜单入口: `[7]` 抓包询问选 `s` 后输入 |
+| `--speedtest-node` | 指定测速服务器 (可选): Ookla 服务器数字 ID (配合 `--speedtest-net`) 或上行节点 `host:port`; 默认自动选延迟最低的国内运营商节点。菜单入口: 单选测速时询问 (默认 3633 上海电信) |
 | `--speedtest-net` | 启用 Ookla 官方测速 (CLI 默认关闭, 交互菜单默认启用; 结论优先采用 Ookla 结果) |
 | `--diagnose` | 按场景 Profile 诊断: `slow` / `disconnect` / `web` / `gaming` / `wifi`, 跑完输出根因分析; 也支持 `netpulse diagnose <profile>` 子命令形式 |
 | `--parallel` | 多模块并行执行 (输出经线程锁同步, 详细结果仍按模块顺序排列); 交互菜单多模块默认并发 |
@@ -174,7 +175,7 @@ python netpulse.py --install
 | `--port-concurrency` | 端口探测并发数 (默认 8) |
 | `--pip-mirror` | `--install` 自动装依赖时显式指定 pip 镜像 |
 | `--json-schema` | 输出当前 JSON Schema 版本号与结构路径 (供 AI Agent / RMM / bot introspect), 不跑诊断 |
-| `--debug-bundle` | 生成脱敏调试包 zip (system.json + diagnostic.json + netpulse.log, SSID/MAC/公网 IP/hostname 已脱敏), 用于上报 bug 或远端排障. 例: `--debug-bundle ./out` |
+| `--debug-bundle` | 生成脱敏调试包 zip (system.json + diagnostic.json + netpulse.log, SSID/MAC/公网 IP/hostname 已脱敏), 用于上报 bug 或远端排障. 例: `--debug-bundle ./out`。菜单入口: 工程师菜单 `d` 键 (需先跑过一次诊断) |
 | `--export` | 诊断后导出报告，逗号分隔多格式（`report.html,report.json`） |
 
 ## 📋 诊断模块（23 项）

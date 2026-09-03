@@ -3250,7 +3250,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.9.5"
+APP_VERSION = "1.9.6"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -8387,6 +8387,75 @@ def _prompt_for_iperf3():
     return (host, port)
 
 
+def _prompt_for_web_targets(input_fn=None):
+    """交互式询问网页体检追加目标 (v1.9.6 菜单入口, 对应 --web-target)。
+
+    返回 URL 列表 (空 = 不追加)。默认 3 站 + 追加 ≤5 = 模块上限 8
+    (WebPageTester.MAX_TARGETS), 超出截断并提示。
+    非 TTY 场景不应调用本函数 (调用方需先 sys.stdout.isatty() 判断)。
+    """
+    input_fn = input_fn or input
+    print(_c("  网页体检: 默认检测 3 个国内大站 (QQ/百度/阿里云)。", C_YELLOW))
+    print(_c("  客户指定的站点 (如 OA/CRM) 可在此追加。", C_GRAY))
+    try:
+        spec = input_fn(_c("  追加体检站点 [Enter=不追加 / 完整URL, 逗号分隔最多5个] > ",
+                           C_GREEN)).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return []
+    if not spec:
+        return []
+    urls = [u.strip() for u in spec.replace("，", ",").split(",") if u.strip()]
+    valid = []
+    for u in urls:
+        if u.startswith(("http://", "https://")):
+            valid.append(u)
+        else:
+            print(_c(f"  ! 忽略非法目标 (须 http:// 或 https:// 开头): {u}", C_YELLOW))
+    if len(valid) > 5:
+        print(_c("  ! 追加目标超过 5 个 (默认 3 站 + 追加 5 = 模块上限 8), "
+                 "只保留前 5 个", C_YELLOW))
+        valid = valid[:5]
+    if valid:
+        print(_c(f"  → 网页体检追加 {len(valid)} 个目标", C_GRAY))
+    return valid
+
+
+def _prompt_for_speedtest_node(input_fn=None):
+    """交互式询问测速节点 (v1.9.6 菜单入口, 对应 --speedtest-node)。
+
+    返回输入原文 (Ookla 数字 ID 或上行节点 host:port) 或 None=不换。
+    解析与写入由调用方完成 (与 CLI --speedtest-node 的写入逻辑保持一致)。
+    非 TTY 场景不应调用本函数 (调用方需先 sys.stdout.isatty() 判断)。
+    """
+    input_fn = input_fn or input
+    cur = SPEEDTEST_CONFIG.get("ookla_server_id") or OOKLA_DEFAULT_SERVER_ID
+    print(_c(f"  当前 Ookla 测速节点 ID: {cur} (默认 3633=上海电信)。", C_YELLOW))
+    try:
+        spec = input_fn(_c("  换测速节点? [Enter=不换 / 服务器ID 或 host:port, "
+                           "如 5396=北京联通] > ", C_GREEN)).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    return spec or None
+
+
+def _prompt_for_iperf3_mode(input_fn=None):
+    """iperf3 服务器已具备时追问测速口径 (v1.9.6 菜单入口, 对应 --iperf3-udp)。
+
+    返回 "udp" (UDP 抖动/丢包口径) 或 None (=默认 TCP 吞吐)。
+    非 TTY 场景不应调用本函数 (调用方需先 sys.stdout.isatty() 判断)。
+    """
+    input_fn = input_fn or input
+    try:
+        ans = input_fn(_c("  测速口径? [Enter=TCP吞吐 / u=UDP抖动丢包(语音游戏口径)] > ",
+                          C_GREEN)).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    return "udp" if ans.startswith("u") else None
+
+
 class PortProbeTester:
     """端口连通性探测: 对每个 host:port 发起 TCP/UDP 探测 (类 tcping / udpping)。
 
@@ -11694,6 +11763,54 @@ def _write_capture_ack(ack):
             f.write(datetime.now().isoformat())
     except OSError:
         pass                           # 标记写不进 (只读目录): 下次再问一次
+
+
+def _prompt_for_capture(input_fn=None):
+    """盯障前的抓包取证询问 (v1.9.6 菜单入口, 设计稿 §4 图 A/B)。
+
+    装维不加参数原则: --capture 的菜单入口。先跑 precheck 亮状态 —
+    可用 → 出 y/f/s 选择 (Enter=不开启, 与 CLI 默认关闭一致);
+    不可用 → 只显客户语言原因 + 回车继续, 不出「选了也白选」的选择题。
+
+    返回 (capture_mode, capture_mb): mode 为 None / "slice" / "full"。
+    非 TTY (脚本/管道) 直接返回 (None, 默认), 不打断 — 与 _capture_confirm_once
+    的非交互语义一致。
+    """
+    if not sys.stdin.isatty():
+        return None, CAPTURE_DEFAULT_MB
+    input_fn = input_fn or input
+    print(_c("  ── 抓包取证（可选）──────────────────────────", C_GRAY))
+    cap = _PcapCaptureSession("slice", CAPTURE_DEFAULT_MB)
+    if not cap.precheck():
+        print(_c(f"  ✘ 抓包暂不可用: {cap.unavailable_reason}", C_YELLOW))
+        print(_c("     本次仅统计层盯障 (掉线/抖动统计不受影响)。", C_GRAY))
+        try:
+            input_fn(_c("  按 Enter 继续...", C_GRAY))
+        except (EOFError, KeyboardInterrupt):
+            pass
+        return None, CAPTURE_DEFAULT_MB
+    print(_c("  ✔ 抓包条件满足: Npcap · 管理员权限 · 抓包接口已就绪", C_GREEN))
+    print(_c("     掉线/抖动发生时自动保存前后 30 秒原始报文 (.pcap),", C_GRAY))
+    print(_c("     Wireshark 可直接打开; 仅保留包头与域名, 不存账号密码。", C_GRAY))
+    try:
+        ans = input_fn(_c("  开启抓包取证? [Enter=不开启 / y=事件切片 / "
+                          "f=全程 / s=切片+改上限]: ", C_GREEN)).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None, CAPTURE_DEFAULT_MB
+    if ans in ("", "n", "no"):
+        return None, CAPTURE_DEFAULT_MB
+    if ans.startswith("f"):
+        return "full", CAPTURE_DEFAULT_MB
+    if ans.startswith("s"):
+        try:
+            mb_s = input_fn(_c("  抓包缓冲上限 MB (默认 64, 最小 8): ",
+                               C_GREEN)).strip()
+            mb = int(mb_s) if mb_s else CAPTURE_DEFAULT_MB
+        except (EOFError, KeyboardInterrupt, ValueError):
+            mb = CAPTURE_DEFAULT_MB    # 输入非法 (非数字/中断): 用默认, 不拦盯障
+        return "slice", max(8, mb)
+    return "slice", CAPTURE_DEFAULT_MB   # y / yes / 其他 → 事件切片
 
 
 def _cleanup_old_captures(cap_dir=None):
@@ -17911,9 +18028,13 @@ def _run_scene_monitor(install=False, pip_mirror=None):
         except ValueError:
             minutes = 10
     minutes = max(1, min(1440, minutes))
+    # 抓包取证菜单入口 (v1.9.6): 时长问完问一次, Enter=不开启 (与 CLI 默认一致)。
+    # 不可用 (非管理员/无 Npcap) 时函数内部亮原因后直接返回 None, 不出选择题。
+    capture_mode, capture_mb = _prompt_for_capture()
     print(_c(f"  开始盯障 {minutes} 分钟（{minutes*60} 秒）... Ctrl+C 可提前结束", C_BOLD))
     try:
-        run_monitor_mode(minutes * 60)
+        run_monitor_mode(minutes * 60, capture_mode=capture_mode,
+                         capture_mb=capture_mb)
     # (Exception, KeyboardInterrupt): Ctrl+C 是 BaseException, 只捕 Exception
     # 会把原始回溯打到客户屏幕上, _format_error_for_user 的中断文案成死分支 (审查 #4)
     except (Exception, KeyboardInterrupt) as e:
@@ -18123,9 +18244,10 @@ def _module_menu(install=False, pip_mirror=None):
         print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发, 含Ookla官方测速)', C_GRAY)}")
         print(f"    {_c(' m', C_CYAN)}. 盯障模式 {_c('(600秒找偶发掉线, Ctrl+C可提前停)', C_GRAY)}")
         print(f"    {_c(' e', C_CYAN)}. 导出上次诊断报告")
+        print(f"    {_c(' d', C_CYAN)}. 生成调试包 {_c('(脱敏zip: 报告+证据+日志, 上报排障用)', C_GRAY)}")
         print(f"    {_c(' r', C_CYAN)}. 返回场景模式主菜单")
         print(f"    {_c(' q', C_CYAN)}. 退出")
-        print(_c("  快捷: 0=全部 a/b/c=按分类 m=盯障 e=导出 r=返回场景 q=退出", C_GRAY))
+        print(_c("  快捷: 0=全部 a/b/c=按分类 m=盯障 e=导出 d=调试包 r=返回场景 q=退出", C_GRAY))
         print(_c("-" * 60, C_GRAY))
         try:
             choice = input(_c("  输入 > ", C_GREEN)).strip()
@@ -18153,6 +18275,22 @@ def _module_menu(install=False, pip_mirror=None):
                 print(_c("  尚无诊断数据，请先运行一次诊断。", C_YELLOW))
             else:
                 prompt_export_report()
+            try:
+                input(_c("  按 Enter 返回菜单...", C_GRAY))
+            except (EOFError, KeyboardInterrupt):
+                break
+            continue
+        # d / debug: 生成脱敏调试包 (v1.9.6, --debug-bundle 的菜单入口)。
+        # 上报排障主通道: 无诊断数据时提示先跑 (不像 CLI 那样自动跑全诊断 —
+        # 菜单里 30-120 秒的意外等待比一次提示更伤)。
+        if choice.lower() in ("d", "debug", "调试包"):
+            if not LAST_RUN:
+                print(_c("  尚无诊断数据，请先运行一次诊断 (0=全部 或选模块)。", C_YELLOW))
+            else:
+                print(_c("  → 打包: system.json + diagnostic.json + evidence.json"
+                         " + netpulse.log (SSID/MAC/公网IP/主机名 已脱敏)", C_GRAY))
+                _export_debug_bundle(_report_dir())
+                print(_c("  → 请将 zip 文件发给后端/厂商支持, 无需手工截图。", C_GRAY))
             try:
                 input(_c("  按 Enter 返回菜单...", C_GRAY))
             except (EOFError, KeyboardInterrupt):
@@ -18192,6 +18330,28 @@ def _module_menu(install=False, pip_mirror=None):
                     PORT_PROBE_CONFIG["count"] = cnt
             else:
                 keys = [k for k in keys if k != "port"]
+        # 网页体检: 单选时询问追加目标 (v1.9.6, --web-target 的菜单入口)。
+        # 全量诊断默认 3 站照跑, 不打断流程; 已有目标 (CLI 传入/本会话答过) 不再问。
+        if ("web" in keys and not WEB_CONFIG.get("targets")
+                and not is_all and sys.stdout.isatty()):
+            extra = _prompt_for_web_targets()
+            if extra:
+                WEB_CONFIG["targets"] = extra
+        # 测速: 单选时询问换节点 (v1.9.6, --speedtest-node 的菜单入口)。
+        # 一次会话只问一次 (_node_prompted 标记); 全量诊断直接默认节点。
+        if ("speedtest" in keys and not is_all and sys.stdout.isatty()
+                and not SPEEDTEST_CONFIG.get("_node_prompted")):
+            SPEEDTEST_CONFIG["_node_prompted"] = True
+            _node = _prompt_for_speedtest_node()
+            if _node:
+                # 写入口径与 CLI --speedtest-node 一致: 始终记 node, 数字 ID
+                # 同时切 ookla_server_id (覆盖默认 3633)
+                SPEEDTEST_CONFIG["node"] = _node
+                if _node.isdigit():
+                    SPEEDTEST_CONFIG["ookla_server_id"] = int(_node)
+                    print(_c(f"  → Ookla 节点切换为 {_node}", C_GRAY))
+                else:
+                    print(_c(f"  → 测速上行节点: {_node}", C_GRAY))
         # iperf3 模块: 单选 iperf3 时才询问服务器; 选 0/全部时自动跳过
         # (iperf3 需要用户自备服务器, 全量诊断时没服务器就跳过不测)
         if ("iperf3" in keys and not SPEEDTEST_CONFIG.get("iperf3_server")):
@@ -18210,6 +18370,15 @@ def _module_menu(install=False, pip_mirror=None):
                     print(_c("  → 未提供 iperf3 服务器, 该模块运行时会提示缺少服务器", C_GRAY))
             else:
                 keys = [k for k in keys if k != "iperf3"]
+        # iperf3 测速口径 (v1.9.6, --iperf3-udp 的菜单入口): 服务器已具备
+        # (CLI 传入或刚答) 且单选时追问一次 TCP/UDP; 一次会话只问一次。
+        if ("iperf3" in keys and not is_all and sys.stdout.isatty()
+                and SPEEDTEST_CONFIG.get("iperf3_server")
+                and not SPEEDTEST_CONFIG.get("_iperf3_mode_prompted")):
+            SPEEDTEST_CONFIG["_iperf3_mode_prompted"] = True
+            if _prompt_for_iperf3_mode() == "udp":
+                SPEEDTEST_CONFIG["iperf3_udp"] = True
+                print(_c("  → iperf3 改用 UDP 口径 (抖动/丢包, 1 Mbps 发包率)", C_GRAY))
         # 菜单模式: 多模块默认并发 (与 CLI `all --parallel` 对齐)。
         # run_diagnostics 内部 `parallel and len(keys) > 1` 会自动避免
         # 单模块走并发 (无意义且会浪费线程开销)。

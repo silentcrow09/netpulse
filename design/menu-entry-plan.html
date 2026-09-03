@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NetPulse 交互菜单补口设计稿 — v1.9.6 提案</title>
+<style>
+  :root {
+    --ink: #1f2733;
+    --ink-2: #5a6572;
+    --line: #dde3ea;
+    --bg: #f5f7fa;
+    --card: #ffffff;
+    --accent: #0f6fff;
+    --accent-soft: #e8f1ff;
+    --ok: #0e8a4d;
+    --ok-soft: #e7f6ee;
+    --warn: #b25e00;
+    --warn-soft: #fdf1e0;
+    --bad: #c2321f;
+    --bad-soft: #fbe9e6;
+    --hold: #6b7480;
+    --hold-soft: #eef1f4;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    line-height: 1.65;
+    padding: 0 0 80px;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 28px; }
+
+  /* ── 页头 ── */
+  header {
+    background: linear-gradient(135deg, #0d1b2e 0%, #14304f 100%);
+    color: #fff; padding: 40px 0 32px; margin-bottom: 36px;
+  }
+  header .wrap { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-end; justify-content: space-between; }
+  header h1 { font-size: 26px; font-weight: 700; letter-spacing: 0.5px; }
+  header .sub { margin-top: 8px; color: #a9c1dd; font-size: 14px; }
+  .meta { display: flex; gap: 10px; flex-wrap: wrap; }
+  .meta span {
+    font-size: 12px; padding: 4px 12px; border-radius: 999px;
+    background: rgba(255,255,255,0.12); color: #d7e5f5; border: 1px solid rgba(255,255,255,0.18);
+  }
+  .meta span.hot { background: rgba(255,196,0,0.18); border-color: rgba(255,196,0,0.45); color: #ffd57a; }
+
+  /* ── 章节 ── */
+  section { margin-bottom: 44px; }
+  h2 {
+    font-size: 19px; font-weight: 700; margin-bottom: 14px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  h2 .no {
+    font-size: 13px; font-weight: 700; color: #fff; background: var(--accent);
+    width: 24px; height: 24px; border-radius: 6px;
+    display: inline-flex; align-items: center; justify-content: center; flex: none;
+  }
+  h3 { font-size: 15px; font-weight: 700; margin: 22px 0 8px; color: var(--ink); }
+  p.lead { color: var(--ink-2); font-size: 14px; margin-bottom: 12px; }
+
+  /* ── 摘要卡 ── */
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
+  .stat {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px; text-align: center;
+  }
+  .stat b { display: block; font-size: 30px; font-weight: 700; line-height: 1.2; }
+  .stat span { font-size: 12.5px; color: var(--ink-2); }
+  .stat.gap b { color: var(--bad); }
+  .stat.ok b { color: var(--ok); }
+  .stat.hold b { color: var(--hold); }
+
+  .callout {
+    border-left: 4px solid var(--accent); background: var(--accent-soft);
+    border-radius: 0 10px 10px 0; padding: 12px 18px; font-size: 14px; margin: 14px 0;
+  }
+  .callout.warn { border-color: var(--warn); background: var(--warn-soft); }
+
+  /* ── 表格 ── */
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; font-size: 13.5px; }
+  th { background: #eef2f7; text-align: left; padding: 9px 14px; font-size: 12.5px; color: var(--ink-2); font-weight: 700; white-space: nowrap; }
+  td { padding: 9px 14px; border-top: 1px solid var(--line); vertical-align: top; }
+  td code, li code, p code {
+    font-family: Consolas, "Courier New", monospace; font-size: 12.5px;
+    background: #eef2f7; border: 1px solid #e0e6ee; border-radius: 4px; padding: 1px 6px; color: #14304f;
+  }
+  .pill { display: inline-block; font-size: 11.5px; font-weight: 700; padding: 2px 10px; border-radius: 999px; white-space: nowrap; }
+  .pill.ok { background: var(--ok-soft); color: var(--ok); }
+  .pill.bad { background: var(--bad-soft); color: var(--bad); }
+  .pill.hold { background: var(--hold-soft); color: var(--hold); }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); }
+
+  /* ── 终端 mockup ── */
+  .term {
+    background: #0c0c14; border-radius: 10px; overflow: hidden;
+    border: 1px solid #23233a; box-shadow: 0 8px 24px rgba(13,27,46,0.18);
+    margin: 14px 0 6px; font-family: Consolas, "Courier New", monospace;
+    font-size: 13px; line-height: 1.55;
+  }
+  .term .bar {
+    display: flex; align-items: center; gap: 7px;
+    background: #17172a; padding: 8px 14px;
+  }
+  .term .bar i { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+  .term .bar i:nth-child(1) { background: #ff5f56; }
+  .term .bar i:nth-child(2) { background: #ffbd2e; }
+  .term .bar i:nth-child(3) { background: #27c93f; }
+  .term .bar em { font-style: normal; color: #7c7ca0; font-size: 11.5px; margin-left: 8px; }
+  .term pre { padding: 14px 18px 16px; color: #d6dbe5; overflow-x: auto; white-space: pre; }
+  .c { color: #4fd8eb; }            /* C_CYAN */
+  .g { color: #3ee281; }            /* C_GREEN prompt */
+  .gr { color: #8b93a7; }           /* C_GRAY hint */
+  .w { color: #ffffff; }            /* C_WHITE / C_BOLD */
+  .y { color: #ffd57a; }            /* C_YELLOW */
+  .r { color: #ff7b72; }            /* C_RED */
+  .b { color: #6fb4ff; }            /* C_BLUE bar */
+  .caret { display: inline-block; width: 8px; height: 15px; background: #d6dbe5; vertical-align: -2px; animation: blink 1.1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .anno { color: #0c0c14; }
+  .anno-line { display: block; position: relative; }
+  /* 标注: 稿内用右侧标签说明新增/现有 */
+  .tag {
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 11px; font-weight: 700;
+    border-radius: 4px; padding: 0 7px; margin-left: 12px; vertical-align: 1px; white-space: nowrap;
+  }
+  .tag.new { background: #ffe08a; color: #6b4b00; }
+  .tag.now { background: #2c2c44; color: #9aa3b8; font-weight: 500; }
+  .figcap { font-size: 12.5px; color: var(--ink-2); margin: 6px 0 20px 4px; }
+
+  /* ── 步骤/原则 ── */
+  ol.principles { list-style: none; counter-reset: pr; }
+  ol.principles li {
+    counter-increment: pr; background: var(--card); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px 18px 14px 58px; margin-bottom: 10px; position: relative; font-size: 14px;
+  }
+  ol.principles li::before {
+    content: counter(pr); position: absolute; left: 16px; top: 14px;
+    width: 26px; height: 26px; border-radius: 8px; background: var(--accent); color: #fff;
+    font-weight: 700; font-size: 13px; display: flex; align-items: center; justify-content: center;
+  }
+  ol.principles b { display: block; margin-bottom: 2px; }
+
+  ol.impl { margin-left: 20px; font-size: 14px; }
+  ol.impl li { margin-bottom: 8px; }
+
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 860px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .two-col { grid-template-columns: 1fr; }
+  }
+
+  footer { text-align: center; color: var(--ink-2); font-size: 12.5px; margin-top: 40px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div>
+      <h1>NetPulse 交互菜单补口设计稿</h1>
+      <div class="sub">「装维不加参数」原则收口 — CLI 功能 vs 交互菜单入口缺口审计与补齐方案</div>
+    </div>
+    <div class="meta">
+      <span>版本 v1.9.6 提案</span>
+      <span>2026-09-03</span>
+      <span class="hot">状态：已实施 (v1.9.6)</span>
+      <span>静态稿 · 无交互</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<!-- ═══════════ 1. 结论摘要 ═══════════ -->
+<section>
+  <h2><span class="no">1</span>结论摘要</h2>
+  <p class="lead">全量比对 <code>argparse</code> 34 个参数位与交互菜单（场景层 + 工程师层）入口后：</p>
+  <div class="stats">
+    <div class="stat"><b>34</b><span>CLI 参数位</span></div>
+    <div class="stat ok"><b>11</b><span>已有菜单等价入口</span></div>
+    <div class="stat gap"><b>6</b><span>装维级功能无入口<br>（本方案补齐）</span></div>
+    <div class="stat hold"><b>17</b><span>调优/输出类<br>维持 CLI-only（合理）</span></div>
+  </div>
+  <div class="callout">
+    <b>典型缺口就是 <code>--capture</code></b>：盯障抓包取证是 v1.8.0 的核心能力，但场景 [7] 盯障与工程师 <code>m</code> 键都调用
+    <code>run_monitor_mode()</code> 时<b>不传 capture_mode</b> —— 菜单用户永远用不到，只有读 README 记参数的人才能触发。本方案以
+    <b>5 处菜单改动</b> 补齐全部 6 项缺口，CLI 参数与现有行为完全不动。
+  </div>
+</section>
+
+<!-- ═══════════ 2. 现状审计 ═══════════ -->
+<section>
+  <h2><span class="no">2</span>现状审计：菜单缺口清单</h2>
+
+  <h3>2.1 缺口 — 装维用得上，但菜单没有入口（6 项，全部补齐）</h3>
+  <table>
+    <tr><th>CLI 参数</th><th>功能</th><th>现状</th><th>补口位置</th><th>优先级</th></tr>
+    <tr>
+      <td><code>--capture</code></td>
+      <td>盯障期间抓包取证（事件切片 ±30s / 全程 pcap），Wireshark 可开</td>
+      <td><span class="pill bad">无入口</span> 场景 [7] / 工程师 m 均不传参</td>
+      <td>场景 [7] 盯障流程新增询问（见 §4 图 A/B）</td>
+      <td><span class="pill bad">P0</span></td>
+    </tr>
+    <tr>
+      <td><code>--capture-mb</code></td>
+      <td>抓包缓冲上限 MB（默认 64，最小 8）</td>
+      <td><span class="pill bad">无入口</span></td>
+      <td>随 --capture 询问的高级项，输入 <code>s</code> 可改（默认 64 不再追问）</td>
+      <td><span class="pill warn">P1</span></td>
+    </tr>
+    <tr>
+      <td><code>--debug-bundle</code></td>
+      <td>生成脱敏调试包 zip（system + diagnostic + evidence + log）</td>
+      <td><span class="pill bad">无入口</span> 仅 CLI</td>
+      <td>工程师菜单新增 <code>d</code> 键（见 §4 图 C）— 装维上报排障的主通道</td>
+      <td><span class="pill bad">P0</span></td>
+    </tr>
+    <tr>
+      <td><code>--web-target</code></td>
+      <td>网页体检追加客户指定站点（如客户的 OA/CRM 打不开）</td>
+      <td><span class="pill bad">无入口</span></td>
+      <td>单选「网页体检」模块时 JIT 询问（见 §4 图 D）</td>
+      <td><span class="pill warn">P1</span></td>
+    </tr>
+    <tr>
+      <td><code>--speedtest-node</code></td>
+      <td>指定测速节点（菜单现在写死上海电信 3633，无法换点复测）</td>
+      <td><span class="pill bad">无入口</span> 交互模式固定 3633</td>
+      <td>单选「宽带测速」模块时 JIT 询问（同图 D 模式）</td>
+      <td><span class="pill warn">P1</span></td>
+    </tr>
+    <tr>
+      <td><code>--iperf3-udp</code></td>
+      <td>iperf3 改 UDP 口径测抖动/丢包（语音/游戏质量）</td>
+      <td><span class="pill bad">无入口</span> JIT 只问服务器</td>
+      <td>iperf3 单选询问追加口径选项（见 §4 图 E）</td>
+      <td><span class="pill warn">P1</span></td>
+    </tr>
+  </table>
+
+  <h3>2.2 已有菜单等价入口（11 项，无需改动）</h3>
+  <table>
+    <tr><th>CLI 参数</th><th>菜单等价入口</th></tr>
+    <tr><td><code>modules</code>（位置参数）</td><td>工程师菜单模块编号 1-19 / 分类 a-b-c / <code>0</code> 全部</td></tr>
+    <tr><td><code>--diagnose</code></td><td>场景层 [1]-[5]（网络很慢 / 经常断网 / 网页打不开 / 游戏卡顿 / WiFi 信号差）</td></tr>
+    <tr><td><code>--monitor</code></td><td>场景层 [7]（问时长）/ 工程师 <code>m</code> 键（600s 零输入）</td></tr>
+    <tr><td><code>--export</code></td><td>工程师 <code>e</code> 键 + 诊断完成后「生成诊断报告?」询问</td></tr>
+    <tr><td><code>--port-target / --port-proto / --port-count</code></td><td>单选端口探测模块时 JIT 询问（已有交互）</td></tr>
+    <tr><td><code>--iperf3-server</code></td><td>单选 iperf3 模块时 JIT 询问（已有交互）</td></tr>
+    <tr><td><code>--parallel / --max-workers</code></td><td>菜单模式自动并发（对齐 CLI <code>all --parallel</code>）</td></tr>
+    <tr><td><code>--speedtest-net</code></td><td>交互菜单默认启用 Ookla 官方测速</td></tr>
+    <tr><td><code>--install</code></td><td>与菜单 install 联动（依赖缺失时自动安装）</td></tr>
+  </table>
+
+  <h3>2.3 维持 CLI-only（17 项，合理，不进菜单）</h3>
+  <p class="lead">
+    <span class="pill hold">输出控制</span> <code>--json --verbose --no-color --list --json-schema</code>
+    &nbsp;·&nbsp; <span class="pill hold">调优旋钮</span> <code>--port-force --port-timeout --port-concurrency --iperf3-duration --tcpcc-target --tcpcc-max --nattype-server --max-workers</code>
+    &nbsp;·&nbsp; <span class="pill hold">环境/兜底</span> <code>--pip-mirror --no-scapy --monitor-target --monitor-load --load-url</code>
+  </p>
+  <div class="callout warn">
+    其中 <code>--monitor-target / --monitor-load / --load-url</code> 三项有真实价值（盯指定 IP / 压负载盯障），但为保住工程师
+    <code>m</code> 键「零输入直接跑」的刻意设计，本期不进菜单 —— 装维需要盯指定目标时，用 [7] 的抓包切片 + 报告结论已够用。理由详见 §6。
+  </div>
+</section>
+
+<!-- ═══════════ 3. 设计原则 ═══════════ -->
+<section>
+  <h2><span class="no">3</span>设计原则</h2>
+  <ol class="principles">
+    <li>
+      <b>场景动作进菜单，参数用 JIT 询问</b>
+      菜单只新增「做不做这件事」的选择（如 开抓包吗 / 出调试包吗）；「做到什么程度」（MB 上限、节点 ID、URL）只在用户已选定该功能后追问，
+      且 Enter 永远落在安全默认值上。完全复用 <code>_prompt_for_port_targets</code> 已验证的交互范式。
+    </li>
+    <li>
+      <b>不可用先亮状态，再决定问不问</b>
+      抓包需要 管理员 + Npcap + scapy 三重前置。菜单在询问<b>之前</b>先跑 precheck 并把结论翻译成客户语言亮出来（一行）：
+      可用 → 出 y/f 询问；不可用 → 只显示原因 + 回车继续，<b>不出选择题</b>（选了也白选，还让装维困惑）。降级语义与现有 CLI 完全一致：统计层照跑。
+    </li>
+    <li>
+      <b>CLI 路径一行不动</b>
+      菜单补口只发生在交互函数内部（<code>_run_scene_monitor</code> / <code>_module_menu</code>），<code>run_monitor_mode</code> 等核心函数签名不变；
+      已显式带 <code>--capture</code> 的 CLI 用户行为字节级不变。
+    </li>
+  </ol>
+</section>
+
+<!-- ═══════════ 4. 屏幕设计稿 ═══════════ -->
+<section>
+  <h2><span class="no">4</span>屏幕设计稿（终端 mockup）</h2>
+  <p class="lead">黄色 <span class="tag new" style="vertical-align:0;">新增</span> 标签为本方案新增的行；灰色 <span class="tag now" style="vertical-align:0;">现有</span> 为已有输出。闪烁光标 ▌ 表示等待输入。</p>
+
+  <!-- 图 A -->
+  <h3>图 A · 场景 [7] 持续盯障 — 抓包入口（主改动 · 可用态）</h3>
+  <div class="term">
+    <div class="bar"><i></i><i></i><i></i><em>命令提示符 — netpulse</em></div>
+    <pre><span class="b">============================================================</span>
+<span class="w">  NetPulse v1.9.6    网络诊断（场景模式）</span>
+<span class="b">============================================================</span>
+<span class="w">  请选择场景（输入数字回车）：</span>
+
+    <span class="c">[1]</span> 网络很慢        <span class="c">[2]</span> 经常断网      <span class="c">[3]</span> 网页打不开
+    <span class="c">[4]</span> 游戏卡顿        <span class="c">[5]</span> WiFi 信号差
+
+    <span class="c">[7]</span> 持续盯障（输入分钟数）
+    <span class="c">[9]</span> 高级选项（工程师用）   <span class="c">[0]</span> 退出
+<span class="gr">------------------------------------------------------------</span>
+<span class="g">  选择 [0-9]: </span>7
+<span class="w">  持续盯障: 持续监测外网连通性, 找偶发掉线/抖动。</span><span class="tag now">现有</span>
+<span class="g">  盯障时长（分钟, 1-1440, 默认 10）: </span><span class="caret"></span><span class="tag now">现有</span>
+
+<span class="gr">  ── 抓包取证（可选）──────────────────────────────────────</span><span class="tag new">新增</span>
+<span class="g">  ✔</span> 抓包条件满足: Npcap 已安装 · 管理员权限 · 接口已解析<span class="tag new">新增 · precheck 结论</span>
+<span class="gr">     掉线/抖动发生时自动保存前后 30 秒原始报文 (.pcap),</span><span class="tag new">新增 · 一句话说明</span>
+<span class="gr">     Wireshark 可直接打开; 仅保留包头与域名, 不存账号密码。</span><span class="tag new">↑</span>
+<span class="g">  开启抓包取证? [Enter=不开启 / y=事件切片 / f=全程 / s=切片+改上限]: </span><span class="caret"></span><span class="tag new">新增 · Enter=安全默认</span>
+
+<span class="y">  ⚠ 抓包取证首次使用确认</span><span class="tag now">现有逻辑 · 仅首次出现</span>
+<span class="gr">     · 只保留诊断所需的网络元数据: 80/443 每条连接的前 2 个包多留 384 字节</span>
+<span class="gr">     · 不保存普通 TCP/HTTP 应用载荷 (账号、密码、聊天或页面内容不落盘)</span>
+<span class="gr">     · DNS 查询域名与访问域名 (QNAME/Host/SNI) 会出现在报告里</span>
+<span class="g">  确认开启抓包取证? [y/N]: </span><span class="caret"></span>
+
+<span class="w">  开始盯障 10 分钟（600 秒）... Ctrl+C 可提前结束</span><span class="tag now">现有</span>
+<span class="gr">  抓包层: 已启动 (事件触发切片, 64MB 上限; 仅保留包头/首 2 包 384B)</span><span class="tag now">现有输出 · 由本入口首次在菜单里点亮</span></pre>
+  </div>
+  <div class="figcap">图 A — 输入 <b>7</b> → 时长回车默认 10 分钟 → 抓包询问 <b>y</b>（Enter 则完全等于现状，仅统计层）。首次确认弹窗为既有逻辑复用，回答一次后永久落标记。</div>
+
+  <!-- 图 B -->
+  <h3>图 B · 场景 [7] 持续盯障 — 抓包不可用态（非管理员 / 无 Npcap）</h3>
+  <div class="term">
+    <div class="bar"><i></i><i></i><i></i><em>命令提示符 — netpulse（非管理员启动）</em></div>
+    <pre><span class="g">  盯障时长（分钟, 1-1440, 默认 10）: </span>15
+<span class="gr">  ── 抓包取证（可选）──────────────────────────────────────</span><span class="tag new">新增</span>
+<span class="r">  ✘</span> 抓包暂不可用: Npcap 默认只允许管理员抓包 — 请以管理员身份重跑<span class="tag new">新增 · 复用 precheck 客户文案</span>
+<span class="gr">     本次仅统计层盯障 (掉线/抖动统计不受影响), 回车继续。</span><span class="tag new">新增 · 不出选择题</span>
+<span class="g">  按 Enter 继续...</span><span class="caret"></span>
+<span class="w">  开始盯障 15 分钟（900 秒）... Ctrl+C 可提前结束</span></pre>
+  </div>
+  <div class="figcap">图 B — precheck 失败时只有状态行 + 回车继续，不让装维做「选了也没用」的选择。三类失败（非管理员 / 未装 Npcap / scapy 禁用）文案逐条复用 CLI 现有提示，不新造话术。</div>
+
+  <!-- 图 C -->
+  <h3>图 C · 工程师菜单（场景层 [9]）— 新增 d 键：调试包</h3>
+  <div class="term">
+    <div class="bar"><i></i><i></i><i></i><em>命令提示符 — netpulse · 高级选项</em></div>
+    <pre><span class="b">============================================================</span>
+<span class="w">  NetPulse v1.9.6    命令行网络诊断</span>
+<span class="b">============================================================</span>
+<span class="w">  工程师模式 (模块级诊断)。运行完成后可返回场景模式主菜单。</span>
+
+  <span class="c">[A]</span> <span class="w">连通性</span>        1. 外网连通      2. 网关检测     ...
+  <span class="c">[B]</span> <span class="w">性能与质量</span>     3. 宽带测速      4. 网页体检     ...
+    <span class="gr">……（模块清单与现状一致，此处省略）……</span>
+
+    <span class="c"> 0</span>. 运行全部诊断 <span class="gr">(默认并发, 含Ookla官方测速)</span>
+    <span class="c"> m</span>. 盯障模式 <span class="gr">(600秒找偶发掉线, Ctrl+C可提前停)</span>
+    <span class="c"> e</span>. 导出上次诊断报告
+    <span class="c"> d</span>. 生成调试包 <span class="gr">(脱敏zip: 报告+证据+日志, 上报排障用)</span><span class="tag new">新增</span>
+    <span class="c"> r</span>. 返回场景模式主菜单
+    <span class="c"> q</span>. 退出
+<span class="gr">  快捷: 0=全部 a/b/c=按分类 m=盯障 e=导出 d=调试包 r=返回场景 q=退出</span><span class="tag new">快捷行同步加 d</span>
+<span class="gr">------------------------------------------------------------</span>
+<span class="g">  输入 > </span>d<span class="caret"></span>
+
+<span class="gr">  → 打包: system.json + diagnostic.json + evidence.json + netpulse.log (SSID/MAC/公网IP/主机名 已脱敏)</span><span class="tag new">新增</span>
+<span class="g">  ✓ 调试包已生成: D:\...\reports\debug_bundle_20260903_141022.zip</span><span class="tag new">新增</span>
+<span class="gr">  → 请将此文件发给后端/厂商支持, 无需手工截图。</span><span class="tag new">新增 · 引导话术</span>
+<span class="g">  按 Enter 返回菜单...</span><span class="caret"></span></pre>
+  </div>
+  <div class="figcap">图 C — 无上次诊断数据（LAST_RUN 为空）时：<code>d</code> 键提示「尚无诊断数据，请先运行一次诊断」+ 回车返回，与 <code>e</code> 键语义完全对称。</div>
+
+  <!-- 图 D -->
+  <h3>图 D · 单选模块 JIT 询问 — 网页体检追加站点（测速换节点同范式）</h3>
+  <div class="term">
+    <div class="bar"><i></i><i></i><i></i><em>命令提示符 — netpulse · 高级选项</em></div>
+    <pre><span class="g">  输入 > </span>4
+<span class="gr">  → 网页体检: 默认检测 3 个国内大站。</span><span class="tag new">新增</span>
+<span class="g">  追加体检站点 [Enter=不追加 / 输入完整URL, 可逗号分隔最多5个]: </span><span class="caret"></span><span class="tag new">新增 · 例: https://crm.example.com</span>
+
+<span class="gr">  （宽带测速 单选时为同范式:）</span><span class="tag new">对照</span>
+<span class="gr">  → 当前节点: 上海电信 (3633)。</span><span class="tag new">新增</span>
+<span class="g">  换测速节点? [Enter=不换 / 服务器ID 或 host:port]: </span><span class="caret"></span><span class="tag new">新增 · 例: 5396=北京联通</span></pre>
+  </div>
+  <div class="figcap">图 D — 追加 URL 进 <code>web_targets</code>（沿用总数上限 8 校验）；节点输入进 <code>ookla_server_id</code>（数字）或上行节点（host:port）。非 TTY 环境跳过询问走默认，与现有 port/iperf3 JIT 行为一致。</div>
+
+  <!-- 图 E -->
+  <h3>图 E · iperf3 单选 — 现有服务器询问后追加口径选项</h3>
+  <div class="term">
+    <div class="bar"><i></i><i></i><i></i><em>命令提示符 — netpulse · 高级选项</em></div>
+    <pre><span class="g">  输入 > </span>5
+<span class="g">  iperf3 服务器 (host[:port], 直接回车跳过): </span>192.168.1.10<span class="tag now">现有</span>
+<span class="gr">  → iperf3 server: 192.168.1.10:5201</span><span class="tag now">现有</span>
+<span class="g">  测速口径? [Enter=TCP吞吐 / u=UDP抖动丢包(语音游戏口径)]: </span><span class="caret"></span><span class="tag new">新增 · 对应 --iperf3-udp</span></pre>
+  </div>
+  <div class="figcap">图 E — 选 <code>u</code> 时设置 UDP 模式（抖动 &gt;30ms / 丢包 &gt;1% 告警阈值沿用模块内置）。</div>
+</section>
+
+<!-- ═══════════ 5. 边界情况 ═══════════ -->
+<section>
+  <h2><span class="no">5</span>边界情况一览</h2>
+  <table>
+    <tr><th>场景</th><th>行为</th><th>依据 / 一致性</th></tr>
+    <tr><td>非管理员 / 未装 Npcap / scapy 被禁</td><td>亮 ✘ 状态行 + 原因，不出选择题，回车继续仅统计层</td><td>复用 <code>precheck()</code> 的客户文案，与 CLI 降级语义逐字一致</td></tr>
+    <tr><td>非 TTY（管道 / 脚本调菜单）</td><td>抓包询问跳过 = 不开启；JIT 询问跳过 = 默认值</td><td>与 <code>_capture_confirm_once</code> 及 port/iperf3 JIT 的非交互语义一致</td></tr>
+    <tr><td>已确认过隐私（<code>.capture_ack</code> 存在）</td><td>不再弹首次确认</td><td>现有落标记逻辑，零改动</td></tr>
+    <tr><td>盯障时长输入非法（非数字）</td><td>沿用现有 clamp：默认 10，范围 1-1440</td><td><code>_run_scene_monitor</code> 现行为</td></tr>
+    <tr><td>CLI 显式带 <code>--capture</code></td><td>完全走现有 CLI 路径，菜单代码不参与</td><td>补口只在交互函数内部</td></tr>
+    <tr><td>工程师 <code>m</code> 键（高级页盯障）</td><td><b>保持零询问直接跑</b>；要抓包走场景 [7]</td><td>「m = 快」是 v1.6.0 的刻意设计，不回退</td></tr>
+    <tr><td><code>d</code> 键无诊断数据</td><td>提示先跑一次诊断，回车返回（对称 <code>e</code> 键）</td><td><code>LAST_RUN</code> 判空</td></tr>
+    <tr><td>追加 URL 超 8 个上限 / 节点格式非法</td><td>提示原因并按默认集继续，不中断模块运行</td><td>沿用 <code>web_targets</code> 上限校验与节点解析</td></tr>
+  </table>
+</section>
+
+<!-- ═══════════ 6. 明确不做 ═══════════ -->
+<section>
+  <h2><span class="no">6</span>明确不做（本期范围外）</h2>
+  <table>
+    <tr><th>项</th><th>不做的理由</th></tr>
+    <tr><td><code>--monitor-target</code> 进菜单</td><td>盯指定 IP 是工程师级操作；给 <code>m</code> 加询问会破坏「零输入直接跑」的刻意设计。装维侧 [7]+抓包已覆盖主场景。</td></tr>
+    <tr><td><code>--monitor-load / --load-url</code> 进菜单</td><td>压负载盯障属专题排障（QoS 限速类），需要理解「负载会占带宽」，放进菜单反而诱导误用。</td></tr>
+    <tr><td>调优旋钮进菜单（port-force/timeout/concurrency、tcpcc-max、iperf3-duration 等）</td><td>默认值即最佳实践，暴露旋钮只增加决策负担；CLI 保留给懂的人。</td></tr>
+    <tr><td>抓包询问里直接暴露 MB 数字输入</td><td>64MB 默认覆盖 99% 场景；<code>s</code> 子选项够用，避免「64 是什么单位」式困惑。输错 clamp 到 ≥8（现有逻辑）。</td></tr>
+    <tr><td>场景层 [6] / [8] 空号启用（如 [6]=抓包盯障独立入口）</td><td>抓包是盯障的属性不是独立场景，拆入口会让「盯障到底选哪个」成为新问题。</td></tr>
+  </table>
+</section>
+
+<!-- ═══════════ 7. 实施清单 ═══════════ -->
+<section>
+  <h2><span class="no">7</span>实施清单（评审通过后）</h2>
+  <ol class="impl">
+    <li><b>新增 <code>_prompt_for_capture()</code></b>（约 35 行）：precheck → 状态行 → Enter/y/f/s 解析 → 返回 <code>(capture_mode, capture_mb)</code>。非 TTY 返回 <code>(None, 默认)</code>。</li>
+    <li><b><code>_run_scene_monitor</code></b>：时长询问后接入上述函数，透传 <code>run_monitor_mode(..., capture_mode=…, capture_mb=…)</code>（改动 2 行）。</li>
+    <li><b><code>_module_menu</code></b>：新增 <code>d</code> 键分支调 <code>_export_debug_bundle</code>（判空提示），快捷行文案加 <code>d=调试包</code>（约 12 行）。</li>
+    <li><b>三个 JIT 询问</b>：网页体检追加 URL / 测速换节点 / iperf3 口径，仿 <code>_prompt_for_port_targets</code> 范式（各约 15 行，仅在单选对应模块且 TTY 时触发）。</li>
+    <li><b>测试</b>：<code>tests/test_v160_scene.py</code> 补菜单输入流用例（7 → 时长 → y → 首次确认 y）；抓包询问用合成 TTY（mock stdin isatty）；<code>d</code> 键 LAST_RUN 空/非空两态；JIT 追加 URL 上限拒绝用例。</li>
+    <li><b>README</b>：盯障参数表补「菜单入口」列（顺手修复 README 漂移 — 本次审计的教训来源）。</li>
+  </ol>
+  <div class="callout">
+    工作量估计：<b>半天到一天</b>（含测试与 README 同步）。改动全部落在交互层，核心诊断路径零变更，符合质量收口阶段「冻结大 Probe / 只收口」的硬规则。
+  </div>
+</section>
+
+<footer>NetPulse 交互菜单补口设计稿 · 静态评审版 · 2026-09-03 · 通过后按 §7 实施</footer>
+</div>
+</body>
+</html>
