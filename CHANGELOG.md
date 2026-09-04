@@ -7,6 +7,52 @@
 
 ## [Unreleased]
 
+## [1.9.10] - 2026-09-04
+
+全量代码审查修复批（v1.9.6–v1.9.9 引入缺陷的收口）：scapy 预载竞态、
+提权重启接续意图丢失、交互提示污染 JSON 输出等 11 处。
+
+### 修复
+
+- **`--no-scapy` 被预载线程击穿 (P1)**：旧版 `_start_scapy_preload()` 在
+  argparse 前启动，`--no-scapy` 解析后置的 `SCAPY_AVAILABLE = False` 会被
+  线程稍后完成的导入写回 `True`，DHCP 照走 scapy（正是该开关要防的
+  Npcap 段错误场景）。修复 = 启动点后移到置位之后 + `_load_scapy` 兜底
+  （`FORCE_NO_SCAPY` 时强制 False），双保险
+- **提权重启接续意图丢失 (P1)**：场景 `[7]` 抓包权限不足提权重启时，
+  `resume_tail` 把分钟传给了按秒的 `--monitor`（10 分钟缩成 30 秒）且漏了
+  `--capture`（重启后只剩统计层）。现为 `["--monitor", 秒, "--capture"]`
+- **wt 提权启动参数条件写反 (P1)**：源码运行经 Windows Terminal 重启时
+  丢失 python.exe 前缀，wt 拿裸 .py 当命令（启动失败/开编辑器）而旧窗口
+  已退出；frozen exe 不受影响。两分支统一同源拼接
+- **`_migrate_pcap.py` 越界写 (P1)**：UDP 包被 snaplen 截到 L4 头中间时
+  `_patch_ip_lengths` 写越界 → IndexError 中途崩、无输出文件；补
+  `len < l4_off+8` 守卫（与主代码同源）
+- **交互提示污染 JSON 输出 (P2)**：提权提议与修复命令一键执行改查双向
+  TTY —— stdout 被重定向（`--json > file`，RMM/AI-Agent 管道场景）时
+  静默跳过，不再写脏机器可读输出、不再阻塞 `input()`
+- **提权提议不验原因 (P2)**：`_PcapCaptureSession` 新增 `needs_admin`，
+  仅 precheck 判定「缺管理员」才提议提权 —— scapy 被禁用/接口解析失败
+  不再白弹 UAC（也不再经重启静默丢 `--no-scapy`）
+- **首用双次隐私确认消除 (P2)**：`run_monitor_mode` 新增
+  `capture_confirmed`，菜单路径（询问已含隐私要点 + 显式选择）跳过 CLI
+  首用确认 —— 旧版同屏两问措辞不同，第二问答 n 会静默降级，自相矛盾
+- **菜单 `d` 键不再直读 `LAST_RUN` (P2)**：新增 runner 层访问器
+  `_has_diagnostic_data()`，收口规则「新代码不直读 LAST_RUN」回到正轨
+
+### 文档
+
+- README 参数表补 `--install-npcap`，系统要求补场景 `[A]` 一键管理员模式
+
+### 测试
+
+- 383 → 396：新增 13 个回归用例（预载竞态双保险、wt 启动参数、盯障接续
+  参数、stdout 重定向静默、提权提议原因判定、迁移脚本边界含越界写）
+- 修复环境依赖红测：`_prompt_for_capture` 不可用分支未 mock
+  `_is_admin`/`_npcap_installed`（非管理员+已装 Npcap 机器必红）；交互
+  提议类测试统一双向 TTY mock —— 管道环境 stdin TTY/stdout 非 TTY 的
+  组合会被本版的 stdout 门正确拦截，测试必须密封
+
 ## [1.9.9] - 2026-09-03
 
 抓包复核 P0：截断 pcap 的 IP 长度字段修正（用户 Wireshark 打开抓包文件满屏

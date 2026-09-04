@@ -39,15 +39,48 @@ class TestPromptForCapture(unittest.TestCase):
         self.assertEqual(mb, np.CAPTURE_DEFAULT_MB)
 
     def test_unavailable_shows_reason_no_question(self):
-        # 不可用: 只有「按 Enter 继续」, 没有选择题 (input 恰好一次)
+        # 不可用: 只有「按 Enter 继续」, 没有选择题 (input 恰好一次)。
+        # v1.9.10 修复: mock 权限/Npcap 状态 — 此前依赖真机状态, 非管理员+
+        # 已装 Npcap 的机器上提权提议多消费一次 input (环境依赖红测)
         s = self._sess(False, "Npcap 默认只允许管理员抓包 — 请以管理员身份重跑")
         with mock.patch("sys.stdin.isatty", return_value=True), \
              mock.patch("netpulse._PcapCaptureSession", return_value=s), \
+             mock.patch("netpulse._is_admin", return_value=False), \
+             mock.patch("netpulse._npcap_installed", return_value=False), \
              mock.patch("builtins.input", return_value="") as m_in:
             mode, mb = np._prompt_for_capture()
         self.assertIsNone(mode)
         self.assertEqual(mb, np.CAPTURE_DEFAULT_MB)
         self.assertEqual(m_in.call_count, 1)
+
+    def test_unavailable_admin_missing_offers_elevation_once(self):
+        # 不可用且仅缺管理员 (Npcap 已就绪): 恰一次提权提议 (v1.9.7 PR-3)
+        s = self._sess(False, "抓包取证需要管理员权限")
+        with mock.patch("sys.stdin.isatty", return_value=True), \
+             mock.patch("netpulse._PcapCaptureSession", return_value=s), \
+             mock.patch("netpulse._is_admin", return_value=False), \
+             mock.patch("netpulse._npcap_installed", return_value=True), \
+             mock.patch("builtins.input", return_value=""), \
+             mock.patch("netpulse._offer_elevation_relaunch") as m_offer:
+            mode, mb = np._prompt_for_capture(
+                resume_tail=["--monitor", "600", "--capture"])
+        m_offer.assert_called_once()
+        self.assertIsNone(mode)
+
+    def test_scapy_disabled_no_elevation_offer(self):
+        # v1.9.10: precheck 失败原因不是缺管理员 (如 --no-scapy) 时不得提议提权
+        # (提权也白提, 且接续参数会丢掉 --no-scapy)
+        s = self._sess(False, "scapy 被禁用 (--no-scapy 或未安装 scapy), 抓包不可用")
+        s.needs_admin = False
+        with mock.patch("sys.stdin.isatty", return_value=True), \
+             mock.patch("netpulse._PcapCaptureSession", return_value=s), \
+             mock.patch("netpulse._is_admin", return_value=False), \
+             mock.patch("netpulse._npcap_installed", return_value=True), \
+             mock.patch("builtins.input", return_value=""), \
+             mock.patch("netpulse._offer_elevation_relaunch") as m_offer:
+            mode, mb = np._prompt_for_capture()
+        m_offer.assert_not_called()
+        self.assertIsNone(mode)
 
     def _ask(self, answers, sess_ok=True):
         s = self._sess(sess_ok)
@@ -92,7 +125,21 @@ class TestSceneMonitorPassthrough(unittest.TestCase):
              mock.patch("netpulse.run_monitor_mode") as m_run, \
              mock.patch("netpulse._pause_enter"):
             np._run_scene_monitor()
-        m_run.assert_called_once_with(600, capture_mode="slice", capture_mb=128)
+        # capture_confirmed=True: 菜单询问已含隐私要点+显式选择, 不再二次确认
+        m_run.assert_called_once_with(600, capture_mode="slice", capture_mb=128,
+                                      capture_confirmed=True)
+
+    def test_resume_tail_seconds_and_capture(self):
+        # v1.9.10 回归: 接续参数必须换算成秒 (--monitor 是 SEC, 旧版传分钟
+        # 使 10 分钟缩成 30s), 且必须带 --capture (提权本是为抓包)
+        with mock.patch("builtins.input", return_value="10"), \
+             mock.patch("netpulse._prompt_for_capture",
+                        return_value=(None, np.CAPTURE_DEFAULT_MB)) as m_prompt, \
+             mock.patch("netpulse.run_monitor_mode"), \
+             mock.patch("netpulse._pause_enter"):
+            np._run_scene_monitor()
+        m_prompt.assert_called_once_with(
+            resume_tail=["--monitor", "600", "--capture"])
 
     def test_scene_menu_7_routes_to_monitor(self):
         # 场景层 [7] → _run_scene_monitor (接线检查)

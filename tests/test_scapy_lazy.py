@@ -113,5 +113,40 @@ class TestReloadScapy(unittest.TestCase):
                 self.assertIsNotNone(getattr(N, name))
 
 
+class TestNoScapyRace(unittest.TestCase):
+    """v1.9.10 回归: --no-scapy 不得被预载线程的导入结果击穿。
+
+    旧时序: main() 在 argparse 前开预载线程; --no-scapy 解析后才置
+    FORCE_NO_SCAPY / SCAPY_AVAILABLE=False; 线程稍后完成导入把 True 写回,
+    DHCPDetector.detect() 只认 SCAPY_AVAILABLE → 照走 scapy。
+    修复 = 启动点后移 + _load_scapy 兜底, 这里锁两道。"""
+
+    def setUp(self):
+        self._saved = (N.FORCE_NO_SCAPY, N.SCAPY_AVAILABLE,
+                       N.SCAPY_LOADED, N._scapy_thread)
+
+    def tearDown(self):
+        (N.FORCE_NO_SCAPY, N.SCAPY_AVAILABLE,
+         N.SCAPY_LOADED, N._scapy_thread) = self._saved
+
+    def test_load_scapy_never_overrides_force_no_scapy(self):
+        """兜底: FORCE_NO_SCAPY=True 时导入成功也不得把 SCAPY_AVAILABLE 置 True。"""
+        N.FORCE_NO_SCAPY = True
+        N.SCAPY_AVAILABLE = False
+        N.SCAPY_LOADED.clear()
+        N._load_scapy()                # 装了 scapy 的机器导入会成功
+        self.assertFalse(N.SCAPY_AVAILABLE,
+                         "FORCE_NO_SCAPY 下导入结果不得覆盖显式禁用")
+        self.assertTrue(N.SCAPY_LOADED.is_set(), "成败都必须置位 SCAPY_LOADED")
+
+    def test_main_preload_starts_after_no_scapy_branch(self):
+        """main() 里 _start_scapy_preload() 必须在 --no-scapy 置位之后调用。"""
+        import inspect
+        src = inspect.getsource(N.main)
+        self.assertLess(src.index("args.no_scapy"),
+                        src.index("_start_scapy_preload()"),
+                        "预载启动点必须在 --no-scapy 置位之后 (否则线程照常导 scapy)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

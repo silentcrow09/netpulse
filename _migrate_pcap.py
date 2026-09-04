@@ -38,6 +38,8 @@ def fix_pcap_bytes(raw):
         return None
     proto = raw[ip_off + 9]
     l4_off = ip_off + ihl
+    if proto == 17 and len(raw) < l4_off + 8:
+        return None                   # UDP 头不完整: 修长度会越界写 (主代码同守卫)
     buf = bytearray(raw)
     N._patch_ip_lengths(buf, ip_off, ihl, l4_off, proto)
     return bytes(buf)

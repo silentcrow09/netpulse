@@ -82,6 +82,12 @@ def _load_scapy():
     except Exception:
         SCAPY_AVAILABLE = False
     finally:
+        # v1.9.10 修复: 预载线程启动早于 argparse, --no-scapy 在解析后才置
+        # FORCE_NO_SCAPY — 若导入恰在置位之后完成, 上面的 True 会把主线程
+        # 刚写的 False 覆盖回去, --no-scapy 被静默击穿 (DHCP 照走 scapy)。
+        # 显式禁用优先于任何导入结果。
+        if FORCE_NO_SCAPY:
+            SCAPY_AVAILABLE = False
         SCAPY_LOADED.set()
     return SCAPY_AVAILABLE
 
@@ -138,6 +144,13 @@ SCAPY_OFFER_STATE = SCAPY_OFFER_STATE_NEVER
 
 # 最近一次诊断运行的完整数据 (供报告生成使用)
 LAST_RUN = None
+
+def _has_diagnostic_data():
+    """runner 层访问器: 是否已有可用诊断数据。
+
+    收口规则: 菜单/渲染层不得直接读写 LAST_RUN (数据流向
+    runner → report → renderer)。存量直读点逐步迁移到本访问器。"""
+    return bool(LAST_RUN and LAST_RUN.get("results"))
 
 # 模块运行参数统一配置 (阶段 B · v1.2.0 引入 — B12)
 # 设计: 把散落各模块的 XXX_CONFIG 集中到顶层 CONFIG 字典, 按模块名分 key.
@@ -254,8 +267,10 @@ def _build_elevated_launch(args_tail=None, workdir=None):
     wt = _find_windows_terminal()
     if wt:
         wd = workdir or os.getcwd()
-        inner = lp_params if not getattr(sys, "frozen", False) \
-            else f'"{lp_file}"' + (f" {lp_params}" if lp_params else "")
+        # v1.9.10 修复: 此前三目条件写反 — 源码运行时 inner 少了 python.exe,
+        # wt 拿裸 .py 当命令 (启动失败/开编辑器) 而旧窗口已 sys.exit(0)。
+        # frozen: '"<exe>" <tail>'; 源码: '"<python.exe>" "<脚本>" <tail>'
+        inner = f'"{lp_file}"' + (f" {lp_params}" if lp_params else "")
         return wt, f'-d "{wd}" {inner}'
     return lp_file, lp_params
 
@@ -284,8 +299,9 @@ def _offer_elevation_relaunch(args_tail=None, reason="", input_fn=None):
     reason: 一句话说明为什么要管理员 (会展示给用户)。
     用户取消 / 提权失败: 打印降级提示后正常返回, 不打断当前流程。
     """
-    if not sys.stdin.isatty():
-        return  # 非交互 (脚本/管道): 只静默跳过, CLI 用户自己控制提权
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return  # 非交互 / stdout 被重定向 (脚本/管道/--json > file): 静默跳过 —
+        # 提示文案会污染机器可读输出且阻塞在 input() (v1.9.10 补 stdout 检查)
     input_fn = input_fn or input
     print()
     print(_c(f"  ⚠ {reason}", C_YELLOW))
@@ -343,8 +359,8 @@ def _offer_admin_fix_shell(commands, input_fn=None):
     返回实际发起执行的命令数 (用户跳过/取消 → 0)。
     非 TTY 直接跳过 (脚本/管道不打断)。
     """
-    if not commands or not sys.stdin.isatty():
-        return 0
+    if not commands or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return 0   # 非交互 / stdout 重定向 (--json > file): 零打扰 (v1.9.10 补 stdout)
     input_fn = input_fn or input
     print()
     print(_c(f"  ⚠ 发现 {len(commands)} 条管理员修复命令 "
@@ -3528,7 +3544,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.9.9"
+APP_VERSION = "1.9.10"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -12066,8 +12082,11 @@ def _prompt_for_capture(input_fn=None, resume_tail=None):
     cap = _PcapCaptureSession("slice", CAPTURE_DEFAULT_MB)
     if not cap.precheck():
         print(_c(f"  ✘ 抓包暂不可用: {cap.unavailable_reason}", C_YELLOW))
-        # v1.9.7 PR-3: 只缺管理员权限时, 别让用户手动关闭重开 — 一键提权接续
-        if not _is_admin() and _npcap_installed():
+        # v1.9.7 PR-3: 只缺管理员权限时, 别让用户手动关闭重开 — 一键提权接续。
+        # v1.9.10: 仅 precheck 判定「缺管理员」(needs_admin) 时才提议 —
+        # scapy 被禁用/接口解析失败时提权也白提, 且接续参数会丢 --no-scapy
+        if (getattr(cap, "needs_admin", False)
+                and not _is_admin() and _npcap_installed()):
             _offer_elevation_relaunch(
                 resume_tail, reason="抓包取证需要管理员权限 (Npcap 已就绪)")
         print(_c("     本次仅统计层盯障 (掉线/抖动统计不受影响)。", C_GRAY))
@@ -12312,6 +12331,7 @@ class _PcapCaptureSession:
         self.max_mb = max(8, int(max_mb))
         self.available = False
         self.unavailable_reason = ""
+        self.needs_admin = False    # precheck 失败是否仅因缺管理员 (供提权提议判定)
         self.iface = None
         self._sniffer = None
         self.ring = None
@@ -12340,6 +12360,7 @@ class _PcapCaptureSession:
         if not _is_admin():
             self.unavailable_reason = ("Npcap 默认只允许管理员抓包 — 请以管理员身份"
                                        "重跑 (统计层不受影响)")
+            self.needs_admin = True  # 仅此分支才值得弹 UAC (v1.9.10)
             return False
         try:
             # 默认路由出口接口 (iface 在 route 3 元组第 0 位, 校验在接口清单内)
@@ -12979,8 +13000,13 @@ def _apply_capture_evidence(result):
 
 
 def run_monitor_mode(duration_s, ext_target=None, load_url=None,
-                     capture_mode=None, capture_mb=CAPTURE_DEFAULT_MB):
+                     capture_mode=None, capture_mb=CAPTURE_DEFAULT_MB,
+                     capture_confirmed=False):
     """盯障模式入口 (CLI --monitor 与菜单 m 共用)。
+
+    capture_confirmed: 菜单路径传 True — _prompt_for_capture 已展示隐私要点
+    (仅包头与域名/不存账号密码) 且获用户显式选择, 不再走 CLI 的首用隐私
+    确认 (旧版同屏两问措辞不同, 第二问答 n 会静默降级, 自相矛盾; v1.9.10)。
 
     全文件唯一在长循环外层捕获 KeyboardInterrupt 的地方: Ctrl+C 提前结束
     也必须走统一的报告落盘路径 (装维随时可停, 数据不丢)。"""
@@ -12999,8 +13025,9 @@ def run_monitor_mode(duration_s, ext_target=None, load_url=None,
     # 抓包层 (v1.8.0 PR-F1): 显式 --capture 才启用; 检查链失败 → 降级提示,
     # 统计层照跑、退出码不变
     cap = None
-    if capture_mode:
-        # 首次使用确认 (PR-F5): 拒绝 → 降级仅统计层, 盯障照常
+    if capture_mode and not capture_confirmed:
+        # 首次使用确认 (PR-F5): 拒绝 → 降级仅统计层, 盯障照常。
+        # 菜单路径 (capture_confirmed=True) 跳过, 见函数 docstring
         if not _capture_confirm_once():
             print(_c("  已跳过抓包 (未确认), 继续仅统计层监测", C_YELLOW))
             capture_mode = None
@@ -18367,11 +18394,14 @@ def _run_scene_monitor(install=False, pip_mirror=None):
     # 不可用 (非管理员/无 Npcap) 时函数内部亮原因后直接返回 None, 不出选择题。
     # v1.9.7 PR-3: 传盯障接续参数 — 仅缺管理员权限时可一键提权重启并直接续盯
     capture_mode, capture_mb = _prompt_for_capture(
-        resume_tail=["--monitor", str(minutes)])
+        # v1.9.10 修复: --monitor 单位是秒 (argparse metavar=SEC), 此前传分钟
+        # 使接续会话 60 倍缩水 (10 分钟 → 30s); 补 --capture — 提权本是为
+        # 抓包, 不带则重启后只剩统计层
+        resume_tail=["--monitor", str(minutes * 60), "--capture"])
     print(_c(f"  开始盯障 {minutes} 分钟（{minutes*60} 秒）... Ctrl+C 可提前结束", C_BOLD))
     try:
         run_monitor_mode(minutes * 60, capture_mode=capture_mode,
-                         capture_mb=capture_mb)
+                         capture_mb=capture_mb, capture_confirmed=True)
     # (Exception, KeyboardInterrupt): Ctrl+C 是 BaseException, 只捕 Exception
     # 会把原始回溯打到客户屏幕上, _format_error_for_user 的中断文案成死分支 (审查 #4)
     except (Exception, KeyboardInterrupt) as e:
@@ -18637,7 +18667,7 @@ def _module_menu(install=False, pip_mirror=None):
         # 上报排障主通道: 无诊断数据时提示先跑 (不像 CLI 那样自动跑全诊断 —
         # 菜单里 30-120 秒的意外等待比一次提示更伤)。
         if choice.lower() in ("d", "debug", "调试包"):
-            if not LAST_RUN:
+            if not _has_diagnostic_data():
                 print(_c("  尚无诊断数据，请先运行一次诊断 (0=全部 或选模块)。", C_YELLOW))
             else:
                 print(_c("  → 打包: system.json + diagnostic.json + evidence.json"
@@ -18753,8 +18783,6 @@ def _module_menu(install=False, pip_mirror=None):
 
 
 def main():
-    # v1.9.7 PR-2: scapy 后台预加载 — 越早开线程, 菜单渲染完时越可能已加载完
-    _start_scapy_preload()
     parser = argparse.ArgumentParser(
         prog="netpulse.py",
         description=f"{APP_NAME} v{APP_VERSION} — Windows 网络诊断工具 (命令行)")
@@ -18899,6 +18927,12 @@ def main():
         global FORCE_NO_SCAPY, SCAPY_AVAILABLE
         FORCE_NO_SCAPY = True
         SCAPY_AVAILABLE = False
+    # v1.9.7 PR-2: scapy 后台预加载 — argparse 只耗毫秒, 解析完即开线程,
+    # 菜单渲染完时基本已加载完。必须放在 --no-scapy 置位之后: 此前在 main()
+    # 入口启动时 FORCE_NO_SCAPY 还是 False, --no-scapy 下线程照常导 scapy,
+    # 完成后把刚写的 SCAPY_AVAILABLE=False 覆盖回 True (v1.9.10 修复;
+    # _load_scapy 里的 FORCE_NO_SCAPY 兜底是第二道防线)。
+    _start_scapy_preload()
 
     # 端口探测参数 -> 全局配置 (run_diagnostics 读取)
     # 注意: args.port_target 已经是 argparse action="append" 后的 list,

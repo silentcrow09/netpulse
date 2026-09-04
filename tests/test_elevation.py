@@ -54,6 +54,30 @@ class TestBuildElevatedLaunch(unittest.TestCase):
         self.assertIn(r'"C:\My Dir\out"', lp_params,
                       "含空格的参数必须加引号")
 
+    def test_wt_source_run_keeps_python(self):
+        """v1.9.10 回归: wt 分支源码运行必须带 python.exe。
+
+        旧版三目条件写反, inner 丢了 python.exe → wt 拿裸 .py 当命令
+        (启动失败/开编辑器) 而旧窗口已 sys.exit(0)。"""
+        wt = r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\wt.exe"
+        with mock.patch.object(N, "_find_windows_terminal", return_value=wt):
+            lp_file, lp_params = N._build_elevated_launch(["--install-npcap"])
+        self.assertEqual(lp_file, wt)
+        self.assertIn(f'"{sys.executable}"', lp_params,
+                      "wt 参数必须含带引号的 python.exe (源码运行不依赖文件关联)")
+
+    def test_wt_frozen_keeps_exe_quoted(self):
+        """frozen 分支: wt 参数里本体 exe 带引号且位于 tail 之前 (同源拼接)。"""
+        wt = r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\wt.exe"
+        with mock.patch.object(N, "_find_windows_terminal", return_value=wt), \
+             mock.patch.object(sys, "frozen", True, create=True):
+            _, lp_params = N._build_elevated_launch(["--monitor", "10"])
+        exe_q = f'"{sys.executable}"'
+        self.assertIn(exe_q, lp_params,
+                      "frozen: wt 参数须含带引号的本体 exe")
+        self.assertLess(lp_params.index(exe_q), lp_params.index("--monitor"),
+                        "本体 exe 必须在 tail 参数之前 (wt 的命令部分)")
+
 
 class TestRelaunchElevated(unittest.TestCase):
     """ShellExecuteW 分支。"""
@@ -93,8 +117,19 @@ class TestOfferElevationRelaunch(unittest.TestCase):
             N._offer_elevation_relaunch(["--x"], reason="测试")
         m_re.assert_not_called()
 
+    def test_stdout_redirect_skips_silently(self):
+        """v1.9.10: stdout 重定向 (如 --json > file) 时静默跳过提权提议。"""
+        with mock.patch.object(N.sys.stdin, "isatty", return_value=True), \
+             mock.patch.object(N.sys.stdout, "isatty", return_value=False), \
+             mock.patch.object(N, "_relaunch_elevated") as m_re, \
+             mock.patch("builtins.input") as m_in:
+            N._offer_elevation_relaunch(["--x"], reason="测试")
+        m_re.assert_not_called()
+        m_in.assert_not_called()
+
     def test_decline_keeps_running(self):
         with mock.patch.object(N.sys.stdin, "isatty", return_value=True), \
+             mock.patch.object(N.sys.stdout, "isatty", return_value=True), \
              mock.patch("builtins.input", return_value="n"), \
              mock.patch.object(N, "_relaunch_elevated") as m_re:
             N._offer_elevation_relaunch(["--x"], reason="测试")
@@ -102,6 +137,7 @@ class TestOfferElevationRelaunch(unittest.TestCase):
 
     def test_accept_and_success_exits_zero(self):
         with mock.patch.object(N.sys.stdin, "isatty", return_value=True), \
+             mock.patch.object(N.sys.stdout, "isatty", return_value=True), \
              mock.patch("builtins.input", return_value="y"), \
              mock.patch.object(N, "_relaunch_elevated",
                                return_value=(True, "ok")) as m_re:
@@ -113,6 +149,7 @@ class TestOfferElevationRelaunch(unittest.TestCase):
     def test_accept_but_failure_degrades(self):
         """提权失败 (用户取消 UAC): 不抛异常, 流程继续 (不藏退路)。"""
         with mock.patch.object(N.sys.stdin, "isatty", return_value=True), \
+             mock.patch.object(N.sys.stdout, "isatty", return_value=True), \
              mock.patch("builtins.input", return_value="y"), \
              mock.patch.object(N, "_relaunch_elevated",
                                return_value=(False, "拒绝")):
@@ -216,8 +253,12 @@ class TestOfferAdminFixShell(unittest.TestCase):
                      'store=persistent']
 
     def _run(self, cmds, answer, se_ret=33):
-        """公共桩: TTY + 输入 answer + ShellExecuteW 返回 se_ret。"""
+        """公共桩: 双向 TTY + 输入 answer + ShellExecuteW 返回 se_ret。
+
+        stdout 也要 mock — v1.9.10 起交互提议检查双向 TTY, 管道环境下
+        不 mock stdout 会环境依赖红。"""
         with mock.patch.object(N.sys.stdin, "isatty", return_value=True), \
+             mock.patch.object(N.sys.stdout, "isatty", return_value=True), \
              mock.patch("builtins.input", return_value=answer), \
              mock.patch("ctypes.windll.shell32.ShellExecuteW",
                         return_value=se_ret) as m_se:
@@ -225,6 +266,15 @@ class TestOfferAdminFixShell(unittest.TestCase):
 
     def test_non_tty_skips(self):
         with mock.patch.object(N.sys.stdin, "isatty", return_value=False), \
+             mock.patch("builtins.input") as m_in:
+            self.assertEqual(N._offer_admin_fix_shell(self.cmds), 0)
+        m_in.assert_not_called()
+
+    def test_stdout_redirect_skips(self):
+        """v1.9.10: stdout 被重定向 (--json > file) 时静默跳过 — 提示会污染
+        机器可读输出且阻塞管道, 即便 stdin 仍是 TTY (RMM/AI-Agent 场景)。"""
+        with mock.patch.object(N.sys.stdin, "isatty", return_value=True), \
+             mock.patch.object(N.sys.stdout, "isatty", return_value=False), \
              mock.patch("builtins.input") as m_in:
             self.assertEqual(N._offer_admin_fix_shell(self.cmds), 0)
         m_in.assert_not_called()

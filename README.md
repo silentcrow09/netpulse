@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.9.9
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.9.10
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -148,6 +148,7 @@ python netpulse.py --install
 | `--verbose` | 显示完整原始字段（默认仅显示结论 + 关键指标 + 问题清单，细节保存在 HTML/JSON 报告中） |
 | `--no-color` | 禁用彩色输出（兼容老旧终端） |
 | `--install` | 自动安装缺失依赖 |
+| `--install-npcap` | 仅安装 Npcap 抓包驱动后进入菜单 (需管理员权限; 普通权限下仅提示)。自提权重启的落点 — 场景 `[A]` 管理员模式 / 抓包权限不足时的一键提权都经它接续 |
 | `--no-scapy` | 禁用 scapy 二层抓包，DHCP 检测降级 |
 | `--port-target` | 端口探测目标，支持单端口/范围/混合，详见下方 |
 | `--port-proto` | 端口探测协议：`tcp`（默认）/ `udp` / `both` |
@@ -412,7 +413,7 @@ irm https://<bucket>.oss-cn-hangzhou.aliyuncs.com/netpulse/v1-beta/install.ps1 |
 
 - Windows 10 / 11（64 位）
 - Python 3.10+
-- 部分功能需**管理员权限**（如 scapy 的 DHCP 二层检测）
+- 部分功能需**管理员权限**（抓包取证、Npcap 安装、scapy 的 DHCP 二层检测）。普通权限启动后可经场景菜单 `[A]` 一键以管理员身份重启 (UAC 确认后接续当前意图)，无需手动关闭再右键运行
 
 ## 📁 目录结构
 
