@@ -7,6 +7,33 @@
 
 ## [Unreleased]
 
+## [1.9.11] - 2026-09-04
+
+代码审查 P3 收尾（边界正确性 + 提权意图接续 + 暗耦合锁死）。
+
+### 修复
+
+- **分片包整包保留**：`_capture_strip_packet` / `_migrate_pcap.py` 对 MF
+  置位或 frag_off≠0 的 IPv4 包不再截断/改写长度 —— 首片改短会与后续分片
+  偏移脱节，Wireshark 重组报 hole/malformed（v1.9.9 长度修正的反向边界）
+- **wt 提权启动盘根 cwd 转义**：cwd 为盘根（`C:\`）时 `-d "C:\"` 的尾反
+  斜杠吞掉闭引号（CommandLineToArgvW 把 `\"` 解析为转义引号），后续参数
+  全部错乱；尾部反斜杠翻倍转义
+- **ensure_scapy 提权重启携带原 argv**：旧版只传 `["--install-npcap"]`，
+  `--diagnose`/`--modules` 的原始意图被丢进交互菜单且原进程 exit 0 无
+  产出；现为 `["--install-npcap"] + sys.argv[1:]`，新管理员窗口装完
+  Npcap 接续原命令（菜单场景 argv 为空，行为不变）
+
+### 测试
+
+- 396 → 402：新增 6 个回归用例（MF 首片/非首片整包保留、迁移脚本分片
+  跳过、盘根 cwd 转义、ensure_scapy 提权携带 argv、提取器↔
+  `_rule_mtu_blackhole` 生产者现产文案契约 —— 旧测试锁手抄副本，生产者
+  改文案时测试照样绿的暗耦合）
+- 评估不修：菜单盯障 capture precheck 跑两遍（询问一遍 + run_monitor_mode
+  再验一遍）—— 毫秒级开销，且 start 前复验是刻意防御（询问到启动之间
+  接口/驱动状态可能变化），改动面触及盯障热路径，得不偿失
+
 ## [1.9.10] - 2026-09-04
 
 全量代码审查修复批（v1.9.6–v1.9.9 引入缺陷的收口）：scapy 预载竞态、

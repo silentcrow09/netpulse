@@ -267,6 +267,9 @@ def _build_elevated_launch(args_tail=None, workdir=None):
     wt = _find_windows_terminal()
     if wt:
         wd = workdir or os.getcwd()
+        # 盘根 cwd ("C:\\") 的尾反斜杠会吞掉闭引号 (CommandLineToArgvW 把
+        # \" 解析成转义引号), 后续参数全部错乱 — 尾部反斜杠翻倍转义 (v1.9.11)
+        wd = re.sub(r"(\\+)$", r"\1\1", wd)
         # v1.9.10 修复: 此前三目条件写反 — 源码运行时 inner 少了 python.exe,
         # wt 拿裸 .py 当命令 (启动失败/开编辑器) 而旧窗口已 sys.exit(0)。
         # frozen: '"<exe>" <tail>'; 源码: '"<python.exe>" "<脚本>" <tail>'
@@ -3530,10 +3533,13 @@ def ensure_scapy(auto_yes=False, mirror=None):
                 print(_c("  ⚠ Npcap: " + msg2, C_YELLOW))
                 print(_c("    scapy 已装好，但二层收发仍需 Npcap 才能做完整 DHCP 检测。", C_GRAY))
                 # v1.9.7 PR-3: 非管理员时提供一键提权重启 (装完 Npcap 回菜单),
-                # 替代旧的「关闭 → 右键管理员运行」手工断档
+                # 替代旧的「关闭 → 右键管理员运行」手工断档。
+                # v1.9.11: 接续当前意图 — 原样携带本次 argv (如 --diagnose
+                # full), 新管理员窗口装完 Npcap 后继续跑原命令; 菜单场景
+                # argv 为空, 行为与旧版一致 (装完回菜单)
                 if not _is_admin():
                     _offer_elevation_relaunch(
-                        ["--install-npcap"],
+                        ["--install-npcap"] + list(sys.argv[1:]),
                         reason="安装 Npcap 抓包驱动需要管理员权限")
 
     return SCAPY_AVAILABLE
@@ -3544,7 +3550,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.9.10"
+APP_VERSION = "1.9.11"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -12268,6 +12274,11 @@ def _capture_strip_packet(pkt, flow_state):
     if ihl < 20 or len(raw) < ip_off + ihl:
         return pkt
     proto = raw[ip_off + 9]
+    # 分片 (MF 置位或 frag_off≠0) 整包保留: 截断改写 IP 总长会让首片声明的
+    # 长度与后续分片偏移脱节, Wireshark 重组报 hole/malformed (v1.9.11)。
+    # BPF 端口过滤本只匹配 offset=0 首片, 此处防御非首片漏网。
+    if ((raw[ip_off + 6] << 8) | raw[ip_off + 7]) & 0x3FFF:
+        return pkt
     l4_off = ip_off + ihl
 
     if proto == 1:                     # ICMP: 整包

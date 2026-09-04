@@ -189,6 +189,22 @@ class TestCaptureStripPacket(unittest.TestCase):
             except OSError:
                 pass
 
+    # ---- v1.9.11: 分片包整包保留 (改写首片 IP 总长会与后续分片偏移脱节) ----
+
+    def test_mf_first_fragment_kept_whole(self):
+        """MF 置位首片: 不得截断 (改短 IP 总长 → Wireshark 重组报 hole)。"""
+        p = _pkt(payload=b"F" * 400, dport=443, proto=UDP)
+        p[IP].flags = "MF"
+        out = N._capture_strip_packet(p, {})
+        self.assertEqual(len(bytes(out)), len(bytes(p)), "MF 首片必须整包保留")
+
+    def test_nonfirst_fragment_kept_whole(self):
+        """frag_off≠0 非首片 (BPF 端口过滤本不该放行, 防御性整包保留)。"""
+        p = _pkt(payload=b"F" * 400, dport=443, proto=UDP)
+        p[IP].frag = 185                       # 1480/8, 单位 8 字节
+        out = N._capture_strip_packet(p, {})
+        self.assertEqual(len(bytes(out)), len(bytes(p)), "非首片必须整包保留")
+
 
 @unittest.skipUnless(SCAPY_OK, "scapy 未安装")
 class TestSliceWriteAndCleanup(unittest.TestCase):

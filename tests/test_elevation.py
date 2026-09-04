@@ -78,6 +78,16 @@ class TestBuildElevatedLaunch(unittest.TestCase):
         self.assertLess(lp_params.index(exe_q), lp_params.index("--monitor"),
                         "本体 exe 必须在 tail 参数之前 (wt 的命令部分)")
 
+    def test_wt_drive_root_workdir_escaped(self):
+        """v1.9.11: 盘根 cwd ("C:\\") 尾反斜杠翻倍 — 否则 \" 被解析为转义
+        引号吞掉闭引号, 后续参数全部错乱。"""
+        wt = r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\wt.exe"
+        with mock.patch.object(N, "_find_windows_terminal", return_value=wt):
+            _, lp_params = N._build_elevated_launch(["--install-npcap"],
+                                                    workdir="C:\\")
+        self.assertTrue(lp_params.startswith('-d "C:\\\\"'),
+                        f"盘根 cwd 尾反斜杠必须翻倍转义, 实际: {lp_params!r}")
+
 
 class TestRelaunchElevated(unittest.TestCase):
     """ShellExecuteW 分支。"""
@@ -155,6 +165,34 @@ class TestOfferElevationRelaunch(unittest.TestCase):
                                return_value=(False, "拒绝")):
             # 不应抛 SystemExit
             N._offer_elevation_relaunch(["--x"], reason="测试")
+
+
+class TestEnsureScapyRelaunch(unittest.TestCase):
+    """ensure_scapy 失败分支的一键提权 (v1.9.11: 必须携带原始 argv)。"""
+
+    def test_relaunch_carries_original_argv(self):
+        """旧版只传 ["--install-npcap"] — --diagnose/--modules 的原始意图
+        被丢进交互菜单且原进程 exit 0 无产出。现须接续原命令。"""
+        saved_state = N.SCAPY_OFFER_STATE
+        try:
+            with mock.patch.object(N, "SCAPY_AVAILABLE", False), \
+                 mock.patch.object(N, "_pip_install_scapy",
+                                   return_value=(True, "ok")), \
+                 mock.patch.object(N, "_reload_scapy", return_value=True), \
+                 mock.patch.object(N, "_npcap_installed", return_value=False), \
+                 mock.patch.object(N, "_install_npcap",
+                                   return_value=(False, "需要管理员权限")), \
+                 mock.patch.object(N, "_is_admin", return_value=False), \
+                 mock.patch.object(N, "_offer_elevation_relaunch") as m_offer, \
+                 mock.patch.object(sys, "argv",
+                                   ["netpulse.py", "--diagnose", "full"]):
+                N.ensure_scapy(auto_yes=True)
+        finally:
+            N.SCAPY_OFFER_STATE = saved_state
+        m_offer.assert_called_once()
+        self.assertEqual(m_offer.call_args[0][0],
+                         ["--install-npcap", "--diagnose", "full"],
+                         "提权重启必须携带原始 argv (装完 Npcap 接续原命令)")
 
 
 class TestInstallNpcapEntry(unittest.TestCase):
@@ -243,6 +281,20 @@ class TestExtractAdminFixCommands(unittest.TestCase):
     def test_none_and_empty_safe(self):
         self.assertEqual(N._extract_admin_fix_commands(None), [])
         self.assertEqual(N._extract_admin_fix_commands([_fake_rc(None)]), [])
+
+    def test_extract_matches_live_producer(self):
+        """v1.9.11: 提取器必须吃下 _rule_mtu_blackhole 的现产文案 — 锁死
+        「文案一改提取哑火」的暗耦合 (旧测试锁手抄副本, 生产者改文案时
+        测试照样绿)。"""
+        results = {"mtu": {"path_mtus": [{"path_mtu": 1400}],
+                           "local_mtus": [{"mtu": 1500, "interface": "以太网",
+                                           "egress": True}]}}
+        rc = N._rule_mtu_blackhole(results)
+        self.assertIsNotNone(rc, "构造的 results 必须能触发 MTU 黑洞规则")
+        cmds = N._extract_admin_fix_commands([rc])
+        self.assertEqual(len(cmds), 1, "生产者的 (管理员) netsh 建议必须可提取")
+        self.assertIn("mtu=1400", cmds[0])
+        self.assertIn("以太网", cmds[0], "接口名来自生产者填充, 不得丢失")
 
 
 class TestOfferAdminFixShell(unittest.TestCase):

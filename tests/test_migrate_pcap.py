@@ -20,14 +20,16 @@ except ImportError:
     M = None
 
 
-def _ipv4_udp_raw(udp_bytes, ip_total=200):
+def _ipv4_udp_raw(udp_bytes, ip_total=200, flags_frag=0):
     """手工以太帧: Ether(14) + IPv4(20, proto=17, 总长字段=ip_total) + udp_bytes。
 
-    布局: [0:6] dst / [6:12] src / [12:14] 0x0800 / [14] 0x45 /
-    [16:18] IP 总长 / [23] proto=17 / [24:26] IP 校验和(先置 0) / [34:] UDP。"""
+    flags_frag: 16-bit Flags+分片偏移字段 (0x2000=MF)。布局: [0:6] dst /
+    [6:12] src / [12:14] 0x0800 / [14] 0x45 / [16:18] IP 总长 /
+    [20:22] Flags+frag / [23] proto=17 / [24:26] IP 校验和(先置 0) / [34:] UDP。"""
     eth = b"\xaa" * 6 + b"\xbb" * 6 + b"\x08\x00"
     ip = bytes([0x45, 0, (ip_total >> 8) & 0xFF, ip_total & 0xFF,
-                0, 0, 0, 0, 64, 17, 0, 0]) \
+                0, 0, (flags_frag >> 8) & 0xFF, flags_frag & 0xFF,
+                64, 17, 0, 0]) \
         + b"\x0a\x00\x00\x01" + b"\xc0\xa8\x01\x01"
     return eth + ip + udp_bytes
 
@@ -64,6 +66,12 @@ class TestFixPcapBytes(unittest.TestCase):
         raw = _ipv4_udp_raw(b"\x01\xbb\x01\xbb\x00\x30\x00\x18" + b"\xff" * 8,
                             ip_total=36)
         self.assertIsNone(M.fix_pcap_bytes(raw))
+
+    def test_first_fragment_left_untouched(self):
+        """v1.9.11: MF 首片不做长度改写 — 改短会与后续分片偏移脱节, 重组报错。"""
+        raw = _ipv4_udp_raw(b"\x01\xbb\x01\xbb\x00\x30\x00\x18" + b"\xff" * 8,
+                            ip_total=200, flags_frag=0x2000)
+        self.assertIsNone(M.fix_pcap_bytes(raw), "分片包必须原样跳过")
 
     def test_non_ipv4_skipped(self):
         raw = b"\xaa" * 6 + b"\xbb" * 6 + b"\x86\xdd" + b"\x00" * 40

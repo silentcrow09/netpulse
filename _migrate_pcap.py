@@ -37,6 +37,11 @@ def fix_pcap_bytes(raw):
     if ip_total <= actual:             # 无需修正 (整包或已修正)
         return None
     proto = raw[ip_off + 9]
+    # 分片 (MF 置位或 frag_off≠0) 不做长度改写: 首片改短会与后续分片偏移
+    # 脱节, Wireshark 重组报错 — 保持原样 (与主代码 _capture_strip_packet
+    # 的分片守卫同源, v1.9.11)
+    if ((raw[ip_off + 6] << 8) | raw[ip_off + 7]) & 0x3FFF:
+        return None
     l4_off = ip_off + ihl
     if proto == 17 and len(raw) < l4_off + 8:
         return None                   # UDP 头不完整: 修长度会越界写 (主代码同守卫)
