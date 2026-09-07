@@ -7,6 +7,47 @@
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-09-07
+
+盯障模式链路层补盲：网卡错误暴增检测（现场案例驱动——LAN 内一台电脑大流量
+上传导致全网断网、强制百兆全双工恢复，千兆自协商兼容性/双工不匹配类故障）。
+
+### 新增
+
+- **`nic_error_burst` 事件与根因结论**：盯障 30s 周期采样
+  `Get-NetAdapterStatistics` 收发错误/丢弃计数（`_nic_err_snapshot()`，
+  开机累计 → `_nic_quality()` 会话差分）。会话错误增量 ≥
+  `NIC_ERR_BURST_MIN_DELTA=20` 触发事件（含错误最集中时段定位，单区间
+  判据 `NIC_ERR_BURST_WINDOW_MIN=10`），与丢包/抖动/DNS 症状同现时结论
+  追加「LAN 链路层错包实锤——上层丢包/解析失败大概率同源」+ 排查指引。
+  **CRC 错帧在驱动层被丢弃，抓包（libpcap）永远看不到这一层，NIC 计数器
+  是唯一链路层硬证据**；相邻采样计数下降视为回绕/重置，本会话不判
+- **强制百兆全双工一键修复命令**：建议文案附
+  `powershell Set-NetAdapterAdvancedProperty -Name "以太网"
+  -RegistryKeyword "*SpeedDuplex" -RegistryValue 4 (管理员)`
+  （100M 全双工；恢复自动协商 RegistryValue 0）；诊断完成屏沿用 v1.9.8
+  的一键执行机制
+- **管理员命令提取器扩展**：`_extract_admin_fix_commands` 支持双前缀
+  netsh / powershell（正则分别匹配），返回 `[(kind, 命令体)]`；
+  `_offer_admin_fix_shell` 按 kind 选择外壳（PS 命令经
+  `cmd /k powershell -NoProfile -ExecutionPolicy Bypass -Command` 发起）
+- **抓包联动**：`nic_error_burst` 加入 `CAPTURE_TRIGGER_TYPES`，
+  事件时刻自动落盘前后 30s 切片 pcap（佐证当时的流量形态）
+
+### 修复
+
+- **盯障 CSV tcp_retrans 行重复 4 次**（v1.7.0 引入）：行生成块缩进落在
+  probe 四元素大循环体内，gw_ping/ext_ping/ext_tcp/dns 每遍历一次就重复
+  写一遍重传采样行——移出循环只写一遍
+
+### 测试
+
+- 417 → 432：新增 `tests/test_v1110_nic_burst.py` 14 个用例（快照解析
+  聚合/异常安全、会话差分含回绕防御、事件生成与时段定位、结论矩阵
+  有症状追加/无症状不升级、一键命令可提取、tcp_retrans 行去重的源码
+  契约）；`test_elevation.py` 适配 `[(kind, cmd)]` 结构并补 PS 外壳分支
+- `_smoke_report.py` 244 → 246（+2: 链路层结论进报告、强制百兆命令可提取）
+
 ## [1.10.0] - 2026-09-07
 
 全量诊断口径调整 + TCP 并发压测增强（用户需求: "选 0 = 支持的功能全部测一遍"）。

@@ -256,9 +256,9 @@ class TestExtractAdminFixCommands(unittest.TestCase):
 
     def test_extract_mtu_netsh(self):
         cmds = N._extract_admin_fix_commands([_fake_rc(_MTU_REC)])
-        self.assertEqual(cmds, ['interface ipv4 set subinterface "以太网" '
-                                'mtu=1472 store=persistent'])
-        self.assertNotIn("(管理员)", cmds[0], "标记尾缀不得混入命令体")
+        self.assertEqual(cmds, [('netsh', 'interface ipv4 set subinterface "以太网" '
+                                 'mtu=1472 store=persistent')])
+        self.assertNotIn("(管理员)", cmds[0][1], "标记尾缀不得混入命令体")
 
     def test_no_marker_no_extract(self):
         """没有 (管理员) 标记的 netsh 文本不得被提取 (防误执行)。"""
@@ -275,7 +275,7 @@ class TestExtractAdminFixCommands(unittest.TestCase):
     def test_trailing_punctuation_stripped(self):
         rec = "netsh interface ipv4 show interfaces (管理员)，改后复测"
         cmds = N._extract_admin_fix_commands([_fake_rc(rec)])
-        self.assertEqual(cmds, ["interface ipv4 show interfaces"],
+        self.assertEqual(cmds, [("netsh", "interface ipv4 show interfaces")],
                          "标记后的中文逗号与文案不得混入命令体")
 
     def test_none_and_empty_safe(self):
@@ -293,16 +293,17 @@ class TestExtractAdminFixCommands(unittest.TestCase):
         self.assertIsNotNone(rc, "构造的 results 必须能触发 MTU 黑洞规则")
         cmds = N._extract_admin_fix_commands([rc])
         self.assertEqual(len(cmds), 1, "生产者的 (管理员) netsh 建议必须可提取")
-        self.assertIn("mtu=1400", cmds[0])
-        self.assertIn("以太网", cmds[0], "接口名来自生产者填充, 不得丢失")
+        self.assertEqual(cmds[0][0], "netsh")
+        self.assertIn("mtu=1400", cmds[0][1])
+        self.assertIn("以太网", cmds[0][1], "接口名来自生产者填充, 不得丢失")
 
 
 class TestOfferAdminFixShell(unittest.TestCase):
     """一键执行交互: 序号选择 / 跳过 / 提权失败降级。"""
 
     def setUp(self):
-        self.cmds = ['interface ipv4 set subinterface "以太网" mtu=1472 '
-                     'store=persistent']
+        self.cmds = [('netsh', 'interface ipv4 set subinterface "以太网" '
+                     'mtu=1472 store=persistent')]  # v1.11.0: (kind, cmd)
 
     def _run(self, cmds, answer, se_ret=33):
         """公共桩: 双向 TTY + 输入 answer + ShellExecuteW 返回 se_ret。
@@ -342,15 +343,28 @@ class TestOfferAdminFixShell(unittest.TestCase):
         args = m_se.call_args[0]
         self.assertEqual(args[1], "runas")
         self.assertEqual(args[2], "cmd.exe")
-        self.assertEqual(args[3], f"/k netsh {self.cmds[0]}")
+        self.assertEqual(args[3], f"/k netsh {self.cmds[0][1]}")
 
     def test_multi_select_dedupe_and_order(self):
-        cmds = ["interface ipv4 show interfaces", "interface ipv4 show dns"]
+        cmds = [("netsh", "interface ipv4 show interfaces"),
+                ("netsh", "interface ipv4 show dns")]
         n, m_se = self._run(cmds, "2,1,2")
         self.assertEqual(n, 2, "重复序号必须去重")
         launched = [c[0][3] for c in m_se.call_args_list]
-        self.assertEqual(launched, [f"/k netsh {cmds[1]}", f"/k netsh {cmds[0]}"],
+        self.assertEqual(launched, [f"/k netsh {cmds[1][1]}", f"/k netsh {cmds[0][1]}"],
                          "按输入顺序发起, 每条独立 cmd /k 窗口")
+
+    def test_powershell_kind_uses_ps_shell(self):
+        """v1.11.0: powershell 类命令走 PS 外壳 (强制百兆等 netsh 覆盖不到的配置)。"""
+        cmds = [('powershell',
+                 'Set-NetAdapterAdvancedProperty -Name "以太网" '
+                 '-RegistryKeyword "*SpeedDuplex" -RegistryValue 4')]
+        n, m_se = self._run(cmds, "1")
+        self.assertEqual(n, 1)
+        args = m_se.call_args[0]
+        self.assertEqual(args[2], "cmd.exe")
+        self.assertIn("powershell -NoProfile", args[3])
+        self.assertIn("*SpeedDuplex", args[3])
 
     def test_invalid_input_skips(self):
         n, m_se = self._run(self.cmds, "x,9")

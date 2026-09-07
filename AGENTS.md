@@ -86,13 +86,13 @@
 
 ```bash
 for f in tests/test_*.py; do python "$f"; done
-#   单元/回归套件 (18 文件 / 417 用例): parsers/diagnosis/诊断矩阵/丢包口径/
+#   单元/回归套件 (19 文件 / 432 用例): parsers/diagnosis/诊断矩阵/丢包口径/
 #   XSS 转义/pcap 分析与取证 (含 v1.9.9 截断长度字段修正)/probes/redaction/
 #   场景菜单/盯障统计/scapy 懒加载 (v1.9.7 PR-2)/自提权重启 (v1.9.7 PR-3)/
 #   管理员修复命令一键执行 (v1.9.8)/全量口径与 tcpcc 多目标轮转 (v1.10.0)
 #   注意: 壳环境 `python` 可能指向未装 scapy 的解释器 → test_pcap_capture
 #   模块级 proto=TCP NameError; 用装了 scapy 的系统 Python 跑
-python _smoke_report.py          # 244 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项 + v1.10.0 全量口径/多目标轮转 6 项
+python _smoke_report.py          # 246 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项 + v1.10.0 全量口径/多目标轮转 6 项 + v1.11.0 网卡错误暴增 2 项
 # 抓包取证: 截断存储会剥载荷 — v1.9.9 起截断时同步修正 IP/UDP 长度字段,
 # 避免 Wireshark 专家误报 (ACKed lost 满屏)。旧文件用根目录 _migrate_pcap.py 修正
 ```
@@ -110,6 +110,15 @@ RFC 3849 文档前缀、假 hostname/GUID）；真实抓包或含隐私的本地
 - 事件定位：网关段 `internal`；外网段按段窗口内网关状态分 `both_down`（网关同时丢包 ≥2 次）/ `carrier` / `unknown`；与本**流** `outage` 段重叠不重复报（跨流是独立证据，不互相吞段）
 - 结论矩阵：`jitter_burst` 优先级高于 `latency_spike`，verdict=`degraded`
 - 阈值常量在 `MonitorSession`：`JITTER_WINDOW_S=60 / JITTER_STEP_S=10（触发窗口合并间隔）/ MIN_JITTER_LOSS=3 / MIN_JITTER_PCT=10.0 / MIN_JITTER_SAMPLES=10`
+- **网卡错误采样 (v1.11.0)**：`_nic_err_snapshot()` 30s 采
+  Get-NetAdapterStatistics 收发错误/丢弃（开机累计，`_nic_quality()` 差分）。
+  判据：会话错误增量 ≥ `NIC_ERR_BURST_MIN_DELTA=20` 出 `nic_error_burst`
+  事件（错误集中区间另需单区间 ≥ `NIC_ERR_BURST_WINDOW_MIN=10`），与丢包
+  症状同现 → 结论追加链路层根因 + 强制百兆一键命令（建议格式
+  `powershell ... (管理员)`，提取器 `_extract_admin_fix_commands` 已支持
+  netsh/powershell 双前缀，返回 `[(kind, cmd)]`）。相邻采样计数下降 =
+  回绕/重置，本会话不判。CRC 错帧在驱动层被丢弃，**抓包看不到这一层**，
+  NIC 计数器是唯一链路层硬证据
 
 ## scapy 懒加载契约 (v1.9.7 PR-2)
 

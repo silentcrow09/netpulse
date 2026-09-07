@@ -336,7 +336,7 @@ class TestCapturePrecheckChain(unittest.TestCase):
         self.assertEqual(N.CAPTURE_PAYLOAD_KEEP, 384)
         self.assertEqual(N.CAPTURE_TRIGGER_TYPES,
                          ("outage", "jitter_burst", "tcp_fail",
-                          "tcp_retrans_burst"))
+                          "tcp_retrans_burst", "nic_error_burst"))
         self.assertNotIn("mtu_mismatch", N.CAPTURE_TRIGGER_TYPES)
 
 

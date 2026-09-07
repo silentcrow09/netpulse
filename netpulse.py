@@ -328,39 +328,47 @@ def _offer_elevation_relaunch(args_tail=None, reason="", input_fn=None):
 # ============================================================
 # 修复命令一键执行 (v1.9.8 · 遗留项 1)
 # ============================================================
-# 根因建议里带 "(管理员)" 标记的命令 (目前唯一生产者: MTU 黑洞规则的
-# netsh 接口 MTU 修复)。交互式诊断打印完后提供一键执行: UAC 确认后在
-# 独立管理员 cmd 窗口运行 (cmd /k 保持窗口), NetPulse 本身不动系统配置。
+# 根因建议里带 "(管理员)" 标记的命令 (生产者: MTU 黑洞规则的 netsh 接口
+# MTU 修复 / v1.11.0 网卡错误暴增建议的 Set-NetAdapterAdvancedProperty
+# 强制百兆)。交互式诊断打印完后提供一键执行: UAC 确认后在独立管理员
+# cmd 窗口运行 (cmd /k 保持窗口), NetPulse 本身不动系统配置。
 # 只提取、不代写命令 — 命令文本仍来自规则建议, 与报告显示逐字一致。
 
 
-_ADMIN_FIX_RE = re.compile(r"netsh\s+(.+?)\s*\(管理员\)")
+_ADMIN_NETSH_RE = re.compile(r"netsh\s+(.+?)\s*\(管理员\)")
+_ADMIN_PS_RE = re.compile(r"powershell\s+(.+?)\s*\(管理员\)")
 
 
 def _extract_admin_fix_commands(root_causes):
-    """从根因建议里提取带 "(管理员)" 标记的 netsh 命令 (去重保序)。
+    """从根因建议里提取带 "(管理员)" 标记的命令 (去重保序)。
 
-    只认 "(管理员)" 尾标的命令段 — 这是规则建议的既定格式
-    (参考 _rule_mtu_blackhole), 不做猜测式提取, 避免误执行。
-    返回命令体列表 (不含 "netsh " 前缀, 展示/执行时统一补)。
+    v1.11.0 起支持两种前缀: netsh (原) 与 powershell (网卡速率/双工等
+    netsh 覆盖不到的配置)。只认 "(管理员)" 尾标的命令段 — 这是规则建议
+    的既定格式, 不做猜测式提取, 避免误执行。
+    返回 [(kind, 命令体)] 列表, kind ∈ {"netsh", "powershell"} —
+    kind 供执行端选择外壳, 展示/执行时统一补回前缀。
     """
     cmds, seen = [], set()
     for rc in (root_causes or []):
         for rec in (getattr(rc, "recommendations", None) or []):
-            m = _ADMIN_FIX_RE.search(str(rec))
-            if not m:
-                continue
-            cmd = m.group(1).strip().rstrip("，,;；")
-            if cmd and cmd not in seen:
-                seen.add(cmd)
-                cmds.append(cmd)
+            text = str(rec)
+            for kind, rx in (("netsh", _ADMIN_NETSH_RE),
+                             ("powershell", _ADMIN_PS_RE)):
+                m = rx.search(text)
+                if not m:
+                    continue
+                cmd = m.group(1).strip().rstrip("，,;；")
+                key = (kind, cmd)
+                if cmd and key not in seen:
+                    seen.add(key)
+                    cmds.append((kind, cmd))
     return cmds
 
 
 def _offer_admin_fix_shell(commands, input_fn=None):
     """交互式提议以管理员身份执行修复命令 (cmd /k, 窗口保持可核对)。
 
-    commands: _extract_admin_fix_commands 的结果 (命令体, 无 netsh 前缀)。
+    commands: _extract_admin_fix_commands 的结果 [(kind, 命令体)]。
     返回实际发起执行的命令数 (用户跳过/取消 → 0)。
     非 TTY 直接跳过 (脚本/管道不打断)。
     """
@@ -370,8 +378,8 @@ def _offer_admin_fix_shell(commands, input_fn=None):
     print()
     print(_c(f"  ⚠ 发现 {len(commands)} 条管理员修复命令 "
              f"(将以管理员权限修改系统配置, 改完可复测验证):", C_YELLOW))
-    for i, cmd in enumerate(commands, 1):
-        print(_c(f"    [{i}] netsh {cmd}", C_WHITE))
+    for i, (kind, cmd) in enumerate(commands, 1):
+        print(_c(f"    [{i}] {kind} {cmd}", C_WHITE))
     hint = "  输入要执行的序号 (逗号分隔, Enter=跳过): "
     try:
         ans = input_fn(_c(hint, C_GREEN)).strip()
@@ -388,12 +396,16 @@ def _offer_admin_fix_shell(commands, input_fn=None):
             if c not in picked:
                 picked.append(c)
     launched = 0
-    for cmd in picked:
+    for kind, cmd in picked:
         try:
+            if kind == "powershell":
+                inner = f"powershell -NoProfile -ExecutionPolicy Bypass -Command {cmd}"
+            else:
+                inner = f"netsh {cmd}"
             # cmd /k: 执行后窗口保持打开, 用户能核对结果/错误码再关闭;
             # runas: 已是管理员时 UAC 不弹窗, 静默放行
             ret = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", "cmd.exe", f"/k netsh {cmd}", None, 1)
+                None, "runas", "cmd.exe", f"/k {inner}", None, 1)
             if ret > 32:
                 launched += 1
             else:
@@ -3552,7 +3564,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -9373,6 +9385,39 @@ def _tcp_stats_snapshot():
     return stats
 
 
+def _nic_err_snapshot():
+    """采集本机网卡收发错误/丢弃计数 (v1.11.0 盯障链路层补盲)。
+
+    Get-NetAdapterStatistics 开机累计计数器 (与 TCP 重传统计同口径), 会话
+    差分由 MonitorSession 完成。聚合全部适配器 — Down 态适配器计数冻结,
+    不影响差分; 网卡收发错误 (CRC/FCS) 是自协商兼容性/双工不匹配/网线
+    质量差的**链路层硬证据**, 这类错帧在驱动层就被丢弃, 抓包 (libpcap)
+    永远看不到, 只有计数器能暴露。失败返回 (None, None)。
+    """
+    try:
+        _code, out, _e = run_ps(
+            "Get-NetAdapterStatistics | Select-Object Name, "
+            "ReceivedPacketErrors, SentPacketErrors, "
+            "ReceivedDiscardedPackets, SentDiscardedPackets | ConvertTo-Json",
+            timeout=15)
+        if not (out and out.strip()):
+            return None, None
+        data = json.loads(out)
+        if isinstance(data, dict):
+            data = [data]
+        errs = disc = 0
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            errs += (int(item.get("ReceivedPacketErrors") or 0)
+                     + int(item.get("SentPacketErrors") or 0))
+            disc += (int(item.get("ReceivedDiscardedPackets") or 0)
+                     + int(item.get("SentDiscardedPackets") or 0))
+        return errs, disc
+    except Exception:
+        return None, None
+
+
 def _default_route_if_mtu():
     """取默认路由出口接口的 MTU (v1.7.0 PR-F0)。
 
@@ -11002,6 +11047,28 @@ def _detect_monitor_events(snap, t0, ended_at):
              f"传输层在丢包 (拥塞 / 链路质量 / MTU 不匹配)",
              retrans_rate_pct=tq["retrans_rate_pct"])
 
+    # v1.11.0: 网卡错误暴增 — 链路层硬证据 (CRC 错帧驱动层丢弃, 抓包看不到,
+    # 只有 NIC 计数器能暴露)。典型: LAN 内某台机器大流量上传时千兆自协商
+    # 兼容性/双工不匹配发作, 错包污染整个广播域 (其他设备全断)。
+    nq = snap.get("nic_quality") or {}
+    if (nq.get("err_delta") or 0) >= MonitorSession.NIC_ERR_BURST_MIN_DELTA:
+        bs, be = nq.get("burst_start_s"), nq.get("burst_end_s")
+        if bs is not None:
+            s0, s1 = t0 + bs, t0 + be
+            detail = (f"盯障期间本机网卡收发错误增加 {nq['err_delta']} 个"
+                      f"(丢弃 {nq.get('discarded_delta', 0)}), 错误集中在 "
+                      f"{_disp(s0)}~{_disp(s1)} (单区间 +{nq.get('max_window_delta')}) "
+                      f"— 链路层错包 (CRC/自协商/双工/网线), 该层故障抓包看不到")
+        else:
+            s0, s1 = t0, ended_at
+            detail = (f"盯障期间本机网卡收发错误增加 {nq['err_delta']} 个"
+                      f"(丢弃 {nq.get('discarded_delta', 0)}), 无明显集中区间 "
+                      f"— 网线质量/接口接触不良倾向")
+        _add("nic_error_burst", "nic", s0, s1, False, "nic", detail,
+             err_delta=nq["err_delta"],
+             discarded_delta=nq.get("discarded_delta", 0),
+             max_window_delta=nq.get("max_window_delta", 0))
+
     events.sort(key=lambda e: e["start_ts"])
     for i, ev in enumerate(events, 1):
         ev["id"] = i
@@ -11128,6 +11195,27 @@ def _monitor_conclusion(events, stats, snap):
         else:
             advice_bits.append("MTU 正常而重传率超标: 运营商链路质量/拥塞问题, "
                                "带上本报告 (含重传时序) 报障")
+    # v1.11.0: 网卡错误暴增 — 链路层根因, 优先级最高 (错包是物理层实锤,
+    # 上层所有症状大概率同源)。有网络症状时才升级 verdict; 单独出现
+    # (错包涨但网络没断) 只出提示不升级, 单次诊断交给 linkspeed 的 nic_errors。
+    nic_evs = has("nic_error_burst")
+    if nic_evs and (internal or carrier or has("jitter_burst")
+                    or has("dns_fail", "dns") or rt_evs):
+        ev = nic_evs[0]
+        if verdict == "stable":
+            verdict = "degraded"
+        text_bits.append(
+            f"本机网卡收发错误暴增 {ev.get('err_delta')} 个 "
+            f"(丢弃 {ev.get('discarded_delta', 0)}) — LAN 链路层错包实锤, "
+            f"上层丢包/解析失败大概率同源")
+        advice_bits.append(
+            "链路层错包典型根因: 千兆自协商兼容性差 / 双工不匹配 / 网线质量。"
+            "排查: ①故障时段若有某台电脑在大流量上传, 在那台电脑上跑 netpulse "
+            "linkspeed 看协商速率与错误计数 (或逐台拔线二分); ②修复 — 将该电脑"
+            "或光猫口强制百兆全双工复测, 管理员命令: powershell Set-NetAdapterAdvancedProperty "
+            "-Name \"以太网\" -RegistryKeyword \"*SpeedDuplex\" -RegistryValue 4 (管理员)"
+            " (100M 全双工; 接口名按 Get-NetAdapter 实际名称改, 恢复自动协商把 "
+            "RegistryValue 改回 0; 个别驱动编号不同, 可在设备管理器-网卡高级属性核对)")
     return verdict, "；".join(text_bits), "\n".join(advice_bits)
 
 
@@ -11150,6 +11238,11 @@ class MonitorSession:
     TCPSTAT_MIN_SENT_DELTA = 5000    # 分母保护: 会话发送增量低于此值不判重传率
     MTU_MISMATCH_MIN_DIFF = 100      # 接口 MTU − 路径 MTU ≥ 此值才判不匹配 (PPPoE 1492 不误报)
     TCP_RETRANS_ERR_PCT = 5.0        # 会话重传率阈值 (与 diagnose tcpstats err 档一致)
+    # v1.11.0: 网卡错误计数采样 (链路层补盲 — CRC 错帧驱动不上送, 抓包看不到,
+    # 只有计数器能暴露自协商兼容性/双工不匹配/网线质量问题)
+    NIC_ERR_INTERVAL_S = 30.0        # 网卡错误计数采样周期 (与 TCPSTAT 同节拍线程)
+    NIC_ERR_BURST_MIN_DELTA = 20     # 会话错误增量 ≥ 此值才判暴增 (开机累计差分噪声保护)
+    NIC_ERR_BURST_WINDOW_MIN = 10    # 单采样区间增量 ≥ 此值记为错误集中区间 (burst 时段)
     MONITOR_LOAD_URL = "https://dldir1.qq.com/weixin/Windows/WeChatSetup.exe"
     LOAD_DELAY_S = 60                # 主动负载延迟启动 (先让盯障跑起来, 避开启动期噪声)
     LOAD_DURATION_S = 15             # 主动负载读取时长 (读即丢弃, 不落盘)
@@ -11175,6 +11268,7 @@ class MonitorSession:
         self._mtu_done = threading.Event()
         self._tcpstat_thread = None   # 周期 TCP 重传统计采样 (PR-F0)
         self._tcpstat_samples = []    # [(t, sent, retrans)] 开机累计计数器
+        self._nicstat_samples = []    # [(t, errors, discarded)] v1.11.0 开机累计计数器
 
     def note(self, text):
         self._notes.append({"t": round(time.time() - self._t0, 1) if self._t0 else 0,
@@ -11287,7 +11381,8 @@ class MonitorSession:
 
     def _tcpstat_loop(self):
         """周期采样 TCP 重传统计 (PR-F0): 开机累计计数器, 会话口径由
-        build_result 做差分。首采立即执行 (baseline 越早, 差分窗口越长)。"""
+        build_result 做差分。首采立即执行 (baseline 越早, 差分窗口越长)。
+        v1.11.0: 同一节拍顺带采网卡错误/丢弃计数 (链路层补盲)。"""
         while not self._stop.is_set():
             t = time.time()
             try:
@@ -11296,6 +11391,13 @@ class MonitorSession:
                 if sent is not None and retrans is not None:
                     with self._probe_lock:
                         self._tcpstat_samples.append((t, sent, retrans))
+            except Exception:
+                pass
+            try:
+                errs, disc = _nic_err_snapshot()
+                if errs is not None:
+                    with self._probe_lock:
+                        self._nicstat_samples.append((time.time(), errs, disc))
             except Exception:
                 pass
             self._stop.wait(self.TCPSTAT_INTERVAL_S)
@@ -11420,6 +11522,49 @@ class MonitorSession:
                         retrans_delta / sent_delta * 100, 2)
         return tq
 
+    def _nic_quality(self):
+        """网卡错误计数会话差分 (v1.11.0): 开机累计 → 会话口径, 并定位
+        错误最集中的采样区间 (burst 时段) 供与丢包时段对齐。
+        burst 判定: 会话错误增量 ≥ NIC_ERR_BURST_MIN_DELTA 且存在单区间
+        增量 ≥ NIC_ERR_BURST_WINDOW_MIN 的采样段 — 两级阈值滤掉日常
+        +1/+2 的计数噪声。样本不足 2 个 (会话太短/PS 失败) 返回空口径。
+        """
+        with self._probe_lock:
+            series = list(self._nicstat_samples)
+        nq = {"series": [], "err_delta": 0, "discarded_delta": 0,
+              "max_window_delta": 0, "burst_start_s": None, "burst_end_s": None,
+              "samples": len(series)}
+        if len(series) < 2:
+            return nq
+        # 计数器回绕/适配器重置防御: 任意相邻采样出现下降即视为计数不可靠
+        # (清零后首尾差可能落在暴增阈值内造成误判), 本会话不判 NIC 根因。
+        for i in range(1, len(series)):
+            if series[i][1] < series[i - 1][1]:
+                nq["series"] = [[round(t - self._t0, 1), e, d]
+                                for t, e, d in series]
+                return nq
+        err_delta = series[-1][1] - series[0][1]
+        disc_delta = series[-1][2] - series[0][2]
+        nq["err_delta"] = err_delta
+        nq["discarded_delta"] = max(0, disc_delta)
+        nq["series"] = [[round(t - self._t0, 1), e, d] for t, e, d in series]
+        # 错误最集中的连续区间: 累计计数单调增, 最大跨度增量 = 全局最小值
+        # (最早) 与其后最大值 (最晚) 之差 — 单遍 O(n)。
+        min_err, min_i = series[0][1], 0
+        best = None           # (max_incr, i, j)
+        for j in range(1, len(series)):
+            e = series[j][1]
+            if e < min_err:                 # 计数回绕保护: 重置基线
+                min_err, min_i = e, j
+                continue
+            if e - min_err > (best[0] if best else 0):
+                best = (e - min_err, min_i, j)
+        if best and best[0] >= self.NIC_ERR_BURST_WINDOW_MIN:
+            nq["max_window_delta"] = best[0]
+            nq["burst_start_s"] = round(series[best[1]][0] - self._t0, 1)
+            nq["burst_end_s"] = round(series[best[2]][0] - self._t0, 1)
+        return nq
+
     @staticmethod
     def _stream_stats(stream):
         ok_vals = [s[2] for s in stream if s[0] == "ok" and s[2] is not None]
@@ -11472,8 +11617,10 @@ class MonitorSession:
         with self._probe_lock:
             tcpstat_series = list(self._tcpstat_samples)
         tq = self._tcpstat_quality()
+        nq = self._nic_quality()
         snap["mtu"] = mtu_block
         snap["tcp_quality"] = tq
+        snap["nic_quality"] = nq
         events = _detect_monitor_events(snap, self._t0, ended_at)
         verdict, conclusion, advice = _monitor_conclusion(events, stats, snap)
 
@@ -11510,6 +11657,7 @@ class MonitorSession:
             "stats": stats,
             "mtu": mtu_block,
             "tcp_quality": tq,
+            "nic_quality": nq,
             "events": events,
             "verdict": verdict,
             "conclusion_text": conclusion,
@@ -11532,6 +11680,8 @@ class MonitorSession:
             # v1.7.0 (PR-F0): 统计层新事件的定位
             "mtu":      "MTU 不匹配 (路径 MTU 小于本机接口, full-size 包可能被静默丢弃)",
             "l4_loss":  "TCP 传输层丢包 (会话重传率超标)",
+            # v1.11.0: 链路层
+            "nic":      "LAN 链路层错包 (网卡收发错误暴增 — 自协商/双工/网线, 抓包看不到这一层)",
         }
         for ev in events:
             cls = ev.get("cls", "")
@@ -11566,7 +11716,9 @@ class MonitorSession:
                              probe, i,
                              round(val, 1) if isinstance(val, (int, float)) else "",
                              1 if (val is not None) else 0, note_fn(s)])
-        # v1.7.0 (PR-F0): TCP 重传采样行 (区间差分口径, 与 ping 类并列)
+        # v1.7.0 (PR-F0): TCP 重传采样行 (区间差分口径, 与 ping 类并列)。
+        # v1.11.0 修正: 这段曾在 probe 大循环体内, 每个采样行重复写入 4 次
+        # (gw_ping/ext_ping/ext_tcp/dns 各一遍) — 移出到循环外, 只写一遍。
         for i in range(1, len(tcpstat_series)):
             _tp, _sp, _rp = tcpstat_series[i - 1]
             _tc, _sc, _rc = tcpstat_series[i]
@@ -11575,6 +11727,13 @@ class MonitorSession:
                          "tcp_retrans", i,
                          round(dr / ds * 100, 2) if ds > 0 else "",
                          1, f"retrans {dr}/{ds}"])
+        # v1.11.0: 网卡错误采样行 (区间差分, 与 tcp_retrans 同口径)
+        for i in range(1, len(nq.get("series") or [])):
+            _np, _ne, _nd = nq["series"][i - 1]
+            _nc, _ce, _cd = nq["series"][i]
+            rows.append([datetime.fromtimestamp(_np + t0).strftime("%Y-%m-%d %H:%M:%S"),
+                         "nic_error", i, _ce - _ne, 1,
+                         f"errors +{_ce - _ne} (disc +{_cd - _nd})"])
         result["_csv_rows"] = rows
         outages = [e for e in events if e["type"] == "outage"]
         jitters = [e for e in events if e["type"] == "jitter_burst"]
@@ -11592,6 +11751,8 @@ class MonitorSession:
             summary_bits.append(f"TCP 重传率 {tq['retrans_rate_pct']}%")
         if any(e["type"] == "mtu_mismatch" for e in events):
             summary_bits.append("路径 MTU 受限")
+        if any(e["type"] == "nic_error_burst" for e in events):
+            summary_bits.append(f"网卡错误 +{nq['err_delta']}")
         result["summary"] = ", ".join(summary_bits)
         return result
 
@@ -11751,11 +11912,14 @@ def _render_monitor_html(res):
                   "latency_spike": "延迟突增", "jitter_burst": "抖动集中",
                   "monitor_gap": "采集间隙",
                   # v1.7.0 (PR-F0): 统计层新事件
-                  "mtu_mismatch": "MTU 不匹配", "tcp_retrans_burst": "TCP 重传爆发"}
+                  "mtu_mismatch": "MTU 不匹配", "tcp_retrans_burst": "TCP 重传爆发",
+                  # v1.11.0: 链路层
+                  "nic_error_burst": "网卡错误暴增"}
     cls_names = {"internal": "内网侧", "carrier": "运营商侧", "both_down": "内外同断",
                  "dns": "解析侧", "with_outage": "随中断", "policy": "端口策略",
                  "target_unreachable": "目标不可达", "unknown": "无法定位", "": "",
-                 "mtu": "MTU 受限", "l4_loss": "传输层丢包"}
+                 "mtu": "MTU 受限", "l4_loss": "传输层丢包",
+                 "nic": "链路层错包"}
     for e in events:
         if e["type"] == "monitor_gap":
             continue
@@ -12020,7 +12184,7 @@ CAPTURE_DEFAULT_MB = 64        # ring buffer 上限 (MB)
 CAPTURE_SLICE_BEFORE_S = 30    # 事件切片: 事件开始前保留秒数
 CAPTURE_SLICE_AFTER_S = 30     # 事件切片: 事件结束后保留秒数
 CAPTURE_TRIGGER_TYPES = ("outage", "jitter_burst", "tcp_fail",
-                         "tcp_retrans_burst")
+                         "tcp_retrans_burst", "nic_error_burst")
 # mtu_mismatch 是持续态不是时刻事件, 不触发切片 (只在报告建议里引导)
 CAPTURE_RETENTION_DAYS = 7     # 切片保留天数 (下次运行时清理)
 CAPTURE_MAX_FILES = 10         # 切片最大个数 (超删最旧)
