@@ -86,13 +86,14 @@
 
 ```bash
 for f in tests/test_*.py; do python "$f"; done
-#   单元/回归套件 (19 文件 / 432 用例): parsers/diagnosis/诊断矩阵/丢包口径/
+#   单元/回归套件 (20 文件 / 457 用例): parsers/diagnosis/诊断矩阵/丢包口径/
 #   XSS 转义/pcap 分析与取证 (含 v1.9.9 截断长度字段修正)/probes/redaction/
 #   场景菜单/盯障统计/scapy 懒加载 (v1.9.7 PR-2)/自提权重启 (v1.9.7 PR-3)/
-#   管理员修复命令一键执行 (v1.9.8)/全量口径与 tcpcc 多目标轮转 (v1.10.0)
+#   管理员修复命令一键执行 (v1.9.8)/全量口径与 tcpcc 多目标轮转 (v1.10.0)/
+#   自动检查更新 (v1.12.0)
 #   注意: 壳环境 `python` 可能指向未装 scapy 的解释器 → test_pcap_capture
 #   模块级 proto=TCP NameError; 用装了 scapy 的系统 Python 跑
-python _smoke_report.py          # 246 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项 + v1.10.0 全量口径/多目标轮转 6 项 + v1.11.0 网卡错误暴增 2 项
+python _smoke_report.py          # 250 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项 + v1.10.0 全量口径/多目标轮转 6 项 + v1.11.0 网卡错误暴增 2 项 + v1.12.0 更新检查 4 项
 # 抓包取证: 截断存储会剥载荷 — v1.9.9 起截断时同步修正 IP/UDP 长度字段,
 # 避免 Wireshark 专家误报 (ACKed lost 满屏)。旧文件用根目录 _migrate_pcap.py 修正
 ```
@@ -132,6 +133,16 @@ RFC 3849 文档前缀、假 hostname/GUID）；真实抓包或含隐私的本地
 
 ## 其它
 
+- **发版清单 (v1.12.0 起)**：版本号**三处同步**——`netpulse.py` 的
+  `APP_VERSION` + 仓库根 `version.json`（jsDelivr 回落源读它，漏更会让
+  国内用户永远检查不到新版本）+ README 头部；然后 tag + 双 remote 推送
+- **自动检查更新 (v1.12.0)**：`_start_update_check()` 在 main() 参数解析
+  后开 daemon 线程（**不阻塞启动**，失败静默）；双源
+  `UPDATE_CHECK_API`(GitHub Releases) → `UPDATE_CHECK_FALLBACK`(jsDelivr
+  version.json)；24h 频控缓存 `%LOCALAPPDATA%\NetPulse\update_check.json`，
+  仅成功才写；提示行走 `UPDATE_DL_PROXY`(gh-proxy.com) 加速前缀。菜单渲染
+  经 `_update_notice_line()` 读 `_UPDATE_STATE`（锁保护）；`--json`/CLI
+  单次运行不显示提示；测试改这几个函数时全部 mock 网络，不许真实联网
 - 打包：`build_exe.bat` 或 `build_exe.ps1` → `dist/NetPulse.exe`。
   改了 `netpulse.py` 后需重新打包，否则 exe 落后于代码
 - 根目录 `nul` 是 Windows 保留设备名误产生的 54B 垃圾文件，

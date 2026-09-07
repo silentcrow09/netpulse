@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.11.0
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.12.0
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -36,6 +36,7 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 - **测速实时可视化**：单独测速时终端实时刷新速率/进度，结束自动生成独立测速报告。
 - **原生 UDP DNS 探测**：自构造 DNS 报文，并行查询多家国内 DNS，速度快、无需 `nslookup` 进程。
 - **双运行模式**：场景菜单（适合新手；原模块清单收在 `[9]` 高级选项）+ 命令行参数（适合脚本/自动化）。
+- **自动检查更新（v1.12.0）**：启动时后台静默查询最新 Release（GitHub API 主源 → jsDelivr CDN 国内回落，企业代理环境自动走 `http_proxy`），有新版本时在菜单标题下提示一行，附 **gh-proxy.com 加速下载链接**（国内直连可下）；24h 频控缓存（`%LOCALAPPDATA%\NetPulse\update_check.json`），失败完全静默不影响使用，`--no-update-check` 可关闭。
 - **专业报告**：导出 HTML（工程风可视化）/ JSON，按日期自动归档到 `reports/YYYY-MM-DD/`。
 - **国内网络优化**：默认检测国内 DNS（AliDNS / DNSPod / 114）与公网 IP 服务，不探测国外站点。
 - **优雅降级**：可选依赖（scapy / speedtest-cli）缺失时自动降级，不会报错退出。

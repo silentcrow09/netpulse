@@ -3564,11 +3564,149 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
 SCHEMA_FILENAME = f"netpulse-result-v{SCHEMA_VERSION.rsplit('.', 1)[0]}.json"
+
+# ------------------------------------------------------------
+# 更新检查 (v1.12.0): 启动时后台查最新 Release, 有新版本时在交互菜单
+# 标题下提示一行 (含 gh-proxy 加速下载链接)。设计约束:
+#   - daemon 线程 + 短超时, 失败完全静默 — 离线/被墙用户零感知,
+#     绝不拖慢启动 (v1.9.7 性能红线), 不污染 --json 输出 (只在菜单显示)
+#   - 双源: GitHub Releases API 官方 → jsDelivr CDN 回落 (国内可达;
+#     读仓库根 version.json, 发版时须同步更新, CDN 缓存可能滞后数小时)
+#   - 频控: %LOCALAPPDATA%\NetPulse\update_check.json 记录上次成功检查,
+#     24h 内直接用缓存版本号不发请求; 失败不写缓存 (下次启动重试)
+GH_REPO = "silentcrow09/netpulse"
+UPDATE_CHECK_API = f"https://api.github.com/repos/{GH_REPO}/releases/latest"
+UPDATE_CHECK_FALLBACK = (f"https://cdn.jsdelivr.net/gh/{GH_REPO}@master/"
+                         "version.json")
+UPDATE_DL_PROXY = "https://gh-proxy.com/"    # 国内加速前缀
+UPDATE_CHECK_INTERVAL_S = 24 * 3600          # 自动检查最小间隔
+UPDATE_CHECK_TIMEOUT_S = 5.0                 # 单源超时 (daemon 线程内, 不阻塞主流程)
+
+_UPDATE_LOCK = threading.Lock()
+# 后台检查结果 (菜单渲染时读取; 线程只写, 菜单只读, 锁保护元组更新)
+_UPDATE_STATE = {"latest": None, "checked_at": 0.0, "is_new": False}
+
+
+def _parse_version(text):
+    """'v1.12.0' / '1.12.0' / '1.12' -> (1, 12, 0) / (1, 12); 无法解析 None。"""
+    m = re.match(r"^[vV]?(\d+(?:\.\d+)+)", str(text or "").strip())
+    if not m:
+        return None
+    return tuple(int(x) for x in m.group(1).split("."))
+
+
+def _version_str(ver):
+    return ".".join(map(str, ver))
+
+
+def _version_newer(remote, local):
+    """remote 是否严格大于 local (逐段数字比较, 缺段补 0; 解析失败 False)。"""
+    r, l = _parse_version(remote), _parse_version(local)
+    if not r or not l:
+        return False
+    n = max(len(r), len(l))
+    return r + (0,) * (n - len(r)) > l + (0,) * (n - len(l))
+
+
+def _fetch_latest_version(timeout=UPDATE_CHECK_TIMEOUT_S):
+    """依次尝试 GitHub API / jsDelivr 回落, 返回最新版本号字符串; 全失败 None。"""
+    sources = (
+        # 1) GitHub Releases API (官方; tag_name 形如 'v1.12.0')
+        UPDATE_CHECK_API,
+        # 2) jsDelivr CDN (国内可达; 仓库根 version.json {"version": "1.12.0"})
+        UPDATE_CHECK_FALLBACK,
+    )
+    for url in sources:
+        try:
+            with _urlopen_with_proxy(url, timeout=timeout) as resp:
+                data = json.loads(resp.read(1 << 20).decode("utf-8", "replace"))
+            ver = _parse_version(data.get("tag_name") or data.get("version"))
+            if ver:
+                return _version_str(ver)
+        except Exception:
+            continue    # 单源失败静默, 落到下一源
+    return None
+
+
+def _update_cache_path():
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    return os.path.join(base, "NetPulse", "update_check.json")
+
+
+def _load_update_cache(now):
+    """读频控缓存; 新鲜 (24h 内) 返回 (ts, 版本号), 过期/损坏返回 (0.0, None)。"""
+    try:
+        with open(_update_cache_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        ts = float(data.get("checked_at") or 0)
+        ver = _parse_version(data.get("latest"))
+        if not ver or now - ts > UPDATE_CHECK_INTERVAL_S:
+            return 0.0, None
+        return ts, _version_str(ver)
+    except Exception:
+        return 0.0, None
+
+
+def _save_update_cache(now, latest):
+    """写频控缓存 (只在检查成功时调用; 失败静默 — 缓存不是关键数据)。"""
+    try:
+        p = _update_cache_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"checked_at": now, "latest": latest}, f)
+    except Exception:
+        pass
+
+
+def _check_update(force=False):
+    """执行一次检查 (测试可直接调用)。返回最新版本号; 失败静默返回 None。
+
+    force=True 跳过频控缓存强制联网; False 时 24h 内命中缓存不发请求。
+    成功后更新 _UPDATE_STATE (菜单经 _update_notice_line 消费)。
+    """
+    now = time.time()
+    if not force:
+        ts, cached = _load_update_cache(now)
+        if cached is not None:
+            with _UPDATE_LOCK:
+                _UPDATE_STATE.update(latest=cached, checked_at=ts,
+                                     is_new=_version_newer(cached, APP_VERSION))
+            return cached
+    latest = _fetch_latest_version()
+    if latest:
+        _save_update_cache(now, latest)
+        with _UPDATE_LOCK:
+            _UPDATE_STATE.update(latest=latest, checked_at=now,
+                                 is_new=_version_newer(latest, APP_VERSION))
+    return latest
+
+
+def _start_update_check(force=False):
+    """启动后台更新检查线程 (daemon; 异常兜底静默, 永不影响主流程)。"""
+    def _worker():
+        try:
+            _check_update(force=force)
+        except Exception:
+            pass
+    t = threading.Thread(target=_worker, name="update-check", daemon=True)
+    t.start()
+    return t
+
+
+def _update_notice_line():
+    """有新版本时返回提示行 (gh-proxy 加速下载链接); 无/未检查 None。"""
+    with _UPDATE_LOCK:
+        if not _UPDATE_STATE.get("is_new") or not _UPDATE_STATE.get("latest"):
+            return None
+        latest = _UPDATE_STATE["latest"]
+    url = (f"{UPDATE_DL_PROXY}https://github.com/{GH_REPO}/releases/"
+           f"download/v{latest}/NetPulse.exe")
+    return (f"⬆ 有新版本 v{latest} (当前 v{APP_VERSION}), 下载: {url}")
 
 
 # 常用外网测试目标 (国内网络环境)
@@ -18705,6 +18843,9 @@ def _scene_menu(install=False, pip_mirror=None):
         print(_c(bar, C_BLUE))
         print(_c(f"  {APP_NAME} v{APP_VERSION}    网络诊断（场景模式）", C_BOLD)
               + _perm_badge())
+        notice = _update_notice_line()
+        if notice:
+            print(_c(f"  {notice}", C_YELLOW))
         print(_c(bar, C_BLUE))
         print(_c("  请选择场景（输入数字回车）：", C_WHITE))
         print()
@@ -18789,6 +18930,9 @@ def _module_menu(install=False, pip_mirror=None):
         print(_c(bar, C_BLUE))
         print(_c(f"  {APP_NAME} v{APP_VERSION}    命令行网络诊断", C_BOLD)
               + _perm_badge())
+        notice = _update_notice_line()
+        if notice:
+            print(_c(f"  {notice}", C_YELLOW))
         print(_c(bar, C_BLUE))
         print(_c("  工程师模式 (模块级诊断)。运行完成后可返回场景模式主菜单。", C_WHITE))
         idx = 0
@@ -19004,6 +19148,9 @@ def main():
                         help="完整输出, 不截断长字段")
     parser.add_argument("--no-color", action="store_true",
                         help="禁用彩色输出 (兼容老旧终端)")
+    parser.add_argument("--no-update-check", action="store_true",
+                        help="跳过启动时的自动检查更新 (v1.12.0; 检查本身"
+                             "为后台静默, 失败无感知)")
     parser.add_argument("--diagnose", metavar="PROFILE",
                         choices=sorted(list(DIAGNOSE_PROFILES.keys())),
                         help="按场景 Profile 诊断 (阶段 C · v1.3.0 引入). "
@@ -19142,6 +19289,11 @@ def main():
     # 完成后把刚写的 SCAPY_AVAILABLE=False 覆盖回 True (v1.9.10 修复;
     # _load_scapy 里的 FORCE_NO_SCAPY 兜底是第二道防线)。
     _start_scapy_preload()
+
+    # v1.12.0: 启动时后台检查更新 (daemon 线程, 失败静默; 24h 频控缓存)。
+    # 只在交互菜单渲染 notice, CLI 单次运行/--json 不掺人读文本。
+    if not getattr(args, "no_update_check", False):
+        _start_update_check()
 
     # 端口探测参数 -> 全局配置 (run_diagnostics 读取)
     # 注意: args.port_target 已经是 argparse action="append" 后的 list,

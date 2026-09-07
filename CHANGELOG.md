@@ -7,6 +7,36 @@
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-09-07
+
+自动检查更新：启动时后台静默查询最新 Release，有新版本时在交互菜单提示
+（国内网络环境友好——加速下载链接 + jsDelivr 回落源）。
+
+### 新增
+
+- **启动时自动检查更新**：main() 解析参数后开 daemon 线程后台查询
+  （不阻塞启动，失败完全静默——离线/被墙用户零感知）；仅交互菜单
+  （场景菜单 + 工程师菜单）标题下显示一行提示，CLI 单次运行与
+  `--json` 输出不掺人读文本
+- **双源检查**：GitHub Releases API（`api.github.com/.../releases/latest`）
+  主源 → jsDelivr CDN 回落（`cdn.jsdelivr.net/gh/...@master/version.json`，
+  国内可达；**发版时须同步更新仓库根 `version.json`**，CDN 缓存可能滞后
+  数小时）；请求走 `_urlopen_with_proxy`（兼容企业代理环境变量）
+- **加速下载链接**：提示行附
+  `https://gh-proxy.com/https://github.com/silentcrow09/netpulse/releases/download/vX.Y.Z/NetPulse.exe`
+  （gh-proxy.com 国内加速前缀，下载不走 Release 页）
+- **24h 频控缓存**：`%LOCALAPPDATA%\NetPulse\update_check.json` 记录上次
+  成功检查时间与版本号，24h 内命中缓存不发请求；仅检查成功时写缓存
+  （失败下次启动重试）；`--no-update-check` 一键关闭
+
+### 测试
+
+- 432 → 457：新增 `tests/test_v1120_update_check.py` 25 个用例
+  （版本解析/比较、双源回落、频控缓存、状态机、提示行构造、后台线程
+  异常兜底、`--no-update-check`，全 mock 无真实网络依赖）
+- `_smoke_report.py` 246 → 250（+4: 版本解析比较 / 加速链接构造 /
+  提示行文案 / 双源端点契约；顺带清理重复的断言结果打印）
+
 ## [1.11.0] - 2026-09-07
 
 盯障模式链路层补盲：网卡错误暴增检测（现场案例驱动——LAN 内一台电脑大流量
