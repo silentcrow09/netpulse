@@ -72,8 +72,12 @@
   `tech.evidence`（Schema v1.2）与 debug-bundle 的 evidence.json 为正式出口。
   builder 一律以 `evd` 参数接证据映射，不要再往模块 results 里塞保留键。
   P0-03 收尾余项（低优）：剩余非根因模块 (proxy/loop/route/arp/dhcp) 补证据。
-- **压力级模块**（`STRESS_MODULE_KEYS`，现为 tcpcc）不随 `all` / 交互菜单 0-all-* /
-  debug-bundle 静默执行，必须显式点名（展开口径统一走 `all_module_keys()`）。
+- **压力级模块**（`STRESS_MODULE_KEYS`，现为 tcpcc）的口径 (v1.10.0 收窄)：
+  仅 debug-bundle 自动全诊断排除（静默场景不压测，走 `all_module_keys()`）；
+  **菜单 0 / CLI `--modules all` 包含**压力级（走 `full_module_keys()`，
+  用户显式点名的"全部"= 支持的功能全测一遍），单独选中始终允许。
+  tcpcc 默认上限 4000，预检通过的候选目标全部入池 round-robin 轮转
+  （防单 IP 高频建连被限流/拉黑），`--tcpcc-target` 指定后保持单目标。
 - **置信度显示走 `_conf_band()` 三档**（高/中/低）：内部 0-1 数值是规则设计值不是统计
   概率，UI 不做伪精确百分比；JSON 保留原始数值。旧结果包装的 `Issue.confidence=None`
   （无依据不显示），不要回填统一数字。
@@ -82,13 +86,13 @@
 
 ```bash
 for f in tests/test_*.py; do python "$f"; done
-#   单元/回归套件 (17 文件 / 383 用例): parsers/diagnosis/诊断矩阵/丢包口径/
+#   单元/回归套件 (18 文件 / 417 用例): parsers/diagnosis/诊断矩阵/丢包口径/
 #   XSS 转义/pcap 分析与取证 (含 v1.9.9 截断长度字段修正)/probes/redaction/
 #   场景菜单/盯障统计/scapy 懒加载 (v1.9.7 PR-2)/自提权重启 (v1.9.7 PR-3)/
-#   管理员修复命令一键执行 (v1.9.8)
+#   管理员修复命令一键执行 (v1.9.8)/全量口径与 tcpcc 多目标轮转 (v1.10.0)
 #   注意: 壳环境 `python` 可能指向未装 scapy 的解释器 → test_pcap_capture
 #   模块级 proto=TCP NameError; 用装了 scapy 的系统 Python 跑
-python _smoke_report.py          # 238 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项
+python _smoke_report.py          # 244 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项 + v1.10.0 全量口径/多目标轮转 6 项
 # 抓包取证: 截断存储会剥载荷 — v1.9.9 起截断时同步修正 IP/UDP 长度字段,
 # 避免 Wireshark 专家误报 (ACKed lost 满屏)。旧文件用根目录 _migrate_pcap.py 修正
 ```

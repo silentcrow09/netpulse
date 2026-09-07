@@ -188,9 +188,11 @@ CONFIG = {
     # 网页体检模块的运行参数 (由 CLI --web-target 写入, 追加到默认 3 目标后)
     "web": {"targets": []},
     # TCP 并发模块的运行参数 (由 CLI --tcpcc-max / --tcpcc-target 写入)
-    # - max: 阶梯上限 (默认 1600, 硬上限 8000; Windows 临时端口 ~16k, 高上限勿短时重复跑)
-    # - target: 自定义目标 host:port (默认自动挑公网 anycast DNS 的 TCP 53)
-    "tcpcc": {"max": 1600, "target": None},
+    # - max: 阶梯上限 (默认 4000, 硬上限 8000; Windows 临时端口 ~16k, 高上限勿短时重复跑)
+    # - target: 自定义目标 host:port; 默认自动预检 3 个公网 anycast DNS 的 TCP 53,
+    #   预检通过的候选**全部入池轮转压测** (连接 round-robin 分散到多 IP,
+    #   避免单 IP 高频建连被对方限流/拉黑; custom 指定时保持单目标)
+    "tcpcc": {"max": 4000, "target": None},
 }
 
 # 兼容性 alias (B12): 旧名字指向 CONFIG 子项, 旧代码不改即可继续工作
@@ -3550,7 +3552,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.9.11"
+APP_VERSION = "1.10.0"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -10312,6 +10314,10 @@ class TCPConcurrencyTester:
     = NAT 并发上限; 同时跑本机回环对照, 区分"本机瓶颈 (安全软件/系统
     限制) vs 网络路径瓶颈 (NAT/网关/运营商)"。
 
+    v1.10.0: 默认上限 1600 → 4000 (旧值对主流家用 NAT 明显偏小, 常常
+    "capped 全级别通过"测不出真实容量); 预检通过的候选全部入池, 压测
+    连接 round-robin 轮转, 避免集中打同一 IP 被对方限流/拉黑。
+
     实现要点 (Windows 高并发实测结论):
       - select() 后端 >512 fd 报错, 必须用 asyncio Proactor (IOCP);
       - asyncio.run 跑在 _run_module_with_timeout 的 daemon 线程里 (合法,
@@ -10334,37 +10340,49 @@ class TCPConcurrencyTester:
         self.results = {}
         self._family = socket.AF_INET
 
-    # ── 目标选择: 自定义优先, 否则候选逐个预检 (20 并发小波次 ≥90% 即选中) ──
+    # ── 目标选择: 自定义单目标优先, 否则候选逐个预检, 通过者全部入池 ──
     # 预检必须测"并发友好度"而非单纯可达: 部分公网端点 (如实测中的 DNSPod)
     # 对单 IP 快速并发连接限流, 若只做串行预检会把目标限流误诊成用户 NAT 差。
-    def _pick_target(self, custom, callback=None):
+    # v1.10.0: 默认上限提到 4000 后, 压测连接 round-robin 分散到预检通过的
+    # **全部**候选 (多目标轮转), 避免几千条建连集中打同一个 IP 被对方
+    # 限流/拉黑; --tcpcc-target 显式指定时保持单目标不变。
+    def _pick_targets(self, custom, callback=None):
+        """返回 (addrs, label, records); addrs 为空列表 = 无可用目标。"""
         if custom:
             host, _, port = custom.rpartition(":")
             if not port.isdigit():
-                return None, custom, [{"host": custom, "port": None,
-                                       "ok": 0, "fail": 0,
-                                       "error": "目标需含端口, 例 223.5.5.5:53"}]
+                return [], custom, [{"host": custom, "port": None,
+                                     "ok": 0, "fail": 0,
+                                     "error": "目标需含端口, 例 223.5.5.5:53"}]
             host = host.strip("[]")
             try:
                 info = socket.getaddrinfo(host, int(port), 0, socket.SOCK_STREAM)[0]
                 self._family = info[0]
             except Exception as e:
-                return None, custom, [{"host": host, "port": int(port),
-                                       "ok": 0, "fail": 3, "error": f"解析失败: {e}"[:60]}]
+                return [], custom, [{"host": host, "port": int(port),
+                                     "ok": 0, "fail": 3, "error": f"解析失败: {e}"[:60]}]
             ok = sum(1 for _ in range(3)
                      if _tcping_ms(f"{host}:{port}", timeout=2.0) is not None)
             recs = [{"host": host, "port": int(port), "ok": ok, "fail": 3 - ok}]
-            return ((host, int(port)) if ok >= 2 else None), f"{host}:{port}", recs
+            addr = (host, int(port)) if ok >= 2 else None
+            return ([addr] if addr else []), f"{host}:{port}", recs
 
-        records = []
+        records, pool = [], []
         for host, port in self.CANDIDATE_TARGETS:
             if callback:
                 callback(f"预检目标 {host}:{port} (20 并发) ...")
             rec = self._concurrency_precheck((host, port))
             records.append(rec)
             if rec.get("success_rate", 0) >= 90:
-                return (host, port), f"{host}:{port}", records
-        return None, "", records
+                pool.append((host, port))
+        if not pool:
+            return [], "", records
+        if len(pool) == 1:
+            h, p = pool[0]
+            return pool, f"{h}:{p}", records
+        label = (f"{len(pool)} 目标轮转: "
+                 + "+".join(f"{h}:{p}" for h, p in pool))
+        return pool, label, records
 
     def _concurrency_precheck(self, addr, n=20):
         """候选端点并发友好度预检: n 条并发连接, 成功率 ≥90% 才算可用。"""
@@ -10405,18 +10423,24 @@ class TCPConcurrencyTester:
         except OSError:
             pass
 
-    async def _run_ladder(self, addr, mx, callback):
-        """阶梯主测: 每级补足到目标并发数 → 保持 → 下一级; 失败率超标即停。"""
+    async def _run_ladder(self, addrs, mx, callback):
+        """阶梯主测: 每级补足到目标并发数 → 保持 → 下一级; 失败率超标即停。
+
+        addrs 为目标池 (v1.10.0): 每级补建的新连接按 round-robin 轮转分配
+        到池内各端点, 单 IP 承受的建连压力 ≈ need/N, 防高频建连被拉黑。
+        成功率/失败分类按全池聚合 — 测的是整条路径 (NAT 表与目标个数无关)。"""
         held, level_records = [], []
         try:
             levels = self._ladder(mx)
+            n_t = max(1, len(addrs))
             for li, level in enumerate(levels):
                 need = level - len(held)
                 stats = {"ok": 0, "timeout": 0, "refused": 0, "other": 0, "lat": []}
                 t0 = time.perf_counter()
                 if need > 0:
-                    await asyncio.gather(*[self._connect_one(addr, held, stats)
-                                           for _ in range(need)])
+                    await asyncio.gather(*[
+                        self._connect_one(addrs[i % n_t], held, stats)
+                        for i in range(need)])
                 wave_s = max(time.perf_counter() - t0, 1e-6)
                 lat = sorted(stats["lat"])
                 rate = stats["ok"] / need if need else 1.0
@@ -10525,10 +10549,10 @@ class TCPConcurrencyTester:
                 self._rst_close(s)
             time.sleep(0.05)
 
-    def detect(self, max_concurrency=1600, target=None, callback=None):
-        mx = max(50, min(self.HARD_MAX, int(max_concurrency or 1600)))
-        addr, target_label, precheck = self._pick_target(target, callback)
-        if not addr:
+    def detect(self, max_concurrency=4000, target=None, callback=None):
+        mx = max(50, min(self.HARD_MAX, int(max_concurrency or 4000)))
+        addrs, target_label, precheck = self._pick_targets(target, callback)
+        if not addrs:
             self.results = {
                 "error": ("无可用并发测试目标 — 候选公网端点均不可达; "
                           "可用 --tcpcc-target host:port 指定自建服务器"),
@@ -10542,7 +10566,7 @@ class TCPConcurrencyTester:
         if callback:
             callback(f"目标 {target_label}, 阶梯 50→{mx} (累计保持) ...")
         try:
-            level_records = asyncio.run(self._run_ladder(addr, mx, callback))
+            level_records = asyncio.run(self._run_ladder(addrs, mx, callback))
         except Exception as e:
             self.results = {"error": f"并发测试异常: {e}", "method": "asyncio-tcp 阶梯并发",
                             "target": target_label, "timestamp": datetime.now().isoformat()}
@@ -10645,6 +10669,7 @@ class TCPConcurrencyTester:
         self.results = {
             "method": "asyncio-tcp 阶梯并发",
             "target": target_label,
+            "target_pool": [f"{h}:{p}" for h, p in addrs],
             "target_candidates": precheck,
             "max_concurrency": mx,
             "levels": level_records,
@@ -13161,21 +13186,24 @@ MODULE_REGISTRY = [
 ]
 MODULE_MAP = {k: (n, c) for k, n, c in MODULE_REGISTRY}
 
-# 压力级模块 (审计 §12): 对网络/NAT 表制造显著负载, 不随 all / debug-bundle
-# 静默执行 — 只在用户显式点名时运行。
+# 压力级模块 (审计 §12): 对网络/NAT 表制造显著负载。v1.10.0 起语义收窄:
+# 只从 debug-bundle 的自动全诊断中排除 (静默场景不压测); 菜单 0 / CLI
+# --modules all 是用户显式点名的"全部", **包含**压力级模块 (full_module_keys)。
+# 单独选中压力级模块 (菜单序号 / key) 始终允许。
 STRESS_MODULE_KEYS = ("tcpcc",)
 
 
 def all_module_keys():
-    """all 展开口径: 全部模块去掉压力级。CLI --modules all / 交互菜单
-    0-all-* / debug-bundle 三处共用, 保证口径一致。"""
+    """debug-bundle 自动全诊断的展开口径: 全部模块去掉压力级 (静默场景
+    不制造 NAT 压测负载)。菜单 0 / CLI all 用 full_module_keys()。"""
     return [k for k, _, _ in MODULE_REGISTRY if k not in STRESS_MODULE_KEYS]
 
 
-def _stress_excluded_hint():
-    excluded = [k for k, _, _ in MODULE_REGISTRY if k in STRESS_MODULE_KEYS]
-    return (f"  提示: 压力级模块 {', '.join(excluded)} 已排除, 不随 all 执行; "
-            f"需要时显式指定 (如 --modules {excluded[0]})")
+def full_module_keys():
+    """用户显式点名的"全部"展开口径 (菜单 0/all/* 与 CLI --modules all):
+    全部模块, 含压力级。v1.10.0: 用户要求"选 0 = 支持的功能全测一遍",
+    tcpcc 有内置候选目标池, 不需要手动指定, 不再从 all 排除。"""
+    return [k for k, _, _ in MODULE_REGISTRY]
 
 # 模块三大分类 (装维工作流: 先看 → 再测 → 后查)
 # 每项: (分类名, keys, 一句话定位); 顺序即展示顺序
@@ -13765,7 +13793,7 @@ def _module_detect_kwargs(key):
     if key == "web":
         return dict(extra_targets=WEB_CONFIG.get("targets") or [])
     if key == "tcpcc":
-        return dict(max_concurrency=TCPCC_CONFIG.get("max", 1600),
+        return dict(max_concurrency=TCPCC_CONFIG.get("max", 4000),
                     target=TCPCC_CONFIG.get("target"))
     return {}
 
@@ -13782,7 +13810,7 @@ def _module_timeout(key):
         return 30 + 60 * ((n + 2) // 3)
     if key == "tcpcc":
         # 时长随 --tcpcc-max 的级别数伸缩: 每级 (波 3~8s + 保持 1s) ×12s + 预检/回环/余量
-        mx = max(50, min(8000, int(TCPCC_CONFIG.get("max", 1600) or 1600)))
+        mx = max(50, min(8000, int(TCPCC_CONFIG.get("max", 4000) or 4000)))
         n_levels = len({l for l in TCPConcurrencyTester.LADDER_BASE if l <= mx} | {mx})
         return 30 + 12 * n_levels + 10
     return MODULE_TIMEOUTS.get(key, DEFAULT_MODULE_TIMEOUT)
@@ -18235,7 +18263,7 @@ def prompt_export_report():
 
 def parse_choice(choice):
     """解析交互菜单输入 -> keys 列表; 无效返回 None。
-    支持: 数字 (空格分隔多选)、0/all/* (全部, 压力级模块除外)、分类字母 a/b/c、
+    支持: 数字 (空格分隔多选)、0/all/* (全部, 含压力级 tcpcc)、分类字母 a/b/c、
     模块 key、模块中文名。
     严格模式: 任一 token 非法即整体拒绝。
     """
@@ -18243,8 +18271,9 @@ def parse_choice(choice):
     if choice == "":
         return None
     if choice.lower() in ("0", "all", "*"):
-        print(_c(_stress_excluded_hint(), C_GRAY))
-        return all_module_keys()
+        print(_c("  全量口径: 全部 23 模块, 含压力级 tcpcc 压测"
+                 " (多目标轮转, 约多花 2 分钟)", C_GRAY))
+        return full_module_keys()
     return _parse_keys(choice.split(), strict=True)
 
 
@@ -18635,7 +18664,7 @@ def _module_menu(install=False, pip_mirror=None):
             for line in _columnize(cells, columns=2, gap=4):
                 print("    " + line)
         print()
-        print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发, 含Ookla官方测速)', C_GRAY)}")
+        print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发, 含Ookla测速+TCP并发压测)', C_GRAY)}")
         print(f"    {_c(' m', C_CYAN)}. 盯障模式 {_c('(600秒找偶发掉线, Ctrl+C可提前停)', C_GRAY)}")
         print(f"    {_c(' e', C_CYAN)}. 导出上次诊断报告")
         print(f"    {_c(' d', C_CYAN)}. 生成调试包 {_c('(脱敏zip: 报告+证据+日志, 上报排障用)', C_GRAY)}")
@@ -18700,7 +18729,11 @@ def _module_menu(install=False, pip_mirror=None):
             continue
         # 端口探测: 单选 port 时才询问目标; 选 0/全部时自动跳过 (避免打断全流程)
         # (用户偏好: 端口探测必须有显式目标, 全量诊断时没目标就跳过不测)
-        is_all = (len(keys) == len(MODULE_REGISTRY))
+        # "全部"判定: 与 full_module_keys() 对齐 (v1.8.1 起压力级进出于
+        # all 口径, len(MODULE_REGISTRY) 常数比较会失效 — 曾导致选 0 被
+        # port/web/测速/iperf3 四个单选询问连续打断)
+        is_all = (len(keys) == len(full_module_keys())
+                  and set(keys) == set(full_module_keys()))
         if "port" in keys and not PORT_PROBE_CONFIG.get("targets"):
             if is_all:
                 # 全量诊断: 没目标就跳过端口探测, 不打断流程
@@ -18887,9 +18920,10 @@ def main():
                              "总数上限 8), 例: --web-target https://example.com")
     parser.add_argument("--tcpcc-target", metavar="HOST:PORT",
                         help="TCP 并发测试的自定义目标 (可选, 如自建服务器/内网设备); "
-                             "默认自动挑公网 anycast DNS 的 TCP 53 端点")
-    parser.add_argument("--tcpcc-max", type=int, default=1600, metavar="N",
-                        help="TCP 并发阶梯上限 (默认 1600, 硬上限 8000)。高上限会短时"
+                             "默认自动预检公网 anycast DNS 的 TCP 53 端点, 通过的"
+                             "全部入池轮转压测 (防单 IP 被限流/拉黑)")
+    parser.add_argument("--tcpcc-max", type=int, default=4000, metavar="N",
+                        help="TCP 并发阶梯上限 (默认 4000, 硬上限 8000)。高上限会短时"
                              "建立大量连接, 勿短时间重复运行; 并行模式下建议单跑本模块")
     parser.add_argument("--monitor", metavar="SEC", type=int, nargs="?", const=600,
                         help="盯障模式: 持续监测 SEC 秒找偶发掉线, 结束生成 CSV/HTML/JSON "
@@ -18988,7 +19022,7 @@ def main():
                              if u and u.strip()]
 
     # TCP 并发参数 -> 全局配置 (runner -> TCPConcurrencyTester.detect 读取)
-    TCPCC_CONFIG["max"] = max(50, min(8000, int(getattr(args, "tcpcc_max", 1600) or 1600)))
+    TCPCC_CONFIG["max"] = max(50, min(8000, int(getattr(args, "tcpcc_max", 4000) or 4000)))
     TCPCC_CONFIG["target"] = (getattr(args, "tcpcc_target", None) or "").strip() or None
 
     if args.list:
@@ -19054,9 +19088,11 @@ def main():
     if args.modules:
         is_all_only = (args.modules == ["all"])
         if is_all_only:
-            keys = all_module_keys()
+            keys = full_module_keys()
             if not args.json:      # JSON 输出不掺人读文本
-                print(_c(_stress_excluded_hint(), C_GRAY))
+                print(_c("  全量口径: 全部模块, 含压力级 tcpcc 压测 "
+                         "(多目标轮转; debug-bundle 自动全诊断仍排除压力级)",
+                         C_GRAY))
         else:
             keys = parse_module_names(args.modules)
         if not keys:

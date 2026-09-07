@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.9.11
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.10.0
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -101,9 +101,10 @@ python netpulse.py iperf3 --iperf3-server 192.168.1.10:5201
 python netpulse.py iperf3 --iperf3-server 10.0.0.1 --iperf3-duration 15   # 单方向 15s
 # 缺 iperf3.exe 时会询问自动下载; 服务器不可达时明确报"双向均失败"并给出排查提示
 
-# TCP 并发能力压测: 阶梯 50→1600 累计保持连接, 找 NAT 并发上限 + 本机回环对照
+# TCP 并发能力压测: 阶梯 50→4000 累计保持连接, 找 NAT 并发上限 + 本机回环对照
+#     (多目标轮转: 预检通过的公网候选全部入池, 防单 IP 被限流/拉黑)
 python netpulse.py tcpcc
-python netpulse.py tcpcc --tcpcc-max 3200                          # 提高阶梯上限
+python netpulse.py tcpcc --tcpcc-max 4000                          # 提高阶梯上限 (默认 4000)
 python netpulse.py tcpcc --tcpcc-target 192.168.1.10:5201          # 指向自建服务器复测
 
 # 网页体检: DNS/TCP/TLS/TTFB 分段计时 + 证书 + 重定向 (默认 qq/baidu/aliyun)
@@ -156,8 +157,8 @@ python netpulse.py --install
 | `--port-force` | 强制执行端口探测（即使展开后目标数超过 1000 上限） |
 | `--iperf3-server` | iperf3 服务器地址 (iperf3 独立模块必填): 测到该服务器的上下行吞吐 (iperf3.exe 缺失时会交互式询问自动下载)。例: `192.168.1.10` 或 `192.168.1.10:5201` |
 | `--iperf3-duration` | iperf3 单方向测速时长秒数 (默认 10) |
-| `--tcpcc-target` | TCP 并发测试自定义目标 `HOST:PORT` (可选): 默认自动挑公网 anycast DNS 的 TCP 53 端点 (预检并发友好度) |
-| `--tcpcc-max` | TCP 并发阶梯上限 (默认 1600, 硬上限 8000)。高上限会短时建立大量连接, 勿短时间重复运行 |
+| `--tcpcc-target` | TCP 并发测试自定义目标 `HOST:PORT` (可选): 默认自动预检公网 anycast DNS 的 TCP 53 端点, 预检通过的**全部入池轮转压测** (防单 IP 被限流/拉黑); 指定后保持单目标 |
+| `--tcpcc-max` | TCP 并发阶梯上限 (默认 4000, 硬上限 8000)。高上限会短时建立大量连接, 勿短时间重复运行 |
 | `--web-target` | 网页体检追加目标 URL (可选, 可多次; 追加到默认 3 个国内大站后, 总数上限 8)。菜单入口: 单选网页体检时询问 |
 | `--nattype-server` | NAT 类型检测的 STUN 服务器 `HOST[:PORT]` (可选, 可指定两次提供两台; 缺省端口 3478); 默认内置国内服务器自动回退 |
 | `--iperf3-udp` | iperf3 改用 UDP 模式测抖动/丢包 (1 Mbps 发包率, 语音/游戏质量口径); 默认 TCP 测吞吐。菜单入口: 单选 iperf3 (已有服务器) 时询问 |
