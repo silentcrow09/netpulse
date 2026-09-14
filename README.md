@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.12.0
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.12.1
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -200,7 +200,7 @@ python netpulse.py --install
 | 11 | `gateway` | 网关检测 | Ping 默认网关，统计延迟、丢包率、抖动 |
 | 12 | `external` | 外网检测 | 多目标 Ping + Traceroute，逐跳延迟、丢包与路径可视化 |
 | 13 | `dns` | DNS 诊断 | 多 DNS 服务器原生 UDP 对比，延迟 / 异常 / **DNS 劫持检测** |
-| 14 | `web` | 网页体检 | DNS/TCP/TLS/TTFB 分段计时, 证书检查, 重定向跟踪, 断层定位 |
+| 14 | `web` | 网页体检 | DNS/TCP/TLS/TTFB 分段计时, 证书检查, 重定向跟踪, 断层定位, 慢访问判定 (首字节 ≥500ms 警告 / ≥2s 异常) |
 | 15 | `arp` | ARP 分析 | ARP 冲突检测、网关 MAC 验证、ARP 欺骗排查 |
 | 16 | `loop` | 环路检测 | ARP 表 / TTL / 丢包模式分析内网环路 |
 | 17 | `tcp` | TCP 连接 | 按状态 / 进程统计 TCP 连接，检测连接数超限 |

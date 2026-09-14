@@ -3564,7 +3564,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.12.1"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -10226,6 +10226,10 @@ class WebPageTester:
     MAX_TARGETS, MAX_REDIRECTS = 8, 5
     DNS_TIMEOUT, TCP_TIMEOUT, TLS_TIMEOUT, TTFB_TIMEOUT = 5, 5, 8, 10   # 秒
     BUDGET_S = 60            # 单目标总预算 (含全部重定向跳)
+    # "慢但通"issue 化阈值: 此前全部成功时再慢也不产生 issue → 模块"完成" 0 扣分。
+    # 与 THRESHOLDS["web"] / _metrics_web 的客户视角配色同值, 改这里须三处同步。
+    TTFB_WARN_MS, TTFB_ERR_MS = 500, 2000
+    DNS_WARN_MS, TCP_WARN_MS, TLS_WARN_MS = 200, 500, 500
 
     def __init__(self):
         self.name = "网页体检"
@@ -10428,10 +10432,40 @@ class WebPageTester:
             assessment = "网页访问异常"
         elif ok_count < total:
             assessment = "网页访问一般"
-        elif avg["ttfb_ms"] is not None and avg["ttfb_ms"] >= 500:
+        elif avg["ttfb_ms"] is not None and avg["ttfb_ms"] >= self.TTFB_ERR_MS:
+            assessment = "网页访问严重缓慢"
+        elif avg["ttfb_ms"] is not None and avg["ttfb_ms"] >= self.TTFB_WARN_MS:
             assessment = "网页访问偏慢"
         else:
             assessment = "网页访问正常"
+        # 模块级"慢"升格 (放在 per-record 之前: 全部成功时它是唯一/首要发现)
+        if avg["ttfb_ms"] is not None:
+            if avg["ttfb_ms"] >= self.TTFB_ERR_MS:
+                issues.append({
+                    "type": "web_slow", "severity": "critical",
+                    "message": (f"网页访问严重缓慢 (平均首字节 {avg['ttfb_ms']:.0f}ms, "
+                                f"阈值 {self.TTFB_ERR_MS}ms)"),
+                    "detail": "所有目标均可达但首字节普遍超阈值, 体验接近不可用; "
+                              "多为带宽不足或链路绕路, 结合测速与 route 定位",
+                })
+            elif avg["ttfb_ms"] >= self.TTFB_WARN_MS:
+                issues.append({
+                    "type": "web_slow", "severity": "warning",
+                    "message": (f"网页访问偏慢 (平均首字节 {avg['ttfb_ms']:.0f}ms, "
+                                f"阈值 {self.TTFB_WARN_MS}ms)"),
+                    "detail": "目标可达但首字节偏慢, 多为链路绕路/服务端慢/带宽不足",
+                })
+        for seg_key, seg_type, seg_label, seg_warn in (
+                ("dns_ms", "dns_slow", "DNS 解析", self.DNS_WARN_MS),
+                ("tcp_ms", "tcp_slow", "TCP 连接", self.TCP_WARN_MS),
+                ("tls_ms", "tls_slow", "TLS 握手", self.TLS_WARN_MS)):
+            v = avg[seg_key]
+            if v is not None and v >= seg_warn:
+                issues.append({
+                    "type": seg_type, "severity": "warning",
+                    "message": f"{seg_label}段慢 (平均 {v:.0f}ms, 阈值 {seg_warn}ms)",
+                    "detail": "",
+                })
         for r in records:
             url, stage = r.get("url", ""), r.get("fail_stage")
             err = r.get("error", "")
@@ -15694,6 +15728,10 @@ def _issues_web(res):
         "tls_fail": "检查中间盒拦截或 TLS 版本兼容性",
         "http_fail": "结合外网检测 (external) 判断链路, 或目标站点本身故障",
         "ttfb_slow": "DNS/TCP/TLS 均正常时为服务端或链路慢, 结合测速与 route 判断",
+        "web_slow": "结合测速 (带宽) 与 route (绕路) 判断慢因, 对比 external 延迟/丢包",
+        "dns_slow": "运行 dns 模块对比各 DNS 响应耗时, 必要时更换系统 DNS",
+        "tcp_slow": "建连慢多为链路丢包/绕路, 结合 external 丢包与 route 判断",
+        "tls_slow": "握手慢多为链路 RTT 高或丢包, 结合 external 延迟与 wifi 信号判断",
         "cert_expire": "联系站点管理员续期证书",
         "cert_soon": "关注证书续期",
     }
