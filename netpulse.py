@@ -3564,7 +3564,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.12.1"
+APP_VERSION = "1.12.2"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -13528,6 +13528,13 @@ MODULE_MAP = {k: (n, c) for k, n, c in MODULE_REGISTRY}
 # 单独选中压力级模块 (菜单序号 / key) 始终允许。
 STRESS_MODULE_KEYS = ("tcpcc",)
 
+# 带宽/负载敏感模块 (v1.12.2): 并行模式下必须独占网络跑。
+# speedtest/bufferbloat/iperf3 的吞吐测量会被其它模块同时产生的流量明显
+# 压低 (网页体检下载、LAN 扫描、外网探测并行抢带宽 → 全量报告测速偏低,
+# 与单独测速报告不一致), tcpcc 的高频建连也会反过来干扰并发的延迟/吞吐
+# 测量。并行跑多模块时: 普通模块先并发跑完, 这批模块再逐个串行独占跑。
+EXCLUSIVE_NET_MODULE_KEYS = ("speedtest", "bufferbloat", "iperf3", "tcpcc")
+
 
 def all_module_keys():
     """debug-bundle 自动全诊断的展开口径: 全部模块去掉压力级 (静默场景
@@ -14295,6 +14302,9 @@ def _run_diagnostics_parallel(keys, max_workers, total):
       - print() 走 _safe_print (lock) 避免交错
       - 共享状态 (_CMD_CACHE / _LOCAL_SUBNET_CACHE / _DECODE_CACHE / DNS socket)
         均为只读 / GIL-safe / thread-local, 多个 detector 并发安全
+      - 带宽敏感模块 (EXCLUSIVE_NET_MODULE_KEYS) 不参与并发: 普通模块并发
+        跑完后逐个串行独占跑, 测量期间网络空闲 (v1.12.2: 修复全量报告测速
+        被其它并行模块流量压低、与单独测速报告不一致)
     """
     results = {}
     full = {}
@@ -14314,11 +14324,20 @@ def _run_diagnostics_parallel(keys, max_workers, total):
         name = MODULE_MAP[key][0]
         _safe_print(_c(f"  [{i}/{total}] 正在 {name} …", C_GRAY))
 
+    # v1.12.2: 带宽/负载敏感模块不参与并发 — 普通模块先并发跑完,
+    # 独占模块再逐个串行跑 (测量期间网络空闲, 口径与单独运行一致)
+    normal_keys = [k for k in keys if k not in EXCLUSIVE_NET_MODULE_KEYS]
+    solo_keys = [k for k in keys if k in EXCLUSIVE_NET_MODULE_KEYS]
+
     # 等待所有 worker 完成 (每个 worker 内部自带超时, 不会无限等)
     with ThreadPoolExecutor(max_workers=max(1, min(max_workers, total))) as ex:
-        futs = [ex.submit(_run_one, k) for k in keys]
+        futs = [ex.submit(_run_one, k) for k in normal_keys]
         for fut in as_completed(futs):
             fut.result()  # 等待, 不打印
+
+    # 独占阶段: 测速/Bufferbloat/iperf3/TCP 并发逐个跑
+    for key in solo_keys:
+        _run_one(key)
 
     # 完成行: 主线程按 keys 顺序打 (1-19 整齐一行)
     for i, key in enumerate(keys, 1):

@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.12.1
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.12.2
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -22,7 +22,7 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 - **23 个诊断模块**：从局域网设备扫描、TCP 并发压测、网页分层体检到 NAT 类型与代理检测，覆盖端到端排障链路。
 - **根因分析引擎**：8 条内置规则（DNS / WAN / WiFi / Bufferbloat / 网关丢包 / NAT / **MTU 黑洞** / **TCP 传输层丢包**）跨模块聚合证据，按严重度排序输出根因 + 置信度 + 建议；HTML 报告每条根因带「为什么这样判断 / 已基本排除」证据链和**一句话报障卡**（可直接复制发给客服）。
 - **场景化诊断 Profile**：无参数启动（双击 exe）进**场景菜单** — `[1] 网络很慢 / [2] 经常断网 / [3] 网页打不开 / [4] 游戏卡顿 / [5] WiFi 信号差 / [7] 持续盯障 / [9] 高级选项`，选完自动跑对应模块组合并给出根因结论，报告存到 `桌面\NetPulse\`（文件名含时分秒，同日复测不覆盖）；CLI 同步支持 `--diagnose slow|disconnect|web|gaming|wifi`，按场景过滤规则评估（gaming 不误报「WiFi 信号弱」），导出报告与屏幕结论同源。
-- **并行执行**：`--parallel` 多模块并发跑（`--max-workers N` 控制并发数），交互菜单多模块默认并发。
+- **并行执行**：`--parallel` 多模块并发跑（`--max-workers N` 控制并发数），交互菜单多模块默认并发；测速 / Bufferbloat / iperf3 / TCP 并发等**带宽敏感模块不参与并发**（v1.12.2），在并发阶段结束后独占串行跑，测速口径与单独运行一致。
 - **JSON Schema + 调试包**：结果文件遵循 `schema/netpulse-result-v1.2.json`（`--json-schema` 离线查询版本与字段，供 AI Agent / RMM introspect；v1.2.0 起 `tech.evidence` 为一等结构——每模块 probe 认证证据，与根因证据链同源）；`--debug-bundle DIR` 一键导出脱敏调试包（system + diagnostic + evidence + log 的 zip）。
 - **TCP 并发能力压测**：阶梯并发连接测试（累计保持），判定网络路径（光猫/路由器 NAT）最大可持续并发；同跑本机回环对照，自动区分「本机瓶颈 vs 网络/NAT 瓶颈」，零依赖、无需自建服务器。
 - **盯障模式 `--monitor`**：分钟级持续监测网关/外网 ping + TCP + DNS，抓偶发掉线（普通模块全是快照抓不到）；自动事件检测 + 分段定位（内网侧/运营商侧/解析侧/内外同抖），含**抖动窗口**检测（60s 窗口内反复丢包但未达连续中断 → 抖动集中段，偶发掉线最典型形态）；v1.7.0 起叠加**统计层**——后台二分探测路径 MTU（识别 MTU 不匹配/PMTUD 黑洞类故障，ping 小包看不出的盲区）+ TCP 重传率 30s 差分采样（开机累计计数器差出会话口径，含分母保护）+ 网卡收发错误计数 30s 差分采样（v1.11.0：CRC 错帧在驱动层被丢弃、抓包看不到，只有计数器能暴露——错误暴增与丢包时段同时出现时判定为「LAN 链路层错包」，典型根因千兆自协商兼容性/双工不匹配，报告附强制百兆全双工的一键管理员命令），`--monitor-load` 在盯障启动 60s 后自动制造 15s 下载负载让 full-size 包真正跑起来；输出带时间轴的 HTML 报告 + Excel 直开的 CSV + 完整 JSON。
@@ -172,7 +172,7 @@ python netpulse.py --install
 | `--speedtest-node` | 指定测速服务器 (可选): Ookla 服务器数字 ID (配合 `--speedtest-net`) 或上行节点 `host:port`; 默认自动选延迟最低的国内运营商节点。菜单入口: 单选测速时询问 (默认 3633 上海电信) |
 | `--speedtest-net` | 启用 Ookla 官方测速 (CLI 默认关闭, 交互菜单默认启用; 结论优先采用 Ookla 结果) |
 | `--diagnose` | 按场景 Profile 诊断: `slow` / `disconnect` / `web` / `gaming` / `wifi`, 跑完输出根因分析; 也支持 `netpulse diagnose <profile>` 子命令形式 |
-| `--parallel` | 多模块并行执行 (输出经线程锁同步, 详细结果仍按模块顺序排列); 交互菜单多模块默认并发 |
+| `--parallel` | 多模块并行执行 (输出经线程锁同步, 详细结果仍按模块顺序排列); 交互菜单多模块默认并发; 测速/Bufferbloat/iperf3/TCP 并发独占串行跑 (v1.12.2) |
 | `--max-workers` | 并行模式最大并发数 (默认 4) |
 | `--port-timeout` | 端口探测总时长上限秒数 (默认 60), 超过跳过剩余目标并在报告 `timed_out_specs` 列出 |
 | `--port-concurrency` | 端口探测并发数 (默认 8) |
