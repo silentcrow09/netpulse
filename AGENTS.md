@@ -168,7 +168,8 @@ RFC 3849 文档前缀、假 hostname/GUID）；真实抓包或含隐私的本地
   后开 daemon 线程（**不阻塞启动**，失败静默）；双源
   `UPDATE_CHECK_API`(GitHub Releases) → `UPDATE_CHECK_FALLBACK`(jsDelivr
   version.json)；24h 频控缓存 `%LOCALAPPDATA%\NetPulse\update_check.json`，
-  仅成功才写；提示行走 `UPDATE_DL_PROXY`(gh-proxy.com) 加速前缀。菜单渲染
+  **主源成功或回落源报新版才写**（v1.14.2：jsDelivr @master 快照实测可滞后数周，
+  回落源的“无新版”答案不写缓存，否则陈旧答案锁死提示一整天）；提示行走 `UPDATE_DL_PROXY`(gh-proxy.com) 加速前缀。菜单渲染
   经 `_update_notice_line()` 读 `_UPDATE_STATE`（锁保护）；`--json`/CLI
   单次运行不显示提示；测试改这几个函数时全部 mock 网络，不许真实联网
 - 打包：`build_exe.bat` 或 `build_exe.ps1` → `dist/NetPulse.exe`。

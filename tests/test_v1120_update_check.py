@@ -94,27 +94,27 @@ class TestFetchLatestVersion(unittest.TestCase):
         with mock.patch.object(N, "_urlopen_with_proxy",
                                side_effect=_resp_side_effect(
                                    [{"tag_name": "v1.13.0"}])):
-            self.assertEqual(N._fetch_latest_version(), "1.13.0")
+            self.assertEqual(N._fetch_latest_version(), ("1.13.0", True))
 
     def test_fallback_jsdelivr(self):
-        """API 挂 → jsDelivr version.json 回落。"""
+        """API 挂 → jsDelivr version.json 回落 (标记非主源)。"""
         with mock.patch.object(
                 N, "_urlopen_with_proxy",
                 side_effect=_resp_side_effect(
                     [OSError("timeout"), {"version": "1.14.0"}])):
-            self.assertEqual(N._fetch_latest_version(), "1.14.0")
+            self.assertEqual(N._fetch_latest_version(), ("1.14.0", False))
 
     def test_both_fail_returns_none(self):
         with mock.patch.object(
                 N, "_urlopen_with_proxy",
                 side_effect=_resp_side_effect([OSError(), OSError()])):
-            self.assertIsNone(N._fetch_latest_version())
+            self.assertEqual(N._fetch_latest_version(), (None, False))
 
     def test_malformed_json_returns_none(self):
         with mock.patch.object(
                 N, "_urlopen_with_proxy",
                 side_effect=_resp_side_effect([b"not json{", b"<html>"])):
-            self.assertIsNone(N._fetch_latest_version())
+            self.assertEqual(N._fetch_latest_version(), (None, False))
 
 
 class TestCache(unittest.TestCase):
@@ -188,7 +188,7 @@ class TestCheckUpdate(unittest.TestCase):
     def test_cache_miss_fetch_success(self):
         newer = _newer_fake_version()
         with mock.patch.object(N, "_fetch_latest_version",
-                               return_value=newer):
+                               return_value=(newer, True)):
             ver = N._check_update()
         self.assertEqual(ver, newer)
         self.assertTrue(N._UPDATE_STATE["is_new"])   # newer > 当前版本
@@ -198,7 +198,8 @@ class TestCheckUpdate(unittest.TestCase):
         N._save_update_cache(time.time() - N.UPDATE_CHECK_INTERVAL_S - 60,
                              "1.13.0")     # 过期缓存
         self._reset_state()
-        with mock.patch.object(N, "_fetch_latest_version", return_value=None):
+        with mock.patch.object(N, "_fetch_latest_version",
+                               return_value=(None, False)):
             self.assertIsNone(N._check_update())
         self.assertIsNone(N._UPDATE_STATE["latest"])   # 状态未被污染
         self.assertEqual(N._load_update_cache(time.time()), (0.0, None))
@@ -206,10 +207,38 @@ class TestCheckUpdate(unittest.TestCase):
     def test_force_skips_cache(self):
         N._save_update_cache(time.time(), "1.13.0")
         with mock.patch.object(N, "_fetch_latest_version",
-                               return_value="1.15.0") as m_fetch:
+                               return_value=("1.15.0", True)) as m_fetch:
             ver = N._check_update(force=True)
         m_fetch.assert_called_once()
         self.assertEqual(ver, "1.15.0")
+
+    def test_fallback_stale_answer_not_cached(self):
+        """v1.14.1 回归: GitHub API 挂 + jsDelivr @master 快照滞后数周,
+        回落源返回旧版本号 → 不得写 24h 频控缓存 (否则陈旧答案锁死提示)。
+        """
+        old_ver = "1.12.2"          # 确保 < 当前 APP_VERSION
+        self.assertTrue(N._version_newer(N.APP_VERSION, old_ver))
+        with mock.patch.object(N, "_fetch_latest_version",
+                               return_value=(old_ver, False)):
+            self.assertEqual(N._check_update(force=True), old_ver)
+        self.assertFalse(N._UPDATE_STATE["is_new"])   # 旧版本不提示, 正常
+        self.assertEqual(N._load_update_cache(time.time()), (0.0, None))
+        # 下次启动重两 → 网络重试 (不走陈旧缓存)
+        with mock.patch.object(N, "_fetch_latest_version",
+                               return_value=(_newer_fake_version(), False)) \
+                as m_retry:
+            N._check_update()
+        m_retry.assert_called_once()
+        self.assertTrue(N._UPDATE_STATE["is_new"])
+
+    def test_fallback_newer_answer_cached(self):
+        """回落源报告"确有新版"时照常写缓存 (陈旧但仍领先本地即可信)。"""
+        newer = _newer_fake_version()
+        with mock.patch.object(N, "_fetch_latest_version",
+                               return_value=(newer, False)):
+            N._check_update(force=True)
+        self.assertEqual(N._load_update_cache(time.time())[1], newer)
+        self.assertTrue(N._UPDATE_STATE["is_new"])
 
 
 class TestNoticeLine(unittest.TestCase):
@@ -251,7 +280,7 @@ class TestThreadAndArgparse(unittest.TestCase):
     def test_thread_sets_state(self):
         newer = _newer_fake_version()
         with mock.patch.object(N, "_fetch_latest_version",
-                               return_value=newer), \
+                               return_value=(newer, True)), \
              mock.patch.object(N, "_save_update_cache"):
             t = N._start_update_check(force=True)
         t.join(timeout=10)

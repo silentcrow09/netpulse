@@ -3564,7 +3564,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.1"
+APP_VERSION = "1.14.2"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -3576,7 +3576,8 @@ SCHEMA_FILENAME = f"netpulse-result-v{SCHEMA_VERSION.rsplit('.', 1)[0]}.json"
 #   - daemon 线程 + 短超时, 失败完全静默 — 离线/被墙用户零感知,
 #     绝不拖慢启动 (v1.9.7 性能红线), 不污染 --json 输出 (只在菜单显示)
 #   - 双源: GitHub Releases API 官方 → jsDelivr CDN 回落 (国内可达;
-#     读仓库根 version.json, 发版时须同步更新, CDN 缓存可能滞后数小时)
+#     读仓库根 version.json, 发版时须同步更新。v1.14.2 实测 @master 快照
+#     可滞后数周 — 回落源说"没有新版本"不写频控缓存, 不锁死提示)
 #   - 频控: %LOCALAPPDATA%\NetPulse\update_check.json 记录上次成功检查,
 #     24h 内直接用缓存版本号不发请求; 失败不写缓存 (下次启动重试)
 GH_REPO = "silentcrow09/netpulse"
@@ -3614,23 +3615,18 @@ def _version_newer(remote, local):
 
 
 def _fetch_latest_version(timeout=UPDATE_CHECK_TIMEOUT_S):
-    """依次尝试 GitHub API / jsDelivr 回落, 返回最新版本号字符串; 全失败 None。"""
-    sources = (
-        # 1) GitHub Releases API (官方; tag_name 形如 'v1.12.0')
-        UPDATE_CHECK_API,
-        # 2) jsDelivr CDN (国内可达; 仓库根 version.json {"version": "1.12.0"})
-        UPDATE_CHECK_FALLBACK,
-    )
-    for url in sources:
+    """依次尝试 GitHub API / jsDelivr 回落; 返回 (版本号, 是否主源), 全失败 (None, False)。"""
+    for url, is_primary in ((UPDATE_CHECK_API, True),
+                            (UPDATE_CHECK_FALLBACK, False)):
         try:
             with _urlopen_with_proxy(url, timeout=timeout) as resp:
                 data = json.loads(resp.read(1 << 20).decode("utf-8", "replace"))
             ver = _parse_version(data.get("tag_name") or data.get("version"))
             if ver:
-                return _version_str(ver)
+                return _version_str(ver), is_primary
         except Exception:
             continue    # 单源失败静默, 落到下一源
-    return None
+    return None, False
 
 
 def _update_cache_path():
@@ -3677,9 +3673,13 @@ def _check_update(force=False):
                 _UPDATE_STATE.update(latest=cached, checked_at=ts,
                                      is_new=_version_newer(cached, APP_VERSION))
             return cached
-    latest = _fetch_latest_version()
+    latest, from_primary = _fetch_latest_version()
     if latest:
-        _save_update_cache(now, latest)
+        # v1.14.2 修复: jsDelivr @master 快照实测滞后数周, 回落源的
+        # "没有新版本"不可信 — 不写 24h 频控缓存 (下次启动重试),
+        # 否则陈旧答案会把更新提示锁死一整天; 主源结果或"确有新版"才锁定
+        if from_primary or _version_newer(latest, APP_VERSION):
+            _save_update_cache(now, latest)
         with _UPDATE_LOCK:
             _UPDATE_STATE.update(latest=latest, checked_at=now,
                                  is_new=_version_newer(latest, APP_VERSION))
