@@ -3564,7 +3564,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.14.1"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -19190,31 +19190,42 @@ def prompt_export_report():
         print(_c(f"  ✓ 报告已导出: {os.path.abspath(_normalize_report_path(name))}", C_GREEN))
 
 
-def _find_chrome_exe():
-    """探测本机 Chrome (v1.14.0, 现场模式 PDF 导出用)。
+def _find_pdf_browser():
+    """探测可用于无头打印的浏览器 (v1.14.1: Chrome → Edge 探测链)。
 
-    探测顺序: 常见安装路径 → 注册表 App Paths。找不到返回 None —
-    调用方静默跳过 PDF, 不阻塞现场流程 (浏览器 Ctrl+P 兜底)。
+    Edge 是 Win10/11 系统必装且同为 Chromium 内核, 无头打印行为与 Chrome
+    完全一致 — 探测链覆盖后, PDF 能力实际是"Windows 自带, 零额外安装"。
+    找不到返回 None — 调用方静默跳过 PDF, 不阻塞现场流程 (Ctrl+P 兜底)。
     """
     pf = os.environ.get("ProgramFiles", r"C://Program Files")
     pf86 = os.environ.get("ProgramFiles(x86)", r"C://Program Files (x86)")
     lad = os.environ.get("LOCALAPPDATA", "")
-    for c in (os.path.join(pf, r"Google\Chrome\Application\chrome.exe"),
-              os.path.join(pf86, r"Google\Chrome\Application\chrome.exe"),
-              os.path.join(lad, r"Google\Chrome\Application\chrome.exe")):
+    cands = [
+        # Chrome 优先 (与开发预览同内核同版本系)
+        os.path.join(pf, r"Google\Chrome\Application\chrome.exe"),
+        os.path.join(pf86, r"Google\Chrome\Application\chrome.exe"),
+        os.path.join(lad, r"Google\Chrome\Application\chrome.exe"),
+        # Edge 兜底: Win10/11 系统必装, 默认装在 x86 Program Files
+        os.path.join(pf86, r"Microsoft\Edge\Application\msedge.exe"),
+        os.path.join(pf, r"Microsoft\Edge\Application\msedge.exe"),
+        os.path.join(lad, r"Microsoft\Edge\Application\msedge.exe"),
+    ]
+    for c in cands:
         if c and os.path.isfile(c):
             return c
     try:
         import winreg
-        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            try:
-                with winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows"
-                                        r"\CurrentVersion\App Paths\chrome.exe") as k:
-                    val = winreg.QueryValue(k, None)
-                    if val and os.path.isfile(val):
-                        return val
-            except OSError:
-                continue
+        for exe in ("chrome.exe", "msedge.exe"):
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                try:
+                    with winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows"
+                                            r"\CurrentVersion\App Paths" + "\\" +
+                                            + exe) as k:
+                        val = winreg.QueryValue(k, None)
+                        if val and os.path.isfile(val):
+                            return val
+                except OSError:
+                    continue
     except ImportError:
         pass
     return None
@@ -19260,7 +19271,7 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
 
     流程: 手输(客户名/检测时间/签约带宽) → 全量诊断(all_module_keys(),
     排除 tcpcc 压测 — 不在客户网络里制造压测负载) → 机房勾选 →
-    同一份 report 出 一页客户报告/完整版/.json (+PDF, 检测到 Chrome 时)。
+    同一份 report 出 一页客户报告/完整版/.json (+PDF, Chrome/Edge 任一即可)。
     customer: CLI --customer 预填, 空则终端询问 (必填)。
     """
     if not sys.stdout.isatty():
@@ -19365,10 +19376,12 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
             done.append((desc, os.path.abspath(_normalize_report_path(path))))
 
     # ── 步骤 5: PDF (检测到 Chrome 才产出; 没有则 Ctrl+P 兜底, 不阻塞流程) ──
-    chrome = _find_chrome_exe()
-    if chrome:
-        print(_c("  → 检测到 Chrome, 生成 PDF...", C_GRAY))
-        err = _html_to_pdf(chrome, base + ".html", base + ".pdf")
+    browser = _find_pdf_browser()
+    if browser:
+        bname = "Edge" if "msedge" in os.path.basename(browser).lower() \
+                else "Chrome"
+        print(_c(f"  → 检测到 {bname}, 生成 PDF...", C_GRAY))
+        err = _html_to_pdf(browser, base + ".html", base + ".pdf")
         if err:
             print(_c(f"  ✗ PDF 生成失败: {err} (可打开 HTML 后 Ctrl+P 另存)",
                      C_YELLOW))
@@ -19376,8 +19389,8 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
             done.insert(0, ("一页客户报告 PDF (直接打印交客户)",
                             os.path.abspath(base + ".pdf")))
     else:
-        print(_c("  → 未检测到 Chrome, 跳过 PDF (可打开 HTML 后 Ctrl+P 另存)",
-                 C_GRAY))
+        print(_c("  → 未检测到 Chrome/Edge, 跳过 PDF "
+                 "(可打开 HTML 后 Ctrl+P 另存)", C_GRAY))
 
     print()
     print(_c(bar, C_BLUE))
@@ -20085,8 +20098,8 @@ def main():
     parser.add_argument("--site", action="store_true",
                         help="现场检测模式 (v1.13.0): 上门全量诊断(排除压测) + "
                              "机房 6 项逐项勾选 + 现场备注, 自动生成 一页客户报告/"
-                             "完整版/JSON, 检测到 Chrome 自动加出 PDF; "
-                             "需交互终端, 与其他模块互斥")
+                             "完整版/JSON, 检测到 Chrome/Edge 自动加出 "
+                             "PDF; 需交互终端, 与其他模块互斥")
     parser.add_argument("--customer", metavar="NAME",
                         help="现场检测模式的客户名称预填 (配合 --site; 不填则终端询问)")
     parser.add_argument("--capture", nargs="?", const="slice",

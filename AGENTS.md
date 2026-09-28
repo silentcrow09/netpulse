@@ -97,10 +97,12 @@
 - **机房 6 项**：`SITE_CHECK_ITEMS` 常量（建议文案 ≤24 字，破坏会折行破坏
   一页高度锁）；`_normalize_site_check` 白名单校验，清单外 key/值按「未检查」。
 - **四件套**：同一 report 出 一页客户报告（`render_report_html_brief`，
-  A4 单页，官方 logo 反白内嵌）/ 完整版 / .json / **PDF**（v1.14.0：
-  `_find_chrome_exe()` 探测 Chrome，`_html_to_pdf()` 无头打印 A4；
+  A4 单页，官方 logo 反白内嵌）/ 完整版 / .json / **PDF**（v1.14.0，
+  v1.14.1 起 `_find_pdf_browser()` 按 Chrome → **Edge** 探测链兜底——
+  Edge 系统必装且同为 Chromium 内核，PDF 能力=Windows 自带；
+  `_html_to_pdf()` 无头打印 A4；
   profile 复用 `%TEMP%\np_pdf_profile` + 禁首跑/组件联网 —— 冷启动
-  45s → ~3s；无 Chrome 静默跳过，Ctrl+P 兜底），文件名
+  45s → ~3s；Chrome/Edge 都没有才静默跳过，Ctrl+P 兜底），文件名
   `reports/现场检测_客户名_时间戳.*`。
 - **数据流**：`build_report(site_check=, meta_manual=, site_note=)` 显式
   传参进 report dict —— 不新增 LAST_RUN 依赖（守收口规则）。

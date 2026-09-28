@@ -7,6 +7,23 @@
 
 ## [Unreleased]
 
+## [1.14.1] - 2026-09-28
+
+PDF 生成不再依赖"装了 Chrome"：探测链加入 Edge 兜底。
+
+### 修复/增强
+
+- `_find_chrome_exe()` → `_find_pdf_browser()`：探测链 **Chrome → Edge**
+  （Program Files ×2 / LOCALAPPDATA / 注册表 App Paths 各扫一遍）。
+  Edge 是 Win10/11 系统必装且同为 Chromium 内核，无头打印行为与 Chrome
+  完全一致 —— PDF 能力从"装了 Chrome 才有"变为 **Windows 自带，零额外
+  安装**；完成屏按实际使用的浏览器显示「检测到 Chrome/Edge」
+- 实测 Edge 转换一页报告：3.5s / 1 页，与 Chrome 无差异
+
+### 测试
+
+- 探测/转换用例随探测链更新；全量 24 文件 497 用例 + smoke 262 项通过
+
 ## [1.14.0] - 2026-09-28
 
 现场检测模式自动导出 PDF（用户反馈：最后直接要 PDF，不想手动 Ctrl+P）。

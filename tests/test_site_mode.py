@@ -339,16 +339,16 @@ class TestPdfHelpers(unittest.TestCase):
 
     def test_find_chrome_returns_path_or_none(self):
         """探测结果要么 None (无 Chrome), 要么指向真实存在的 chrome.exe."""
-        result = N._find_chrome_exe()
+        result = N._find_pdf_browser()
         self.assertTrue(result is None
                         or (isinstance(result, str) and os.path.isfile(result)),
                         msg=f"非法探测结果: {result!r}")
 
     def test_html_to_pdf_real_when_chrome_available(self):
         """本机有 Chrome 时真实转换一次 (1~2s); 无 Chrome 跳过."""
-        chrome = N._find_chrome_exe()
-        if not chrome:
-            self.skipTest("本机无 Chrome")
+        browser = N._find_pdf_browser()
+        if not browser:
+            self.skipTest("本机无 Chrome/Edge")
         with tempfile_dir() as d:
             html = os.path.join(d, "in.html")
             with open(html, "w", encoding="utf-8") as f:
@@ -356,22 +356,22 @@ class TestPdfHelpers(unittest.TestCase):
                         "<title>测试</title></head>"
                         "<body><h1>测试 PDF 转换</h1></body></html>")
             pdf = os.path.join(d, "out.pdf")
-            err = N._html_to_pdf(chrome, html, pdf)
+            err = N._html_to_pdf(browser, html, pdf)
             self.assertIsNone(err)
             self.assertTrue(os.path.isfile(pdf)
                             and os.path.getsize(pdf) > 1000)
 
     def test_html_to_pdf_bad_target_returns_error_text(self):
         """输出路径非法 → 返回错误文本而非抛异常 (现场流程不能因 PDF 中断)."""
-        chrome = N._find_chrome_exe()
-        if not chrome:
-            self.skipTest("本机无 Chrome")
+        browser = N._find_pdf_browser()
+        if not browser:
+            self.skipTest("本机无 Chrome/Edge")
         with tempfile_dir() as d:
             html = os.path.join(d, "in.html")
             with open(html, "w", encoding="utf-8") as f:
                 f.write("<html><body>x</body></html>")
             bad = os.path.join(d, "no_such_dir", "out.pdf")
-            err = N._html_to_pdf(chrome, html, bad, timeout=30)
+            err = N._html_to_pdf(browser, html, bad, timeout=30)
             self.assertIsNotNone(err)
             self.assertIsInstance(err, str)
 
