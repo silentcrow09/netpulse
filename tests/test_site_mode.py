@@ -171,6 +171,12 @@ class TestBriefRenderer(unittest.TestCase):
         self.assertIn("🎯 签约带宽达标", html)
         self.assertIn("93.6", html)  # 468.2 / 500 = 93.6%
 
+    def test_geo_chip_removed(self):
+        """v1.13.1: 📍 地域/ASN chips 删除 (用户反馈展示多余)."""
+        html = self._brief()
+        self.assertNotIn("📍", html)
+        self.assertNotIn("AS4134", html)
+
     def test_plan_absent_hides_cell(self):
         """没填签约带宽 → 整格隐藏 (第五轮拍板: 终端手输, 有值才显示)."""
         html = self._brief()
@@ -227,6 +233,65 @@ class TestBriefRenderer(unittest.TestCase):
         html = self._brief()
         self.assertIn("@page{ size:A4 portrait;", html)
         self.assertIn("data:image/png;base64,", html)  # 官方 logo 内嵌
+
+
+class TestBriefIssueFallback(unittest.TestCase):
+    """v1.13.1: 无根因但有模块级异常/警告 → 回退为 issue 行 (真实现场首跑暴露).
+
+    场景: ipv6=异常 / proxy=警告 均为评分豁免模块 → 不触发根因规则,
+    旧版自拼"未发现明确故障"与检测覆盖的红黄徽章自相矛盾。
+    """
+
+    def _report_with_module_issues(self):
+        r = _fake_report(diagnosis={"root_causes": [],
+                                    "overall_confidence": 1.0,
+                                    "rules_evaluated": 8, "rules_fired": 0})
+        mods = r["modules"]
+        for m in mods:
+            if m["key"] == "wifi":
+                m["status"] = "异常"
+                m["issues"] = [{"severity": "异常",
+                                "text": "当前信道 6 拥堵，邻居 AP 达 8 个",
+                                "impact": "", "action": ""}]
+            if m["key"] == "gateway":
+                m["status"] = "警告"
+                m["issues"] = [{"severity": "警告",
+                                "text": "网关延迟轻微抖动",
+                                "impact": "", "action": ""}]
+        # 模拟评分豁免模块的非完成状态 (徽章展示但不扣分)
+        r["summary"]["ipv6"] = "异常"
+        r["health"] = {"score": 100, "grade": "A", "label": "优秀",
+                       "verdict": "优秀 · 2 个模块需关注 (含 1 个异常)"}
+        return r
+
+    def test_issue_rows_rendered(self):
+        html = N.render_report_html_brief(self._report_with_module_issues())
+        self.assertIn("当前信道 6 拥堵", html)
+        self.assertIn("网关延迟轻微抖动", html)
+        self.assertIn("bissues", html)
+
+    def test_verdict_used_as_headline(self):
+        """结论行必须用全口径 verdict — 不再自拼"未发现明确故障"."""
+        html = N.render_report_html_brief(self._report_with_module_issues())
+        self.assertIn("2 个模块需关注", html)
+        self.assertNotIn("未发现明确故障", html)
+
+    def test_cap_names_exempt_modules(self):
+        """检测覆盖 cap 点破豁免模块不计分 (满分 + 红黄徽章不再像算错)."""
+        r = self._report_with_module_issues()
+        html = N.render_report_html_brief(r)
+        self.assertIn("属评分豁免模块", html)
+        self.assertIn("IPv6", html)  # MODULE_MAP 中文名
+
+    def test_clean_branch_still_works(self):
+        """无根因且无模块级问题 → 仍走绿色"未发现明确故障"分支."""
+        r = _fake_report(diagnosis={"root_causes": [],
+                                    "overall_confidence": 1.0,
+                                    "rules_evaluated": 8, "rules_fired": 0})
+        for m in r["modules"]:
+            m["issues"] = []
+        html = N.render_report_html_brief(r)
+        self.assertIn("未发现明确故障", html)
 
 
 class TestExportBrief(unittest.TestCase):

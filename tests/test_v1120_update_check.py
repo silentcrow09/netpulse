@@ -159,13 +159,26 @@ class TestCheckUpdate(unittest.TestCase):
         with N._UPDATE_LOCK:
             N._UPDATE_STATE.update(latest=None, checked_at=0.0, is_new=False)
 
+    @staticmethod
+    def _newer_fake_version():
+        """构造必然大于当前 APP_VERSION 的假远端版本。
+
+        此前硬编码 "1.13.0", 本地版本 bump 到 1.13.0 后该用例必挂
+        (remote == local → is_new False)。改为 minor+1 动态构造,
+        以后发版不再踩。
+        """
+        parts = (N.APP_VERSION.split(".") + ["0", "0"])[:3]
+        major, minor, _patch = (int(x) for x in parts)
+        return f"{major}.{minor + 1}.0"
+
     def test_cache_hit_no_network(self):
-        N._save_update_cache(time.time(), "1.13.0")
+        newer = self._newer_fake_version()
+        N._save_update_cache(time.time(), newer)
         with mock.patch.object(N, "_fetch_latest_version") as m_fetch:
             ver = N._check_update()
         m_fetch.assert_not_called()          # 24h 内缓存命中, 不发请求
-        self.assertEqual(ver, "1.13.0")
-        self.assertTrue(N._UPDATE_STATE["is_new"])   # 1.13.0 > 1.12.0
+        self.assertEqual(ver, newer)
+        self.assertTrue(N._UPDATE_STATE["is_new"])   # newer > 当前版本
 
     def test_cache_hit_same_version_not_new(self):
         N._save_update_cache(time.time(), N.APP_VERSION)

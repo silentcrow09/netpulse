@@ -3564,7 +3564,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.13.1"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -16265,7 +16265,7 @@ SITE_CHECK_ITEMS = [
      "options": ["达标（超五类及以上）", "五类线", "有损伤或超 100m",
                  "光纤弯曲过小或接头污染"],
      "bad": ["五类线", "有损伤或超 100m", "光纤弯曲过小或接头污染"],
-     "advice": "换超五类及以上网线，光纤弯折需重新布放"},
+     "advice": "劣质线材仅支持百兆，是测速不达标最常见原因"},
     {"key": "onu_led", "cat": "设备运行", "label": "光猫 / ONU 指示灯",
      "options": ["正常（PON 常亮）", "LOS 告警", "电源异常"],
      "bad": ["LOS 告警", "电源异常"],
@@ -16276,6 +16276,11 @@ SITE_CHECK_ITEMS = [
      "advice": "确认设备用途并登记，防 NAT 叠加双重出口"},
 ]
 SITE_CHECK_BY_KEY = {it["key"]: it for it in SITE_CHECK_ITEMS}
+
+# 评分豁免模块 (原 build_report 内局部集合, v1.13.1 提为常量供渲染层引用):
+# iperf3 未配置不是故障 / ipv6 可选 / proxy·VPN 环境特性 / nattype 运营商侧。
+# 豁免 = 不扣分, 但状态徽章照常展示 (全口径), 报告需说明这层差异。
+SCORE_EXEMPT_MODULES = ("iperf3", "ipv6", "proxy", "nattype")
 
 
 def _normalize_site_check(site_check):
@@ -16343,7 +16348,7 @@ def build_report(rule_filter=None, diagnosis=None, site_check=None,
 
     # 状态计数 (按模块状态)
     # 豁免模块不参与扣分: iperf3(未配置不是故障), ipv6(可选), proxy/VPN(环境特性), nattype(运营商侧)
-    EXEMPT_MODULES = {"iperf3", "ipv6", "proxy", "nattype"}
+    EXEMPT_MODULES = set(SCORE_EXEMPT_MODULES)
     counts = {}          # 扣分口径: 不含豁免模块
     all_counts = {}      # 文案口径: 全部模块 (与"检测结果一览"的徽章一致)
     exempt_count = 0
@@ -18569,6 +18574,10 @@ def render_report_json(report, indent=2):
         "diagnosis": report["diagnosis"],
         "modules": report["modules"],
         "tech": report["tech"],
+        # v1.13.0: 现场检测模式手输数据 (普通模式为空值; schema 允许未知字段)
+        "site_check": report.get("site_check", {}),
+        "site_note": report.get("site_note", ""),
+        "meta_manual": report.get("meta_manual", {}),
         # 兼容视图: v1.4.0 之前的消费方读 meta.host / meta.app
         "meta": {
             "app": report["app"],
@@ -18657,7 +18666,7 @@ body{background:#fff;color:#16203a;margin:0;font-size:10.5pt;line-height:1.55;
 .bmain .bttl{font-size:14pt;font-weight:800;letter-spacing:.3px;line-height:1.2;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .bmain .bttl .bcname{border-bottom:1.5px dashed rgba(255,255,255,.5)}
-.bverdict{display:flex;gap:13px;align-items:center;margin-top:7px;
+.bverdict{display:flex;gap:13px;align-items:center;margin-top:9px;
   border:1px solid #e3e8f0;border-left:4px solid #d97706;border-radius:9px;
   padding:7px 13px}
 .bring{flex:none;position:relative;width:96px;height:96px}
@@ -18678,7 +18687,7 @@ body{background:#fff;color:#16203a;margin:0;font-size:10.5pt;line-height:1.55;
 .bchips span{font-size:8.2pt;color:#5a6472;background:#f6f8fb;
   border:1px solid #e3e8f0;border-radius:999px;padding:1px 8px;white-space:nowrap}
 .bchips b{color:#16203a;font-family:'Cascadia Mono',Consolas,monospace;font-weight:700}
-.bmetrics{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:6px}
+.bmetrics{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:9px}
 .bmet{border:1px solid #e3e8f0;border-radius:8px;padding:6px 9px 7px;background:#fbfcfe}
 .bmet .lab{font-size:8.2pt;color:#8a94a6}
 .bmet .val{font-size:14.5pt;font-weight:800;line-height:1.18;margin-top:2px;
@@ -18687,8 +18696,10 @@ body{background:#fff;color:#16203a;margin:0;font-size:10.5pt;line-height:1.55;
 .bmet .note{font-size:7.8pt;margin-top:2px;color:#8a94a6}
 .bmet.good .val{color:#0e8a4f}.bmet.bad .val{color:#d92d20}.bmet.mid .val{color:#b26a00}
 .bmet.pact{border-style:dashed;border-color:#c3cfe4;background:#f7faff}
+.bmet.pact.bad{border-style:solid;border-color:#f6cfcf;background:#fef4f3}
+.bmet.pact.bad .val{color:#d92d20}
 .bsec{display:flex;align-items:center;gap:7px;font-size:11pt;font-weight:800;
-  margin:9px 0 5px}
+  margin:14px 0 6px}
 .bsec::before{content:"";width:4px;height:13px;border-radius:2px;background:#1a56db}
 .bsec .cnt{font-size:7.8pt;font-weight:700;color:#5a6472;background:#f1f3f7;
   border-radius:999px;padding:1px 8px}
@@ -18709,10 +18720,18 @@ body{background:#fff;color:#16203a;margin:0;font-size:10.5pt;line-height:1.55;
 .brc .a b{color:#0b6b3a}
 .bmore{font-size:8.2pt;color:#5a6472;background:#f6f8fb;border:1px dashed #c3cfe4;
   border-radius:6px;padding:5px 11px}
+.bissues{border:1px solid #e3e8f0;border-radius:8px;background:#fbfcfe;
+  padding:4px 12px;break-inside:avoid}
+.bissues .irow{display:flex;align-items:baseline;gap:8px;padding:5px 0;
+  border-top:1px solid #eef1f6;font-size:8.6pt}
+.bissues .irow:first-child{border-top:0}
+.bissues .sev{flex:none;width:9%;font-weight:800;color:#a61b1b}
+.bissues .tx{flex:1;min-width:0;color:#16203a;font-weight:600}
+.bissues .src{flex:none;font-size:7.6pt;color:#8a94a6}
 .bclean{border:1px solid #cfe9db;border-left:5px solid #0e8a4f;background:#f4fbf7;
   border-radius:0 8px 8px 0;padding:8px 13px;font-size:10pt;font-weight:700;color:#0b6b3a}
 .bsite{border:1px solid #e3e8f0;border-radius:8px;background:#fbfcfe;
-  padding:8px 12px 9px;break-inside:avoid}
+  padding:8px 12px 9px;margin-bottom:12px;break-inside:avoid}
 .bsite .cats{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:4px}
 .bsite .cat{font-size:7.6pt;font-weight:700;border-radius:5px;padding:2px 8px;
   background:#eef7f1;color:#0b6b3a;border:1px solid #cfe9db;white-space:nowrap}
@@ -18826,18 +18845,22 @@ def render_report_html_brief(report):
             pct = 0.0
         ok = pct >= 90.0
         metrics.append(_met(
-            "pact", "🎯 签约带宽达标",
+            "pact" + ("" if ok else " bad"), "🎯 签约带宽达标",
             f'{pct:.1f}<small>%</small>',
             f'签约 {plan_mbps:g}M · {"达标" if ok else "未达标"}'))
     if isinstance(g_avg, (int, float)):
+        # Windows ping 对局域网 (<1ms) 输出整数粒度 0, 直写 "0ms" 会被误读
+        # (与完整版 v1.9.3 同一口径): 0 或 <1 一律表达为 "<1"
+        def _ms(v):
+            return "<1" if v < 1 else f"{v:g}"
         note_bits = []
         if isinstance(g_peak, (int, float)):
-            note_bits.append(f"峰值 {g_peak:g} ms")
+            note_bits.append(f"峰值 {_ms(g_peak)} ms")
         if isinstance(g_loss, (int, float)) and g_loss > 0:
             note_bits.append(f"丢包 {g_loss:g}%")
         metrics.append(_met(
             "mid" if (g_peak or 0) > 30 else "", "⏱ 网关延迟",
-            f'{g_avg:g}<small>ms</small>',
+            f'{_ms(g_avg)}<small>ms</small>',
             " · ".join(note_bits) or "局域网 <1ms 视为正常"))
     if w_ch or w_n:
         cls = "bad" if ("严重" in w_inter or (isinstance(w_n, int) and w_n >= 15)) else "mid"
@@ -18853,11 +18876,36 @@ def render_report_html_brief(report):
     grade_key = str(health.get("grade") or "").strip()[:1].upper()
     lbl_fg, lbl_bg = GRADE_BADGE.get(grade_key, GRADE_BADGE["C"])
     n_site_bad = sum(1 for it in SITE_CHECK_ITEMS if sc.get(it["key"]) in it["bad"])
+
+    # 模块级问题收集 (与完整版待办同源: 异常/错误/警告, severity+text 去重)。
+    # v1.13.1: 此前问题区只看 root_causes, 评分豁免模块 (ipv6/proxy 等) 的
+    # 异常/警告不触发根因规则 → 前文"未发现故障"、检测覆盖却有红黄徽章,
+    # 自相矛盾 (真实现场首跑暴露)。回退: 无根因时逐条列出模块级问题。
+    todo = []
+    _seen = set()
+    for m in modules:
+        for iss in m.get("issues") or []:
+            sev = iss.get("severity", "信息")
+            text = (iss.get("text") or "").strip()
+            if sev not in ("异常", "错误", "警告") or not text:
+                continue
+            k = (sev, text)
+            if k in _seen:
+                continue
+            _seen.add(k)
+            todo.append({"severity": sev, "text": text,
+                         "module": m.get("name", "")})
+    todo.sort(key=lambda i: 0 if i["severity"] in ("异常", "错误") else 1)
+
+    verdict_txt = str(health.get("verdict") or "").strip()
     if rcs:
         vline = (f'实测发现 <span class="em">{len(rcs)} 个主要问题</span>'
                  f'（{_html_esc(health.get("label", ""))}）')
         vsub = _brief_clip(rcs[0].get("description") or rcs[0].get("title", ""),
                            _BRIEF_CLIP["desc"])
+    elif todo:
+        vline = _html_esc(verdict_txt) or '实测存在需关注模块'
+        vsub = "模块级问题逐条列出如下；评分口径说明见「检测覆盖」。"
     else:
         vline = '实测<span class="em">未发现明确故障</span>'
         vsub = "各项核心检测均通过，详细指标见随附完整报告。"
@@ -18872,9 +18920,6 @@ def render_report_html_brief(report):
                      ("DNS", sysinfo.get("dns"))):
         if val:
             chips.append(f"<span>{_html_esc(lab)} <b>{_html_esc(str(val))}</b></span>")
-    geo = " / ".join(x for x in (sysinfo.get("geo"), sysinfo.get("asn")) if x)
-    if geo:
-        chips.append(f"<span>📍 <b>{_html_esc(geo)}</b></span>")
 
     # ── 一、网络实测问题 (severity 降序, 最多 3 张) ──
     sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -18906,6 +18951,23 @@ def render_report_html_brief(report):
                     f'<span class="cnt">{len(rcs)} 项</span>'
                     '<span class="rd">由 NetPulse 自动检测判定</span></div>')
         problems_html = sec_head + "".join(rc_blocks) + more_html
+    elif todo:
+        # v1.13.1: 无根因回退 — 模块级 issue 行 (最多 4 条, 溢出折叠)
+        shown_t, hidden_t = todo[:4], todo[4:]
+        rows = "".join(
+            f'<div class="irow"><span class="sev">{_html_esc(i["severity"])}</span>'
+            f'<span class="tx">{_html_esc(_brief_clip(i["text"], _BRIEF_CLIP["desc"]))}</span>'
+            f'<span class="src">{_html_esc(_brief_clip(i["module"], 12))}</span></div>'
+            for i in shown_t)
+        if hidden_t:
+            rows += (f'<div class="irow"><span class="sev">…</span>'
+                     f'<span class="tx">另有 {len(hidden_t)} 项，详见随附完整报告</span>'
+                     f'<span class="src"></span></div>')
+        sec_head = ('<div class="bsec">一、网络实测问题 '
+                    f'<span class="cnt">{len(todo)} 项</span>'
+                    '<span class="rd">由 NetPulse 自动检测判定</span></div>')
+        problems_html = (sec_head
+                         + f'<div class="bissues">{rows}</div>')
     else:
         clean_more = more_html.replace('class="bmore"', 'class="bmore" style="margin-top:6px"')
         problems_html = ('<div class="bsec">一、网络实测问题 '
@@ -18977,7 +19039,17 @@ def render_report_html_brief(report):
     status_bar = _svg_status_bar(all_counts)
     cap = (f'健康分 {score} 为扣分口径 {sum(counts.values())} 项'
            + (f'（iperf3 / ipv6 / proxy / nattype 共 {exempt_count} 项豁免）' if exempt_count else '')
-           + '。整改项建议下次上门免费复核。')
+           + '。')
+    # v1.13.1: 豁免模块的非完成状态照常显示徽章但不扣分 — 必须点破,
+    # 否则"检测覆盖有红黄徽章 + 健康分满分"看起来像算错 (真实现场首跑反馈)
+    exempt_bad = sorted(
+        MODULE_MAP.get(k, (k, k))[0]
+        for k, st in (report.get("summary") or {}).items()
+        if st not in ("完成", "未检测") and k in SCORE_EXEMPT_MODULES)
+    if exempt_bad:
+        cap += (f'其中 {len(exempt_bad)} 项属评分豁免模块'
+                f'（{_html_esc("、".join(exempt_bad))}），不计分。')
+    cap += '整改项建议下次上门免费复核。'
     lg_bits = "".join(
         f'<span><i style="background:{_html_status_color(st)}"></i>{_html_esc(st)} '
         f'{all_counts.get(st, 0)}</span>'
@@ -19155,7 +19227,8 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
         raw_t = input(_c(f"  检测时间 (回车 = "
                          f"{datetime.now().strftime('%Y-%m-%d %H:%M')}) > ",
                          C_GREEN)).strip()
-        plan = input(_c("  签约带宽 (可空, 如 500M) > ", C_GREEN)).strip()
+        plan = input(_c("  签约带宽 (建议填写, 用于达标判定, 如 500M) > ",
+                        C_GREEN)).strip()
     except (EOFError, KeyboardInterrupt):
         print(_c("\n  已取消。", C_YELLOW))
         return
