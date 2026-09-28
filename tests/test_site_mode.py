@@ -229,6 +229,17 @@ class TestBriefRenderer(unittest.TestCase):
         self.assertIn("超" * 26 + "…", html)
         self.assertNotIn("超" * 40, html)
 
+    def test_coverage_count_matches_badges(self):
+        """v1.14.3 回归: 「网络自动检测 N 项」必须与右侧徽章同源同数
+        (summary 实跑口径), 不得用 total_modules 全量宇宙口径 —
+        现场模式剔除 tcpcc/port/iperf3 后 20 ≠ 23, 客户看见像算错。
+        """
+        r = _fake_report()      # 3 个模块, total_modules=23 (宇宙口径)
+        self.assertLess(len(r["summary"]), r["total_modules"])
+        html = N.render_report_html_brief(r)
+        self.assertIn(f'网络自动检测 {len(r["summary"])} 项', html)
+        self.assertNotIn(f'网络自动检测 {r["total_modules"]} 项', html)
+
     def test_a4_print_css_present(self):
         html = self._brief()
         self.assertIn("@page{ size:A4 portrait;", html)

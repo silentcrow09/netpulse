@@ -3564,7 +3564,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.2"
+APP_VERSION = "1.14.3"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -18758,7 +18758,8 @@ body{background:#fff;color:#16203a;margin:0;font-size:10.5pt;line-height:1.55;
 .bcov .lg i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:4px}
 .bcov .bar{margin-top:4px}
 .bcov .cap{font-size:7.6pt;color:#8a94a6;margin-top:4px;line-height:1.45}
-.bfoot{margin-top:auto;padding-top:12px;border-top:2px solid #0a4f8f}
+.bgap{flex:1 0 14px}
+.bfoot{padding-top:12px;border-top:2px solid #0a4f8f}
 .bslogan{text-align:center;font-size:9.2pt;font-weight:800;letter-spacing:.6px;
   color:#0057a8}
 .bslogan .dot{margin:0 7px;color:#a8791a}
@@ -19056,14 +19057,15 @@ def render_report_html_brief(report):
         for st in STATUS_BAR_ORDER if all_counts.get(st))
     cov_html = (f'<div class="bcov"><div class="row">'
                 f'<span class="k">检测覆盖</span>'
-                f'<span>网络自动检测 {report.get("total_modules", len(modules))} 项'
+                # v1.14.3: 用与右侧徽章/状态条同源的实际计数 (summary 口径)。
+                # 旧版用 total_modules (全量 23 宇宙口径): 现场模式剔除
+                # tcpcc/port/iperf3 后实跑 20 项, 右侧 18+1+1=20 对不上 23
+                f'<span>网络自动检测 {sum(all_counts.values()) or len(modules)} 项'
                 f' · 机房现场检查 {n_checked} 项</span>'
                 f'<span class="lg">{lg_bits}</span></div>'
                 f'<div class="bar">{status_bar}</div>'
                 f'<div class="cap">{_html_esc(cap)}</div></div>')
 
-    app = report.get("app", "NetPulse")
-    ver = report.get("version", "")
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -19106,9 +19108,10 @@ def render_report_html_brief(report):
 
   {cov_html}
 
+  <div class="bgap"></div>
   <div class="bfoot">
     <div class="bslogan">中国电信<span class="dot">·</span>用心服务每一次上门</div>
-    <div class="bfine">本报告由 {_html_esc(app)} v{_html_esc(ver)} 于 {_html_esc(g)} 现场生成 · 检测时间 {_html_esc(tested_at)} · 数据为本次实测结果，完整原始数据另附 · 第 1 / 1 页</div>
+    <div class="bfine">检测时间 {_html_esc(tested_at)} · 数据为本次实测结果，完整原始数据另附 · 第 1 / 1 页</div>
   </div>
 
 </div>
