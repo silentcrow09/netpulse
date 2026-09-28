@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.12.2
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.13.0
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -25,6 +25,7 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 - **并行执行**：`--parallel` 多模块并发跑（`--max-workers N` 控制并发数），交互菜单多模块默认并发；测速 / Bufferbloat / iperf3 / TCP 并发等**带宽敏感模块不参与并发**（v1.12.2），在并发阶段结束后独占串行跑，测速口径与单独运行一致。
 - **JSON Schema + 调试包**：结果文件遵循 `schema/netpulse-result-v1.2.json`（`--json-schema` 离线查询版本与字段，供 AI Agent / RMM introspect；v1.2.0 起 `tech.evidence` 为一等结构——每模块 probe 认证证据，与根因证据链同源）；`--debug-bundle DIR` 一键导出脱敏调试包（system + diagnostic + evidence + log 的 zip）。
 - **TCP 并发能力压测**：阶梯并发连接测试（累计保持），判定网络路径（光猫/路由器 NAT）最大可持续并发；同跑本机回环对照，自动区分「本机瓶颈 vs 网络/NAT 瓶颈」，零依赖、无需自建服务器。
+- **现场检测模式 `--site`**（v1.13.0）：装维上门一键流程 — 输入客户名称 / 检测时间 / 签约带宽（可空）→ 网络全量诊断（**自动排除 TCP 并发压测**，不在客户网络里制造压测负载）→ 机房环境 6 项逐项勾选 + 现场备注 → 自动产出**三件套**：A4 单页「客户报告」（电信品牌蓝头 + 官方 logo，浏览器 Ctrl+P 恰好一页，打印交客户）、完整版 HTML、原始数据 JSON。菜单入口：场景 `[6]`。
 - **盯障模式 `--monitor`**：分钟级持续监测网关/外网 ping + TCP + DNS，抓偶发掉线（普通模块全是快照抓不到）；自动事件检测 + 分段定位（内网侧/运营商侧/解析侧/内外同抖），含**抖动窗口**检测（60s 窗口内反复丢包但未达连续中断 → 抖动集中段，偶发掉线最典型形态）；v1.7.0 起叠加**统计层**——后台二分探测路径 MTU（识别 MTU 不匹配/PMTUD 黑洞类故障，ping 小包看不出的盲区）+ TCP 重传率 30s 差分采样（开机累计计数器差出会话口径，含分母保护）+ 网卡收发错误计数 30s 差分采样（v1.11.0：CRC 错帧在驱动层被丢弃、抓包看不到，只有计数器能暴露——错误暴增与丢包时段同时出现时判定为「LAN 链路层错包」，典型根因千兆自协商兼容性/双工不匹配，报告附强制百兆全双工的一键管理员命令），`--monitor-load` 在盯障启动 60s 后自动制造 15s 下载负载让 full-size 包真正跑起来；输出带时间轴的 HTML 报告 + Excel 直开的 CSV + 完整 JSON。
 - **抓包取证层 `--capture`（v1.8.0）**：盯障时叠加**证据级**抓包（需 Npcap + 管理员，默认关闭，首次使用有隐私确认）——中断/抖动/TCP 失败/重传爆发等事件触发时自动落盘**前后各 30s 切片 pcap**（Wireshark 直开），结束后离线分析三信号判定 **PMTU 黑洞**（ICMP 分片指示 / full-size 段同序号停滞重传 / 握手 MSS 大于路径 MTU）、链路丢包形态、DNS 慢查询，结论联动盯障报告并给**置信度徽标**（黑洞确认为「高置信度」档）；**隐私边界**：默认仅保存诊断所需的网络元数据——80/443 每流仅前 2 包多留 384B（提取 Host/SNI 定位访问的域名），DNS/ICMP 整包保留（**DNS 查询域名 QNAME / HTTP Host / TLS SNI 可能被记录**），其余一律剥到头部，**不保存普通 TCP/HTTP 应用载荷**（账号/密码/页面内容不落盘）；抓包分析当前仅覆盖 IPv4；切片超 7 天或超 10 个自动清理。
 - **iperf3 UDP 模式**：`--iperf3-udp` 以 1 Mbps 发包率测点对点抖动/丢包 —— 语音/游戏质量的关键指标。
@@ -123,6 +124,8 @@ python netpulse.py proxy
 python netpulse.py iperf3 --iperf3-server 192.168.1.10 --iperf3-udp
 
 # 盯障模式 (独立运行, 不属于 23 个模块): 长时间监测找偶发掉线
+python netpulse.py --site                # 现场检测模式: 诊断+机房勾选+客户报告三件套
+python netpulse.py --site --customer "某某公司"   # 预填客户名称
 python netpulse.py --monitor              # 默认 600 秒 (10 分钟)
 python netpulse.py --monitor 1800         # 30 分钟
 python netpulse.py --monitor 600 --monitor-target www.baidu.com
@@ -179,6 +182,8 @@ python netpulse.py --install
 | `--pip-mirror` | `--install` 自动装依赖时显式指定 pip 镜像 |
 | `--json-schema` | 输出当前 JSON Schema 版本号与结构路径 (供 AI Agent / RMM / bot introspect), 不跑诊断 |
 | `--debug-bundle` | 生成脱敏调试包 zip (system.json + diagnostic.json + netpulse.log, SSID/MAC/公网 IP/hostname 已脱敏), 用于上报 bug 或远端排障. 例: `--debug-bundle ./out`。菜单入口: 工程师菜单 `d` 键 (需先跑过一次诊断) |
+| `--site` | 现场检测模式 (v1.13.0): 全量诊断(排除压测) + 机房 6 项勾选 + 现场备注, 自动生成 一页客户报告 / 完整版 / JSON 三件套到 reports/。菜单入口: 场景 `[6]` |
+| `--customer` | 现场检测模式的客户名称预填 (配合 `--site`; 不填则终端询问) |
 | `--export` | 诊断后导出报告，逗号分隔多格式（`report.html,report.json`） |
 
 ## 📋 诊断模块（23 项）
