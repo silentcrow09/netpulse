@@ -17,6 +17,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import netpulse as N
 
 
+def _newer_fake_version():
+    """构造必然大于当前 APP_VERSION 的假远端版本。
+
+    此前各用例硬编码固定版本 ("1.13.0"/"1.14.0"), 本地 APP_VERSION bump
+    追平后 remote == local → is_new False → 用例必挂。改为 minor+1 动态
+    构造, 以后发版不再踩 (v1.13.1 修复)。
+    """
+    parts = (N.APP_VERSION.split(".") + ["0", "0"])[:3]
+    major, minor, _patch = (int(x) for x in parts)
+    return f"{major}.{minor + 1}.0"
+
+
 class FakeResp:
     """上下文管理器风格的假 HTTP 响应。"""
 
@@ -159,20 +171,8 @@ class TestCheckUpdate(unittest.TestCase):
         with N._UPDATE_LOCK:
             N._UPDATE_STATE.update(latest=None, checked_at=0.0, is_new=False)
 
-    @staticmethod
-    def _newer_fake_version():
-        """构造必然大于当前 APP_VERSION 的假远端版本。
-
-        此前硬编码 "1.13.0", 本地版本 bump 到 1.13.0 后该用例必挂
-        (remote == local → is_new False)。改为 minor+1 动态构造,
-        以后发版不再踩。
-        """
-        parts = (N.APP_VERSION.split(".") + ["0", "0"])[:3]
-        major, minor, _patch = (int(x) for x in parts)
-        return f"{major}.{minor + 1}.0"
-
     def test_cache_hit_no_network(self):
-        newer = self._newer_fake_version()
+        newer = _newer_fake_version()
         N._save_update_cache(time.time(), newer)
         with mock.patch.object(N, "_fetch_latest_version") as m_fetch:
             ver = N._check_update()
@@ -186,12 +186,13 @@ class TestCheckUpdate(unittest.TestCase):
         self.assertFalse(N._UPDATE_STATE["is_new"])
 
     def test_cache_miss_fetch_success(self):
+        newer = _newer_fake_version()
         with mock.patch.object(N, "_fetch_latest_version",
-                               return_value="1.14.0"):
+                               return_value=newer):
             ver = N._check_update()
-        self.assertEqual(ver, "1.14.0")
-        self.assertTrue(N._UPDATE_STATE["is_new"])
-        self.assertEqual(N._load_update_cache(time.time())[1], "1.14.0")
+        self.assertEqual(ver, newer)
+        self.assertTrue(N._UPDATE_STATE["is_new"])   # newer > 当前版本
+        self.assertEqual(N._load_update_cache(time.time())[1], newer)
 
     def test_fetch_fail_silent_no_cache(self):
         N._save_update_cache(time.time() - N.UPDATE_CHECK_INTERVAL_S - 60,
@@ -248,14 +249,15 @@ class TestThreadAndArgparse(unittest.TestCase):
             N._UPDATE_STATE.update(latest=None, checked_at=0.0, is_new=False)
 
     def test_thread_sets_state(self):
+        newer = _newer_fake_version()
         with mock.patch.object(N, "_fetch_latest_version",
-                               return_value="1.14.0"), \
+                               return_value=newer), \
              mock.patch.object(N, "_save_update_cache"):
             t = N._start_update_check(force=True)
         t.join(timeout=10)
         self.assertFalse(t.is_alive())
         self.assertTrue(N._UPDATE_STATE["is_new"])
-        self.assertEqual(N._UPDATE_STATE["latest"], "1.14.0")
+        self.assertEqual(N._UPDATE_STATE["latest"], newer)
 
     def test_thread_swallows_exception(self):
         """检查崩溃不得影响主流程 (daemon 兜底)。"""

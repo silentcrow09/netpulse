@@ -96,8 +96,11 @@
   有值才渲染一页版「达标」格，按实测/签约 ≥90% 判达标）。
 - **机房 6 项**：`SITE_CHECK_ITEMS` 常量（建议文案 ≤24 字，破坏会折行破坏
   一页高度锁）；`_normalize_site_check` 白名单校验，清单外 key/值按「未检查」。
-- **三件套**：同一 report 出 一页客户报告（`render_report_html_brief`，
-  A4 单页，官方 logo 反白内嵌）/ 完整版 / .json，文件名
+- **四件套**：同一 report 出 一页客户报告（`render_report_html_brief`，
+  A4 单页，官方 logo 反白内嵌）/ 完整版 / .json / **PDF**（v1.14.0：
+  `_find_chrome_exe()` 探测 Chrome，`_html_to_pdf()` 无头打印 A4；
+  profile 复用 `%TEMP%\np_pdf_profile` + 禁首跑/组件联网 —— 冷启动
+  45s → ~3s；无 Chrome 静默跳过，Ctrl+P 兜底），文件名
   `reports/现场检测_客户名_时间戳.*`。
 - **数据流**：`build_report(site_check=, meta_manual=, site_note=)` 显式
   传参进 report dict —— 不新增 LAST_RUN 依赖（守收口规则）。
@@ -108,15 +111,15 @@
 
 ```bash
 for f in tests/test_*.py; do python "$f"; done
-#   单元/回归套件 (24 文件 / 494 用例): parsers/diagnosis/诊断矩阵/丢包口径/
+#   单元/回归套件 (24 文件 / 497 用例): parsers/diagnosis/诊断矩阵/丢包口径/
 #   XSS 转义/pcap 分析与取证 (含 v1.9.9 截断长度字段修正)/probes/redaction/
 #   场景菜单/盯障统计/scapy 懒加载 (v1.9.7 PR-2)/自提权重启 (v1.9.7 PR-3)/
 #   管理员修复命令一键执行 (v1.9.8)/全量口径与 tcpcc 多目标轮转 (v1.10.0)/
 #   自动检查更新 (v1.12.0)/现场检测模式 (v1.13.0: 白名单/截断/一页版渲染)/
-#   一页版问题区回退与豁免说明 (v1.13.1)
+#   一页版问题区回退与豁免说明 (v1.13.1)/现场模式自动 PDF (v1.14.0)
 #   注意: 壳环境 `python` 可能指向未装 scapy 的解释器 → test_pcap_capture
 #   模块级 proto=TCP NameError; 用装了 scapy 的系统 Python 跑
-python _smoke_report.py          # 261 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项 + v1.10.0 全量口径/多目标轮转 6 项 + v1.11.0 网卡错误暴增 2 项 + v1.12.0 更新检查 4 项 + v1.13.0 一页客户报告 8 项
+python _smoke_report.py          # 262 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项 + v1.10.0 全量口径/多目标轮转 6 项 + v1.11.0 网卡错误暴增 2 项 + v1.12.0 更新检查 4 项 + v1.13.0 一页客户报告 8 项
 # 抓包取证: 截断存储会剥载荷 — v1.9.9 起截断时同步修正 IP/UDP 长度字段,
 # 避免 Wireshark 专家误报 (ACKed lost 满屏)。旧文件用根目录 _migrate_pcap.py 修正
 ```

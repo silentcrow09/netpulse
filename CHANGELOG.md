@@ -7,7 +7,30 @@
 
 ## [Unreleased]
 
-## [1.13.1] - 2026-09-28
+## [1.14.0] - 2026-09-28
+
+现场检测模式自动导出 PDF（用户反馈：最后直接要 PDF，不想手动 Ctrl+P）。
+
+### 新增
+
+- 现场检测模式导出**自动加出 PDF**：`_find_chrome_exe()` 探测本机 Chrome
+  （常见安装路径 → 注册表 App Paths），`_html_to_pdf()` 用无头 Chrome 把
+  一页客户报告 HTML 打印为 A4 PDF，四件套落地
+  （PDF / 一页 HTML / 完整版 / .json）；完成屏 PDF 列首位
+- 无 Chrome 静默跳过（提示 Ctrl+P 兜底），任何失败只返回错误文本不中断
+  现场流程；独立 profile 不与用户正在运行的 Chrome 抢锁
+- **性能**：每次新建 profile 冷启动实测 45s → 复用 `%TEMP%\np_pdf_profile`
+  + 禁首跑/组件更新/后台联网后 ~3s
+- `render_report_json` 补 `site_check` / `site_note` / `meta_manual`
+  （v1.13.0 现场手输数据此前未进 JSON，补录于 1.13.1）
+
+### 测试
+
+- `test_site_mode.py` +3 用例（探测契约 / 真实转换 / 非法输出路径返回
+  错误文本），全量 24 文件 497 用例 + smoke 262 项通过；
+  `test_v1120_update_check.py` 假远端版本全部改动态构造（硬编码版本在
+  本地 bump 追平后 is_new 断言必挂——发版踩坑修复）
+
 
 一页客户报告真实现场首跑反馈修复（间距 / 前后一致性 / 豁免说明 / 细节）。
 

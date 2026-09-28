@@ -3564,7 +3564,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.13.1"
+APP_VERSION = "1.14.0"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -19190,12 +19190,77 @@ def prompt_export_report():
         print(_c(f"  ✓ 报告已导出: {os.path.abspath(_normalize_report_path(name))}", C_GREEN))
 
 
+def _find_chrome_exe():
+    """探测本机 Chrome (v1.14.0, 现场模式 PDF 导出用)。
+
+    探测顺序: 常见安装路径 → 注册表 App Paths。找不到返回 None —
+    调用方静默跳过 PDF, 不阻塞现场流程 (浏览器 Ctrl+P 兜底)。
+    """
+    pf = os.environ.get("ProgramFiles", r"C://Program Files")
+    pf86 = os.environ.get("ProgramFiles(x86)", r"C://Program Files (x86)")
+    lad = os.environ.get("LOCALAPPDATA", "")
+    for c in (os.path.join(pf, r"Google\Chrome\Application\chrome.exe"),
+              os.path.join(pf86, r"Google\Chrome\Application\chrome.exe"),
+              os.path.join(lad, r"Google\Chrome\Application\chrome.exe")):
+        if c and os.path.isfile(c):
+            return c
+    try:
+        import winreg
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows"
+                                        r"\CurrentVersion\App Paths\chrome.exe") as k:
+                    val = winreg.QueryValue(k, None)
+                    if val and os.path.isfile(val):
+                        return val
+            except OSError:
+                continue
+    except ImportError:
+        pass
+    return None
+
+
+_PDF_PROFILE_DIR = None   # 模块级缓存: 复用 profile, 冷启动 45s → ~3s (实测)
+
+
+def _html_to_pdf(chrome_exe, html_path, pdf_path, timeout=90):
+    """无头 Chrome 把 HTML 打印为 A4 PDF (v1.14.0, 现场模式出口)。
+
+    成功返回 None; 失败返回错误文本 (不抛异常 — 现场流程不能因 PDF 中断)。
+    profile 复用 %TEMP%\\np_pdf_profile (不与用户正在运行的 Chrome 抢锁);
+    flags 禁首跑/组件更新/后台联网 — 每次新建 profile 的冷启动实测 45s,
+    复用 + 禁联网后 ~3s。现场流程不能因 PDF 中断, 任何失败只返回错误文本。
+    """
+    global _PDF_PROFILE_DIR
+    from urllib.parse import quote
+    if not _PDF_PROFILE_DIR:
+        _PDF_PROFILE_DIR = os.path.join(tempfile.gettempdir(), "np_pdf_profile")
+        os.makedirs(_PDF_PROFILE_DIR, exist_ok=True)
+    url = "file:///" + quote(html_path.replace("\\", "/"), safe="/:")
+    cmd = [chrome_exe, "--headless=new", "--disable-gpu", "--no-sandbox",
+           "--no-pdf-header-footer", "--no-first-run", "--disable-extensions",
+           "--disable-background-networking", "--disable-component-update",
+           "--disable-sync", f"--user-data-dir={_PDF_PROFILE_DIR}",
+           f"--print-to-pdf={pdf_path}", url]
+    try:
+        # CREATE_NO_WINDOW: 不闪黑框 (现场模式在 cmd 里, 子进程弹窗很突兀)
+        subprocess.run(cmd, capture_output=True, timeout=timeout,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+        if os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 0:
+            return None
+        return "Chrome 未产出 PDF 文件"
+    except subprocess.TimeoutExpired:
+        return f"Chrome 打印超时 (>{timeout}s)"
+    except OSError as exc:
+        return f"调用 Chrome 失败: {exc}"
+
+
 def run_site_visit(customer=None, install=False, pip_mirror=None):
     """现场检测模式 (v1.13.0): 上门全量诊断 + 机房 6 项勾选 → 一页客户报告。
 
     流程: 手输(客户名/检测时间/签约带宽) → 全量诊断(all_module_keys(),
     排除 tcpcc 压测 — 不在客户网络里制造压测负载) → 机房勾选 →
-    同一份 report 出三件套(一页客户报告/完整版/.json)。
+    同一份 report 出 一页客户报告/完整版/.json (+PDF, 检测到 Chrome 时)。
     customer: CLI --customer 预填, 空则终端询问 (必填)。
     """
     if not sys.stdout.isatty():
@@ -19211,7 +19276,8 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
     print(_c(f"  {APP_NAME} v{APP_VERSION}    现场检测模式 (上门出客户报告)", C_BOLD))
     print(_c(bar, C_BLUE))
     print(_c("  流程: 填基本信息 → 网络全量诊断 (约 2~3 分钟, 不含压测) → "
-             "机房 6 项勾选 → 生成报告三件套", C_WHITE))
+             "机房 6 项勾选 → 生成报告文件 (检测到 Chrome 自动含 PDF)",
+             C_WHITE))
 
     # ── 步骤 1: 手输 (报告里仅有的三处) ──
     cust = (customer or "").strip()
@@ -19275,7 +19341,7 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
     # ── 步骤 4: 同一份 report 出三件套 ──
     print()
     print(_c("─" * 60, C_BLUE))
-    print(_c("  [3/3] 生成报告三件套...", C_BOLD))
+    print(_c("  [3/3] 生成报告文件...", C_BOLD))
     report = build_report(site_check=site_check,
                           meta_manual={"customer": cust,
                                        "tested_at": tested_at,
@@ -19297,16 +19363,31 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
             print(_c(f"  ✗ {desc}: {err}", C_RED))
         else:
             done.append((desc, os.path.abspath(_normalize_report_path(path))))
+
+    # ── 步骤 5: PDF (检测到 Chrome 才产出; 没有则 Ctrl+P 兜底, 不阻塞流程) ──
+    chrome = _find_chrome_exe()
+    if chrome:
+        print(_c("  → 检测到 Chrome, 生成 PDF...", C_GRAY))
+        err = _html_to_pdf(chrome, base + ".html", base + ".pdf")
+        if err:
+            print(_c(f"  ✗ PDF 生成失败: {err} (可打开 HTML 后 Ctrl+P 另存)",
+                     C_YELLOW))
+        else:
+            done.insert(0, ("一页客户报告 PDF (直接打印交客户)",
+                            os.path.abspath(base + ".pdf")))
+    else:
+        print(_c("  → 未检测到 Chrome, 跳过 PDF (可打开 HTML 后 Ctrl+P 另存)",
+                 C_GRAY))
+
     print()
     print(_c(bar, C_BLUE))
     if not done:
-        print(_c("  ✗ 三件套全部导出失败, 请检查磁盘与目录权限。", C_RED))
+        print(_c("  ✗ 报告文件全部导出失败, 请检查磁盘与目录权限。", C_RED))
         return
     print(_c("  ✓ 现场检测完成", C_GREEN))
     for desc, path in done:
         print(_c(f"  · {desc}\n    {path}", C_WHITE))
-    print(_c("  提示: 一页版浏览器打开后 Ctrl+P → A4 恰好一页, 打印交客户;",
-             C_GRAY))
+    print(_c("  提示: 一页报告 (PDF/HTML) 打印后交客户;", C_GRAY))
     print(_c("        完整版与 .json 随工单带回, 供专家会诊与后台深析。", C_GRAY))
 
 
@@ -20004,7 +20085,8 @@ def main():
     parser.add_argument("--site", action="store_true",
                         help="现场检测模式 (v1.13.0): 上门全量诊断(排除压测) + "
                              "机房 6 项逐项勾选 + 现场备注, 自动生成 一页客户报告/"
-                             "完整版/JSON 三件套; 需交互终端, 与其他模块互斥")
+                             "完整版/JSON, 检测到 Chrome 自动加出 PDF; "
+                             "需交互终端, 与其他模块互斥")
     parser.add_argument("--customer", metavar="NAME",
                         help="现场检测模式的客户名称预填 (配合 --site; 不填则终端询问)")
     parser.add_argument("--capture", nargs="?", const="slice",
