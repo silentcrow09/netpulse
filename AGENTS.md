@@ -175,7 +175,11 @@ RFC 3849 文档前缀、假 hostname/GUID）；真实抓包或含隐私的本地
   **v1.14.6**：启动路径改 `force=True` 每次启动真检查（24h 频控曾让检查
   “看起来没生效”，频控机制仅保留给 `force=False` 调用方）；
   `NP_UPDATE_DEBUG=1` 时 worker 向 stderr 打印源/耗时/结论
-  （默认零输出，不污染 stdout/--json），排查“更新检测是否生效”用
+  （默认零输出，不污染 stdout/--json），排查“更新检测是否生效”用。
+  **v1.14.8**：检查仅交互终端启动（`sys.stdout.isatty()`，CLI/--json 不再
+  启动检查线程）；菜单首帧前 `_prime_update_state_from_cache()` 预填
+  缓存 + `join(2.0)` 等首次检查结果（否则线程总输给首帧渲染，
+  新版提示“永远下一屏才出现”）
 - 打包：`build_exe.bat` 或 `build_exe.ps1` → `dist/NetPulse.exe`（64 位默认；
   `-Arch x86` 出 32 位 `NetPulse_x86.exe`，需另装 32 位 Python，Ookla exe 不随包）。
   改了 `netpulse.py` 后需重新打包，否则 exe 落后于代码

@@ -317,12 +317,20 @@ class TestDebugAndSource(unittest.TestCase):
         with N._UPDATE_LOCK:
             N._UPDATE_STATE.update(latest=None, checked_at=0.0, is_new=False,
                                    from_primary=None)
+        # 缓存读写隔离到临时目录, 不碰真实 %LOCALAPPDATA%
+        self._old_env = os.environ.get("LOCALAPPDATA")
+        self.tmp = tempfile.mkdtemp()
+        os.environ["LOCALAPPDATA"] = self.tmp
 
     def tearDown(self):
         with N._UPDATE_LOCK:
             N._UPDATE_STATE.update(latest=None, checked_at=0.0, is_new=False,
                                    from_primary=None)
         os.environ.pop("NP_UPDATE_DEBUG", None)
+        if self._old_env is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = self._old_env
 
     def test_check_update_records_source(self):
         """网络检查成功后在 _UPDATE_STATE 记录来源 (调试输出用)。"""
@@ -365,6 +373,34 @@ class TestDebugAndSource(unittest.TestCase):
              contextlib.redirect_stderr(buf):
             N._start_update_check(force=True).join(timeout=10)
         self.assertEqual(buf.getvalue(), "")
+
+
+    def test_prime_state_from_cache(self):
+        """v1.14.8: 缓存里有比本地新的版本时, 预填 _UPDATE_STATE 首帧可显示。"""
+        newer = _newer_fake_version()
+        N._save_update_cache(time.time(), newer)
+        N._prime_update_state_from_cache()
+        self.assertTrue(N._UPDATE_STATE["is_new"])
+        self.assertEqual(N._UPDATE_STATE["latest"], newer)
+
+    def test_prime_no_cache_no_change(self):
+        """无缓存时预填不动状态 (不凭空造提示)。"""
+        N._prime_update_state_from_cache()
+        self.assertIsNone(N._UPDATE_STATE["latest"])
+
+    def test_main_starts_check_interactive_force(self):
+        """v1.14.8: 交互终端下 main() 以 force=True 启动检查。"""
+        old_argv = sys.argv
+        sys.argv = ["netpulse.py", "--list"]
+        try:
+            with mock.patch.object(N.sys.stdout, "isatty", return_value=True), \
+                 mock.patch.object(N, "_print_module_list"), \
+                 mock.patch.object(N, "_prime_update_state_from_cache"), \
+                 mock.patch.object(N, "_start_update_check") as m_start:
+                N.main()
+        finally:
+            sys.argv = old_argv
+        m_start.assert_called_once_with(force=True)
 
 
 if __name__ == "__main__":

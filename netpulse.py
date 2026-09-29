@@ -3568,7 +3568,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.7"
+APP_VERSION = "1.14.8"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -3722,6 +3722,21 @@ def _start_update_check(force=False):
     t = threading.Thread(target=_worker, name="update-check", daemon=True)
     t.start()
     return t
+
+
+def _prime_update_state_from_cache():
+    """启动时用频控缓存预填显示状态 (线程结果稍后覆盖; v1.14.8)。
+
+    force=True 的后台检查不读缓存 — 不预填的话, 新版本提示只能等线程
+    完成后下一次菜单重绘才出现 (首帧必 miss, 用户以为没生效)。
+    """
+    ts, cached = _load_update_cache(time.time())
+    if cached:
+        with _UPDATE_LOCK:
+            if not _UPDATE_STATE.get("latest"):
+                _UPDATE_STATE.update(latest=cached, checked_at=ts,
+                                     from_primary=None,
+                                     is_new=_version_newer(cached, APP_VERSION))
 
 
 def _update_notice_line():
@@ -20204,11 +20219,16 @@ def main():
     _start_scapy_preload()
 
     # v1.12.0: 启动时后台检查更新 (daemon 线程, 失败静默)。
-    # 只在交互菜单渲染 notice, CLI 单次运行/--json 不掺人读文本。
-    # v1.14.6: 改 force=True 每次启动真检查 (24h 频控曾让检查"看起来没
-    # 生效"; 每次启动 1 个 GET 可接受), NP_UPDATE_DEBUG=1 看 stderr 结果。
-    if not getattr(args, "no_update_check", False):
-        _start_update_check(force=True)
+    # v1.14.6: force=True 每次启动真检查 (24h 频控曾让检查"看起来没生效")。
+    # v1.14.8: 仅交互终端启动 (notice 只在菜单显示, CLI/--json 不该花流量);
+    # 首帧前 join(2s) 等结果 — 否则线程总输给首次菜单渲染, 新版提示永远
+    # "下一屏才出现"; 缓存预填让上次已发现的新版首帧立即可见。
+    # NP_UPDATE_DEBUG=1 看 stderr 结果。离线最坏多等 2s (可接受)。
+    if getattr(args, "no_update_check", False):
+        pass
+    elif sys.stdout.isatty():
+        _prime_update_state_from_cache()
+        _start_update_check(force=True).join(2.0)
 
     # 端口探测参数 -> 全局配置 (run_diagnostics 读取)
     # 注意: args.port_target 已经是 argparse action="append" 后的 list,
