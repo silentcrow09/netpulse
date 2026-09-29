@@ -38,7 +38,7 @@
   .mast .brand img { height: 8mm; display: block; }
   .mast .brand .org { font-size: 11px; font-weight: 700; letter-spacing: 1.6px; }
   .mast .brand .sub { font-size: 9.5px; opacity: .7; letter-spacing: 1.2px; margin-top: .5mm; }
-  .mast .doc { text-align: right; font-size: 10px; line-height: 1.5; opacity: .88; }
+  .mast .doc { text-align: right; font-size: 10px; line-height: 1.55; opacity: .88; }
   .mast .doc b { opacity: 1; font-weight: 600; letter-spacing: .5px; }
   .mast .doc .no { font-size: 11px; letter-spacing: .8px; }
 
@@ -51,7 +51,7 @@
   .title .strip .r { color: var(--mute); font-size: 10px; }
 
   /* ── 评分主区: 三列等高 ── */
-  .score { padding: 3.5mm 12mm 3mm; display: grid; grid-template-columns: 32mm 1fr 48mm; gap: 5mm;
+  .score { padding: 4mm 12mm 4mm; display: grid; grid-template-columns: 32mm 1fr 36mm; gap: 6mm;
            border-bottom: 1px solid var(--rule); }
   .score .donut { position: relative; display: flex; align-items: center; justify-content: center; }
   .score .donut .v { position: absolute; text-align: center; }
@@ -60,14 +60,16 @@
                           margin-top: 1.5mm; }
   .score .verdict { display: flex; flex-direction: column; }
   .score .verdict .grade { font-size: 11px; font-weight: 700; letter-spacing: 2.5px; color: var(--amber); }
-  .score .verdict .head { font-size: 18px; font-weight: 700; margin-top: 1.5mm; line-height: 1.35; letter-spacing: .3px; }
+  .score .verdict .head { font-size: 17px; font-weight: 700; margin-top: 2mm; line-height: 1.4; letter-spacing: .2px; }
+  .score .verdict .head .ok { color: var(--green); font-weight: 700; }
   .score .verdict .note { font-size: 10.5px; color: var(--dim); margin-top: auto; line-height: 1.6; }
-  .score .plan { background: var(--soft); border-left: 2.5mm solid var(--green); padding: 3.5mm 4mm;
+  /* 签约达标格: 作为竖条紧挨 donut, 不要另起独占框 (避免双大数打架) */
+  .score .plan { background: var(--soft); border-top: 2.5mm solid var(--green); padding: 3mm 3.5mm;
                  display: flex; flex-direction: column; justify-content: center; }
-  .score .plan .head { font-size: 10px; letter-spacing: 1.8px; color: var(--dim); font-weight: 600; }
-  .score .plan .big { font-size: 28px; font-weight: 800; margin-top: 1.5mm; line-height: 1; letter-spacing: -1px; }
-  .score .plan .big small { font-size: 13px; font-weight: 600; color: var(--green); margin-left: 1.5mm; letter-spacing: 1px; }
-  .score .plan .desc { font-size: 10px; color: var(--dim); margin-top: 1.8mm; line-height: 1.5; }
+  .score .plan .head { font-size: 9.5px; letter-spacing: 1.5px; color: var(--dim); font-weight: 600; }
+  .score .plan .big { font-size: 24px; font-weight: 800; margin-top: 1.5mm; line-height: 1; letter-spacing: -.5px; }
+  .score .plan .big small { font-size: 11px; font-weight: 600; color: var(--green); margin-left: 1.5mm; letter-spacing: 1px; }
+  .score .plan .desc { font-size: 9.5px; color: var(--dim); margin-top: 1.5mm; line-height: 1.45; }
 
   /* ── KPI 条 ── */
   .kpi { padding: 0 12mm; display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--rule); }
@@ -104,16 +106,21 @@
   .f .act { font-size: 10.5px; color: var(--navy); margin-top: .8mm; font-weight: 600; }
   .f .act .lbl { font-weight: 700; }
 
-  /* ── 机房: 合并行, 单段陈述 ── */
+  /* ── 机房 6 项: 全部独立展示 (3×2 grid, 每项 = 名称 + 状态) ── */
   .site { padding: 2mm 12mm 0; }
-  .site .row { display: flex; flex-wrap: wrap; gap: 1.5mm 2mm; align-items: center; }
-  .site .chip { font-size: 10px; padding: 1.1mm 2.6mm; border: 1px solid var(--rule); color: var(--dim);
-                background: #fff; }
-  .site .chip.bad { border-color: var(--red); color: var(--red); font-weight: 700; }
-  .site .line { margin-top: 2mm; font-size: 10.5px; line-height: 1.55; color: var(--dim); }
-  .site .line b { color: var(--text); font-weight: 700; }
-  .site .line .b { color: var(--red); font-weight: 700; margin-right: 1.5mm; }
-  .site .line .n { color: var(--text); }
+  .site .grid6 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.5mm 3mm; }
+  .site .it { padding: 1.6mm 2.5mm; background: var(--soft); border-left: 2mm solid var(--green);
+              font-size: 10.5px; line-height: 1.4; }
+  .site .it.bad { border-left-color: var(--red); background: #fdf1f0; }
+  .site .it .nm { color: var(--text); font-weight: 600; }
+  .site .it .st { float: right; font-size: 9.5px; font-weight: 700; letter-spacing: .5px;
+                  padding: .3mm 1.6mm; border-radius: 1mm; color: #fff; margin-top: .3mm; }
+  .site .it .st.ok { background: var(--green); }
+  .site .it .st.bad { background: var(--red); }
+  .site .it .st.na { background: var(--mute); }
+  .site .note { margin-top: 2mm; font-size: 10.5px; color: var(--dim); padding-top: 1.5mm;
+                border-top: 1px dashed var(--rule); }
+  .site .note b { color: var(--text); }
 
   /* ── 明细 ── */
   .detail { padding: 2mm 12mm 0; }
@@ -148,7 +155,8 @@
     </div>
     <div class="doc">
       <div class="no">报告编号 NP-20260929-058</div>
-      检测日期 2026-09-29 14:30 · 装维 <b>张工</b>
+      检测日期 2026-09-29 14:30<br>
+      现场检测 20 项 · 实检 20 项
     </div>
   </div>
 
@@ -173,19 +181,19 @@
     </div>
     <div class="verdict">
       <div class="grade">C 级 · 一般</div>
-      <div class="head">网络可用、测速达标</div>
+      <div class="head">网络可用、测速<span class="ok">达标 92%</span></div>
       <div class="note">实检 20 项，17 项参与计分，3 项评分豁免（NAT 类型、IPv6 检测、代理检测；可选/环境类检查，不扣分）。其中 IPv6 检测、代理检测 本次有异常/警告显示，按豁免规则不计分。</div>
     </div>
     <div class="plan">
-      <div class="head">签约带宽达标判定</div>
-      <div class="big num">92%<small>达标</small></div>
-      <div class="desc">实测 462 Mbps / 签约 500 Mbps<br>阈值 ≥90% → 判定达标</div>
+      <div class="head">签约带宽</div>
+      <div class="big num">500M</div>
+      <div class="desc">实测下行 462 Mbps<br>阈值 ≥90% → 达标</div>
     </div>
   </div>
 
   <!-- ─── KPI 条 ─── -->
   <div class="kpi">
-    <div><div class="label">下行实测</div><div class="value num">462<small>Mbps</small></div><div class="delta">签约 500M · 达标 92%</div></div>
+    <div><div class="label">下行实测</div><div class="value num">462<small>Mbps</small></div><div class="delta">签约 500M</div></div>
     <div><div class="label">上行实测</div><div class="value num">118<small>Mbps</small></div><div class="delta">正常</div></div>
     <div><div class="label">网关延迟</div><div class="value num">3.2<small>ms</small></div><div class="delta">优秀（&lt;10ms）</div></div>
     <div><div class="label">出口重传率</div><div class="value num">2.8<small>%</small></div><div class="delta">偏高（&lt;2% 优）</div></div>
@@ -227,16 +235,18 @@
     </div>
   </div>
 
-  <!-- ─── 机房环境 (合并为单行陈述, 不再 broken row 三段式) ── -->
+  <!-- ─── 机房环境 (6 项全部独立展示: 3×2 grid) ─── -->
   <div class="sec-h"><div class="n">§</div><div class="t">机房环境检查</div><div class="r">6 项 · 5 正常 / 1 待整改</div></div>
   <div class="site">
-    <div class="row">
-      <span class="chip">供电与接地  2/2</span>
-      <span class="chip">光路与设备  2/2</span>
-      <span class="chip bad">环境与规范  1/2</span>
+    <div class="grid6">
+      <div class="it"><span class="st ok">正常</span><div class="nm">机柜供电与 UPS</div></div>
+      <div class="it"><span class="st ok">正常</span><div class="nm">机房温湿度</div></div>
+      <div class="it bad"><span class="st bad">待整改</span><div class="nm">线缆整理与标签</div></div>
+      <div class="it"><span class="st ok">正常</span><div class="nm">网线与入户光缆品质</div></div>
+      <div class="it"><span class="st ok">正常</span><div class="nm">光猫 / ONU 指示灯</div></div>
+      <div class="it"><span class="st ok">正常</span><div class="nm">空余端口与私接设备</div></div>
     </div>
-    <div class="line"><span class="b">[待整改]</span><span class="n">线缆标签</span> 2 根未贴标签 — 建议按机房规范补贴标签，记录两端位置</div>
-    <div class="line"><b>现场备注</b>（装维手输）：机房新上 1 台 AP 未贴标签，已一并记录位置</div>
+    <div class="note"><b>现场备注（装维手输）：</b>机房新上 1 台 AP 未贴标签，已一并记录位置</div>
   </div>
 
   <!-- ─── 检测明细 ─── -->
