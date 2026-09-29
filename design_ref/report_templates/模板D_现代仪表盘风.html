@@ -2,140 +2,137 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>模板D v3 · 现场检测报告（极简排版 / 一页客户报告）</title>
+<title>模板D v4 · 现场检测报告（极简排版 · 一页客户报告）</title>
 <style>
-  /* 模板D v3 — 极简排版 · 走审计报告/检测报告气质 (vs v2 网页仪表盘风)
-     ── 单一藏蓝主色 (#0a3b6e 电信蓝), 严重度色 (红/琥珀/绿) 只在 4 处使用
-     ── 零渐变 / 零阴影 / 零 emoji / 零圆角块; 仅靠 hairline 排版节奏
-     ── 数字 tabular-nums 等宽对齐, 信息密度高但不密恐
-     ── 单页 A4 (296mm) · 现场模式 PDF 出口 · 截断锁友好 */
+  /* 模板D v4 — v3 上像素级打磨 + 结构修正
+     ── 结构修正: 296mm 高度不再装下 11 个分块, 合并部分区块, foot 必须可见
+     ── 视觉打磨: 标题层级/字号比例/中文字间距/KPI 大写化 /badge 样式 / 密度均衡
+     ── 单一藏蓝主色, 严重度色仅 4 处, hairline 排版节奏, 数字 tabular-nums */
   @page { size: A4 portrait; margin: 0; }
   :root {
     --navy: #0a3b6e;
-    --navy-light: #5d80a6;
+    --navy-2: #2a5485;
     --red: #b3261e;
     --amber: #ad6e10;
     --green: #1e6e44;
-    --gray-text: #1a2230;
-    --gray-dim: #5b6472;
-    --gray-mute: #98a2ad;
-    --gray-rule: #d8dde5;
-    --bg-soft: #f6f7f9;
+    --text: #1a2230;
+    --dim: #5b6472;
+    --mute: #98a2ad;
+    --rule: #d8dde5;
+    --soft: #f6f7f9;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { background: #cdd1d8; }
-  body { font-family: "Inter", "Microsoft YaHei", "PingFang SC", sans-serif; color: var(--gray-text); -webkit-font-smoothing: antialiased; }
+  body { font-family: "Inter", "Microsoft YaHei", "PingFang SC", sans-serif; color: var(--text); -webkit-font-smoothing: antialiased; }
   .page { width: 210mm; height: 296mm; background: #fff; margin: 8px auto; padding: 0; overflow: hidden;
           display: flex; flex-direction: column; }
   @media print { html, body { background: #fff; } .page { margin: 0; } }
 
   .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
-  .wrap { padding-left: 12mm; padding-right: 12mm; }
+  .pad { padding-left: 12mm; padding-right: 12mm; }
 
-  /* ── 报头: 藏蓝实色条 + logo + 文档元信息 ── */
-  .mast { background: var(--navy); color: #fff; padding: 5mm 12mm 4mm;
+  /* ── 报头 ── */
+  .mast { background: var(--navy); color: #fff; padding: 4.5mm 12mm 4mm;
           display: flex; align-items: center; justify-content: space-between; }
   .mast .brand { display: flex; align-items: center; gap: 3.5mm; }
-  .mast .brand img { height: 7mm; display: block; }
-  .mast .brand .org { font-size: 10px; font-weight: 700; letter-spacing: 1.5px; }
-  .mast .brand .sub { font-size: 9.5px; opacity: .7; letter-spacing: .8px; margin-top: .5mm; }
-  .mast .doc { text-align: right; font-size: 9.5px; line-height: 1.45; opacity: .85; }
+  .mast .brand img { height: 8mm; display: block; }
+  .mast .brand .org { font-size: 11px; font-weight: 700; letter-spacing: 1.6px; }
+  .mast .brand .sub { font-size: 9.5px; opacity: .7; letter-spacing: 1.2px; margin-top: .5mm; }
+  .mast .doc { text-align: right; font-size: 10px; line-height: 1.5; opacity: .88; }
   .mast .doc b { opacity: 1; font-weight: 600; letter-spacing: .5px; }
+  .mast .doc .no { font-size: 11px; letter-spacing: .8px; }
 
-  /* ── 标题区 ── */
-  .title { padding: 8mm 12mm 5mm; border-bottom: 2px solid var(--navy); }
-  .title h1 { font-size: 26px; font-weight: 700; letter-spacing: .5px; }
-  .title .strip { display: flex; justify-content: space-between; align-items: baseline; margin-top: 2mm;
-                  font-size: 10.5px; color: var(--gray-dim); }
-  .title .strip .l span + span::before { content: "·"; margin: 0 4mm; color: var(--gray-mute); }
-  .title .strip .r { color: var(--gray-mute); font-size: 10px; }
+  /* ── 标题 ── */
+  .title { padding: 4.5mm 12mm 3mm; border-bottom: 1.5px solid var(--navy); }
+  .title h1 { font-size: 23px; font-weight: 700; letter-spacing: .3px; }
+  .title .strip { display: flex; justify-content: space-between; align-items: baseline; margin-top: 1.5mm;
+                  font-size: 11px; color: var(--dim); }
+  .title .strip .l span + span::before { content: "·"; margin: 0 4mm; color: var(--mute); }
+  .title .strip .r { color: var(--mute); font-size: 10px; }
 
-  /* ── 评分主区: 三列 ── */
-  .score { padding: 5mm 12mm 4mm; display: grid; grid-template-columns: 34mm 1fr 46mm; gap: 5mm;
-           border-bottom: 1px solid var(--gray-rule); }
-  .score .donut { display: flex; align-items: center; justify-content: center; position: relative; }
+  /* ── 评分主区: 三列等高 ── */
+  .score { padding: 3.5mm 12mm 3mm; display: grid; grid-template-columns: 32mm 1fr 48mm; gap: 5mm;
+           border-bottom: 1px solid var(--rule); }
+  .score .donut { position: relative; display: flex; align-items: center; justify-content: center; }
   .score .donut .v { position: absolute; text-align: center; }
-  .score .donut .v b { display: block; font-size: 30px; font-weight: 800; letter-spacing: -1px; }
-  .score .donut .v span { display: block; font-size: 9px; color: var(--gray-mute); letter-spacing: 2px;
-                          margin-top: 1mm; }
-  .score .verdict .grade { font-size: 11px; font-weight: 700; letter-spacing: 2px; color: var(--amber); }
-  .score .verdict .head { font-size: 16px; font-weight: 700; margin-top: 2mm; line-height: 1.4; }
-  .score .verdict .note { font-size: 10.5px; color: var(--gray-dim); margin-top: 2.5mm; line-height: 1.6;
-                          border-top: 1px dashed var(--gray-rule); padding-top: 2mm; }
-  .score .plan { background: var(--bg-soft); border-left: 2.5mm solid var(--green); padding: 3mm 3.5mm;
+  .score .donut .v b { display: block; font-size: 30px; font-weight: 800; letter-spacing: -1px; line-height: 1; }
+  .score .donut .v span { display: block; font-size: 9px; color: var(--mute); letter-spacing: 2.5px;
+                          margin-top: 1.5mm; }
+  .score .verdict { display: flex; flex-direction: column; }
+  .score .verdict .grade { font-size: 11px; font-weight: 700; letter-spacing: 2.5px; color: var(--amber); }
+  .score .verdict .head { font-size: 18px; font-weight: 700; margin-top: 1.5mm; line-height: 1.35; letter-spacing: .3px; }
+  .score .verdict .note { font-size: 10.5px; color: var(--dim); margin-top: auto; line-height: 1.6; }
+  .score .plan { background: var(--soft); border-left: 2.5mm solid var(--green); padding: 3.5mm 4mm;
                  display: flex; flex-direction: column; justify-content: center; }
-  .score .plan.fail { border-left-color: var(--red); }
-  .score .plan .head { font-size: 9.5px; letter-spacing: 1.5px; color: var(--gray-dim); }
-  .score .plan .big { font-size: 26px; font-weight: 800; margin-top: 1.5mm; }
-  .score .plan .big small { font-size: 12px; font-weight: 600; color: var(--gray-dim); }
-  .score .plan .desc { font-size: 10px; color: var(--gray-dim); margin-top: 1.5mm; line-height: 1.5; }
+  .score .plan .head { font-size: 10px; letter-spacing: 1.8px; color: var(--dim); font-weight: 600; }
+  .score .plan .big { font-size: 28px; font-weight: 800; margin-top: 1.5mm; line-height: 1; letter-spacing: -1px; }
+  .score .plan .big small { font-size: 13px; font-weight: 600; color: var(--green); margin-left: 1.5mm; letter-spacing: 1px; }
+  .score .plan .desc { font-size: 10px; color: var(--dim); margin-top: 1.8mm; line-height: 1.5; }
 
-  /* ── KPI 条: 4 列细线分隔 ── */
-  .kpi { padding: 0 12mm; display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--gray-rule); }
-  .kpi > div { padding: 3mm 3mm 3.2mm 0; border-right: 1px solid var(--gray-rule); }
-  .kpi > div:first-child { padding-left: 0; }
-  .kpi > div:last-child { border-right: none; padding-right: 0; }
-  .kpi .label { font-size: 9px; color: var(--gray-mute); letter-spacing: 1.2px; text-transform: uppercase; }
-  .kpi .value { font-size: 17px; font-weight: 700; margin-top: 1.5mm; }
-  .kpi .value small { font-size: 10px; font-weight: 500; color: var(--gray-dim); margin-left: 1mm; }
-  .kpi .delta { font-size: 9.5px; color: var(--gray-dim); margin-top: 1mm; }
+  /* ── KPI 条 ── */
+  .kpi { padding: 0 12mm; display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--rule); }
+  .kpi > div { padding: 2.5mm 0 2.7mm 0; border-right: 1px solid var(--rule); padding-left: 0; padding-right: 0; margin-left: 3mm; }
+  .kpi > div:first-child { margin-left: 0; }
+  .kpi > div:last-child { border-right: none; margin-right: 0; }
+  .kpi .label { font-size: 10px; color: var(--mute); letter-spacing: 1px; }
+  .kpi .value { font-size: 18px; font-weight: 700; margin-top: 1.5mm; }
+  .kpi .value small { font-size: 10.5px; font-weight: 500; color: var(--dim); margin-left: 1mm; }
+  .kpi .delta { font-size: 10px; color: var(--dim); margin-top: 1mm; }
 
   /* ── 章节头 ── */
-  .sec-h { padding: 5mm 12mm 0; display: flex; align-items: baseline; gap: 2mm; }
-  .sec-h .n { font-size: 11px; font-weight: 700; color: var(--navy); letter-spacing: 2px; }
-  .sec-h .t { font-size: 11px; font-weight: 700; color: var(--navy); letter-spacing: 2px; }
-  .sec-h .r { margin-left: auto; font-size: 9.5px; color: var(--gray-mute); }
+  .sec-h { padding: 3mm 12mm 0; display: flex; align-items: baseline; gap: 2mm; }
+  .sec-h .n { font-size: 11px; font-weight: 700; color: var(--navy); letter-spacing: 1.5px; }
+  .sec-h .t { font-size: 11px; font-weight: 700; color: var(--navy); letter-spacing: 2.5px; }
+  .sec-h .r { margin-left: auto; font-size: 9.5px; color: var(--mute); }
 
-  /* ── 发现区: 审计编号式 ── */
-  .findings { padding: 2.5mm 12mm 0; }
-  .f { display: grid; grid-template-columns: 10mm 1fr; gap: 2mm; padding: 2.5mm 0;
-       border-bottom: 1px dashed var(--gray-rule); }
-  .f:last-child { border-bottom: none; }
-  .f .num { font-size: 14px; font-weight: 800; color: var(--navy); letter-spacing: 1px; }
+  /* ── 主要发现 ── */
+  .findings { padding: 1.5mm 12mm 0; }
+  .f { display: grid; grid-template-columns: 9mm 1fr; gap: 2mm; padding: 1.8mm 0;
+       border-bottom: 1px solid var(--rule); }
+  .f:last-child { border-bottom: none; padding-bottom: 0; }
+  .f .num { font-size: 14px; font-weight: 800; color: var(--navy); letter-spacing: .5px; padding-top: .8mm; }
   .f.high .num { color: var(--red); }
   .f.mid .num { color: var(--amber); }
-  .f .row { display: flex; align-items: baseline; gap: 2mm; }
-  .f .ttl { font-size: 11.5px; font-weight: 700; }
-  .f .badge { font-size: 9px; font-weight: 700; letter-spacing: 1px; padding: .5mm 1.8mm;
-              border: 1px solid currentColor; border-radius: 1.5mm; }
-  .f.high .badge { color: var(--red); }
-  .f.mid .badge { color: var(--amber); }
-  .f.exempt .badge { color: var(--gray-mute); }
-  .f .obs { font-size: 10.5px; color: var(--gray-dim); margin-top: .8mm; line-height: 1.5; }
-  .f .act { font-size: 10.5px; color: var(--navy); margin-top: .8mm; }
-  .f .act::before { content: "整改建议  "; font-weight: 700; }
+  .f .row { display: flex; align-items: center; gap: 2.5mm; }
+  .f .ttl { font-size: 12px; font-weight: 700; letter-spacing: .2px; }
+  .f .badge { font-size: 9.5px; font-weight: 700; letter-spacing: 1.5px; padding: .6mm 2.2mm;
+              border-radius: 1mm; color: #fff; }
+  .f.high .badge { background: var(--red); }
+  .f.mid .badge { background: var(--amber); }
+  .f.exempt .badge { background: var(--mute); }
+  .f .obs { font-size: 10.5px; color: var(--dim); margin-top: .8mm; line-height: 1.55; }
+  .f .act { font-size: 10.5px; color: var(--navy); margin-top: .8mm; font-weight: 600; }
+  .f .act .lbl { font-weight: 700; }
 
-  /* ── 机房行 ── */
-  .site { padding: 3mm 12mm 0; }
-  .site .chips { display: flex; flex-wrap: wrap; gap: 1.5mm 2mm; }
-  .site .chip { font-size: 10px; padding: 1mm 2.5mm; border: 1px solid var(--gray-rule); color: var(--gray-dim);
+  /* ── 机房: 合并行, 单段陈述 ── */
+  .site { padding: 2mm 12mm 0; }
+  .site .row { display: flex; flex-wrap: wrap; gap: 1.5mm 2mm; align-items: center; }
+  .site .chip { font-size: 10px; padding: 1.1mm 2.6mm; border: 1px solid var(--rule); color: var(--dim);
                 background: #fff; }
   .site .chip.bad { border-color: var(--red); color: var(--red); font-weight: 700; }
-  .site .badrow { margin-top: 2.5mm; font-size: 10.5px; line-height: 1.5; color: var(--gray-dim); }
-  .site .badrow b { color: var(--gray-text); font-weight: 700; }
-  .site .badrow .b { color: var(--red); font-weight: 700; margin-right: 1.5mm; }
-  .site .note { margin-top: 2mm; padding-top: 1.5mm; border-top: 1px dashed var(--gray-rule);
-                font-size: 10.5px; color: var(--gray-dim); }
-  .site .note b { color: var(--gray-text); }
+  .site .line { margin-top: 2mm; font-size: 10.5px; line-height: 1.55; color: var(--dim); }
+  .site .line b { color: var(--text); font-weight: 700; }
+  .site .line .b { color: var(--red); font-weight: 700; margin-right: 1.5mm; }
+  .site .line .n { color: var(--text); }
 
-  /* ── 明细表 ── */
-  .detail { padding: 4mm 12mm 0; }
+  /* ── 明细 ── */
+  .detail { padding: 2mm 12mm 0; }
   table { width: 100%; border-collapse: collapse; font-size: 10.5px; }
-  table th { text-align: left; padding: 1.5mm 2mm 1.5mm 0; border-bottom: 1.2px solid var(--gray-text);
-             color: var(--gray-dim); font-weight: 600; font-size: 9.5px; letter-spacing: .5px; }
-  table td { padding: 1.5mm 2mm 1.5mm 0; border-bottom: 1px solid var(--gray-rule); }
+  table th { text-align: left; padding: 1.5mm 2mm 1.5mm 0; border-bottom: 1.5px solid var(--text);
+             color: var(--text); font-weight: 700; font-size: 10.5px; letter-spacing: 1px; }
+  table td { padding: 1.6mm 2mm 1.6mm 0; border-bottom: 1px solid var(--rule); }
   table tr:last-child td { border-bottom: none; }
-  table .mod { font-weight: 600; }
+  table .mod { font-weight: 600; color: var(--text); }
   table .stat { font-weight: 700; font-size: 10px; letter-spacing: .5px; }
   table .stat.high { color: var(--red); }
   table .stat.mid { color: var(--amber); }
   table .stat.ok { color: var(--green); }
-  table .stat.na { color: var(--gray-mute); }
+  table .stat.na { color: var(--mute); }
 
   /* ── 页脚 ── */
-  .foot { margin-top: auto; padding: 3.5mm 12mm; border-top: 1.5px solid var(--navy);
-          display: flex; justify-content: space-between; font-size: 9px; color: var(--gray-mute); }
-  .foot .l b { color: var(--gray-text); font-weight: 700; }
+  .foot { margin-top: auto; padding: 3.5mm 12mm; border-top: 2px solid var(--navy);
+          display: flex; justify-content: space-between; align-items: flex-start; font-size: 10px; color: var(--dim); }
+  .foot .l b { color: var(--text); font-weight: 700; }
   .foot .r { text-align: right; }
   .foot .r b { color: var(--navy); font-weight: 700; }
 </style>
@@ -150,8 +147,8 @@
       <div><div class="org">CHINA TELECOM</div><div class="sub">NETPULSE · 现场检测</div></div>
     </div>
     <div class="doc">
-      报告编号 <b>NP-20260929-058</b><br>
-      检测日期 2026-09-29 14:30 · 装维 张工
+      <div class="no">报告编号 NP-20260929-058</div>
+      检测日期 2026-09-29 14:30 · 装维 <b>张工</b>
     </div>
   </div>
 
@@ -181,17 +178,17 @@
     </div>
     <div class="plan">
       <div class="head">签约带宽达标判定</div>
-      <div class="big num">92%<small> 达标</small></div>
+      <div class="big num">92%<small>达标</small></div>
       <div class="desc">实测 462 Mbps / 签约 500 Mbps<br>阈值 ≥90% → 判定达标</div>
     </div>
   </div>
 
   <!-- ─── KPI 条 ─── -->
   <div class="kpi">
-    <div><div class="label">下行实测</div><div class="value num">462<small>Mbps</small></div><div class="delta">签约 500M · 达标率 92%</div></div>
+    <div><div class="label">下行实测</div><div class="value num">462<small>Mbps</small></div><div class="delta">签约 500M · 达标 92%</div></div>
     <div><div class="label">上行实测</div><div class="value num">118<small>Mbps</small></div><div class="delta">正常</div></div>
     <div><div class="label">网关延迟</div><div class="value num">3.2<small>ms</small></div><div class="delta">优秀（&lt;10ms）</div></div>
-    <div><div class="label">出口重传率</div><div class="value num">2.8<small>%</small></div><div class="delta">偏高（&lt;2% 为优）</div></div>
+    <div><div class="label">出口重传率</div><div class="value num">2.8<small>%</small></div><div class="delta">偏高（&lt;2% 优）</div></div>
   </div>
 
   <!-- ─── 主要发现 ─── -->
@@ -202,7 +199,7 @@
       <div>
         <div class="row"><span class="ttl">链路协商 100M，签约带宽被钳制</span><span class="badge">异常</span></div>
         <div class="obs">协商仅 100Mbps 全双工，500M 带宽可用约 1/5，判定物理层协商失败。</div>
-        <div class="act">更换超五类及以上跳线或换交换机端口 → 复测 ≥1Gbps</div>
+        <div class="act"><span class="lbl">整改建议</span>  更换超五类及以上跳线或换交换机端口 → 复测 ≥1Gbps</div>
       </div>
     </div>
     <div class="f mid">
@@ -210,7 +207,7 @@
       <div>
         <div class="row"><span class="ttl">DNS 响应 286ms 偏高</span><span class="badge">警告</span></div>
         <div class="obs">114DNS 平均响应超出建议阈值（&lt;80ms），影响网页首包体验。</div>
-        <div class="act">主 DNS 改 223.5.5.5，原 DNS 降为备用</div>
+        <div class="act"><span class="lbl">整改建议</span>  主 DNS 改 223.5.5.5，原 DNS 降为备用</div>
       </div>
     </div>
     <div class="f mid">
@@ -218,7 +215,7 @@
       <div>
         <div class="row"><span class="ttl">出口重传 2.8% / WiFi 信道拥堵</span><span class="badge">警告</span></div>
         <div class="obs">重传偏高建议观察一周；信道 6 周边 8 个 AP 竞争。</div>
-        <div class="act">持续 &gt;2% 报修运营商；AP 信道调至 1 或 11</div>
+        <div class="act"><span class="lbl">整改建议</span>  持续 &gt;2% 报修运营商；AP 信道调至 1 或 11</div>
       </div>
     </div>
     <div class="f exempt">
@@ -230,20 +227,20 @@
     </div>
   </div>
 
-  <!-- ─── 机房环境 ─── -->
+  <!-- ─── 机房环境 (合并为单行陈述, 不再 broken row 三段式) ── -->
   <div class="sec-h"><div class="n">§</div><div class="t">机房环境检查</div><div class="r">6 项 · 5 正常 / 1 待整改</div></div>
   <div class="site">
-    <div class="chips">
+    <div class="row">
       <span class="chip">供电与接地  2/2</span>
       <span class="chip">光路与设备  2/2</span>
-      <span class="chip">环境与规范  1/2</span>
+      <span class="chip bad">环境与规范  1/2</span>
     </div>
-    <div class="badrow"><span class="b">[待整改]</span><b>线缆标签：</b>2 根未贴标签  —  建议按机房规范补贴标签，记录两端位置</div>
-    <div class="note"><b>现场备注（装维手输）：</b>机房新上 1 台 AP 未贴标签，已一并记录位置</div>
+    <div class="line"><span class="b">[待整改]</span><span class="n">线缆标签</span> 2 根未贴标签 — 建议按机房规范补贴标签，记录两端位置</div>
+    <div class="line"><b>现场备注</b>（装维手输）：机房新上 1 台 AP 未贴标签，已一并记录位置</div>
   </div>
 
-  <!-- ─── 明细 ─── -->
-  <div class="sec-h"><div class="n">§</div><div class="t">检测明细</div><div class="r">20 项自动检测 · 技术细节见完整版</div></div>
+  <!-- ─── 检测明细 ─── -->
+  <div class="sec-h"><div class="n">§</div><div class="t">检测明细</div><div class="r">20 项 · 技术细节见完整版</div></div>
   <div class="detail">
     <table>
       <tr><th style="width:30%">模块</th><th>关键结果</th><th style="width:14%;text-align:right">状态</th></tr>
