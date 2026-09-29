@@ -11,6 +11,10 @@ NetPulse - Windows 网络诊断工具
              端口探测 / 路由表 / TCP 传输质量 / MTU / 代理检测 / NAT 类型 (STUN)
 """
 
+# 注解惰性求值: str | None / list[str] 等 PEP 604 写法在 Python 3.8 上不报错
+# (x86 版须用 3.8.10 打包 —— 3.9+ 打包的 exe 在 Win7 报缺 api-ms-win-core-path)
+from __future__ import annotations
+
 # ============================================================
 # SECTION 1: IMPORTS
 # ============================================================
@@ -3564,7 +3568,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.4"
+APP_VERSION = "1.14.5"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"

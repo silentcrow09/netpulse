@@ -66,10 +66,12 @@ jobs:
             exit $LASTEXITCODE
           }
 
-      - name: 切换 32 位 Python 3.13
+      # x86 必须用 3.8: 3.9+ 打包的 exe 在 Win7 启动报缺
+      # api-ms-win-core-path-l1-1-0.dll (该 API Set 是 Win8+ 才有)
+      - name: 切换 32 位 Python 3.8
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: '3.8'
           architecture: 'x86'
 
       - name: 安装构建依赖 (x86)

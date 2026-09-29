@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.14.4
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.14.5
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -309,8 +309,9 @@ build_exe.bat              # 64 位 (默认) → dist\NetPulse.exe
 build_exe.bat -Arch x86    # 32 位 → dist\NetPulse_x86.exe (老机器/32 位系统)
 ```
 
-> 32 位构建需先装 32 位 Python（python.org 下 Windows installer (32-bit)），
-> 再 `py -3.13-32 -m pip install scapy pyinstaller`；Ookla `speedtest.exe` 官方无
+> 32 位构建需先装 32 位 Python 3.8.10（python.org 下 Windows installer (32-bit)，
+> 最后一个支持 Win7 的版本；3.9+ 打包的 exe 在 Win7 启动报缺
+> api-ms-win-core-path-l1-1-0.dll），再 `py -3.8-32 -m pip install scapy pyinstaller`；Ookla `speedtest.exe` 官方无
 > 32 位版不随包，内置 HTTP 多连接测速不受影响，`--speedtest-net` 对照测速自动降级跳过。
 
 > 若需 DHCP 完整检测，目标机需安装 [Npcap](https://npcap.com/)（勾选 WinPcap API 兼容模式）；

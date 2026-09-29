@@ -107,8 +107,9 @@ $py = Find-Python -Arch $Arch
 if (-not $py) {
     if ($Arch -eq 'x86') {
         Step-Fail "未找到 32 位 Python"
-        Write-Host "      x86 构建需先安装 32 位 Python (python.org 下载 Windows installer (32-bit))" -ForegroundColor Yellow
-        Write-Host "      再执行: py -3.13-32 -m pip install scapy pyinstaller" -ForegroundColor Yellow
+        Write-Host "      x86 构建需先安装 32 位 Python 3.8.10 (python.org 下载 Windows installer (32-bit))" -ForegroundColor Yellow
+        Write-Host "      (3.8 是最后支持 Win7 的版本; 3.9+ 打包的 exe 在 Win7 报缺 api-ms-win-core-path DLL)" -ForegroundColor Yellow
+        Write-Host "      再执行: py -3.8-32 -m pip install scapy pyinstaller" -ForegroundColor Yellow
     } else {
         Step-Fail "未找到 python.exe, 请先安装 Python 3.10+ 并勾选 'Add Python to PATH'"
     }

@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+## [1.14.5] - 2026-09-29
+
+修复 32 位包在 Win7 无法启动的问题。
+
+### 修复
+
+- **Win7 启动报缺 `api-ms-win-core-path-l1-1-0.dll`**：该 DLL 是 Windows 8 才
+  引入的 API Set，Python 3.9+（及其 PyInstaller 产物）启动时必需 —— 不是
+  文件丢失，无法靠拷 DLL 解决。x86 构建链整体回退 **Python 3.8.10**
+  （最后支持 Win7 的版本）：`release.yml` x86 步骤 3.13 → 3.8；
+  `netpulse.py` 顶部加 `from __future__ import annotations` 使 37 处
+  PEP 604 注解（`str | None` / `list[str]`）在 3.8 上合法；
+  `build_exe.ps1` / README 同步安装指引。64 位包不受影响
+
 ## [1.14.1] - 2026-09-28
 
 PDF 生成不再依赖"装了 Chrome"：探测链加入 Edge 兜底。
