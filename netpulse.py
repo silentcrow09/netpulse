@@ -3568,7 +3568,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.8"
+APP_VERSION = "1.14.9"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -16347,6 +16347,18 @@ SITE_CHECK_BY_KEY = {it["key"]: it for it in SITE_CHECK_ITEMS}
 SCORE_EXEMPT_MODULES = ("iperf3", "ipv6", "proxy", "nattype")
 
 
+def _exempt_names(report):
+    """实际参检的评分豁免模块中文名 (按 summary 实跑集合, 非硬编码全名单)。
+
+    v1.14.9: 旧文案硬编码 "iperf3 / ipv6 / proxy / nattype" 四个名字,
+    现场模式 iperf3/port 不跑 → 「列 4 个名字说共 3 项豁免」自相矛盾
+    (真实现场报告反馈)。渲染层一律从 summary ∩ SCORE_EXEMPT_MODULES 取。
+    """
+    return sorted(MODULE_MAP.get(k, (k, k))[0]
+                  for k in (report.get("summary") or {})
+                  if k in SCORE_EXEMPT_MODULES)
+
+
 def _normalize_site_check(site_check):
     """现场机房勾选结果白名单校验 (v1.13.0)。
 
@@ -17768,7 +17780,9 @@ def render_report_html_customer(report):
     timeout_cnt = counts.get("超时", 0)
     band_bits = [f"共 <b>{total_modules}</b> 个模块"]
     if exempt_count:
-        band_bits.append(f"评分豁免 <b>{exempt_count}</b>（iperf3 / ipv6 / proxy / nattype）")
+        _exm = _exempt_names(report)
+        band_bits.append(f"评分豁免 <b>{exempt_count}</b>"
+                         + (f"（{_html_esc('、'.join(_exm))}）" if _exm else ""))
     deduct_bits = []
     if err_cnt:
         deduct_bits.append(f"<b>{err_cnt}</b> 异常级")
@@ -17915,10 +17929,12 @@ def render_report_html_customer(report):
     if total_modules:
         scored_total = sum(v for _, v in stat_items)
         if exempt_count:
+            _exm = _exempt_names(report)
             stats_caption = (
                 f"<div class='stats-caption'>上方为<b>扣分口径</b> {scored_total} 个模块"
-                f"（全量 {total_modules} 个, 其中 {exempt_count} 个评分豁免不计入: "
-                f"iperf3 / ipv6 / proxy / nattype）；下方状态分布条为<b>全口径</b> "
+                f"（全量 {total_modules} 个, 其中 {exempt_count} 个评分豁免不计入"
+                + (f": {_html_esc('、'.join(_exm))}" if _exm else "")
+                + f"）；下方状态分布条为<b>全口径</b> "
                 f"{total_modules} 个模块</div>")
         else:
             stats_caption = f"<div class='stats-caption'>共 {total_modules} 个模块</div>"
@@ -19104,9 +19120,17 @@ def render_report_html_brief(report):
 
     # ── 检测覆盖 ──
     status_bar = _svg_status_bar(all_counts)
-    cap = (f'健康分 {score} 为扣分口径 {sum(counts.values())} 项'
-           + (f'（iperf3 / ipv6 / proxy / nattype 共 {exempt_count} 项豁免）' if exempt_count else '')
-           + '。')
+    # v1.14.9: 豁免说明改为按实跑集合动态生成 — 旧文案三处数字互相打架
+    # (真实现场报告反馈): 硬编码 4 个模块名 vs "共 3 项豁免" (现场 iperf3
+    # 不跑) vs "其中 2 项属豁免" (只数非完成态)。现在实检/计分/豁免三个数
+    # 同源 (summary), 名单随实跑变, 数字必然自洽。
+    _exm = _exempt_names(report)
+    cap = (f'健康分 {score} 分：实检 {sum(all_counts.values())} 项，'
+           f'{sum(counts.values())} 项参与计分')
+    if _exm:
+        cap += (f'，{len(_exm)} 项评分豁免（{_html_esc("、".join(_exm))}；'
+                f'可选/环境类检查，不扣分）')
+    cap += '。'
     # v1.13.1: 豁免模块的非完成状态照常显示徽章但不扣分 — 必须点破,
     # 否则"检测覆盖有红黄徽章 + 健康分满分"看起来像算错 (真实现场首跑反馈)
     exempt_bad = sorted(
@@ -19114,8 +19138,8 @@ def render_report_html_brief(report):
         for k, st in (report.get("summary") or {}).items()
         if st not in ("完成", "未检测") and k in SCORE_EXEMPT_MODULES)
     if exempt_bad:
-        cap += (f'其中 {len(exempt_bad)} 项属评分豁免模块'
-                f'（{_html_esc("、".join(exempt_bad))}），不计分。')
+        cap += (f'其中 {_html_esc("、".join(exempt_bad))} '
+                f'本次有异常/警告显示，按豁免规则不计分。')
     cap += '整改项建议下次上门免费复核。'
     lg_bits = "".join(
         f'<span><i style="background:{_html_status_color(st)}"></i>{_html_esc(st)} '

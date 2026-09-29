@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>模板C · 装维验收单风（单页黑白）</title>
+<style>
+  /* 模板C: 运营商装维验收单风 — 单页, 黑白细线表格, 打印零耗材, 签字栏 */
+  @page { size: A4 portrait; margin: 10mm; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "SimSun", "Microsoft YaHei", serif; color: #000; background: #fff; }
+  .sheet { max-width: 190mm; margin: 0 auto; }
+  .title { text-align: center; margin: 4mm 0 1mm; }
+  .title h1 { font-size: 20px; letter-spacing: 4px; font-family: "SimHei", "Microsoft YaHei", sans-serif; }
+  .title .no { font-size: 11px; color: #333; margin-top: 1mm; }
+  .hr { border-top: 2.5px solid #000; margin: 2.5mm 0; }
+  .hr.thin { border-top: 1px solid #000; margin: 1.5mm 0; }
+
+  table { width: 100%; border-collapse: collapse; }
+  td, th { border: 1px solid #000; padding: 1.6mm 2.4mm; font-size: 11.5px; line-height: 1.5; vertical-align: top; }
+  th { background: #eee; font-family: "SimHei", "Microsoft YaHei", sans-serif; font-weight: normal; text-align: center; }
+  .k { background: #f2f2f2; width: 22mm; text-align: center; font-family: "SimHei", sans-serif; }
+  .sec td { background: #eee; font-family: "SimHei", sans-serif; letter-spacing: 2px; }
+
+  .verdict { font-family: "SimHei", sans-serif; }
+  .v-ok::before { content: "合格"; }
+  .v-fix::before { content: "整改"; }
+  .v-na::before { content: "豁免"; }
+  .score-line { display: flex; justify-content: space-between; font-size: 12px; padding: 1mm 0; }
+  .score-line b { font-family: "SimHei", sans-serif; }
+
+  .signs { display: flex; margin-top: 4mm; }
+  .signs td { height: 20mm; vertical-align: top; }
+  .note { font-size: 10.5px; color: #333; margin-top: 2.5mm; }
+</style>
+</head>
+<body>
+<div class="sheet">
+
+  <div class="title">
+    <h1>网络检测验收单</h1>
+    <div class="no">编号：NP-20260929-058　　检测日期：2026-09-29 14:30　　检测工具：NetPulse v1.14.9</div>
+  </div>
+  <div class="hr"></div>
+
+  <table>
+    <tr>
+      <td class="k">客户名称</td><td>杭州云启科技有限公司</td>
+      <td class="k">检测地点</td><td>滨江区××产业园 3 号楼 5F</td>
+    </tr>
+    <tr>
+      <td class="k">签约带宽</td><td>500M（下行）</td>
+      <td class="k">装维人员</td><td>张工</td>
+    </tr>
+  </table>
+
+  <div class="hr thin"></div>
+  <table>
+    <tr><td class="sec" colspan="4">一、检测结论</td></tr>
+    <tr>
+      <td class="k">健康评分</td><td><b style="font-size:15px">74</b> 分（C 级 · 一般）</td>
+      <td class="k">测速达标</td><td>达标（92%，462/500 Mbps）</td>
+    </tr>
+    <tr><td class="k">状态分布</td><td colspan="3">异常 1 · 警告 4 · 正常 15（实检 20 项：17 项计分，3 项评分豁免不计分）</td></tr>
+  </table>
+
+  <table style="margin-top:2mm">
+    <tr><td class="sec" colspan="4">二、检测结果明细（20 项）</td></tr>
+    <tr><th style="width:8mm">序</th><th style="width:26mm">检测项目</th><th>结果摘要</th><th style="width:14mm">判定</th></tr>
+    <tr><td>1</td><td>链路速率</td><td>协商 100Mbps，低于签约 500M，物理层协商失败</td><td class="verdict v-fix"></td></tr>
+    <tr><td>2</td><td>DNS 诊断</td><td>114DNS 响应 286ms 偏高，建议主用 223.5.5.5</td><td class="verdict v-fix"></td></tr>
+    <tr><td>3</td><td>TCP 传输质量</td><td>出口重传率 2.8%，观察</td><td class="verdict v-fix"></td></tr>
+    <tr><td>4</td><td>WiFi 分析</td><td>2.4G 信道 6 拥堵（周边 8 AP），建议改 1/11</td><td class="verdict v-fix"></td></tr>
+    <tr><td>5</td><td>IPv6 检测</td><td>部分目标不可达（运营商开通范围），评分豁免</td><td class="verdict v-na"></td></tr>
+    <tr><td>6</td><td>宽带测速</td><td>下行 462 / 上行 118 Mbps，达标率 92%</td><td class="verdict v-ok"></td></tr>
+    <tr><td>7</td><td>网关检测</td><td>延迟 3.2ms，丢包 0%</td><td class="verdict v-ok"></td></tr>
+    <tr><td>8</td><td>外网检测</td><td>全部目标可达</td><td class="verdict v-ok"></td></tr>
+    <tr><td>9</td><td>网页体检</td><td>L7 各阶段正常</td><td class="verdict v-ok"></td></tr>
+    <tr><td>10</td><td>Bufferbloat</td><td>负载下延迟增量 18ms，B 级</td><td class="verdict v-ok"></td></tr>
+    <tr><td>11</td><td>DHCP / LAN / ARP / 环路 / 路由 / MTU / NAT / 代理 / 多出口 / TCP连接</td><td>均正常（明细见电子报告）</td><td class="verdict v-ok"></td></tr>
+  </table>
+
+  <table style="margin-top:2mm">
+    <tr><td class="sec" colspan="4">三、机房环境检查（6 项）</td></tr>
+    <tr><td>ONU 光功率 -18.2dBm 合格</td><td>指示灯正常</td><td>UPS 在线</td><td>接地完好</td></tr>
+    <tr><td>散热正常（24℃）</td><td colspan="3">线缆标签：<b>2 根待补</b>（已记录位置）</td></tr>
+  </table>
+
+  <table style="margin-top:2mm">
+    <tr><td class="sec" colspan="2">四、整改事项</td></tr>
+    <tr><td style="width:12mm;text-align:center">1</td><td>更换跳线/交换机端口，恢复千兆协商（整改后测速达标率预计 ≥95%）</td></tr>
+    <tr><td style="text-align:center">2</td><td>主 DNS 调整为 223.5.5.5；AP 信道调至 1/11；补贴线缆标签</td></tr>
+    <tr><td style="text-align:center">3</td><td>整改项建议下次上门免费复核</td></tr>
+  </table>
+
+  <table class="signs">
+    <tr>
+      <td style="width:33%">客户签字：<br><br><br></td>
+      <td style="width:33%">装维人员签字：<br><br><br></td>
+      <td style="width:34%">日期：____年__月__日<br><br><br></td>
+    </tr>
+  </table>
+  <div class="note">注：本单结果仅反映检测时点网络状态；「豁免」为可选/环境类检查项，不参与健康评分（IPv6/代理/NAT 类型/iperf3）。电子版完整报告（含图表与根因分析）随工单交付。</div>
+
+</div>
+</body>
+</html>

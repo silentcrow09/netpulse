@@ -291,8 +291,38 @@ class TestBriefIssueFallback(unittest.TestCase):
         """检测覆盖 cap 点破豁免模块不计分 (满分 + 红黄徽章不再像算错)."""
         r = self._report_with_module_issues()
         html = N.render_report_html_brief(r)
-        self.assertIn("属评分豁免模块", html)
+        self.assertIn("评分豁免", html)
+        self.assertIn("按豁免规则不计分", html)
         self.assertIn("IPv6", html)  # MODULE_MAP 中文名
+
+    def test_cap_exempt_names_match_actual_run(self):
+        """v1.14.9: 豁免名单/数量按实跑集合生成, 不再硬编码 4 名 vs 实数打架.
+
+        现场模式: iperf3/port 不跑, 20 项 = 17 计分 + 3 豁免
+        (nattype 完成 / ipv6 异常 / proxy 警告)。
+        """
+        r = self._report_with_module_issues()
+        # 重置为现场模式真实集合: 17 计分全完成 + 3 豁免 (无 iperf3)
+        summary = {k: "完成" for k in r["summary"]}
+        summary.pop("ipv6", None)
+        for k in ("dhcp", "lan", "dns", "web", "mtu", "multiwan",
+                  "route", "arp", "loop", "tcpstats", "tcpconn"):
+            summary.setdefault(k, "完成")
+        while len([k for k, v in summary.items()
+                   if k not in N.SCORE_EXEMPT_MODULES]) < 17:
+            summary.setdefault(f"mod{len(summary)}", "完成")
+        summary["ipv6"] = "异常"
+        summary["proxy"] = "警告"
+        summary["nattype"] = "完成"
+        r["summary"] = summary
+        scored = {k: v for k, v in summary.items()
+                  if k not in N.SCORE_EXEMPT_MODULES}
+        r["counts"] = {"完成": len(scored)}
+        r["exempt_count"] = 3
+        html = N.render_report_html_brief(r)
+        self.assertIn("实检 20 项，17 项参与计分，3 项评分豁免", html)
+        self.assertIn("其中 IPv6 检测、代理检测", html)
+        self.assertNotIn("iperf3", html)  # 未参检的豁免模块不再被点名
 
     def test_clean_branch_still_works(self):
         """无根因且无模块级问题 → 仍走绿色"未发现明确故障"分支."""

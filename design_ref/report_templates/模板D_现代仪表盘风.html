@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>模板D · 现代仪表盘风</title>
+<style>
+  /* 模板D: SaaS 仪表盘风 — 渐变头图 + 卡片网格 + 环形图/迷你柱图, 圆角现代 */
+  @page { size: A4 portrait; margin: 0; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; color: #1e2430; background: #e8eaed; }
+  .page { width: 210mm; min-height: 297mm; background: #f4f6fa; margin: 8px auto; padding: 0 8mm 8mm; }
+  @media print { body { background: #fff; } .page { margin: 0; } }
+
+  .hero { background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 55%, #a855f7 100%);
+          color: #fff; margin: 0 -8mm; padding: 10mm 12mm 14mm; border-radius: 0 0 6mm 6mm; }
+  .hero .brand { display: flex; justify-content: space-between; font-size: 12px; opacity: .85; }
+  .hero h1 { font-size: 22px; margin-top: 6mm; font-weight: 700; }
+  .hero .meta { margin-top: 2mm; font-size: 11.5px; opacity: .85; }
+
+  .scorecard { display: flex; gap: 5mm; margin-top: -9mm; }
+  .card { background: #fff; border-radius: 4mm; box-shadow: 0 1px 4px rgba(30,36,48,.08); padding: 5mm; }
+  .scorecard .card { flex: 1.2; display: flex; align-items: center; gap: 6mm; }
+  .scorecard .sc-note { flex: 1; font-size: 11.5px; color: #5b6472; }
+  .scorecard .sc-note b { color: #1e2430; }
+  .grade { display: inline-block; padding: 0.8mm 3mm; border-radius: 3mm; font-size: 12px; font-weight: bold; }
+  .g-c { background: #fef3c7; color: #92400e; }
+
+  h2 { font-size: 14px; margin: 6mm 1mm 3mm; display: flex; justify-content: space-between; align-items: baseline; }
+  h2 small { font-size: 10.5px; color: #8a93a0; font-weight: normal; }
+
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3.5mm; }
+  .kpi .v { font-size: 21px; font-weight: 800; }
+  .kpi .k { font-size: 10.5px; color: #8a93a0; margin-top: 1mm; }
+  .kpi .delta { font-size: 10px; margin-top: 1mm; }
+  .up { color: #15803d; } .mid { color: #d97706; } .down { color: #b42318; }
+
+  .row2 { display: flex; gap: 3.5mm; margin-top: 3.5mm; }
+  .row2 .card { flex: 1; }
+
+  .bar-line { display: flex; align-items: center; gap: 3mm; font-size: 11.5px; margin-top: 2.2mm; }
+  .bar-line .nm { width: 20mm; color: #5b6472; }
+  .bar-line .tr { flex: 1; height: 4mm; background: #edf0f5; border-radius: 2mm; overflow: hidden; }
+  .bar-line .fi { height: 100%; border-radius: 2mm; }
+  .bar-line .pc { width: 14mm; text-align: right; font-weight: 600; }
+
+  .issue { border-left: 1.2mm solid; border-radius: 2mm; background: #fff; padding: 3mm 4mm; margin-top: 3mm;
+           box-shadow: 0 1px 3px rgba(30,36,48,.06); }
+  .issue .t { font-weight: 700; font-size: 12.5px; }
+  .issue .d { font-size: 11.5px; color: #5b6472; margin-top: 1mm; line-height: 1.6; }
+  .issue .a { font-size: 11.5px; margin-top: 1mm; color: #4f46e5; }
+  .i-high { border-color: #dc2626; } .i-mid { border-color: #f59e0b; } .i-low { border-color: #3b82f6; }
+  .pill { float: right; font-size: 10px; color: #fff; border-radius: 2mm; padding: 0.5mm 2.4mm; }
+  .p-high { background: #dc2626; } .p-mid { background: #f59e0b; } .p-low { background: #3b82f6; }
+  .p-na { background: #94a3b8; }
+
+  table.grid { width: 100%; border-collapse: collapse; background: #fff; border-radius: 3mm; overflow: hidden;
+               box-shadow: 0 1px 3px rgba(30,36,48,.06); }
+  table.grid th { background: #f0f2f7; font-size: 11px; color: #5b6472; text-align: left; padding: 2.2mm 3mm; }
+  table.grid td { font-size: 11.5px; padding: 2mm 3mm; border-top: 1px solid #eef1f6; }
+  .foot { margin-top: 6mm; text-align: center; font-size: 10px; color: #9aa3af; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="hero">
+    <div class="brand"><span>NETPULSE · 现场检测</span><span>报告编号 NP-20260929-058</span></div>
+    <h1>杭州云启科技有限公司 · 网络体检报告</h1>
+    <div class="meta">滨江区××产业园 3 号楼 5F · 2026-09-29 14:30 · 签约带宽 500M · 装维：张工</div>
+  </div>
+
+  <div class="scorecard card">
+    <svg width="110" height="110" viewBox="0 0 120 120">
+      <circle cx="60" cy="60" r="50" fill="none" stroke="#edf0f5" stroke-width="13"/>
+      <circle cx="60" cy="60" r="50" fill="none" stroke="#f59e0b" stroke-width="13"
+              stroke-dasharray="232.4 314.16" stroke-linecap="round" transform="rotate(-90 60 60)"/>
+      <text x="60" y="58" text-anchor="middle" font-size="28" font-weight="800" fill="#1e2430">74</text>
+      <text x="60" y="78" text-anchor="middle" font-size="11" fill="#8a93a0">健康分</text>
+    </svg>
+    <div class="sc-note">
+      <span class="grade g-c">C 级 · 一般</span>
+      <p style="margin-top:2.5mm"><b>网络可用、测速达标（92%）</b>，但 1 项异常正在限制带宽：
+      链路仅协商出 <b>100M</b>。整改跳线/端口后预计达标率 ≥95%。</p>
+      <p style="margin-top:1.5mm">实检 20 项（17 计分 + 3 豁免）· 机房检查 5/6 正常 · 整改项下次上门免费复核</p>
+    </div>
+  </div>
+
+  <h2>关键指标 <small>与签约/阈值对照</small></h2>
+  <div class="grid">
+    <div class="card kpi"><div class="v">462<span style="font-size:10px"> Mbps</span></div><div class="k">下行 / 500M</div><div class="delta up">达标 92%</div></div>
+    <div class="card kpi"><div class="v">3.2<span style="font-size:10px"> ms</span></div><div class="k">网关延迟</div><div class="delta up">优秀（&lt;10ms）</div></div>
+    <div class="card kpi"><div class="v">0<span style="font-size:10px"> %</span></div><div class="k">网关丢包</div><div class="delta up">无丢包</div></div>
+    <div class="card kpi"><div class="v">2.8<span style="font-size:10px"> %</span></div><div class="k">出口重传率</div><div class="delta mid">偏高（&lt;2% 为优）</div></div>
+  </div>
+
+  <div class="row2">
+    <div class="card">
+      <h2 style="margin:0 0 2mm">速率对照 <small>实测 vs 签约</small></h2>
+      <div class="bar-line"><span class="nm">下行</span><div class="tr"><div class="fi" style="width:92%;background:#4f46e5"></div></div><span class="pc">92%</span></div>
+      <div class="bar-line"><span class="nm">上行</span><div class="tr"><div class="fi" style="width:78%;background:#7c3aed"></div></div><span class="pc">正常</span></div>
+      <div class="bar-line"><span class="nm">协商速率</span><div class="tr"><div class="fi" style="width:10%;background:#dc2626"></div></div><span class="pc down">100M</span></div>
+    </div>
+    <div class="card">
+      <h2 style="margin:0 0 2mm">状态分布 <small>全口径 20 项</small></h2>
+      <div class="bar-line"><span class="nm">完成</span><div class="tr"><div class="fi" style="width:75%;background:#16a34a"></div></div><span class="pc">15</span></div>
+      <div class="bar-line"><span class="nm">警告</span><div class="tr"><div class="fi" style="width:20%;background:#f59e0b"></div></div><span class="pc">4</span></div>
+      <div class="bar-line"><span class="nm">异常</span><div class="tr"><div class="fi" style="width:5%;background:#dc2626"></div></div><span class="pc">1</span></div>
+    </div>
+  </div>
+
+  <h2>待办发现 <small>按优先级</small></h2>
+  <div class="issue i-high"><span class="pill p-high">异常</span><div class="t">链路协商 100M，签约带宽被钳制</div>
+    <div class="d">检测到协商速率仅 100Mbps 全双工，500M 带宽实际可用约 1/5；判定为物理层协商失败。</div>
+    <div class="a">▶ 更换超五类及以上跳线或换交换机端口 → 复测 ≥1Gbps</div></div>
+  <div class="issue i-mid"><span class="pill p-mid">警告</span><div class="t">DNS 响应 286ms 偏高</div>
+    <div class="d">114.114.114.114 平均响应超出建议阈值（&lt;80ms），影响网页首包体验。</div>
+    <div class="a">▶ 主 DNS 改 223.5.5.5，原 DNS 降备</div></div>
+  <div class="issue i-mid"><span class="pill p-mid">警告</span><div class="t">出口重传率 2.8% / WiFi 信道 6 拥堵</div>
+    <div class="d">重传偏高建议观察一周；信道 6 周边 8 个 AP 竞争。</div>
+    <div class="a">▶ 持续 &gt;2% 报修运营商；AP 信道调至 1/11</div></div>
+  <div class="issue i-low"><span class="pill p-na">豁免</span><div class="t">IPv6 部分不可达（不计分）</div>
+    <div class="d">评分豁免项：运营商开通范围问题，不参与健康分扣分，开通后复测。</div></div>
+
+  <h2>检测明细 <small>20 项自动检测</small></h2>
+  <table class="grid">
+    <tr><th>模块</th><th>关键结果</th><th style="width:16mm">状态</th></tr>
+    <tr><td>链路速率</td><td>协商 100M（异常，见 F-01）</td><td style="color:#dc2626">异常</td></tr>
+    <tr><td>宽带测速</td><td>462 / 118 Mbps · 达标 92%</td><td style="color:#16a34a">完成</td></tr>
+    <tr><td>网关 / 外网 / 网页</td><td>延迟 3.2ms · 全目标可达 · L7 正常</td><td style="color:#16a34a">完成</td></tr>
+    <tr><td>DNS / TCP 质量 / WiFi</td><td>286ms · 重传 2.8% · 信道拥堵</td><td style="color:#d97706">警告</td></tr>
+    <tr><td>Bufferbloat</td><td>负载延迟增量 18ms · B 级</td><td style="color:#16a34a">完成</td></tr>
+    <tr><td>其余 12 项</td><td>DHCP/LAN/ARP/路由/MTU 等</td><td style="color:#16a34a">完成</td></tr>
+    <tr><td>IPv6 / 代理 / NAT</td><td>评分豁免（不计分）</td><td style="color:#64748b">豁免</td></tr>
+  </table>
+
+  <div class="foot">NetPulse v1.14.9 自动生成 · 结果仅反映检测时点 · 完整技术报告与 JSON 数据随工单交付</div>
+</div>
+</body>
+</html>
