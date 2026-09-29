@@ -3568,7 +3568,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.6"
+APP_VERSION = "1.14.7"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -14036,18 +14036,16 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
             "geo": geo_str,
             "ipv6_public_ip": pub_v6 or "",
         }
-        extra = ""
+        # v1.14.7: 分组排版 — 原来 7 项挤一行, 窄终端折行错乱难读
+        print(_c(f"  本机IP: {lip}    网关: {gw}    DNS: {dns}", C_WHITE))
+        _l2 = f"  公网IP: {pub}"
         if geo_str:
-            extra += f"    📍 {geo_str}"
+            _l2 += f"    📍 {geo_str}"
         if asn_str:
-            extra += f"    🏢 {asn_str}"
+            _l2 += f"    🏢 {asn_str}"
+        print(_c(_l2, C_WHITE))
         if pub_v6:
-            extra += f"    IPv6: {pub_v6}"
-        print(_c(f"  本机IP: {lip}", C_WHITE) +
-              _c(f"    网关: {gw}", C_WHITE) +
-              _c(f"    DNS: {dns}", C_WHITE) +
-              _c(f"    公网IP: {pub}", C_WHITE) +
-              (_c(extra, C_WHITE) if extra else ""))
+            print(_c(f"  IPv6: {pub_v6}", C_WHITE))
     except Exception as e:
         print(_c(f"  系统信息获取失败: {e}", C_GRAY))
     print(_c("-" * 60, C_GRAY))
@@ -14318,6 +14316,24 @@ def _run_diagnostics_sequential(keys, is_tty):
     return results, full
 
 
+def _print_cols(rows):
+    """进度行两列排版 (v1.14.7): 23 个模块 23 行 → 12 行, 省一半竖向空间。
+
+    rows: [(plain, colored)] — plain 仅参与对齐计算 (_disp_width, CJK=2,
+    ANSI 不计), colored 是实际上屏串。奇数个时最后一行单列。
+    """
+    if not rows:
+        return
+    w = max(_disp_width(p) for p, _ in rows) + 3
+    for i in range(0, len(rows), 2):
+        plain, colored = rows[i]
+        if i + 1 < len(rows):
+            _safe_print(colored + " " * (w - _disp_width(plain))
+                        + rows[i + 1][1])
+        else:
+            _safe_print(colored)
+
+
 def _run_diagnostics_parallel(keys, max_workers, total):
     """并行模式: 4 worker 并发跑, 启动和完成行都按 keys 顺序打印。
 
@@ -14347,10 +14363,11 @@ def _run_diagnostics_parallel(keys, max_workers, total):
             completed[key] = (name, status, res)
         return key
 
-    # 启动行: 主线程按 keys 顺序打 (1-19 整齐一行)
-    for i, key in enumerate(keys, 1):
-        name = MODULE_MAP[key][0]
-        _safe_print(_c(f"  [{i}/{total}] 正在 {name} …", C_GRAY))
+    # 启动行: 主线程按 keys 顺序打。v1.14.7: 两列排版 (23 行 → 12 行)
+    _print_cols([
+        (f"  [{i}/{total}] 正在 {MODULE_MAP[k][0]} …",
+         _c(f"  [{i}/{total}] 正在 {MODULE_MAP[k][0]} …", C_GRAY))
+        for i, k in enumerate(keys, 1)])
 
     # v1.12.2: 带宽/负载敏感模块不参与并发 — 普通模块先并发跑完,
     # 独占模块再逐个串行跑 (测量期间网络空闲, 口径与单独运行一致)
@@ -14367,16 +14384,20 @@ def _run_diagnostics_parallel(keys, max_workers, total):
     for key in solo_keys:
         _run_one(key)
 
-    # 完成行: 主线程按 keys 顺序打 (1-19 整齐一行)
+    # 完成行: 主线程按 keys 顺序打。v1.14.7: 两列排版 (状态徽章计入对齐宽)
+    _rows = []
     for i, key in enumerate(keys, 1):
         if key not in completed:
             # 理论上不会到这里 (except 块也存了), 但兜底
             continue
         name, status, res = completed[key]
-        _safe_print(_c(f"  [{i}/{total}] ✓ {name}", C_BOLD) + "  "
-                    + _cli_status_badge(status))
+        _rows.append((
+            f"  [{i}/{total}] ✓ {name} [{status}]",
+            _c(f"  [{i}/{total}] ✓ {name}", C_BOLD) + "  "
+            + _cli_status_badge(status)))
         results[key] = status
         full[key] = res
+    _print_cols(_rows)
     return results, full
 
 
@@ -19317,7 +19338,7 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
 
     bar = "=" * 60
     print(_c(bar, C_BLUE))
-    print(_c(f"  {APP_NAME} v{APP_VERSION}    现场检测模式 (上门出客户报告)", C_BOLD))
+    print(_c(f"  {APP_NAME} v{APP_VERSION}    现场检测模式 (客户报告)", C_BOLD))
     print(_c(bar, C_BLUE))
     print(_c("  流程: 填基本信息 → 网络全量诊断 (约 2~3 分钟, 不含压测) → "
              "机房 6 项勾选 → 生成报告文件 (检测到 Chrome 自动含 PDF)",
@@ -19435,6 +19456,12 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
         print(_c(f"  · {desc}\n    {path}", C_WHITE))
     print(_c("  提示: 一页报告 (PDF/HTML) 打印后交客户;", C_GRAY))
     print(_c("        完整版与 .json 随工单带回, 供专家会诊与后台深析。", C_GRAY))
+
+    # v1.14.7: 自动打开报告所在文件夹, 省去手动找文件 (失败静默不影响收尾)
+    try:
+        os.startfile(os.path.dirname(done[0][1]))
+    except Exception:
+        pass
 
 
 
@@ -19727,7 +19754,7 @@ def _scene_menu(install=False, pip_mirror=None):
         print(f"    {_c('[1]', C_CYAN)} 网络很慢        {_c('[2]', C_CYAN)} 经常断网      {_c('[3]', C_CYAN)} 网页打不开")
         print(f"    {_c('[4]', C_CYAN)} 游戏卡顿        {_c('[5]', C_CYAN)} WiFi 信号差")
         print()
-        print(f"    {_c('[6]', C_CYAN)} 现场检测（上门出客户报告）")
+        print(f"    {_c('[6]', C_CYAN)} 现场检测（客户报告）")
         print(f"    {_c('[7]', C_CYAN)} 持续盯障（输入分钟数）")
         print(f"    {_c('[9]', C_CYAN)} 高级选项（工程师用）   "
               f"{_c('[A]', C_CYAN)} 管理员模式   {_c('[0]', C_CYAN)} 退出")
