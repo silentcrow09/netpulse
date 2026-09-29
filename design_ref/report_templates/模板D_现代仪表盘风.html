@@ -133,9 +133,11 @@
                    margin-top: 2.5mm; padding: 2mm 3mm 2mm 3.5mm;
                    background: #fdf1f0; border-left: 2mm solid var(--red); }
   .site .bad-row .lab { color: var(--red); font-weight: 700; margin: 0 1mm; }
-  .site .grid6 > .it { display: flex; flex-direction: column; justify-content: center;
-                       min-height: 11mm; padding: 1.8mm 2.5mm; }
-  .site .grid6 > .it .st { float: none; align-self: flex-start; margin-top: 0; }
+  /* grid 项: 名称 + 状态 inline 单行 (名称可能 12-15 字 + 状态 9.5px, 186mm/3≈60 栏容得下) */
+  .site .grid6 > .it { display: flex; flex-direction: row; align-items: center; gap: 2.5mm;
+                       padding: 1.6mm 2.5mm; min-height: 0; }
+  .site .grid6 > .it .st { float: none; margin: 0; flex: none; }
+  .site .grid6 > .it .nm { flex: 1; min-width: 0; }
 
   /* ── 明细 ── */
   .detail { padding: 2mm 12mm 0; }
