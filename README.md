@@ -37,7 +37,16 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 - **测速实时可视化**：单独测速时终端实时刷新速率/进度，结束自动生成独立测速报告。
 - **原生 UDP DNS 探测**：自构造 DNS 报文，并行查询多家国内 DNS，速度快、无需 `nslookup` 进程。
 - **双运行模式**：场景菜单（适合新手；原模块清单收在 `[9]` 高级选项）+ 命令行参数（适合脚本/自动化）。
-- **自动检查更新（v1.12.0）**：启动时后台静默查询最新 Release（GitHub API 主源 → jsDelivr CDN 国内回落，企业代理环境自动走 `http_proxy`），有新版本时在菜单标题下提示一行，附 **gh-proxy.com 加速下载链接**（国内直连可下）；24h 频控缓存（`%LOCALAPPDATA%\NetPulse\update_check.json`），失败完全静默不影响使用，`--no-update-check` 可关闭。
+- **自动检查更新**（v1.12.0 起；v1.14.11 加 gh-proxy 回落）：启动时后台静默查询最新 Release，
+  **4 源路径** （首个成功即用，互不影响）：
+  1. GitHub Releases API 主源
+  2. `gh-proxy.com` 反代 GitHub API （绕过 60/h quota，绕公司 NAT 共享 IP 问题）
+  3. `gh-proxy.com` 拉 `raw.githubusercontent.com` `master/version.json` （API + raw 双反代）
+  4. jsDelivr `master` `version.json` （兑底，部分网络不达）
+  有新版本时在菜单标题下提示一行，附 **gh-proxy.com 加速下载链接**（国内直连可下）；
+  24h 频控缓存（`%LOCALAPPDATA%\NetPulse\update_check.json`，主源 / gh-proxy 取得结果可信则缓存，
+  jsDelivr 兑底说"无新版"不缓存以免锁死提示一整天），失败完全静默不影响使用，
+  `--no-update-check` 可关闭，企业代理环境自动走 `http_proxy` 环境变量。
 - **专业报告**：导出 HTML（工程风可视化）/ JSON，按日期自动归档到 `reports/YYYY-MM-DD/`。
 - **国内网络优化**：默认检测国内 DNS（AliDNS / DNSPod / 114）与公网 IP 服务，不探测国外站点。
 - **优雅降级**：可选依赖（scapy / speedtest-cli）缺失时自动降级，不会报错退出。
@@ -322,100 +331,10 @@ build_exe.bat -Arch x86    # 32 位 → dist\NetPulse_x86.exe (老机器/32 位�
 > 链路吞吐（非互联网宽带），需自建 iperf3 服务器；缺少 `iperf3.exe` 时程序会询问是否自动下载
 > （或手动放到 EXE 同目录）。
 
-## 🚀 一键分发部署
+## 🚀 一键分发部署 (阿里云 OSS)
 
-将 NetPulse 部署到阿里云 OSS 后，客户机**一行命令**即可拉取并执行。
-
-### 客户端体验
-
-```powershell
-# Windows 10/11 PowerShell (无需预装 Python)
-irm https://<bucket>.oss-cn-hangzhou.aliyuncs.com/netpulse/v1/install.ps1 | iex
-
-# 带参数 (透传给 netpulse)
-irm https://.../v1/install.ps1 | iex -- all --export report.html
-```
-
-引导脚本 `install.ps1` 自动完成：
-1. 拉 `index.json` 拿版本号 + SHA256
-2. 检测 Python 3.8+ → 有则用 `.py` (300KB)，无则用 `.exe` (25MB)
-3. SHA256 校验，不一致立即中止
-4. 透传参数并执行
-
-### 5 步上线
-
-| # | 步骤 | 操作 |
-|---|------|------|
-| 1 | 阿里云 OSS 控制台建 bucket `netpulse-dist`，**读写权限 = 公共读** | （控制台操作）|
-| 2 | 装阿里云 CLI 并配置 AccessKey | `winget install Alibaba.AliyunCLI` → `aliyun configure` |
-| 3 | 打包 EXE（首次或改了 .py 后） | `build_exe.bat` |
-| 4 | 上传文件到 OSS（手动） | 详见下方 |
-| 5 | 自测 | `irm https://<bucket>.oss-cn-hangzhou.aliyuncs.com/netpulse/v1/install.ps1 \| iex -- --list` |
-
-### 手动上传一个版本
-
-每次发版需要往 OSS 放 4 个文件（首次还要加 `install.ps1`）：
-
-```
-oss://<bucket>/netpulse/v1/
-├── install.ps1        ← 首次部署上传一次, 之后不变 (v1.14.4 起按 OS 位数自动选包)
-├── netpulse.py        ← 每次发版覆盖
-├── netpulse.exe       ← 每次发版覆盖 (64 位)
-├── netpulse_x86.exe   ← 每次发版覆盖 (32 位; GitHub Release 的 NetPulse_x86.exe 重命名即可)
-└── index.json         ← 每次发版覆盖 (含 SHA256, 见下方生成)
-```
-
-**生成 `index.json`**（PowerShell 一行搞定）：
-
-```powershell
-$pySha = (Get-FileHash netpulse.py -Algorithm SHA256).Hash.ToLower()
-$pySize = (Get-Item netpulse.py).Length
-$exePath = ".\dist\NetPulse.exe"
-$exeX86Path = ".\dist\NetPulse_x86.exe"     # 从 GitHub Release 下载 NetPulse_x86.exe 放这里
-$hasExe = Test-Path $exePath
-$index = [ordered]@{
-  version = "v1.0.0"   # ← 改这里
-  released_at = (Get-Date).ToUniversalTime().ToString("o")
-  python = @{ file = "netpulse.py"; sha256 = $pySha; size = $pySize }
-}
-if ($hasExe) {
-  $index.exe = @{ file = "netpulse.exe"; sha256 = (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLower(); size = (Get-Item $exePath).Length }
-}
-if (Test-Path $exeX86Path) {
-  $index.exe_x86 = @{ file = "netpulse_x86.exe"; sha256 = (Get-FileHash $exeX86Path -Algorithm SHA256).Hash.ToLower(); size = (Get-Item $exeX86Path).Length }
-}
-$index | ConvertTo-Json -Depth 5 | Set-Content index.json -Encoding UTF8
-```
-
-**上传到 OSS**（任选一种）：
-
-```powershell
-# 方式 A: aliyun CLI (推荐)
-aliyun oss cp netpulse.py      oss://<bucket>/netpulse/v1/netpulse.py --force
-aliyun oss cp dist\NetPulse.exe oss://<bucket>/netpulse/v1/netpulse.exe --force  # 有 EXE 才传
-aliyun oss cp dist\NetPulse_x86.exe oss://<bucket>/netpulse/v1/netpulse_x86.exe --force  # 有 32 位 EXE 才传
-aliyun oss cp index.json       oss://<bucket>/netpulse/v1/index.json --force
-
-# 方式 B: OSS 控制台拖拽
-# 把上面 4 个文件拖到 bucket 的 netpulse/v1/ 目录下, 设置 ACL = 公共读
-```
-
-### 灰度发布
-
-把文件上传到 `netpulse/v1-beta/` 子目录，测试组用：
-
-```powershell
-irm https://<bucket>.oss-cn-hangzhou.aliyuncs.com/netpulse/v1-beta/install.ps1 | iex
-```
-
-### 日常发版流程
-
-```
-1. 改 netpulse.py
-2. 跑 build_exe.bat (可选, 重新生成 EXE)
-3. 跑上面那段 PowerShell 生成新的 index.json (改 version 字段)
-4. 上传 3 个文件覆盖 OSS 上的旧版本
-```
+详见 **[deploy/README.md](./deploy/README.md)** —— 含 client 端体验、
+index.json 生成脚本、上传命令、灰度发布、5 步上线流程。
 
 ## 🔧 可选依赖
 
@@ -446,12 +365,14 @@ schema/
 ├── netpulse-result-v1.1.json   旧版 JSON Schema (1.1.0, 留档)
 └── netpulse-result-v1.2.json   JSON 结果 Schema (--json-schema 查询; evidence 一等结构)
 deploy/
-└── install.ps1     客户端引导脚本 (上传到 OSS, 客户用 irm | iex 拉取)
-CHANGELOG.md        更新日志
+├── install.ps1     客户引导脚本 (上传到 OSS, `irm | iex` 拉取)
+└── README.md       发版/OSS 上传/灰度发布说明 (开发者读)
+CHANGELOG.md        更新日志 (Keep a Changelog 格式)
 AGENTS.md           开发/验证约定 (AI 协作者先读)
 .gitignore          忽略缓存 / 打包产物 / 运行时报告
-reports/            诊断报告输出 (运行时自动生成, 已被 .gitignore 忽略)
-└── captures/       抓包切片/全程 pcap (--capture, 同被 .gitignore 忽略)
+design_ref/        设计稿参考 (非运行时依赖: 报告渲染稿 + design_ref 说明)
+reports/          【运行时生成】诊断报告输出 (被 .gitignore 忽略)
+└── captures/       【运行时生成】抓包切片/全程 pcap (--capture, 同被 .gitignore 忽略)
 ```
 
 ## 📜 许可证
