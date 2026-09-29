@@ -20,6 +20,10 @@
   `netpulse.py` 顶部加 `from __future__ import annotations` 使 37 处
   PEP 604 注解（`str | None` / `list[str]`）在 3.8 上合法；
   `build_exe.ps1` / README 同步安装指引。64 位包不受影响
+- **f-string 3.12 前 tokenizer 限制**（真机 3.8 编译暴露）：抓包切片清单
+  的 `{}` 表达式跨行、指标卡 `data-hint` 的 `\'` 转义 —— 均改为提前
+  算好变量再进 f-string，渲染产物逐字节不变。验证：3.8.20 全量
+  24 文件 + smoke 262 项通过（uv 真机 3.8，非仅语法检查）
 
 ## [1.14.1] - 2026-09-28
 

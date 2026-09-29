@@ -12137,10 +12137,12 @@ def _render_monitor_html(res):
         _slice_rows = []
         for s in (cap.get("slices") or []):
             href = s.get("rel") or s.get("path") or ""
+            # f-string 表达式不可跨行 (3.12 前 tokenizer 限制, x86 用 3.8 打包)
+            _etype = type_names.get(s.get("event_type", ""),
+                                    s.get("event_type", "—"))
             _slice_rows.append(
                 f"<tr><td>{_esc_html(str(s.get('ts', '')))}</td>"
-                f"<td>{_esc_html(type_names.get(s.get('event_type', ''),
-                                               s.get('event_type', '—')))}</td>"
+                f"<td>{_esc_html(_etype)}</td>"
                 f"<td>{s.get('pkts', 0)} 包</td>"
                 f"<td><a href='{href}'>{_esc_html(str(s.get('path', '')))}</a></td></tr>")
         _full_html = ""
@@ -17971,9 +17973,11 @@ def render_report_html_customer(report):
                     full_title += f"\n💡 {hint}"
                 # 数值在上、名称在下 (flex-column), 长名称可换行不再截断
                 # data-hint 供触摸设备点击展开 (桌面 hover 走 title)
+                # f-string 表达式内不可有反斜杠/换行 (3.12 前 tokenizer 限制, x86 用 3.8 打包)
+                _hint_attr = (" data-hint='" + _html_attr(hint) + "'") if hint else ""
                 metric_html.append(
                     f"<div class='metric' title='{_html_attr(full_title)}'"
-                    f"{' data-hint=\'' + _html_attr(hint) + '\'' if hint else ''}>"
+                    f"{_hint_attr}>"
                     f"<span class='v {level}'>{_html_esc(me['value'])}</span>"
                     f"<span class='lab'>{_html_esc(me['label'])}</span>"
                     f"</div>"
