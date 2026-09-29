@@ -24,8 +24,10 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { background: #cdd1d8; }
   body { font-family: "Inter", "Microsoft YaHei", "PingFang SC", sans-serif; color: var(--text); -webkit-font-smoothing: antialiased; }
-  .page { width: 210mm; height: 296mm; background: #fff; margin: 8px auto; padding: 0; overflow: hidden;
-          display: flex; flex-direction: column; }
+  .page { width: 210mm; min-height: 296mm; background: #fff; margin: 8px auto; padding: 0;
+          display: flex; flex-direction: column;
+          break-after: page; page-break-after: always; }
+  .page:last-child { break-after: auto; page-break-after: auto; margin-bottom: 0; }
   @media print { html, body { background: #fff; } .page { margin: 0; } }
 
   .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
@@ -34,6 +36,11 @@
   /* ── 报头 ── */
   .mast { background: var(--navy); color: #fff; padding: 4.5mm 12mm 4mm;
           display: flex; align-items: center; justify-content: space-between; }
+  .mast.mast-2 { padding: 3mm 12mm 3mm; }
+  .mast.mast-2 .brand img { height: 6mm; }
+  .mast.mast-2 .brand .org { font-size: 10px; }
+  .mast.mast-2 .brand .sub { font-size: 9px; }
+  .mast.mast-2 .doc { font-size: 9.5px; }
   .mast .brand { display: flex; align-items: center; gap: 3.5mm; }
   .mast .brand img { height: 8mm; display: block; }
   .mast .brand .org { font-size: 11px; font-weight: 700; letter-spacing: 1.6px; }
@@ -165,7 +172,7 @@
     <h1>杭州云启科技有限公司</h1>
     <div class="strip">
       <div class="l"><span>网络现场检测报告</span><span>滨江区××产业园 3 号楼 5F</span><span>签约带宽 500M</span></div>
-      <div class="r">NetPulse v1.14.9</div>
+      <div class="r">选项 6 · 一页客户报告</div>
     </div>
   </div>
 
@@ -241,7 +248,9 @@
     <div class="grid6">
       <div class="it"><span class="st ok">正常</span><div class="nm">机柜供电与 UPS</div></div>
       <div class="it"><span class="st ok">正常</span><div class="nm">机房温湿度</div></div>
-      <div class="it bad"><span class="st bad">待整改</span><div class="nm">线缆整理与标签</div></div>
+      <div class="it bad"><span class="st bad">待整改</span><div class="nm">线缆整理与标签</div>
+        <div class="desc"><span class="lab">问题</span><span>未贴标签</span>
+         · <span class="lab">建议</span><span class="ad">按业务分区捆扎，两端粘贴标签</span></div></div>
       <div class="it"><span class="st ok">正常</span><div class="nm">网线与入户光缆品质</div></div>
       <div class="it"><span class="st ok">正常</span><div class="nm">光猫 / ONU 指示灯</div></div>
       <div class="it"><span class="st ok">正常</span><div class="nm">空余端口与私接设备</div></div>
@@ -249,26 +258,53 @@
     <div class="note"><b>现场备注（装维手输）：</b>机房新上 1 台 AP 未贴标签，已一并记录位置</div>
   </div>
 
-  <!-- ─── 检测明细 ─── -->
-  <div class="sec-h"><div class="n">§</div><div class="t">检测明细</div><div class="r">20 项 · 技术细节见完整版</div></div>
-  <div class="detail">
-    <table>
-      <tr><th style="width:30%">模块</th><th>关键结果</th><th style="width:14%;text-align:right">状态</th></tr>
-      <tr><td class="mod">链路速率</td><td>协商 100M，见发现 01</td><td style="text-align:right"><span class="stat high">异常</span></td></tr>
-      <tr><td class="mod">宽带测速</td><td>下行 462 / 上行 118 Mbps · 达标率 92%</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
-      <tr><td class="mod">网关 / 外网 / 网页体检</td><td>延迟 3.2ms · 全目标可达 · L7 各阶段正常</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
-      <tr><td class="mod">DNS / TCP 质量 / WiFi</td><td>286ms · 重传 2.8% · 信道拥堵</td><td style="text-align:right"><span class="stat mid">警告</span></td></tr>
-      <tr><td class="mod">Bufferbloat</td><td>负载延迟增量 18ms · B 级</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
-      <tr><td class="mod">DHCP / LAN / ARP / 路由 / MTU 等</td><td>均正常</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
-      <tr><td class="mod">IPv6 / 代理 / NAT 类型</td><td>评分豁免（可选/环境类检查，不计分）</td><td style="text-align:right"><span class="stat na">豁免</span></td></tr>
-    </table>
-  </div>
+  <!-- ─── 第 2 页: 检测明细 ─── -->
+  <div class="page">
+    <!-- 续报头 (较薄) -->
+    <div class="mast mast-2">
+      <div class="brand">
+        <img src="data:image/png;base64,__CT_LOGO_B64__" alt="中国电信">
+        <div><div class="org">CHINA TELECOM</div><div class="sub">现场检测报告 · 检测明细</div></div>
+      </div>
+      <div class="doc">
+        <div class="no">报告编号 NP-20260929-058</div>
+        客户：杭州云启科技有限公司
+      </div>
+    </div>
 
-  <!-- ─── 页脚 ─── -->
-  <div class="foot">
-    <div class="l">随单交付：<b>一页客户报告</b> · 完整版报告 · JSON 原始数据 · PDF（Chrome/Edge）<br>
-      整改项建议<b>下次上门免费复核</b></div>
-    <div class="r">数据仅反映检测时点<br><b>NetPulse v1.14.9</b></div>
+    <div class="sec-h" style="margin-top:6mm"><div class="n">§</div><div class="t">检测明细</div><div class="r">20 项 · 技术细节见完整版</div></div>
+    <div class="detail" style="padding-top:2mm">
+      <table>
+        <tr><th style="width:24%">模块</th><th>关键结果</th><th style="width:18%">重点指标</th><th style="width:12%;text-align:right">状态</th></tr>
+        <tr><td class="mod">链路速率</td><td>协商 100Mbps，签约带宽被锥制</td><td class="num">100/1000 Mbps</td><td style="text-align:right"><span class="stat high">异常</span></td></tr>
+        <tr><td class="mod">宽带测速</td><td>下行 462 / 上行 118 Mbps，达标率 92%</td><td class="num">↓ 462 · ↑ 118</td><td style="text-align:right"><span class="stat ok">达标</span></td></tr>
+        <tr><td class="mod">网关连通性</td><td>网关可达，平均 3.2ms，丢包 0%</td><td class="num">3.2 ms · 0%</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
+        <tr><td class="mod">外网检测</td><td>所有目标 TCP 可达</td><td class="num">5/5 目标</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
+        <tr><td class="mod">网页体检</td><td>L7 DNS/TCP/TLS/TTFB/Load 各阶段正常</td><td class="num">TTFB 86 ms</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
+        <tr><td class="mod">Bufferbloat</td><td>负载下延迟增量 18ms，B 级</td><td class="num">+18 ms</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
+        <tr><td class="mod">DNS 诊断</td><td>114DNS 响应 286ms 偏高</td><td class="num">286 ms</td><td style="text-align:right"><span class="stat mid">警告</span></td></tr>
+        <tr><td class="mod">TCP 传输质量</td><td>出口重传率 2.8%，偏高</td><td class="num">2.8 %</td><td style="text-align:right"><span class="stat mid">警告</span></td></tr>
+        <tr><td class="mod">WiFi 分析</td><td>2.4G 信道 6 拥堵，周边 8 AP</td><td class="num">信道 6 · 8 AP</td><td style="text-align:right"><span class="stat mid">警告</span></td></tr>
+        <tr><td class="mod">DHCP 检测</td><td>DHCP 服务正常，地址池充足</td><td class="num">253/255</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
+        <tr><td class="mod">LAN 设备扫描</td><td>局域网 18 台设备在线</td><td class="num">18 台</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
+        <tr><td class="mod">ARP 分析</td><td>无 ARP 欺骗，MAC-IP 绑定正常</td><td class="num">0 异常</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
+        <tr><td class="mod">环路检测</td><td>未发现二层环路</td><td class="num">0 环路</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
+        <tr><td class="mod">路由表</td><td>默认路由正常，静态路由 2 条</td><td class="num">3 条</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
+        <tr><td class="mod">MTU 检测</td><td>出口 MTU 1500，无分片问题</td><td class="num">1500</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
+        <tr><td class="mod">多出口</td><td>探测到 1 个默认出口</td><td class="num">1</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
+        <tr><td class="mod">TCP 连接</td><td>到外网 TCP 握手正常</td><td class="num">正常</td><td style="text-align:right"><span class="stat ok">完成</span></td></tr>
+        <tr><td class="mod">IPv6 检测</td><td>仅部分目标可达（运营商开通范围）</td><td class="num">部分</td><td style="text-align:right"><span class="stat na">豁免</span></td></tr>
+        <tr><td class="mod">代理检测</td><td>未检测到 HTTP/HTTPS 代理</td><td class="num">无</td><td style="text-align:right"><span class="stat na">豁免</span></td></tr>
+        <tr><td class="mod">NAT 类型</td><td>Full Cone NAT，运营商侧</td><td class="num">Full Cone</td><td style="text-align:right"><span class="stat na">豁免</span></td></td></tr>
+      </table>
+    </div>
+
+    <!-- 页脚 -->
+    <div class="foot">
+      <div class="l">随单交付：<b>一页客户报告</b> · 完整版报告 · JSON 原始数据 · PDF（Chrome/Edge）<br>
+        整改项建议<b>下次上门免费复核</b></div>
+      <div class="r">数据仅反映检测时点<br><b>NetPulse v1.14.9</b></div>
+    </div>
   </div>
 
 </div>
