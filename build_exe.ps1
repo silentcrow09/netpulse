@@ -1,3 +1,11 @@
+param(
+    # x64 (默认, 产物 NetPulse.exe) | x86 (32 位系统, 产物 NetPulse_x86.exe,
+    # 需先安装 32 位 Python — py 启动器用 -3-32 选到它; Ookla speedtest.exe
+    # 只有 x64 版不随包, 内置 HTTP 多连接测速不受影响)
+    [ValidateSet('x64', 'x86')]
+    [string]$Arch = 'x64'
+)
+
 # NetPulse 单文件 EXE 构建脚本 (PowerShell 版)
 # 输出分阶段 + 旋转动画, PyInstaller 静默到日志, 失败时回显
 # 用法: 双击 build_exe.bat, 或在 PowerShell 里 .\build_exe.ps1
@@ -34,11 +42,25 @@ function Step-Fail($msg) {
 # 探测 Python 解释器 (用 try/catch 包装, 任何错误都不闪退)
 # 优先用 'py' 启动器 (Windows 官方推荐, 稳定指向已注册 Python, 不依赖 PATH)
 function Find-Python {
-    $candidates = @('py', 'python', 'python3')
+    param([string]$Arch = 'x64')
+    # x86: py 启动器 -32 后缀选 32 位解释器 (需另装 32 位 Python);
+    # 找不到时返回 $null, 由调用方给出安装指引
+    $candidates = if ($Arch -eq 'x86') {
+        @(@{Cmd = 'py'; Args = @('-3-32')}, @{Cmd = 'py'; Args = @('-32')},
+          @{Cmd = 'python'; Args = @()})
+    } else {
+        @(@{Cmd = 'py'; Args = @()}, @{Cmd = 'python'; Args = @()},
+          @{Cmd = 'python3'; Args = @()})
+    }
     foreach ($c in $candidates) {
         try {
-            $ver = & $c --version 2>&1
-            if ($LASTEXITCODE -eq 0) { return @{ Cmd = $c; Ver = ($ver -join '') } }
+            $ver = & $c.Cmd @($c.Args) --version 2>&1
+            if ($LASTEXITCODE -ne 0) { continue }
+            # 位数校验: 防止 x86 构建误用 64 位解释器 (反之亦然)
+            $want = if ($Arch -eq 'x86') { '32' } else { '64' }
+            $bits = (& $c.Cmd @($c.Args) -c "import struct; print(struct.calcsize('P')*8)" 2>&1) -join ''
+            if ($bits.Trim() -ne $want) { continue }
+            return @{ Cmd = $c.Cmd; PyArgs = @($c.Args); Ver = ($ver -join '') }
         } catch {}
     }
     return $null
@@ -46,11 +68,12 @@ function Find-Python {
 
 # 探测 pip 命令 (返回 hashtable: Cmd + ExtraArgs, 让调用方用 splat 展开)
 # 重要: PowerShell 不能把 "python -m pip" 当一个命令名调用, 必须分开传参
-function Find-Pip($pyCmd) {
-    # 优先用 python -m pip (最稳, 不依赖 PATH 里的 pip)
+function Find-Pip($pyCmd, $pyArgs) {
+    # 优先用 python -m pip (最稳, 不依赖 PATH 里的 pip); ExtraArgs 前置解释器
+    # 参数 (如 -3-32), 调用方直接 splat 即可
     try {
-        $ver = & $pyCmd -m pip --version 2>&1
-        if ($LASTEXITCODE -eq 0) { return @{ Cmd = $pyCmd; ExtraArgs = @('-m', 'pip') } }
+        $ver = & $pyCmd @($pyArgs) -m pip --version 2>&1
+        if ($LASTEXITCODE -eq 0) { return @{ Cmd = $pyCmd; ExtraArgs = @($pyArgs) + @('-m', 'pip') } }
     } catch {}
     # 备选: PATH 里的 pip / pip3
     foreach ($p in @('pip', 'pip3')) {
@@ -63,9 +86,9 @@ function Find-Pip($pyCmd) {
 }
 
 # 用 import 测试代替 pip show (更稳, 不依赖 pip 状态)
-function Test-Module($pyCmd, $modName) {
+function Test-Module($pyCmd, $pyArgs, $modName) {
     try {
-        $null = & $pyCmd -c "import $modName" 2>&1
+        $null = & $pyCmd @($pyArgs) -c "import $modName" 2>&1
         return ($LASTEXITCODE -eq 0)
     } catch {
         return $false
@@ -79,17 +102,24 @@ Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
 # ---- 1/6: 查找 Python ----
-Step-Start 1 6 "查找 Python"
-$py = Find-Python
+Step-Start 1 6 "查找 Python ($Arch)"
+$py = Find-Python -Arch $Arch
 if (-not $py) {
-    Step-Fail "未找到 python.exe, 请先安装 Python 3.10+ 并勾选 'Add Python to PATH'"
+    if ($Arch -eq 'x86') {
+        Step-Fail "未找到 32 位 Python"
+        Write-Host "      x86 构建需先安装 32 位 Python (python.org 下载 Windows installer (32-bit))" -ForegroundColor Yellow
+        Write-Host "      再执行: py -3.13-32 -m pip install scapy pyinstaller" -ForegroundColor Yellow
+    } else {
+        Step-Fail "未找到 python.exe, 请先安装 Python 3.10+ 并勾选 'Add Python to PATH'"
+    }
     Read-Host "`n  按 Enter 退出"; exit 1
 }
-Step-Ok "($($py.Ver)  via: $($py.Cmd))"
+$pyArgs = @($py.PyArgs)
+Step-Ok "($($py.Ver) $($pyArgs -join ' ') via: $($py.Cmd))"
 
 # ---- 2/6: 检查/安装依赖 ----
 Step-Start 2 6 "检查依赖"
-$pip = Find-Pip $py.Cmd
+$pip = Find-Pip $py.Cmd $pyArgs
 if (-not $pip) {
     Step-Fail "未找到 pip. 请运行: $($py.Cmd) -m ensurepip --upgrade"
     Read-Host "`n  按 Enter 退出"; exit 1
@@ -107,7 +137,7 @@ $required = @{
 }
 $missing = @()
 foreach ($entry in $required.GetEnumerator()) {
-    $installed = Test-Module $py.Cmd $entry.Value
+    $installed = Test-Module $py.Cmd $pyArgs $entry.Value
     if (-not $installed) { $missing += $entry.Key }
 }
 
@@ -156,10 +186,10 @@ Step-Start 4 6 "打包 EXE (单文件, 通常 30-90 秒)"
 #  - 删 tkinter hiddenimport (零使用)
 #  - --exclude-module cryptography + tkinter (scapy TLS 自动降级, 已实测)
 #  - 不启用 UPX (解压反向拖慢启动 + 杀软误报)
+$exeName = if ($Arch -eq 'x86') { 'NetPulse_x86' } else { 'NetPulse' }
 $piArgs = @(
     '--onefile', '--console', '--noconfirm',
-    '--name', 'NetPulse',
-    '--add-data', 'speedtest/speedtest.exe;speedtest',
+    '--name', $exeName,
     '--hidden-import', 'scapy.all',
     '--collect-all', 'scapy',
     '--exclude-module', 'cryptography',
@@ -167,6 +197,11 @@ $piArgs = @(
     '--log-level', 'WARN',
     'netpulse.py'
 )
+# Ookla speedtest.exe 官方只有 x64 版 — x86 构建不随包:
+# 内置国内 HTTP 多连接测速不受影响, Ookla 对照测速 (--speedtest-net) 缺失时降级跳过
+if ($Arch -ne 'x86') {
+    $piArgs += @('--add-data', 'speedtest/speedtest.exe;speedtest')
+}
 
 # 后台跑 pyinstaller, 同时显示旋转动画
 # 不用 Start-Job (splat 在 job scriptblock 里行为不稳定), 改用 Start-Process
@@ -181,7 +216,7 @@ if (Test-Path $stderrLog) { Remove-Item $stderrLog -Force }
 # py 启动器 ('py') 没有父路径概念, 用 python -c "import sys; print(sys.executable)" 拿真实解释器位置
 $pyinstallerCmd = $null
 try {
-    $realPython = & $py.Cmd -c "import sys; print(sys.executable)" 2>&1
+    $realPython = & $py.Cmd @pyArgs -c "import sys; print(sys.executable)" 2>&1
     if ($LASTEXITCODE -eq 0) {
         $pyScripts = Join-Path (Split-Path $realPython.Trim() -Parent) 'Scripts\pyinstaller.exe'
         if (Test-Path $pyScripts) { $pyinstallerCmd = $pyScripts }
@@ -260,7 +295,7 @@ Step-Ok
 
 # ---- 5/6: 验证 EXE ----
 Step-Start 5 6 "验证 EXE"
-$exePath = Join-Path $PSScriptRoot 'dist\NetPulse.exe'
+$exePath = Join-Path $PSScriptRoot "dist\$exeName.exe"
 if (-not (Test-Path $exePath)) {
     Step-Fail "EXE 未生成"
     Read-Host "`n  按 Enter 退出"; exit 1
@@ -268,7 +303,7 @@ if (-not (Test-Path $exePath)) {
 $sizeMB = [math]::Round((Get-Item $exePath).Length / 1MB, 1)
 Step-Ok "($sizeMB MB)"
 
-# ---- 6/6: 清理临时文件 (build 工作区 + 合并日志, 保留 dist/NetPulse.exe) ----
+# ---- 6/6: 清理临时文件 (build 工作区 + 合并日志, 保留 dist/$exeName.exe) ----
 Step-Start 6 6 "清理临时文件"
 $cleanedSize = 0
 $cleanedItems = @()
@@ -296,7 +331,7 @@ if ($cleanedItems.Count -gt 0) {
 # ---- 完成 ----
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Green
-Write-Host "  [完成] dist\NetPulse.exe 已就绪" -ForegroundColor Green
+Write-Host "  [完成] dist\$exeName.exe 已就绪" -ForegroundColor Green
 Write-Host "============================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "  部署注意:" -ForegroundColor Yellow
@@ -305,6 +340,6 @@ Write-Host "      无管理员时自动降级 ipconfig 简化检测, 仍可用" 
 Write-Host "    - iperf3 测速: 首次跑会询问是否自动下载 (默认 Y, ~2MB)" -ForegroundColor Yellow
 Write-Host "      也可手动下载 https://iperf.fr/iperf-download.php 放 EXE 同目录" -ForegroundColor Yellow
 Write-Host "    - Ookla Speedtest: speedtest.exe 已打包进 EXE, --speedtest-net 启用" -ForegroundColor Yellow
-Write-Host "      (国内自动选点可能偏海外, 用 --speedtest-node <ID> 指定国内服务器)" -ForegroundColor Yellow
+Write-Host "      (国内自动选点可能偏海外, 用 --speedtest-node <ID> 指定国内服务器; x86 构建无此项)" -ForegroundColor Yellow
 Write-Host ""
 Read-Host "  按 Enter 退出"

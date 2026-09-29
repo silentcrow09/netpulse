@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.14.3
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.14.4
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -305,9 +305,13 @@ python netpulse.py all --port-target 223.5.5.5:53 --export report.html,report.js
 ## 📦 打包为单文件 EXE
 
 ```bash
-build_exe.bat
-# 生成的 EXE 位于 dist\NetPulse.exe
+build_exe.bat              # 64 位 (默认) → dist\NetPulse.exe
+build_exe.bat -Arch x86    # 32 位 → dist\NetPulse_x86.exe (老机器/32 位系统)
 ```
+
+> 32 位构建需先装 32 位 Python（python.org 下 Windows installer (32-bit)），
+> 再 `py -3.13-32 -m pip install scapy pyinstaller`；Ookla `speedtest.exe` 官方无
+> 32 位版不随包，内置 HTTP 多连接测速不受影响，`--speedtest-net` 对照测速自动降级跳过。
 
 > 若需 DHCP 完整检测，目标机需安装 [Npcap](https://npcap.com/)（勾选 WinPcap API 兼容模式）；
 > 默认测速 = 带宽体检：下行（国内镜像多连接）+ 上行（内置国内运营商节点）+ 预估宽带 +
@@ -349,14 +353,15 @@ irm https://.../v1/install.ps1 | iex -- all --export report.html
 
 ### 手动上传一个版本
 
-每次发版需要往 OSS 放 3 个文件（首次还要加 `install.ps1`）：
+每次发版需要往 OSS 放 4 个文件（首次还要加 `install.ps1`）：
 
 ```
 oss://<bucket>/netpulse/v1/
-├── install.ps1       ← 首次部署上传一次, 之后不变
-├── netpulse.py       ← 每次发版覆盖
-├── netpulse.exe      ← 每次发版覆盖 (可选)
-└── index.json        ← 每次发版覆盖 (含 SHA256, 见下方生成)
+├── install.ps1        ← 首次部署上传一次, 之后不变 (v1.14.4 起按 OS 位数自动选包)
+├── netpulse.py        ← 每次发版覆盖
+├── netpulse.exe       ← 每次发版覆盖 (64 位)
+├── netpulse_x86.exe   ← 每次发版覆盖 (32 位; GitHub Release 的 NetPulse_x86.exe 重命名即可)
+└── index.json         ← 每次发版覆盖 (含 SHA256, 见下方生成)
 ```
 
 **生成 `index.json`**（PowerShell 一行搞定）：
@@ -365,6 +370,7 @@ oss://<bucket>/netpulse/v1/
 $pySha = (Get-FileHash netpulse.py -Algorithm SHA256).Hash.ToLower()
 $pySize = (Get-Item netpulse.py).Length
 $exePath = ".\dist\NetPulse.exe"
+$exeX86Path = ".\dist\NetPulse_x86.exe"     # 从 GitHub Release 下载 NetPulse_x86.exe 放这里
 $hasExe = Test-Path $exePath
 $index = [ordered]@{
   version = "v1.0.0"   # ← 改这里
@@ -373,6 +379,9 @@ $index = [ordered]@{
 }
 if ($hasExe) {
   $index.exe = @{ file = "netpulse.exe"; sha256 = (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLower(); size = (Get-Item $exePath).Length }
+}
+if (Test-Path $exeX86Path) {
+  $index.exe_x86 = @{ file = "netpulse_x86.exe"; sha256 = (Get-FileHash $exeX86Path -Algorithm SHA256).Hash.ToLower(); size = (Get-Item $exeX86Path).Length }
 }
 $index | ConvertTo-Json -Depth 5 | Set-Content index.json -Encoding UTF8
 ```
@@ -383,10 +392,11 @@ $index | ConvertTo-Json -Depth 5 | Set-Content index.json -Encoding UTF8
 # 方式 A: aliyun CLI (推荐)
 aliyun oss cp netpulse.py      oss://<bucket>/netpulse/v1/netpulse.py --force
 aliyun oss cp dist\NetPulse.exe oss://<bucket>/netpulse/v1/netpulse.exe --force  # 有 EXE 才传
+aliyun oss cp dist\NetPulse_x86.exe oss://<bucket>/netpulse/v1/netpulse_x86.exe --force  # 有 32 位 EXE 才传
 aliyun oss cp index.json       oss://<bucket>/netpulse/v1/index.json --force
 
 # 方式 B: OSS 控制台拖拽
-# 把上面 3 个文件拖到 bucket 的 netpulse/v1/ 目录下, 设置 ACL = 公共读
+# 把上面 4 个文件拖到 bucket 的 netpulse/v1/ 目录下, 设置 ACL = 公共读
 ```
 
 ### 灰度发布

@@ -172,7 +172,8 @@ RFC 3849 文档前缀、假 hostname/GUID）；真实抓包或含隐私的本地
   回落源的“无新版”答案不写缓存，否则陈旧答案锁死提示一整天）；提示行走 `UPDATE_DL_PROXY`(gh-proxy.com) 加速前缀。菜单渲染
   经 `_update_notice_line()` 读 `_UPDATE_STATE`（锁保护）；`--json`/CLI
   单次运行不显示提示；测试改这几个函数时全部 mock 网络，不许真实联网
-- 打包：`build_exe.bat` 或 `build_exe.ps1` → `dist/NetPulse.exe`。
+- 打包：`build_exe.bat` 或 `build_exe.ps1` → `dist/NetPulse.exe`（64 位默认；
+  `-Arch x86` 出 32 位 `NetPulse_x86.exe`，需另装 32 位 Python，Ookla exe 不随包）。
   改了 `netpulse.py` 后需重新打包，否则 exe 落后于代码
 - 根目录 `nul` 是 Windows 保留设备名误产生的 54B 垃圾文件，
   常规删除方式（`rm` / PowerShell / Python）都会被解析成设备路径而失败，已在 `.gitignore` 忽略

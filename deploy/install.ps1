@@ -194,9 +194,23 @@ if ($useExe) {
         Write-Host "  请先在管理端打包并上传 netpulse.exe" -ForegroundColor Gray
         exit 1
     }
-    $localFile = Join-Path $tempDir $index.exe.file
-    Get-NetPulseFile -RemoteName $index.exe.file -LocalPath $localFile
-    Test-Sha256 -FilePath $localFile -Expected $index.exe.sha256
+    # v1.14.4: 按 OS 位数选包 — 32 位系统必须用 x86 包 (x64 包根本跑不起来);
+    # index.json 无 exe_x86 字段时硬报错 (下载 25MB 再跑不起来更糟糕)
+    $exeEntry = $index.exe
+    if (-not [Environment]::Is64BitOperatingSystem) {
+        if ($index.exe_x86) {
+            $exeEntry = $index.exe_x86
+            Write-Ok "32-bit OS detected, using x86 build"
+        } else {
+            Write-Err "32 位系统需要 x86 版 EXE, 但 index.json 没有 exe_x86 字段"
+            Write-Host "  请在管理端构建并上传 netpulse_x86.exe 后更新 index.json" -ForegroundColor Gray
+            Write-Host "  (或本机装 Python 3.8+ 后重跑, Python 模式与位数无关)" -ForegroundColor Gray
+            exit 1
+        }
+    }
+    $localFile = Join-Path $tempDir $exeEntry.file
+    Get-NetPulseFile -RemoteName $exeEntry.file -LocalPath $localFile
+    Test-Sha256 -FilePath $localFile -Expected $exeEntry.sha256
     $runCmd = "& `"$localFile`""
 } else {
     if (-not $index.python) {

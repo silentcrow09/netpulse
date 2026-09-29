@@ -1,18 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from PyInstaller.utils.hooks import collect_all
 
-# v1.9.7 启动优化 PR-1 (打包瘦身):
-#  - datas 不再打包 netpulse.py 源码 (Analysis 已将其冻结进 PYZ, 此前是重复 ~0.7MB)
-#  - hiddenimports 删 tkinter (代码零使用, 白拖 ~3MB tcl/tk)
-#  - excludes 屏蔽 cryptography (仅 scapy TLS 层需要; NetPulse 只用 ARP/DHCP/DNS/
-#    ICMP/TCP, scapy 对缺失 cryptography 自动降级 — 已实测 scapy.all 可正常导入,
-#    且导入耗时 1.11s -> 0.64s)
-#  - upx 关闭 (UPX 解压发生在每次启动, 反向拖慢 onefile; 且是 Defender/SmartScreen
-#    误报大户, 拉长冷启动扫描)
-datas = [('speedtest/speedtest.exe', 'speedtest')]
+# NETPULSE_ARCH=x86 (GitHub Actions / 手动) 时构建 32 位版:
+# 产物 NetPulse_x86.exe, 不打包 speedtest.exe — Ookla 官方无 win32 版,
+# 内置 HTTP 多连接测速不受影响, --speedtest-net 对照测速自动降级跳过
+IS_X86 = os.environ.get('NETPULSE_ARCH', '') == 'x86'
+
+datas = [] if IS_X86 else [('speedtest/speedtest.exe', 'speedtest')]
 binaries = []
 hiddenimports = ['scapy.all']
-excludes = ['cryptography', 'tkinter']
 tmp_ret = collect_all('scapy')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
@@ -26,7 +23,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=excludes,
+    excludes=['cryptography', 'tkinter'],
     noarchive=False,
     optimize=0,
 )
@@ -38,11 +35,11 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='NetPulse',
+    name='NetPulse_x86' if IS_X86 else 'NetPulse',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,
+    upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=True,

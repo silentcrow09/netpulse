@@ -17,21 +17,23 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 设置 Python 3.13
+      - name: 设置 Python 3.13 (x64)
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+          architecture: 'x64'
 
-      - name: 安装构建依赖
+      - name: 安装构建依赖 (x64)
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller scapy
+          python -m pip install pyinstaller scapy
 
       - name: 下载 Ookla Speedtest CLI
         shell: pwsh
         run: |
           # speedtest/ 目录被 .gitignore 忽略, GitHub 上没有 speedtest.exe
           # 但 NetPulse.spec 把它作为 datas 打包, 所以 Actions 必须先下载一份
+          # (仅 x64 — Ookla 官方无 win32 版, x86 构建不打包它)
           $dst = "speedtest/speedtest.exe"
           if (-not (Test-Path $dst)) {
             New-Item -ItemType Directory -Force -Path "speedtest" | Out-Null
@@ -56,7 +58,7 @@ jobs:
           }
           Write-Host "speedtest/speedtest.exe 就绪: $((Get-Item speedtest/speedtest.exe).Length) bytes"
 
-      - name: PyInstaller 打包
+      - name: PyInstaller 打包 (x64)
         run: |
           pyinstaller --noconfirm NetPulse.spec 2>&1 | Tee-Object -FilePath build.log
           if ($LASTEXITCODE -ne 0) {
@@ -64,39 +66,67 @@ jobs:
             exit $LASTEXITCODE
           }
 
+      - name: 切换 32 位 Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: 'x86'
+
+      - name: 安装构建依赖 (x86)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller scapy
+
+      - name: PyInstaller 打包 (x86)
+        env:
+          NETPULSE_ARCH: x86
+        run: |
+          pyinstaller --noconfirm NetPulse.spec 2>&1 | Tee-Object -FilePath build_x86.log
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::PyInstaller(x86) 退出码 $LASTEXITCODE, 详见 build_x86.log"
+            exit $LASTEXITCODE
+          }
+
       - name: 校验产物
         run: |
-          if (-not (Test-Path "dist/NetPulse.exe")) {
-            Write-Error "dist/NetPulse.exe 未生成, 构建失败"
-            exit 1
+          foreach ($name in @('NetPulse', 'NetPulse_x86')) {
+            if (-not (Test-Path "dist/$name.exe")) {
+              Write-Error "dist/$name.exe 未生成, 构建失败"
+              exit 1
+            }
+            $size = (Get-Item "dist/$name.exe").Length
+            Write-Host "$name.exe 大小: $([math]::Round($size / 1MB, 2)) MB"
           }
-          $size = (Get-Item "dist/NetPulse.exe").Length
-          Write-Host "NetPulse.exe 大小: $([math]::Round($size / 1MB, 2)) MB"
 
       - name: 上传构建日志（成功失败都上传, 便于排查）
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-log
-          path: build.log
+          path: |
+            build.log
+            build_x86.log
           if-no-files-found: ignore
 
       - name: 计算 SHA256
         id: hash
         shell: pwsh
         run: |
-          $hash = (Get-FileHash -Algorithm SHA256 "dist/NetPulse.exe").Hash.ToLower()
-          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "SHA256: $hash"
+          $lines = foreach ($name in @('NetPulse', 'NetPulse_x86')) {
+              $hash = (Get-FileHash -Algorithm SHA256 "dist/$name.exe").Hash.ToLower()
+              Write-Host "$name.exe SHA256: $hash"
+              "- ``$name.exe``: ``$hash``"
+          }
+          "summary=$($lines -join "`n")" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: 准备 Release 资源
         shell: pwsh
         run: |
-          Compress-Archive -Path "dist/NetPulse.exe" -DestinationPath "dist/NetPulse.zip" -Force
-          Copy-Item "dist/NetPulse.exe" -Destination "dist/NetPulse.exe.sha256.txt"
-          # 把哈希写进 .sha256 文件
-          $hash = (Get-FileHash -Algorithm SHA256 "dist/NetPulse.exe").Hash.ToLower()
-          Set-Content -Path "dist/NetPulse.exe.sha256.txt" -Value "$hash  NetPulse.exe"
+          foreach ($name in @('NetPulse', 'NetPulse_x86')) {
+            Compress-Archive -Path "dist/$name.exe" -DestinationPath "dist/$name.zip" -Force
+            $hash = (Get-FileHash -Algorithm SHA256 "dist/$name.exe").Hash.ToLower()
+            Set-Content -Path "dist/$name.exe.sha256.txt" -Value "$hash  $name.exe"
+          }
 
       - name: 创建 Release 并上传
         uses: softprops/action-gh-release@v2
@@ -106,14 +136,19 @@ jobs:
             dist/NetPulse.exe
             dist/NetPulse.zip
             dist/NetPulse.exe.sha256.txt
+            dist/NetPulse_x86.exe
+            dist/NetPulse_x86.zip
+            dist/NetPulse_x86.exe.sha256.txt
           body: |
             ## NetPulse ${{ github.ref_name }}
 
-            **SHA256**: `${{ steps.hash.outputs.sha256 }}`
+            **SHA256**:
+            ${{ steps.hash.outputs.summary }}
 
             ### 下载说明
-            - `NetPulse.exe` — 单文件可执行版本（约 25 MB）
-            - `NetPulse.zip` — 同上，ZIP 压缩版（解压后与 .exe 等价）
+            - `NetPulse.exe` — 64 位单文件可执行版本（Windows x64）
+            - `NetPulse_x86.exe` — 32 位单文件可执行版本（老机器 / 32 位 Windows；不含 Ookla 对照测速，其余功能一致）
+            - `NetPulse*.zip` — 同上，ZIP 压缩版（解压后与 .exe 等价）
             - `.sha256.txt` — 哈希校验文件
 
             ### 校验方法
