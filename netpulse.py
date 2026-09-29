@@ -3568,7 +3568,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.9"
+APP_VERSION = "1.14.10"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -19208,7 +19208,533 @@ def render_report_html_brief(report):
 </body>
 </html>
 """
+# ══════════════════════════════════════════════════════════════════════════
+# 模板D 极简报款 (v2, 与 design_ref 同源) — A4 2 页, 选项 6 现场检测模式专用 (本地工作区)
+# ══════════════════════════════════════════════════════════════════════════
+# 设计稿: design_ref/report_templates/模板D_现代仪表盘风.html
+# - 报头藏蓝实色 + 电信 logo (复用现网 _CT_LOGO_BRIEF_B64)
+# - 评分主区 (donut + verdict + 签约) / KPI 4 列 / 主要发现
+# - 机房 6 项 grid (待整改独立红框) / 现场备注
+# - 续报头 + 检测明细 20 行全表 + 页脚
+# 收口: 与现网 brief 一样从 build_report() 输出读取 (不读 LAST_RUN)。
+# 安全: 文本节点 _html_esc (quote=False), 属性一律 _html_attr (quote=True, v1.5.0 P0)。
+# 现场模式不走 _PRESENT_.. 文案抽离 (现场仅选项 6 用, 第三方不需要抽)。
 
+def render_report_html_brief_v2(report):
+    """模板D 极简报款 渲染 (A4 2 页, 选项 6 现场检测模式出口)。
+
+    不修改现网 render_report_html_brief; 通过 export_report(layout='brief_v2') 接入。
+    """
+    if not report:
+        return "<p>尚无诊断数据，请先运行诊断</p>"
+
+    g = (report["generated_at"].strftime("%Y-%m-%d %H:%M")
+         if hasattr(report["generated_at"], "strftime") else str(report["generated_at"] or ""))
+    health = report.get("health") or {}
+    counts = report.get("counts") or {}
+    modules = report.get("modules") or []
+    by_key = {m.get("key"): m for m in modules}
+    mm = report.get("meta_manual") or {}
+    sc = report.get("site_check") or {}
+    site_note = report.get("site_note") or ""
+    rcs = (report.get("diagnosis") or {}).get("root_causes") or []
+    all_counts = {}
+    for st in (report.get("summary") or {}).values():
+        all_counts[st] = all_counts.get(st, 0) + 1
+    score = health.get("score") or 0
+    grade = health.get("grade") or "—"
+    label = health.get("label") or "—"
+    exempt_count = report.get("exempt_count", 0) or 0
+
+    def _raw(key):
+        return (by_key.get(key) or {}).get("raw") or {}
+
+    customer = _brief_clip(mm.get("customer") or "客户", _BRIEF_CLIP["customer"])
+    tested_at = _brief_clip(mm.get("tested_at") or g, 20)
+    plan_str = str(mm.get("plan") or "").strip()
+    m_plan = re.search(r"(\d+(?:\.\d+)?)\s*M(?:BPS)?", plan_str, re.IGNORECASE)
+    plan_mbps = float(m_plan.group(1)) if m_plan else None
+    total_mods = sum(all_counts.values()) or len(by_key)
+    scored_mods = sum(counts.values())
+    n_checked = len(sc)
+    n_site_bad = sum(1 for k, v in sc.items()
+                     if v in SITE_CHECK_BY_KEY.get(k, {}).get("bad", []))
+
+    speed_raw = _raw("speedtest")
+    spd_download = speed_raw.get("download_mbps")
+    spd_upload = speed_raw.get("upload_mbps")
+    spd_method = speed_raw.get("method", "—")
+    ping = _raw("gateway").get("ping") or {}
+    g_avg = ping.get("avg_ms")
+    g_loss = ping.get("loss_pct")
+    tcpstats_raw = _raw("tcpstats")
+    retrans_rate = tcpstats_raw.get("retrans_rate_pct") or tcpstats_raw.get("retransmits_pct")
+
+    def _fmt_mbps(v):
+        try: v = float(v)
+        except (TypeError, ValueError): return None
+        return f"{v:.0f}" if v >= 100 else f"{v:.1f}"
+
+    def _fmt_pct(v):
+        try: return f"{float(v):.1f}"
+        except (TypeError, ValueError): return None
+
+    dl = _fmt_mbps(spd_download)
+    ul = _fmt_mbps(spd_upload)
+    plan_ok = (plan_mbps and spd_download and spd_download / plan_mbps >= 0.9)
+    plan_ratio = (spd_download / plan_mbps * 100) if (plan_mbps and spd_download) else None
+
+    _exm = _exempt_names(report)
+    exempt_bad = sorted(
+        MODULE_MAP.get(k, (k, k))[0]
+        for k, st in (report.get("summary") or {}).items()
+        if st not in ("完成", "未检测") and k in SCORE_EXEMPT_MODULES)
+
+    cap = (f'健康分 {score} 分: 实检 {total_mods} 项, {scored_mods} 项参与计分')
+    if _exm:
+        cap += (f', {len(_exm)} 项评分豁免 ({_html_esc("、".join(_exm))}; '
+                f'可选/环境类检查, 不扣分)')
+    cap += '。'
+    if exempt_bad:
+        cap += (f'其中 {_html_esc("、".join(exempt_bad))} '
+                f'本次有异常/警告显示, 按豁免规则不计分。')
+
+    findings = []
+    for rc in rcs[:4]:
+        title = _brief_clip(rc.get("title", ""), _BRIEF_CLIP["title"])
+        sev = (rc.get("severity") or "low").lower()
+        desc = _brief_clip(rc.get("description", ""), _BRIEF_CLIP["desc"])
+        act = _brief_clip(rc.get("action") or rc.get("recommendation") or "",
+                          _BRIEF_CLIP["advice"])
+        findings.append({"sev": sev, "title": title, "desc": desc, "act": act})
+    if _exm and exempt_bad:
+        findings.append({
+            "sev": "exempt",
+            "title": _brief_clip("豁免项显示异常(不计分)", _BRIEF_CLIP["title"]),
+            "desc": "评分豁免项: 可选/环境类检查, 本次有状态显示但按规则不扣分。",
+            "act": "",
+        })
+
+    site_rows = []
+    bad_row = None
+    for it in SITE_CHECK_ITEMS:
+        key = it["key"]; sel = sc.get(key); nm = it["label"]
+        if not sel: status, klass = "未检查", "muted"
+        elif sel in it["bad"]: status, klass = "待整改", "bad"
+        else: status, klass = "正常", "ok"
+        if klass == "bad":
+            bad_row = {"key": key, "nm": nm, "sel": sel,
+                       "issue": sel, "advice": it["advice"]}
+        else:
+            site_rows.append({"nm": nm, "status": status, "klass": klass})
+
+    stat_color = {"异常": "high", "错误": "high", "警告": "mid",
+                  "完成": "ok", "未检测": "na"}
+    detail_rows = []
+    for m in modules:
+        key = m.get("key"); st = m.get("status", "未检测")
+        detail_rows.append({
+            "nm": m.get("name", key),
+            "verdict": m.get("verdict", "") or "—",
+            "metric": _fmt_kpi_for_detail(key, _raw(key)),
+            "stat": st,
+            "stat_class": stat_color.get(st, "ok"),
+        })
+
+    def sev_class(s): return {"high": "high", "mid": "mid"}.get(s, "low")
+    def sev_pill(s):
+        return {"high": ("异常", "high"), "mid": ("警告", "mid"),
+                "exempt": ("豁免", "exempt")}.get(s, ("", ""))
+
+    findings_html = ""
+    for i, f in enumerate(findings, 1):
+        sev = sev_class(f["sev"])
+        pill_text, pill_class = sev_pill(f["sev"])
+        title = _html_esc(f["title"])
+        desc = _html_esc(f["desc"])
+        act_html = ""
+        if f["act"]:
+            act_html = (f'<div class="act"><span class="lbl">整改建议</span>  '
+                        f'{_html_esc(f["act"])}</div>')
+        findings_html += (
+            f'<div class="f {sev}"><div class="num">{i:02d}</div><div>'
+            f'<div class="row"><span class="ttl">{title}</span>'
+            f'<span class="badge {pill_class}">{_html_esc(pill_text)}</span></div>'
+            f'<div class="obs">{desc}</div>{act_html}</div></div>')
+
+    site_grid_html = ""
+    for r in site_rows:
+        site_grid_html += (
+            f'<div class="it"><span class="st {r["klass"]}">'
+            f'{_html_esc(r["status"])}</span>'
+            f'<div class="nm">{_html_esc(r["nm"])}</div></div>')
+    bad_row_html = ""
+    if bad_row:
+        bad_row_html = (
+            f'<div class="bad-row">'
+            f'<span class="lab">[待整改]</span>'
+            f'<b>{_html_esc(bad_row["nm"])}</b> '
+            f'<span class="lab">问题</span>{_html_esc(bad_row["issue"])} '
+            f'<span class="lab">建议</span>{_html_esc(bad_row["advice"])}'
+            f'</div>')
+    site_note_html = ""
+    if site_note:
+        site_note_html = (
+            f'<div class="note"><b>现场备注(装维手输):</b>'
+            f'{_html_esc(_brief_clip(site_note, 90))}</div>')
+
+    detail_html = ""
+    for d in detail_rows:
+        st_text = d["stat"] if d["stat"] != "未检测" else "—"
+        detail_html += (
+            f'<tr><td class="mod">{_html_esc(d["nm"])}</td>'
+            f'<td>{_html_esc(d["verdict"])}</td>'
+            f'<td class="num">{_html_esc(d["metric"])}</td>'
+            f'<td style="text-align:right">'
+            f'<span class="stat {d["stat_class"]}">{_html_esc(st_text)}</span>'
+            f'</td></tr>')
+
+    score_color = {"A": "#1e6e44", "B": "#5d80a6", "C": "#ad6e10",
+                   "D": "#b8730f", "F": "#b3261e"}.get(grade, "#5b6472")
+    circumference = 263.89
+    dasharray = f"{circumference * score / 100:.1f} {circumference:.1f}"
+
+    if plan_mbps is None or spd_download is None:
+        plan_html = (f'<div class="plan">'
+                     f'<div class="head">签约带宽</div>'
+                     f'<div class="big num">—</div>'
+                     f'<div class="desc">未填写签约带宽</div></div>')
+    else:
+        plan_class = "" if plan_ok else "fail"
+        plan_html = (f'<div class="plan {plan_class}">'
+                    f'<div class="head">签约带宽</div>'
+                    f'<div class="big num">{_html_esc(plan_str or f"{int(plan_mbps)}M")}</div>'
+                    f'<div class="desc">实测下行 {_html_esc(dl or "?")} Mbps'
+                    f'<br>阈值 ≥90% → {"达标" if plan_ok else "未达标"}</div></div>')
+
+    logo = _CT_LOGO_BRIEF_B64
+    headline = (f'网络可用、测速<span class="ok">达标 {plan_ratio:.0f}%</span>'
+                if plan_ok else f'测速不达标 {plan_ratio:.0f}%')
+
+    html = f'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>现场检测报告 · {_html_attr(customer)}</title>
+<style>
+{CSS_BRIEF_V2}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="mast">
+    <div class="brand">
+      <img src="data:image/png;base64,{logo}" alt="中国电信">
+      <div><div class="org">CHINA TELECOM</div>
+      <div class="sub">NETPULSE · 现场检测</div></div>
+    </div>
+    <div class="doc">
+      <div class="no">报告编号 {_html_esc((g[:10].replace("-","") if g else "现场") + "-现场")}</div>
+      检测日期 {_html_esc(tested_at)}<br>
+      现场检测 {total_mods} 项 · 实检 {total_mods} 项
+    </div>
+  </div>
+  <div class="title">
+    <h1>{_html_esc(customer)}</h1>
+    <div class="strip">
+      <div class="l"><span>网络现场检测报告</span>
+        <span>{_html_esc(tested_at)}</span>
+        {f'<span>签约带宽 {int(plan_mbps)}M</span>' if plan_mbps else ''}
+      </div>
+      <div class="r">选项 6 · 现场检测报告</div>
+    </div>
+  </div>
+  <div class="score">
+    <div class="donut">
+      <svg width="100" height="100" viewBox="0 0 100 100">
+        <circle cx="50" cy="50" r="42" fill="none" stroke="#eef0f4" stroke-width="9"/>
+        <circle cx="50" cy="50" r="42" fill="none" stroke="{score_color}" stroke-width="9"
+                stroke-dasharray="{dasharray}" stroke-linecap="butt"
+                transform="rotate(-90 50 50)"/>
+      </svg>
+      <div class="v num"><b>{score}</b><span>SCORE</span></div>
+    </div>
+    <div class="verdict">
+      <div class="grade">{_html_esc(grade)} 级 · {_html_esc(label)}</div>
+      <div class="head">{headline}</div>
+      <div class="note">{_html_esc(cap)}</div>
+    </div>
+    {plan_html}
+  </div>
+  <div class="kpi">
+    <div><div class="label">下行实测</div>
+      <div class="value num">{_html_esc(dl or "—")}<small>Mbps</small></div>
+      <div class="delta">签约 {int(plan_mbps) if plan_mbps else "—"}M</div></div>
+    <div><div class="label">上行实测</div>
+      <div class="value num">{_html_esc(ul or "—")}<small>Mbps</small></div>
+      <div class="delta">{_html_esc(spd_method)}</div></div>
+    <div><div class="label">网关延迟</div>
+      <div class="value num">{_fmt_pct(g_avg) or "—"}<small>ms</small></div>
+      <div class="delta">优秀(&lt;10ms){f" · 丢包 {_fmt_pct(g_loss)}%" if g_loss else ""}</div></div>
+    <div><div class="label">出口重传率</div>
+      <div class="value num">{_fmt_pct(retrans_rate) or "—"}<small>%</small></div>
+      <div class="delta">{'偏高(&lt;2% 优)' if (retrans_rate and retrans_rate > 2) else '正常'}</div></div>
+  </div>
+  <div class="sec-h"><div class="n">§</div><div class="t">主要发现</div>
+    <div class="r">按优先级 · 完整根因链见随单完整版报告</div></div>
+  <div class="findings">{findings_html}</div>
+  <div class="sec-h"><div class="n">§</div><div class="t">机房环境检查</div>
+    <div class="r">{n_checked} 项 · {n_checked - n_site_bad} 正常 / {n_site_bad} 待整改</div></div>
+  <div class="site">
+    <div class="grid6">{site_grid_html}</div>
+    {bad_row_html}
+    {site_note_html}
+  </div>
+</div>
+<div class="page">
+  <div class="mast mast-2">
+    <div class="brand">
+      <img src="data:image/png;base64,{logo}" alt="中国电信">
+      <div><div class="org">CHINA TELECOM</div>
+      <div class="sub">现场检测报告 · 检测明细</div></div>
+    </div>
+    <div class="doc">
+      <div class="no">客户:{_html_esc(customer)}</div>
+      测试时间:{_html_esc(tested_at)}
+    </div>
+  </div>
+  <div class="sec-h" style="margin-top:6mm"><div class="n">§</div><div class="t">检测明细</div>
+    <div class="r">{total_mods} 项 · 技术细节见完整版</div></div>
+  <div class="detail" style="padding-top:2mm">
+    <table>
+      <tr><th style="width:22%">模块</th><th>关键结果</th>
+          <th style="width:18%">重点指标</th>
+          <th style="width:12%;text-align:right">状态</th></tr>
+      {detail_html}
+    </table>
+  </div>
+  <div class="foot">
+    <div class="l">随单交付:<b>一页客户报告</b> · 完整版报告 · JSON 原始数据 · PDF(Chrome/Edge)<br>
+      整改项建议<b>下次上门免费复核</b></div>
+    <div class="r">数据仅反映检测时点<br><b>NetPulse {_html_esc(report.get("version","v1"))}</b></div>
+  </div>
+</div>
+</body>
+</html>'''
+    return html
+
+
+def _fmt_kpi_for_detail(key, raw):
+    """检测明细表“重点指标”列: 按模块 key 取一个紧凑指标串。
+
+    仅取有意义的标量, 拼不出就空字符串 — 不为追求统一字段名造空值。
+    """
+    if not isinstance(raw, dict):
+        return ""
+    if key == "speedtest":
+        dl = raw.get("download_mbps"); ul = raw.get("upload_mbps")
+        if dl is not None and ul is not None:
+            return f"↓ {dl:.0f} · ↑ {ul:.0f} Mbps"
+    if key == "gateway":
+        p = raw.get("ping") or {}
+        if p.get("avg_ms") is not None:
+            return f"{p['avg_ms']:.1f} ms"
+    if key == "tcpstats":
+        r = raw.get("retrans_rate_pct")
+        if r is not None: return f"{r:.1f} %"
+    if key == "dns":
+        items = raw.get("items") or raw.get("results") or []
+        if items and isinstance(items, list):
+            ms = [it.get("avg_ms") for it in items
+                  if isinstance(it, dict) and it.get("avg_ms") is not None]
+            if ms: return f"{min(ms):.0f} ms"
+    if key == "wifi":
+        ch = raw.get("current_channel"); n = raw.get("network_count")
+        if ch and n: return f"信道 {ch} · {n} AP"
+    if key == "dhcp":
+        avail = raw.get("available"); tot = raw.get("total")
+        if avail is not None and tot: return f"{avail}/{tot}"
+    if key == "lan":
+        n = raw.get("device_count") or raw.get("online_count")
+        if n is not None: return f"{n} 台"
+    if key == "arp":
+        bad = raw.get("anomaly_count")
+        if bad is not None: return f"{bad} 异常"
+    if key == "loop":
+        bad = raw.get("loop_count")
+        if bad is not None: return f"{bad} 环路"
+    if key == "route":
+        n = raw.get("route_count")
+        if n is not None: return f"{n} 条"
+    if key == "mtu":
+        m = raw.get("path_mtu") or raw.get("mtu")
+        if m is not None: return f"{int(m)}"
+    if key == "multiwan":
+        n = raw.get("wan_count")
+        if n is not None: return f"{n}"
+    if key == "ipv6":
+        reachable = raw.get("reachable_count"); total = raw.get("total_count")
+        if reachable is not None and total: return f"{reachable}/{total}"
+    if key == "proxy":
+        return (raw.get("detected") and "检测到") or "无"
+    if key == "nattype":
+        return raw.get("type") or "—"
+    if key == "bufferbloat":
+        b = raw.get("bloat_ms") or raw.get("added_ms")
+        if b is not None: return f"+{b:.0f} ms"
+    if key == "web":
+        ttfb = raw.get("ttfb_ms") or raw.get("l7_ttfb")
+        if ttfb is not None: return f"TTFB {ttfb:.0f} ms"
+    if key == "external":
+        n = raw.get("reachable_count"); t = raw.get("total_count")
+        if n is not None and t: return f"{n}/{t} 目标"
+    return ""
+
+
+# CSS_BRIEF_V2 与 design_ref/report_templates/模板D_现代仪表盘风.html 同源。
+# 这里本地代码所需, 不依赖外链文件; 设计调整改这里 + design_ref 同步。
+CSS_BRIEF_V2 = """
+  @page { size: A4 portrait; margin: 0; }
+  :root {
+    --navy: #0a3b6e; --red: #b3261e; --amber: #ad6e10;
+    --green: #1e6e44; --text: #1a2230; --dim: #5b6472;
+    --mute: #98a2ad; --rule: #d8dde5; --soft: #f6f7f9;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #cdd1d8; }
+  body { font-family: "Inter", "Microsoft YaHei", "PingFang SC", sans-serif;
+         color: var(--text); -webkit-font-smoothing: antialiased; }
+  .page { width: 210mm; min-height: 296mm; background: #fff; margin: 8px auto;
+          padding: 0; display: flex; flex-direction: column;
+          break-after: page; page-break-after: always; }
+  .page:last-child { break-after: auto; page-break-after: auto; margin-bottom: 0; }
+  @media print { html, body { background: #fff; } .page { margin: 0; } }
+  .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+  .mast { background: var(--navy); color: #fff; padding: 4.5mm 12mm 4mm;
+          display: flex; align-items: center; justify-content: space-between; }
+  .mast.mast-2 { padding: 3mm 12mm 3mm; }
+  .mast.mast-2 .brand img { height: 6mm; }
+  .mast.mast-2 .brand .org { font-size: 10px; }
+  .mast.mast-2 .brand .sub { font-size: 9px; }
+  .mast.mast-2 .doc { font-size: 9.5px; }
+  .mast .brand { display: flex; align-items: center; gap: 3.5mm; }
+  .mast .brand img { height: 8mm; display: block; }
+  .mast .brand .org { font-size: 11px; font-weight: 700; letter-spacing: 1.6px; }
+  .mast .brand .sub { font-size: 9.5px; opacity: .7; letter-spacing: 1.2px;
+                       margin-top: .5mm; }
+  .mast .doc { text-align: right; font-size: 10px; line-height: 1.55; opacity: .88; }
+  .mast .doc b { opacity: 1; font-weight: 600; letter-spacing: .5px; }
+  .mast .doc .no { font-size: 11px; letter-spacing: .8px; }
+  .title { padding: 4.5mm 12mm 3mm; border-bottom: 1.5px solid var(--navy); }
+  .title h1 { font-size: 23px; font-weight: 700; letter-spacing: .3px; }
+  .title .strip { display: flex; justify-content: space-between; align-items: baseline;
+                  margin-top: 1.5mm; font-size: 11px; color: var(--dim); }
+  .title .strip .l span + span::before { content: "·"; margin: 0 4mm; color: var(--mute); }
+  .title .strip .r { color: var(--mute); font-size: 10px; }
+  .score { padding: 4mm 12mm 4mm; display: grid; grid-template-columns: 32mm 1fr 36mm;
+           gap: 6mm; border-bottom: 1px solid var(--rule); }
+  .score .donut { position: relative; display: flex; align-items: center;
+                  justify-content: center; }
+  .score .donut .v { position: absolute; text-align: center; }
+  .score .donut .v b { display: block; font-size: 30px; font-weight: 800;
+                        letter-spacing: -1px; line-height: 1; }
+  .score .donut .v span { display: block; font-size: 9px; color: var(--mute);
+                          letter-spacing: 2.5px; margin-top: 1.5mm; }
+  .score .verdict { display: flex; flex-direction: column; }
+  .score .verdict .grade { font-size: 11px; font-weight: 700;
+                           letter-spacing: 2.5px; color: var(--amber); }
+  .score .verdict .head { font-size: 17px; font-weight: 700; margin-top: 2mm;
+                          line-height: 1.4; letter-spacing: .2px; }
+  .score .verdict .head .ok { color: var(--green); font-weight: 700; }
+  .score .verdict .note { font-size: 10.5px; color: var(--dim); margin-top: auto;
+                           line-height: 1.6; }
+  .score .plan { background: var(--soft); border-top: 2.5mm solid var(--green);
+                 padding: 3mm 3.5mm; display: flex; flex-direction: column;
+                 justify-content: center; }
+  .score .plan.fail { border-top-color: var(--red); }
+  .score .plan .head { font-size: 9.5px; letter-spacing: 1.5px; color: var(--dim);
+                       font-weight: 600; }
+  .score .plan .big { font-size: 24px; font-weight: 800; margin-top: 1.5mm;
+                      line-height: 1; letter-spacing: -.5px; }
+  .score .plan .desc { font-size: 9.5px; color: var(--dim); margin-top: 1.5mm;
+                       line-height: 1.45; }
+  .kpi { padding: 0 12mm; display: grid; grid-template-columns: repeat(4, 1fr);
+         border-bottom: 1px solid var(--rule); }
+  .kpi > div { padding: 2.5mm 0 2.7mm 0; border-right: 1px solid var(--rule);
+              margin-left: 3mm; }
+  .kpi > div:first-child { margin-left: 0; }
+  .kpi > div:last-child { border-right: none; margin-right: 0; }
+  .kpi .label { font-size: 10px; color: var(--mute); letter-spacing: 1px; }
+  .kpi .value { font-size: 18px; font-weight: 700; margin-top: 1.5mm; }
+  .kpi .value small { font-size: 10.5px; font-weight: 500; color: var(--dim);
+                     margin-left: 1mm; }
+  .kpi .delta { font-size: 10px; color: var(--dim); margin-top: 1mm; }
+  .sec-h { padding: 3mm 12mm 0; display: flex; align-items: baseline; gap: 2mm; }
+  .sec-h .n { font-size: 11px; font-weight: 700; color: var(--navy);
+              letter-spacing: 1.5px; }
+  .sec-h .t { font-size: 11px; font-weight: 700; color: var(--navy);
+              letter-spacing: 2.5px; }
+  .sec-h .r { margin-left: auto; font-size: 9.5px; color: var(--mute); }
+  .findings { padding: 1.5mm 12mm 0; }
+  .f { display: grid; grid-template-columns: 9mm 1fr; gap: 2mm; padding: 1.8mm 0;
+       border-bottom: 1px solid var(--rule); }
+  .f:last-child { border-bottom: none; }
+  .f .num { font-size: 14px; font-weight: 800; color: var(--navy);
+           letter-spacing: .5px; padding-top: .8mm; }
+  .f.high .num { color: var(--red); }
+  .f.mid .num { color: var(--amber); }
+  .f .row { display: flex; align-items: center; gap: 2.5mm; }
+  .f .ttl { font-size: 12px; font-weight: 700; letter-spacing: .2px; }
+  .f .badge { font-size: 9.5px; font-weight: 700; letter-spacing: 1.5px;
+              padding: .6mm 2.2mm; border-radius: 1mm; color: #fff; }
+  .f.high .badge { background: var(--red); }
+  .f.mid .badge { background: var(--amber); }
+  .f.exempt .badge { background: var(--mute); }
+  .f .obs { font-size: 10.5px; color: var(--dim); margin-top: .8mm; line-height: 1.55; }
+  .f .act { font-size: 10.5px; color: var(--navy); margin-top: .8mm; font-weight: 600; }
+  .f .act .lbl { font-weight: 700; }
+  .site { padding: 2mm 12mm 0; }
+  .site .grid6 { display: grid; grid-template-columns: repeat(3, 1fr);
+                 gap: 1.5mm 3mm; }
+  .site .it { padding: 1.8mm 2.5mm; background: var(--soft);
+              border-left: 2mm solid var(--green); font-size: 10.5px;
+              line-height: 1.4; min-height: 0; display: flex;
+              flex-direction: row; align-items: center; gap: 2.5mm; }
+  .site .it .nm { color: var(--text); font-weight: 600; flex: 1; min-width: 0; }
+  .site .it .st { font-size: 9.5px; font-weight: 700; letter-spacing: .5px;
+                  padding: .3mm 1.6mm; border-radius: 1mm; color: #fff;
+                  flex: none; }
+  .site .it .st.ok { background: var(--green); }
+  .site .it .st.bad { background: var(--red); }
+  .site .it .st.muted { background: var(--mute); }
+  .site .bad-row { font-size: 10.5px; line-height: 1.55; color: var(--text);
+                   margin-top: 2.5mm; padding: 2mm 3mm 2mm 3.5mm;
+                   background: #fdf1f0; border-left: 2mm solid var(--red); }
+  .site .bad-row .lab { color: var(--red); font-weight: 700; margin: 0 1mm; }
+  .site .note { margin-top: 2mm; font-size: 10.5px; color: var(--dim);
+                padding-top: 1.5mm; border-top: 1px dashed var(--rule); }
+  .site .note b { color: var(--text); }
+  .detail { padding: 2mm 12mm 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 10.5px; }
+  table th { text-align: left; padding: 1.5mm 2mm 1.5mm 0;
+             border-bottom: 1.5px solid var(--text); color: var(--text);
+             font-weight: 700; font-size: 10.5px; letter-spacing: 1px; }
+  table td { padding: 1.5mm 2mm 1.5mm 0; border-bottom: 1px solid var(--rule); }
+  table tr:last-child td { border-bottom: none; }
+  table .mod { font-weight: 600; color: var(--text); }
+  table .stat { font-weight: 700; font-size: 10px; letter-spacing: .5px; }
+  table .stat.high { color: var(--red); }
+  table .stat.mid { color: var(--amber); }
+  table .stat.ok { color: var(--green); }
+  table .stat.na { color: var(--mute); }
+  .foot { margin-top: auto; padding: 3.5mm 12mm;
+          border-top: 2px solid var(--navy);
+          display: flex; justify-content: space-between; align-items: flex-start;
+          font-size: 10px; color: var(--dim); }
+  .foot .l b { color: var(--text); font-weight: 700; }
+  .foot .r { text-align: right; }
+  .foot .r b { color: var(--navy); font-weight: 700; }
+"""
 
 
 def export_report(path, rule_filter=None, report=None, layout="full"):
@@ -19241,6 +19767,7 @@ def export_report(path, rule_filter=None, report=None, layout="full"):
         if ext in (".html", ".htm"):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(render_report_html_brief(report) if layout == "brief"
+                        else render_report_html_brief_v2(report) if layout == "brief_v2"
                         else render_report_html_customer(report))
             return None
         elif ext == ".json":
@@ -19457,7 +19984,7 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
     safe = re.sub(r'[\\/:*?"<>|\s]+', "_", cust).strip("_") or "客户"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     base = os.path.join(_report_dir(), f"现场检测_{safe}_{ts}")
-    outs = [(base + ".html", "brief", "一页客户报告 (浏览器打开 Ctrl+P 打印交客户)"),
+    outs = [(base + ".html", "brief_v2", "一页客户报告 (浏览器打开 Ctrl+P 打印交客户)"),
             (base + "_完整版.html", "full", "完整版报告 (带回 / 上传专家会诊)"),
             (base + ".json", None, "原始数据 JSON (后台深入分析)")]
     done = []

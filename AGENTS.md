@@ -96,14 +96,19 @@
   有值才渲染一页版「达标」格，按实测/签约 ≥90% 判达标）。
 - **机房 6 项**：`SITE_CHECK_ITEMS` 常量（建议文案 ≤24 字，破坏会折行破坏
   一页高度锁）；`_normalize_site_check` 白名单校验，清单外 key/值按「未检查」。
-- **四件套**：同一 report 出 一页客户报告（`render_report_html_brief`，
-  A4 单页，官方 logo 反白内嵌）/ 完整版 / .json / **PDF**（v1.14.0，
-  v1.14.1 起 `_find_pdf_browser()` 按 Chrome → **Edge** 探测链兜底——
-  Edge 系统必装且同为 Chromium 内核，PDF 能力=Windows 自带；
-  `_html_to_pdf()` 无头打印 A4；
-  profile 复用 `%TEMP%\np_pdf_profile` + 禁首跑/组件联网 —— 冷启动
-  45s → ~3s；Chrome/Edge 都没有才静默跳过，Ctrl+P 兜底），文件名
-  `reports/现场检测_客户名_时间戳.*`。
+- **四件套**：同一 report 出 一页客户报告 / 完整版 / .json / **PDF**。
+  - **v1.14.10 起**：一页客户报告走模板D 极简报风
+    (`render_report_html_brief_v2`，与 `design_ref/report_templates/模板D_现代仪表盘风.html` 同源),
+    `export_report(layout='brief_v2')` 路由, 现场模式主页走该路径; 旧
+    `layout='brief'` / `render_report_html_brief` 保留作为兑底 (未动)。
+    A4 双页: 第 1 页 = 报头/标题/评分/KPI/主要发现/机房6 项;
+    第 2 页 = 检测明细 21 行全表 + 页脚。详情字段 `_fmt_kpi_for_detail` 抽取。
+  - **PDF**（v1.14.0，v1.14.1 起 `_find_pdf_browser()` 按 Chrome → **Edge** 探测链兜底——
+    Edge 系统必装且同为 Chromium 内核，PDF 能力=Windows 自带；
+    `_html_to_pdf()` 无头打印 A4；
+    profile 复用 `%TEMP%\np_pdf_profile` + 禁首跑/组件联网 —— 冷启动
+    45s → ~3s；Chrome/Edge 都没有才静默跳过，Ctrl+P 兜底），文件名
+    `reports/现场检测_客户名_时间戳.*`。
 - **数据流**：`build_report(site_check=, meta_manual=, site_note=)` 显式
   传参进 report dict —— 不新增 LAST_RUN 依赖（守收口规则）。
 - **截断锁高**：一页版问题卡 标题≤26/现象≤41/建议≤36 字（恒 3 行）、

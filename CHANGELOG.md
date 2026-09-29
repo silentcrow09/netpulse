@@ -7,6 +7,29 @@
 
 ## [Unreleased]
 
+## [1.14.10] - 2026-09-29
+
+### 新增
+
+- **现场检测模板D 接入 (选项 6 一页报告)**: 新增 `render_report_html_brief_v2`,
+  走 `design_ref/report_templates/模板D_现代仪表盘风.html` 同源设计.
+  - 报头藏蓝实色 + 电信 logo (复用现网 `_CT_LOGO_BRIEF_B64` 资产)
+  - 评分主区 (donut + verdict + 签约) / KPI 4 列 / 主要发现 4 条
+  - 机房 6 项 grid: 5 正常项 + 1 待整改独立红框 (含问题+建议)
+  - 检测明细 21 行全表 + 页脚
+  - A4 2 页布局 (`break-after: page`, `min-height: 296mm`)
+- `export_report(layout='brief_v2')` 路由; 现场模式 `run_site_visit`
+  改用 `brief_v2` 输出主页 (不动旧 `brief`, 保留作为兑底).
+- 辅助函数 `_fmt_kpi_for_detail`: 按模块 key 取紧凑指标串, 拼不出空字符串
+  (不为追求统一字段名造空值).
+
+### 清理
+
+- 删除临时文件: `_inject_v2.py` / `_v2_content.txt` (v2 渲染器开发期 bootstrap)
+- 设计稿预览迭代清理: `模板D_草稿.*` / `模板D_v14_preview.png` / `模板D_final.pdf` / `模板D_final.png` 仅保留 `模板D_现代仪表盘风.html` (真源)
+
+## [1.14.9] - 2026-09-29
+
 ### 修复
 
 - **报告豁免说明三处数字打架**（真实现场报告反馈）：「硬编码 4 个模块名
