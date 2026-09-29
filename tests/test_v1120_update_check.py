@@ -5,6 +5,8 @@
 24h 频控缓存 (LOCALAPPDATA) | _UPDATE_STATE 状态机 | 菜单提示行
 (gh-proxy 加速链接) | 后台线程 | --no-update-check 参数。
 """
+import contextlib
+import io
 import json
 import os
 import sys
@@ -306,6 +308,63 @@ class TestThreadAndArgparse(unittest.TestCase):
         finally:
             sys.argv = old_argv
         m_start.assert_not_called()
+
+
+class TestDebugAndSource(unittest.TestCase):
+    """v1.14.6: from_primary 状态记录 + NP_UPDATE_DEBUG stderr 输出。"""
+
+    def setUp(self):
+        with N._UPDATE_LOCK:
+            N._UPDATE_STATE.update(latest=None, checked_at=0.0, is_new=False,
+                                   from_primary=None)
+
+    def tearDown(self):
+        with N._UPDATE_LOCK:
+            N._UPDATE_STATE.update(latest=None, checked_at=0.0, is_new=False,
+                                   from_primary=None)
+        os.environ.pop("NP_UPDATE_DEBUG", None)
+
+    def test_check_update_records_source(self):
+        """网络检查成功后在 _UPDATE_STATE 记录来源 (调试输出用)。"""
+        newer = _newer_fake_version()
+        with mock.patch.object(N, "_fetch_latest_version",
+                               return_value=(newer, False)), \
+             mock.patch.object(N, "_save_update_cache"):
+            ver = N._check_update(force=True)
+        self.assertEqual(ver, newer)
+        self.assertIs(N._UPDATE_STATE["from_primary"], False)
+
+    def test_debug_print_on_success(self):
+        newer = _newer_fake_version()
+        os.environ["NP_UPDATE_DEBUG"] = "1"
+        buf = io.StringIO()
+        with mock.patch.object(N, "_fetch_latest_version",
+                               return_value=(newer, True)), \
+             mock.patch.object(N, "_save_update_cache"), \
+             contextlib.redirect_stderr(buf):
+            N._start_update_check(force=True).join(timeout=10)
+        out = buf.getvalue()
+        self.assertIn("GitHub API", out)
+        self.assertIn(newer, out)
+        self.assertIn("[NetPulse]", out)
+
+    def test_debug_print_on_failure(self):
+        os.environ["NP_UPDATE_DEBUG"] = "1"
+        buf = io.StringIO()
+        with mock.patch.object(N, "_fetch_latest_version",
+                               return_value=(None, False)), \
+             contextlib.redirect_stderr(buf):
+            N._start_update_check(force=True).join(timeout=10)
+        self.assertIn("双源失败", buf.getvalue())
+
+    def test_silent_without_debug_env(self):
+        """未设 NP_UPDATE_DEBUG 时零输出 (stderr 也不写)。"""
+        buf = io.StringIO()
+        with mock.patch.object(N, "_fetch_latest_version",
+                               return_value=(None, False)), \
+             contextlib.redirect_stderr(buf):
+            N._start_update_check(force=True).join(timeout=10)
+        self.assertEqual(buf.getvalue(), "")
 
 
 if __name__ == "__main__":

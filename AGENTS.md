@@ -171,7 +171,11 @@ RFC 3849 文档前缀、假 hostname/GUID）；真实抓包或含隐私的本地
   **主源成功或回落源报新版才写**（v1.14.2：jsDelivr @master 快照实测可滞后数周，
   回落源的“无新版”答案不写缓存，否则陈旧答案锁死提示一整天）；提示行走 `UPDATE_DL_PROXY`(gh-proxy.com) 加速前缀。菜单渲染
   经 `_update_notice_line()` 读 `_UPDATE_STATE`（锁保护）；`--json`/CLI
-  单次运行不显示提示；测试改这几个函数时全部 mock 网络，不许真实联网
+  单次运行不显示提示；测试改这几个函数时全部 mock 网络，不许真实联网。
+  **v1.14.6**：启动路径改 `force=True` 每次启动真检查（24h 频控曾让检查
+  “看起来没生效”，频控机制仅保留给 `force=False` 调用方）；
+  `NP_UPDATE_DEBUG=1` 时 worker 向 stderr 打印源/耗时/结论
+  （默认零输出，不污染 stdout/--json），排查“更新检测是否生效”用
 - 打包：`build_exe.bat` 或 `build_exe.ps1` → `dist/NetPulse.exe`（64 位默认；
   `-Arch x86` 出 32 位 `NetPulse_x86.exe`，需另装 32 位 Python，Ookla exe 不随包）。
   改了 `netpulse.py` 后需重新打包，否则 exe 落后于代码

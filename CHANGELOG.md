@@ -7,6 +7,16 @@
 
 ## [Unreleased]
 
+### 变更
+
+- **启动更新检查改为每次启动真检查**（用户反馈“更新检测是否生效”无法
+  观察）：`main()` 启动线程改 `force=True`，不再走 24h 频控缓存
+  （每次启动仅 1 个 GET，daemon 线程不阻塞启动）；新增 `NP_UPDATE_DEBUG=1`
+  环境变量：worker 在 stderr 打印检查结果（源 GitHub API/jsDelivr回落/
+  本地缓存、耗时、最新版、结论），默认零输出不污染 stdout/--json；
+  `_UPDATE_STATE` 新增 `from_primary` 记录来源。频控缓存机制保留
+  （`_check_update(force=False)` 路径与测试继续覆盖）
+
 ## [1.14.5] - 2026-09-29
 
 修复 32 位包在 Win7 无法启动的问题。

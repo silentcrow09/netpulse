@@ -3568,7 +3568,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.5"
+APP_VERSION = "1.14.6"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -3584,6 +3584,9 @@ SCHEMA_FILENAME = f"netpulse-result-v{SCHEMA_VERSION.rsplit('.', 1)[0]}.json"
 #     可滞后数周 — 回落源说"没有新版本"不写频控缓存, 不锁死提示)
 #   - 频控: %LOCALAPPDATA%\NetPulse\update_check.json 记录上次成功检查,
 #     24h 内直接用缓存版本号不发请求; 失败不写缓存 (下次启动重试)
+#     (v1.14.6: 启动路径改 force=True 每次真检查 — 频控曾让检查"看起来
+#     没生效"; 频控机制仅保留给 force=False 调用方。NP_UPDATE_DEBUG=1
+#     时 worker 在 stderr 打印源/耗时/结论, 便于现场排查)
 GH_REPO = "silentcrow09/netpulse"
 UPDATE_CHECK_API = f"https://api.github.com/repos/{GH_REPO}/releases/latest"
 UPDATE_CHECK_FALLBACK = (f"https://cdn.jsdelivr.net/gh/{GH_REPO}@master/"
@@ -3675,6 +3678,7 @@ def _check_update(force=False):
         if cached is not None:
             with _UPDATE_LOCK:
                 _UPDATE_STATE.update(latest=cached, checked_at=ts,
+                                     from_primary=None,
                                      is_new=_version_newer(cached, APP_VERSION))
             return cached
     latest, from_primary = _fetch_latest_version()
@@ -3686,6 +3690,7 @@ def _check_update(force=False):
             _save_update_cache(now, latest)
         with _UPDATE_LOCK:
             _UPDATE_STATE.update(latest=latest, checked_at=now,
+                                 from_primary=from_primary,
                                  is_new=_version_newer(latest, APP_VERSION))
     return latest
 
@@ -3694,7 +3699,24 @@ def _start_update_check(force=False):
     """启动后台更新检查线程 (daemon; 异常兜底静默, 永不影响主流程)。"""
     def _worker():
         try:
-            _check_update(force=force)
+            t0 = time.monotonic()
+            latest = _check_update(force=force)
+            # NP_UPDATE_DEBUG=1: stderr 打印检查结果, 排查"更新检测是否生效"
+            # (默认静默; 走 stderr 不污染 stdout, --json 输出保持纯净)
+            if os.environ.get("NP_UPDATE_DEBUG"):
+                with _UPDATE_LOCK:
+                    st = dict(_UPDATE_STATE)
+                if st.get("latest"):
+                    src = {True: "GitHub API", False: "jsDelivr回落",
+                           None: "本地缓存"}.get(st.get("from_primary"), "?")
+                    print(f"[NetPulse] 更新检查 {time.monotonic() - t0:.1f}s: "
+                          f"源={src}, 最新=v{st['latest']}, "
+                          f"当前=v{APP_VERSION}, "
+                          f"{'有新版!' if st.get('is_new') else '已是最新'}",
+                          file=sys.stderr)
+                else:
+                    print(f"[NetPulse] 更新检查 {time.monotonic() - t0:.1f}s: "
+                          f"双源失败 (被墙/超时), 本次静默", file=sys.stderr)
         except Exception:
             pass
     t = threading.Thread(target=_worker, name="update-check", daemon=True)
@@ -20154,10 +20176,12 @@ def main():
     # _load_scapy 里的 FORCE_NO_SCAPY 兜底是第二道防线)。
     _start_scapy_preload()
 
-    # v1.12.0: 启动时后台检查更新 (daemon 线程, 失败静默; 24h 频控缓存)。
+    # v1.12.0: 启动时后台检查更新 (daemon 线程, 失败静默)。
     # 只在交互菜单渲染 notice, CLI 单次运行/--json 不掺人读文本。
+    # v1.14.6: 改 force=True 每次启动真检查 (24h 频控曾让检查"看起来没
+    # 生效"; 每次启动 1 个 GET 可接受), NP_UPDATE_DEBUG=1 看 stderr 结果。
     if not getattr(args, "no_update_check", False):
-        _start_update_check()
+        _start_update_check(force=True)
 
     # 端口探测参数 -> 全局配置 (run_diagnostics 读取)
     # 注意: args.port_target 已经是 argparse action="append" 后的 list,
