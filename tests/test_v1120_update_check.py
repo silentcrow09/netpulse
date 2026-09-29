@@ -96,27 +96,45 @@ class TestFetchLatestVersion(unittest.TestCase):
         with mock.patch.object(N, "_urlopen_with_proxy",
                                side_effect=_resp_side_effect(
                                    [{"tag_name": "v1.13.0"}])):
-            self.assertEqual(N._fetch_latest_version(), ("1.13.0", True))
+            self.assertEqual(N._fetch_latest_version(), ("1.13.0", "primary"))
 
-    def test_fallback_jsdelivr(self):
-        """API 挂 → jsDelivr version.json 回落 (标记非主源)。"""
+    def test_fallback_gh_proxy_api(self):
+        """API 挂 -> gh-proxy 反代 API (v1.14.11 新增回落源) -> 走通。"""
         with mock.patch.object(
                 N, "_urlopen_with_proxy",
                 side_effect=_resp_side_effect(
-                    [OSError("timeout"), {"version": "1.14.0"}])):
-            self.assertEqual(N._fetch_latest_version(), ("1.14.0", False))
+                    [OSError("quota"), {"tag_name": "v1.14.0"}])):
+            self.assertEqual(N._fetch_latest_version(), ("1.14.0", "gh-proxy-api"))
+
+    def test_fallback_gh_proxy_raw(self):
+        """API+gh-proxy-API 都挂 -> gh-proxy 拉 raw version.json (v1.14.11 新增)。"""
+        with mock.patch.object(
+                N, "_urlopen_with_proxy",
+                side_effect=_resp_side_effect(
+                    [OSError(), OSError(), {"version": "1.14.0"}])):
+            self.assertEqual(N._fetch_latest_version(), ("1.14.0", "gh-proxy-raw"))
+
+    def test_fallback_jsdelivr(self):
+        """前 3 个都挂 -> jsDelivr version.json 兑底。"""
+        with mock.patch.object(
+                N, "_urlopen_with_proxy",
+                side_effect=_resp_side_effect(
+                    [OSError(), OSError(), OSError(),
+                     {"version": "1.14.0"}])):
+            self.assertEqual(N._fetch_latest_version(), ("1.14.0", "jsdelivr"))
 
     def test_both_fail_returns_none(self):
         with mock.patch.object(
                 N, "_urlopen_with_proxy",
-                side_effect=_resp_side_effect([OSError(), OSError()])):
-            self.assertEqual(N._fetch_latest_version(), (None, False))
+                side_effect=_resp_side_effect(
+                    [OSError(), OSError(), OSError(), OSError()])):
+            self.assertEqual(N._fetch_latest_version(), (None, None))
 
     def test_malformed_json_returns_none(self):
         with mock.patch.object(
                 N, "_urlopen_with_proxy",
                 side_effect=_resp_side_effect([b"not json{", b"<html>"])):
-            self.assertEqual(N._fetch_latest_version(), (None, False))
+            self.assertEqual(N._fetch_latest_version(), (None, None))
 
 
 class TestCache(unittest.TestCase):
@@ -190,7 +208,7 @@ class TestCheckUpdate(unittest.TestCase):
     def test_cache_miss_fetch_success(self):
         newer = _newer_fake_version()
         with mock.patch.object(N, "_fetch_latest_version",
-                               return_value=(newer, True)):
+                               return_value=(newer, "primary")):
             ver = N._check_update()
         self.assertEqual(ver, newer)
         self.assertTrue(N._UPDATE_STATE["is_new"])   # newer > 当前版本
@@ -201,7 +219,7 @@ class TestCheckUpdate(unittest.TestCase):
                              "1.13.0")     # 过期缓存
         self._reset_state()
         with mock.patch.object(N, "_fetch_latest_version",
-                               return_value=(None, False)):
+                               return_value=(None, None)):
             self.assertIsNone(N._check_update())
         self.assertIsNone(N._UPDATE_STATE["latest"])   # 状态未被污染
         self.assertEqual(N._load_update_cache(time.time()), (0.0, None))
@@ -237,10 +255,36 @@ class TestCheckUpdate(unittest.TestCase):
         """回落源报告"确有新版"时照常写缓存 (陈旧但仍领先本地即可信)。"""
         newer = _newer_fake_version()
         with mock.patch.object(N, "_fetch_latest_version",
-                               return_value=(newer, False)):
+                               return_value=(newer, "gh-proxy-api")):
             N._check_update(force=True)
         self.assertEqual(N._load_update_cache(time.time())[1], newer)
         self.assertTrue(N._UPDATE_STATE["is_new"])
+
+    def test_fallback_gh_proxy_api_cached(self):
+        """v1.14.11: gh-proxy-api 回落源 — 视为"足够可信"写缓存 (不复走网络)。"""
+        newer = _newer_fake_version()
+        with mock.patch.object(N, "_fetch_latest_version",
+                               return_value=(newer, "gh-proxy-api")):
+            N._check_update(force=True)
+        self.assertEqual(N._load_update_cache(time.time())[1], newer)
+        self.assertEqual(N._UPDATE_STATE["from_source"], "gh-proxy-api")
+
+    def test_fallback_gh_proxy_raw_cached(self):
+        """v1.14.11: gh-proxy-raw 回落源 — 同样写缓存。"""
+        newer = _newer_fake_version()
+        with mock.patch.object(N, "_fetch_latest_version",
+                               return_value=(newer, "gh-proxy-raw")):
+            N._check_update(force=True)
+        self.assertEqual(N._load_update_cache(time.time())[1], newer)
+        self.assertEqual(N._UPDATE_STATE["from_source"], "gh-proxy-raw")
+
+    def test_fallback_jsdelivr_old_still_not_cached(self):
+        """v1.14.11 继承 v1.14.2 规则: jsDelivr 落后答案不写 (连不达公司时设下)。"""
+        old_ver = "1.12.2"
+        with mock.patch.object(N, "_fetch_latest_version",
+                               return_value=(old_ver, "jsdelivr")):
+            N._check_update(force=True)
+        self.assertEqual(N._load_update_cache(time.time()), (0.0, None))
 
 
 class TestNoticeLine(unittest.TestCase):
@@ -282,7 +326,7 @@ class TestThreadAndArgparse(unittest.TestCase):
     def test_thread_sets_state(self):
         newer = _newer_fake_version()
         with mock.patch.object(N, "_fetch_latest_version",
-                               return_value=(newer, True)), \
+                               return_value=(newer, "primary")), \
              mock.patch.object(N, "_save_update_cache"):
             t = N._start_update_check(force=True)
         t.join(timeout=10)
@@ -311,12 +355,14 @@ class TestThreadAndArgparse(unittest.TestCase):
 
 
 class TestDebugAndSource(unittest.TestCase):
-    """v1.14.6: from_primary 状态记录 + NP_UPDATE_DEBUG stderr 输出。"""
+    """v1.14.11: from_source 状态记录 (str 标识) + NP_UPDATE_DEBUG stderr 输出。
+    v1.14.6 原始版用 from_primary (bool); v1.14.11 改为 str 区分 4 个源。
+    """
 
     def setUp(self):
         with N._UPDATE_LOCK:
             N._UPDATE_STATE.update(latest=None, checked_at=0.0, is_new=False,
-                                   from_primary=None)
+                                   from_source=None)
         # 缓存读写隔离到临时目录, 不碰真实 %LOCALAPPDATA%
         self._old_env = os.environ.get("LOCALAPPDATA")
         self.tmp = tempfile.mkdtemp()
@@ -325,7 +371,7 @@ class TestDebugAndSource(unittest.TestCase):
     def tearDown(self):
         with N._UPDATE_LOCK:
             N._UPDATE_STATE.update(latest=None, checked_at=0.0, is_new=False,
-                                   from_primary=None)
+                                   from_source=None)
         os.environ.pop("NP_UPDATE_DEBUG", None)
         if self._old_env is None:
             os.environ.pop("LOCALAPPDATA", None)
@@ -333,21 +379,21 @@ class TestDebugAndSource(unittest.TestCase):
             os.environ["LOCALAPPDATA"] = self._old_env
 
     def test_check_update_records_source(self):
-        """网络检查成功后在 _UPDATE_STATE 记录来源 (调试输出用)。"""
+        """网络检查成功后在 _UPDATE_STATE 记录来源 (str 标识, 调试输出用)。"""
         newer = _newer_fake_version()
         with mock.patch.object(N, "_fetch_latest_version",
-                               return_value=(newer, False)), \
+                               return_value=(newer, "gh-proxy-api")), \
              mock.patch.object(N, "_save_update_cache"):
             ver = N._check_update(force=True)
         self.assertEqual(ver, newer)
-        self.assertIs(N._UPDATE_STATE["from_primary"], False)
+        self.assertEqual(N._UPDATE_STATE["from_source"], "gh-proxy-api")
 
     def test_debug_print_on_success(self):
         newer = _newer_fake_version()
         os.environ["NP_UPDATE_DEBUG"] = "1"
         buf = io.StringIO()
         with mock.patch.object(N, "_fetch_latest_version",
-                               return_value=(newer, True)), \
+                               return_value=(newer, "primary")), \
              mock.patch.object(N, "_save_update_cache"), \
              contextlib.redirect_stderr(buf):
             N._start_update_check(force=True).join(timeout=10)
@@ -360,16 +406,16 @@ class TestDebugAndSource(unittest.TestCase):
         os.environ["NP_UPDATE_DEBUG"] = "1"
         buf = io.StringIO()
         with mock.patch.object(N, "_fetch_latest_version",
-                               return_value=(None, False)), \
+                               return_value=(None, None)), \
              contextlib.redirect_stderr(buf):
             N._start_update_check(force=True).join(timeout=10)
-        self.assertIn("双源失败", buf.getvalue())
+        self.assertIn("四源全部失败", buf.getvalue())
 
     def test_silent_without_debug_env(self):
         """未设 NP_UPDATE_DEBUG 时零输出 (stderr 也不写)。"""
         buf = io.StringIO()
         with mock.patch.object(N, "_fetch_latest_version",
-                               return_value=(None, False)), \
+                               return_value=(None, None)), \
              contextlib.redirect_stderr(buf):
             N._start_update_check(force=True).join(timeout=10)
         self.assertEqual(buf.getvalue(), "")

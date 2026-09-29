@@ -7,6 +7,35 @@
 
 ## [Unreleased]
 
+## [1.14.11] - 2026-09-29
+
+### 修复
+
+- **国内环境检测不到更新**（现场反馈 v1.14.9 看不到 v1.14.10）：实测 api.github.com
+  直连可走 (0.8s) 但 cdn.jsdelivr.net 连接超时 (curl -35)。
+  v1.14.11 重排源优先级、减少对 jsDelivr 的依赖：
+  - 主源: GitHub Releases API (不变)
+  - **新回落 1**: `gh-proxy.com` 反代 GitHub API —— 国内可达, 绕开
+    60/h quota (公司 NAT 共享 IP 常撞)
+  - **新回落 2**: `gh-proxy.com` 拉 `raw.githubusercontent.com` `master/version.json`
+    —— 与回落 1 形成 API + raw 双反代, 主源 + 两个反代同时挂的机率极低
+  - **回落 3 兑底**: jsDelivr @master version.json (保留, 但“说无新版”
+    不写缓存 — v1.14.2 规则沿用, 避免取限期间的陈旧答案锁死提示)
+  - v1.14.2 规则微调: 以前只有主源+jsDelivr>本地才写缓存;
+    现“主源 / gh-proxy-api / gh-proxy-raw 取得任何来源”都写 (gh-proxy
+    几乎实时, 跟主源同步性足够)
+  - _UPDATE_STATE.from_primary (bool) → from_source (str: primary / gh-proxy-api
+    / gh-proxy-raw / jsdelivr), NP_UPDATE_DEBUG 输出随之细化
+  - 下载侧 `gh-proxy.com` 加索引不变 (现网已在用, 通知行提示加速下载)
+
+### 测试
+
+- tests/test_v1120_update_check.py: 34 个用例 -> 39 个:
+  - 4 个回落源穷举 (primary / gh-proxy-api / gh-proxy-raw / jsdelivr) + 兑底空
+  - gh-proxy-api / gh-proxy-raw 新增缓存写入验收
+  - jsDelivr “说无新版” 仍不写缓存 (兑底规则保留)
+- 3.13 + 真机 3.8 双版本全量通过 (预存 pcap/scapy 环境差异项不变)
+
 ## [1.14.10] - 2026-09-29
 
 ### 新增

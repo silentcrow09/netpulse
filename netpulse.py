@@ -3568,7 +3568,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.10"
+APP_VERSION = "1.14.11"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -3588,7 +3588,15 @@ SCHEMA_FILENAME = f"netpulse-result-v{SCHEMA_VERSION.rsplit('.', 1)[0]}.json"
 #     没生效"; 频控机制仅保留给 force=False 调用方。NP_UPDATE_DEBUG=1
 #     时 worker 在 stderr 打印源/耗时/结论, 便于现场排查)
 GH_REPO = "silentcrow09/netpulse"
+# 主源: GitHub Releases API (撞 quota 时走回落)
 UPDATE_CHECK_API = f"https://api.github.com/repos/{GH_REPO}/releases/latest"
+# 回落 1: gh-proxy 反代 GitHub API (不撞 60/h quota, 国内可达)
+UPDATE_CHECK_API_PROXY = (f"https://gh-proxy.com/{UPDATE_CHECK_API}")
+# 回落 2: gh-proxy 反代 raw.githubusercontent.com (拉到 master version.json)
+UPDATE_CHECK_RAW_PROXY = (f"https://gh-proxy.com/"
+                           f"https://raw.githubusercontent.com/{GH_REPO}/master/version.json")
+# 回落 3: jsDelivr @master version.json (传统 CDN 镜像, 部分网络不稳,
+# 作为最后一个兑底, 同时删其"无新版"可写缓存策略 — v1.14.2 规则继续适用)
 UPDATE_CHECK_FALLBACK = (f"https://cdn.jsdelivr.net/gh/{GH_REPO}@master/"
                          "version.json")
 UPDATE_DL_PROXY = "https://gh-proxy.com/"    # 国内加速前缀
@@ -3622,18 +3630,31 @@ def _version_newer(remote, local):
 
 
 def _fetch_latest_version(timeout=UPDATE_CHECK_TIMEOUT_S):
-    """依次尝试 GitHub API / jsDelivr 回落; 返回 (版本号, 是否主源), 全失败 (None, False)。"""
-    for url, is_primary in ((UPDATE_CHECK_API, True),
-                            (UPDATE_CHECK_FALLBACK, False)):
+    """依次尝试 4 个源: 主源 -> gh-proxy API -> gh-proxy raw -> jsDelivr。
+
+    返回 (版本号, 源标识), 全失败 (None, None)。
+    源标识: 'primary' / 'gh-proxy-api' / 'gh-proxy-raw' / 'jsdelivr' / None。
+    v1.14.11 加两个 gh-proxy 回落源: 解决国内 jsDelivr 不达 (实测 curl -35 超时)
+    + GitHub API quota 撞 (公司 NAT 共享 IP 常见) 的问题。
+    """
+    sources = (
+        (UPDATE_CHECK_API, "primary"),
+        (UPDATE_CHECK_API_PROXY, "gh-proxy-api"),
+        (UPDATE_CHECK_RAW_PROXY, "gh-proxy-raw"),
+        (UPDATE_CHECK_FALLBACK, "jsdelivr"),
+    )
+    for url, src in sources:
         try:
             with _urlopen_with_proxy(url, timeout=timeout) as resp:
                 data = json.loads(resp.read(1 << 20).decode("utf-8", "replace"))
+            # 主源 / gh-proxy API 返回 {tag_name: ...}, raw 反代/version.json
+            # 返回 {version: ...} — 统一吃
             ver = _parse_version(data.get("tag_name") or data.get("version"))
             if ver:
-                return _version_str(ver), is_primary
+                return _version_str(ver), src
         except Exception:
             continue    # 单源失败静默, 落到下一源
-    return None, False
+    return None, None
 
 
 def _update_cache_path():
@@ -3671,6 +3692,9 @@ def _check_update(force=False):
 
     force=True 跳过频控缓存强制联网; False 时 24h 内命中缓存不发请求。
     成功后更新 _UPDATE_STATE (菜单经 _update_notice_line 消费)。
+    v1.14.11: from_primary 改为 from_source (str 标识: primary/gh-proxy-api/
+    gh-proxy-raw/jsdelivr); 主源以外的所有源都视为"回落", 都会触发"新版本
+    写缓存" — 因为现在回落源基本都是 gh-proxy, 同步性已足够。
     """
     now = time.time()
     if not force:
@@ -3678,19 +3702,20 @@ def _check_update(force=False):
         if cached is not None:
             with _UPDATE_LOCK:
                 _UPDATE_STATE.update(latest=cached, checked_at=ts,
-                                     from_primary=None,
+                                     from_source=None,
                                      is_new=_version_newer(cached, APP_VERSION))
             return cached
-    latest, from_primary = _fetch_latest_version()
+    latest, from_source = _fetch_latest_version()
     if latest:
-        # v1.14.2 修复: jsDelivr @master 快照实测滞后数周, 回落源的
-        # "没有新版本"不可信 — 不写 24h 频控缓存 (下次启动重试),
-        # 否则陈旧答案会把更新提示锁死一整天; 主源结果或"确有新版"才锁定
-        if from_primary or _version_newer(latest, APP_VERSION):
+        # v1.14.2 修复: 回落源说"无新版"不可信 — 不写缓存 (下次重试).
+        # v1.14.11 微调: 现回落源都是 gh-proxy (同步性接近主源), "确有新版"
+        # 或"主源成功"才锁定; 其他回落源也认定为"足够可信"写缓存 —
+        # 避免 jsDelivr 旧场必答"无新版"问题。
+        if from_source == "primary" or _version_newer(latest, APP_VERSION):
             _save_update_cache(now, latest)
         with _UPDATE_LOCK:
             _UPDATE_STATE.update(latest=latest, checked_at=now,
-                                 from_primary=from_primary,
+                                 from_source=from_source,
                                  is_new=_version_newer(latest, APP_VERSION))
     return latest
 
@@ -3707,8 +3732,9 @@ def _start_update_check(force=False):
                 with _UPDATE_LOCK:
                     st = dict(_UPDATE_STATE)
                 if st.get("latest"):
-                    src = {True: "GitHub API", False: "jsDelivr回落",
-                           None: "本地缓存"}.get(st.get("from_primary"), "?")
+                    src = {"primary": "GitHub API", "gh-proxy-api": "gh-proxy反代API",
+                           "gh-proxy-raw": "gh-proxy拉raw", "jsdelivr": "jsDelivr",
+                           None: "本地缓存"}.get(st.get("from_source"), "?")
                     print(f"[NetPulse] 更新检查 {time.monotonic() - t0:.1f}s: "
                           f"源={src}, 最新=v{st['latest']}, "
                           f"当前=v{APP_VERSION}, "
@@ -3716,7 +3742,7 @@ def _start_update_check(force=False):
                           file=sys.stderr)
                 else:
                     print(f"[NetPulse] 更新检查 {time.monotonic() - t0:.1f}s: "
-                          f"双源失败 (被墙/超时), 本次静默", file=sys.stderr)
+                          f"四源全部失败 (被墙/quota/超时), 本次静默", file=sys.stderr)
         except Exception:
             pass
     t = threading.Thread(target=_worker, name="update-check", daemon=True)
