@@ -359,6 +359,59 @@ class TestExportBrief(unittest.TestCase):
         self.assertNotIn("@page{ size:A4 portrait;", content)
 
 
+class TestBriefV2NoPlan(unittest.TestCase):
+    """v1.14.11 回归: brief_v2 在签约带宽未填/测速无数据时不得抛 TypeError。
+
+    根因: headline 的 {plan_ratio:.0f} 在 plan_ratio=None 时抛 TypeError,
+    旧 export_report 先 open(path,"w") 再渲染 → 留下 0 字节 HTML/PDF。
+    """
+
+    def _report(self, plan):
+        r = _fake_report()
+        r["meta_manual"] = dict(r.get("meta_manual") or {}, plan=plan)
+        return r
+
+    def test_no_plan_renders(self):
+        html = N.render_report_html_brief_v2(self._report(""))
+        self.assertIn("网络检测完成", html)
+        self.assertNotIn("None", html)
+
+    def test_plan_without_speed_renders(self):
+        r = self._report("300M")
+        r["modules"] = [m for m in r["modules"] if m["key"] != "speedtest"]
+        html = N.render_report_html_brief_v2(r)
+        self.assertIn("网络检测完成", html)
+
+    def test_plan_met_renders_ratio(self):
+        # 真 probe raw 是顶层 download_mbps (nested "speedtest" 子字典是 ookla 详情);
+        # _fake_report 的嵌套结构只供旧 brief 渲染器用, 这里给达标路径单独造
+        r = self._report("100M")
+        r["modules"] = [m for m in r["modules"] if m["key"] != "speedtest"] + [
+            {"key": "speedtest", "name": "宽带测速", "status": "完成",
+             "verdict": "测速正常", "key_metrics": [], "issues": [],
+             "has_tech_details": False,
+             "raw": {"download_mbps": 95.0, "upload_mbps": 30.0,
+                     "method": "http"}}]
+        html = N.render_report_html_brief_v2(r)
+        self.assertIn("达标", html)
+        self.assertIn("95%", html)
+
+    def test_export_no_zero_byte_file_on_renderer_error(self):
+        """渲染抛异常时 export_report 报错且不留 0 字节文件 (先渲染后写盘)."""
+        with tempfile_dir() as d:
+            path = os.path.join(d, "x.html")
+            orig = N.render_report_html_brief_v2
+            N.render_report_html_brief_v2 = lambda report: (_ for _ in ()).throw(
+                RuntimeError("boom"))
+            try:
+                err = N.export_report(path, report=self._report(""),
+                                      layout="brief_v2")
+            finally:
+                N.render_report_html_brief_v2 = orig
+            self.assertIn("boom", err)
+            self.assertFalse(os.path.exists(path))
+
+
 class tempfile_dir:
     """最小临时目录上下文 (避免引入 tempfile 之外的依赖语义)."""
 

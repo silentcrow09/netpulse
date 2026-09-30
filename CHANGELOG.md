@@ -7,6 +7,27 @@
 
 ## [Unreleased]
 
+## [1.14.12] - 2026-09-29
+
+### 修复
+
+- **现场检测模式 (选项 6) 一页报告 0 字节**：签约带宽未填（可空，直接回车）
+  或测速无数据时，`render_report_html_brief_v2` 的 headline
+  `{plan_ratio:.0f}` 对 None 格式化抛 TypeError；旧 `export_report`
+  先 `open(path,"w")` 截断文件再渲染，异常被捕获后留下 **0 字节 .html**，
+  无头 Chrome 打印空 HTML 又产出 **0 字节 .pdf**（完整版/JSON 不走该行，
+  所以正常）。
+  - headline 三分支补 `plan_ratio is None` → 显示「网络检测完成」
+  - `export_report` 改为先渲染后写盘：渲染器再抛异常时报错返回，
+    不再留 0 字节半成品文件（全格式生效，根治而非只堵一条路径）
+  - 顺手修 `_find_pdf_browser` 注册表分支的 `+ + exe` TypeError
+    （会逃过 `except ImportError` 直接崩现场流程）
+
+### 测试
+
+- tests/test_site_mode.py: 新增 `TestBriefV2NoPlan` 4 用例
+  （无带宽渲染 / 有带宽无测速 / 达标百分比 / 渲染异常不留 0 字节文件）
+
 ## [1.14.11] - 2026-09-29
 
 ### 修复

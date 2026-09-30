@@ -3568,7 +3568,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.11"
+APP_VERSION = "1.14.12"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -19439,7 +19439,10 @@ def render_report_html_brief_v2(report):
                     f'<br>阈值 ≥90% → {"达标" if plan_ok else "未达标"}</div></div>')
 
     logo = _CT_LOGO_BRIEF_B64
-    headline = (f'网络可用、测速<span class="ok">达标 {plan_ratio:.0f}%</span>'
+    # v1.14.11: plan_ratio 为 None (签约带宽未填或测速无数据) 时不能进 :.0f —
+    # 曾在此抛 TypeError 使 export_report 截断后留下 0 字节 HTML/PDF
+    headline = ("网络检测完成" if plan_ratio is None else
+                f'网络可用、测速<span class="ok">达标 {plan_ratio:.0f}%</span>'
                 if plan_ok else f'测速不达标 {plan_ratio:.0f}%')
 
     html = f'''<!DOCTYPE html>
@@ -19790,15 +19793,18 @@ def export_report(path, rule_filter=None, report=None, layout="full"):
         return "尚无诊断数据，无法生成报告（请先运行诊断）"
     ext = os.path.splitext(path)[1].lower()
     try:
+        # v1.14.11: 先渲染后写盘 — 渲染异常时不留 0 字节半成品文件
         if ext in (".html", ".htm"):
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(render_report_html_brief(report) if layout == "brief"
-                        else render_report_html_brief_v2(report) if layout == "brief_v2"
-                        else render_report_html_customer(report))
-            return None
+            content = (render_report_html_brief(report) if layout == "brief"
+                       else render_report_html_brief_v2(report) if layout == "brief_v2"
+                       else render_report_html_customer(report))
         elif ext == ".json":
+            content = render_report_json(report)
+        else:
+            content = None
+        if content is not None:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(render_report_json(report))
+                f.write(content)
             return None
         elif ext == ".pdf":
             return ("PDF 直接导出已移除。请导出 .html 后用浏览器打开, "
@@ -19865,8 +19871,8 @@ def _find_pdf_browser():
             for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
                 try:
                     with winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows"
-                                            r"\CurrentVersion\App Paths" + "\\" +
-                                            + exe) as k:
+                                            r"\CurrentVersion\App Paths"
+                                            + "\\" + exe) as k:
                         val = winreg.QueryValue(k, None)
                         if val and os.path.isfile(val):
                             return val
