@@ -3568,7 +3568,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.12"
+APP_VERSION = "1.14.13"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -19842,6 +19842,41 @@ def prompt_export_report():
         print(_c(f"  ✓ 报告已导出: {os.path.abspath(_normalize_report_path(name))}", C_GREEN))
 
 
+_CHROMIUM_BROWSER_EXES = ("chrome.exe", "msedge.exe", "chromium.exe",
+                          "brave.exe", "vivaldi.exe", "opera.exe",
+                          "thorium.exe")  # 已知支持 --print-to-pdf 的内核
+
+
+def _default_browser_exe():
+    """读系统默认浏览器 (https 关联 UserChoice) → 解析出 exe 路径 (v1.14.13)。
+
+    仅返回 Chromium 系浏览器路径 (无头 --print-to-pdf 是 Chromium 内核能力,
+    Firefox/IE 无法无头出 PDF → 返回 None 走 Ctrl+P 兕底)。任何失败返回 None。
+    """
+    try:
+        import winreg
+    except ImportError:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"SOFTWARE\Microsoft\Windows\Shell\Associations"
+                            r"\UrlAssociations\https\UserChoice") as k:
+            prog_id = winreg.QueryValueEx(k, "ProgId")[0]
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT,
+                            prog_id + r"\shell\open\command") as k:
+            cmd = winreg.QueryValueEx(k, None)[0] or ""
+    except OSError:
+        return None
+    # 取命令行中第一个 .exe 之前的部分 (兼容引号路径/带参形式)
+    m = re.search(r"(.+?\.exe)", cmd, re.IGNORECASE)
+    if not m:
+        return None
+    exe = m.group(1).strip('"')
+    if os.path.basename(exe).lower() not in _CHROMIUM_BROWSER_EXES:
+        return None
+    return exe
+
+
 def _find_pdf_browser():
     """探测可用于无头打印的浏览器 (v1.14.1: Chrome → Edge 探测链)。
 
@@ -19880,7 +19915,9 @@ def _find_pdf_browser():
                     continue
     except ImportError:
         pass
-    return None
+    # v1.14.13: 标准路径都没有 → 问系统默认浏览器 (Brave/Vivaldi/Opera 等
+    # Chromium 系内核一样支持无头 --print-to-pdf)
+    return _default_browser_exe()
 
 
 _PDF_PROFILE_DIR = None   # 模块级缓存: 复用 profile, 冷启动 45s → ~3s (实测)
@@ -20027,11 +20064,12 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
         else:
             done.append((desc, os.path.abspath(_normalize_report_path(path))))
 
-    # ── 步骤 5: PDF (检测到 Chrome 才产出; 没有则 Ctrl+P 兜底, 不阻塞流程) ──
+    # ── 步骤 5: PDF (有 Chromium 内核浏览器才无头产出; 否则默认浏览器 Ctrl+P 兜底) ──
     browser = _find_pdf_browser()
     if browser:
-        bname = "Edge" if "msedge" in os.path.basename(browser).lower() \
-                else "Chrome"
+        stem = os.path.basename(browser).lower()
+        bname = ("Edge" if "msedge" in stem else "Chrome" if "chrome" in stem
+                 else os.path.basename(browser).rsplit(".", 1)[0])
         print(_c(f"  → 检测到 {bname}, 生成 PDF...", C_GRAY))
         err = _html_to_pdf(browser, base + ".html", base + ".pdf")
         if err:
@@ -20041,8 +20079,15 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
             done.insert(0, ("一页客户报告 PDF (直接打印交客户)",
                             os.path.abspath(base + ".pdf")))
     else:
-        print(_c("  → 未检测到 Chrome/Edge, 跳过 PDF "
-                 "(可打开 HTML 后 Ctrl+P 另存)", C_GRAY))
+        # v1.14.13: 机器上没有任何 Chromium 系浏览器 (默认浏览器是 Firefox 等)
+        # → 自动用默认浏览器打开 HTML, Ctrl+P 另存 PDF (任何浏览器都支持)
+        print(_c("  → 无 Chromium 内核浏览器可无头出 PDF, 用默认浏览器打开 HTML...",
+                 C_GRAY))
+        try:
+            os.startfile(base + ".html")
+            print(_c("    在浏览器里 Ctrl+P → 另存为 PDF 即可", C_GRAY))
+        except OSError:
+            print(_c("    请手动打开 HTML 后 Ctrl+P 另存为 PDF", C_GRAY))
 
     print()
     print(_c(bar, C_BLUE))

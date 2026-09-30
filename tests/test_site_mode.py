@@ -428,6 +428,98 @@ class tempfile_dir:
         return False
 
 
+class _FakeWinreg:
+    """最小 winreg 替身: 树 dict {'ROOT\\path': {valuename: value}}."""
+
+    HKEY_CURRENT_USER = "HKCU"
+    HKEY_CLASSES_ROOT = "HKCR"
+    HKEY_LOCAL_MACHINE = "HKLM"
+
+    def __init__(self, tree):
+        self._tree = tree
+
+    class _K:
+        def __init__(self, vals):
+            self.vals = vals
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def OpenKey(self, root, path):
+        full = root + "\\" + path
+        if full not in self._tree:
+            raise OSError(2, "not found")
+        return self._K(self._tree[full])
+
+    def QueryValueEx(self, key, name):
+        if name not in key.vals:
+            raise OSError(2, "missing")
+        return key.vals[name], None
+
+
+class TestDefaultBrowserExe(unittest.TestCase):
+    """v1.14.13: 默认浏览器探测 (UserChoice → ProgId → open command).
+
+    仅 Chromium 系放行 — Firefox/IE 无法无头 --print-to-pdf。
+    """
+
+    USERCHOICE = (r"HKCU\SOFTWARE\Microsoft\Windows\Shell\Associations"
+                  r"\UrlAssociations\https\UserChoice")
+
+    def _patch(self, tree):
+        """把 sys.modules['winreg'] 换成替身, 测试结束自动还原."""
+        import sys
+        self._saved = sys.modules.get("winreg")
+        sys.modules["winreg"] = _FakeWinreg(tree)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        import sys
+        if self._saved is not None:
+            sys.modules["winreg"] = self._saved
+        else:
+            sys.modules.pop("winreg", None)
+
+    def _tree(self, prog_id, cmd):
+        return {
+            self.USERCHOICE: {"ProgId": prog_id},
+            "HKCR\\" + prog_id + r"\shell\open\command": {None: cmd},
+        }
+
+    def test_brave_default_returns_path(self):
+        self._patch(self._tree(
+            "BraveBFC",
+            r'"C:\Program Files\BraveSoftware\Brave-Browser'
+            r'\Application\brave.exe" --single-argument %1'))
+        self.assertEqual(
+            N._default_browser_exe(),
+            r"C:\Program Files\BraveSoftware\Brave-Browser"
+            r"\Application\brave.exe")
+
+    def test_firefox_default_returns_none(self):
+        self._patch(self._tree(
+            "FirefoxURL-308046B0AF4A39CB",
+            r'"C:\Program Files\Mozilla Firefox\firefox.exe"'
+            r' -osint -url "%1"'))
+        self.assertIsNone(N._default_browser_exe())
+
+    def test_no_userchoice_returns_none(self):
+        self._patch({})
+        self.assertIsNone(N._default_browser_exe())
+
+    def test_chromehtml_command_parsed(self):
+        self._patch(self._tree(
+            "ChromeHTML",
+            r'"C:\Program Files\Google\Chrome'
+            r'\Application\chrome.exe" --single-argument %1'))
+        self.assertEqual(
+            N._default_browser_exe(),
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+
+
 class TestPdfHelpers(unittest.TestCase):
     """v1.14.0: 现场模式自动 PDF — Chrome 探测与 HTML→PDF."""
 

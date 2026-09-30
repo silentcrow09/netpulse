@@ -7,6 +7,27 @@
 
 ## [Unreleased]
 
+## [1.14.13] - 2026-09-30
+
+### 新增
+
+- **PDF 兑底链接入默认浏览器** (现场反馈: 部分电脑 Chrome/Edge 都没装):
+  - `_default_browser_exe()`: 读注册表 https 关联
+    `UserChoice → ProgId → shell\open\command`, 解析出默认浏览器 exe;
+    **仅 Chromium 系放行** (chrome/msedge/chromium/brave/vivaldi/opera/
+    thorium) — 无头 `--print-to-pdf` 是 Chromium 内核能力, Firefox/IE
+    根本不支持, 不做伪支持
+  - `_find_pdf_browser()` 探测链变为: Chrome 路径 → Edge 路径 →
+    App Paths 注册表 → **默认浏览器** → None
+  - 全部探测失败时: 自动用默认浏览器打开一页 HTML 并提示 Ctrl+P 另存
+    PDF (任何浏览器都支持), 不再只是干巴巴一句“未检测到”
+
+### 测试
+
+- tests/test_site_mode.py: 新增 `TestDefaultBrowserExe` 4 用例
+  (Brave 放行 / Firefox 拒绝 / 无 UserChoice / ChromeHTML 解析),
+  mock winreg 进出还原
+
 ## [1.14.12] - 2026-09-29
 
 ### 修复
