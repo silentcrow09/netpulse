@@ -66,3 +66,7 @@ ehthumbs.db
 /video_promo/narr1/*
 !/video_promo/narr1/narr_meta.json
 !/video_promo/narr1/list.txt
+
+# PPT/文档中间产物与 Office 锁文件
+output/
+~$*
