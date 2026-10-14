@@ -12,7 +12,11 @@
 "evidence 一等结构" 重测时整页回放的脆弱性。
 """
 import sys, re, os, datetime
-sys.path.insert(0, "d:/Work/Projects/NetPulse")
+# v1.14.14: 原先硬编码 "d:/Work/Projects/NetPulse", 只在原作者那台机器上能跑,
+# 换 checkout 就 ModuleNotFoundError, 并且会打断 AGENTS.md 的全量测试循环。
+# 改为从 __file__ 推导 (与其余 24 个测试文件同一写法)。
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
 import netpulse as N
 
 _NOW = datetime.datetime.now()
@@ -28,7 +32,7 @@ def _has_css(rule_selector, fragment):
 # 取出 CSS 整段 (_DIAGNOSIS_CSS 已被嵌入到 render_report_html_customer CSS 块)
 HTML = N.render_report_html_customer(N.build_report()) if False else None
 # 不真跑 render, 走更轻的路径: 直接读 netpulse.py 内嵌 CSS
-src = open("d:/Work/Projects/NetPulse/netpulse.py", encoding="utf-8").read()
+src = open(os.path.join(_ROOT, "netpulse.py"), encoding="utf-8").read()
 
 
 # ── 1. 健康卡 .diagnosis.healthy 紧凑化 ───────────────────

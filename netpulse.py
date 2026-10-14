@@ -156,6 +156,38 @@ def _has_diagnostic_data():
     runner → report → renderer)。存量直读点逐步迁移到本访问器。"""
     return bool(LAST_RUN and LAST_RUN.get("results"))
 
+# 控制台编码兜底 (v1.14.14): 本工具面向中文 Windows 装维机, 默认代码页 cp936
+# 无法编码菜单/结论里的符号 (✓ ✗ ⚠ 🔴 等)。实测全文件 133 行含 GBK 编不了的
+# 字符、其中 49 行在 print() 内 —— 直接 print 会抛 UnicodeEncodeError 让整个
+# 进程崩在诊断中途 (tests/test_elevation.py 13 errors / test_v160_scene /
+# test_v196_menu_entry 三个文件就是这么挂的, 设 PYTHONIOENCODING=utf-8 才全绿)。
+# 这里把 stdout/stderr 的编码错误策略降级为 "replace": 编不了的字符显示成 ?,
+# 而不是中断程序。
+# **只改 errors 不改 encoding** —— --json 的输出字节、管道重定向语义均不受影响,
+# 只在"本来就编不出来"的字符上退让。sys.stdout 被测试替换成 StringIO 时
+# 没有 reconfigure, 自动跳过。
+_CONSOLE_SAFE_DONE = False
+
+
+def _ensure_console_safe():
+    """窄代码页控制台上不再因不可编码字符崩溃 (幂等)。"""
+    global _CONSOLE_SAFE_DONE
+    if _CONSOLE_SAFE_DONE:
+        return
+    _CONSOLE_SAFE_DONE = True
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
+_ensure_console_safe()
+
+
 # 模块运行参数统一配置 (阶段 B · v1.2.0 引入 — B12)
 # 设计: 把散落各模块的 XXX_CONFIG 集中到顶层 CONFIG 字典, 按模块名分 key.
 #       旧名字 (PORT_PROBE_CONFIG 等) 作为 alias 指向 CONFIG 子项, 旧代码不改
@@ -558,13 +590,6 @@ def _is_valid_unicast_mac(mac):
     return True
 
 
-def _net_ok(host="pypi.org", port=443, timeout=6):
-    """检测网络连通性 — 注意企业/受限网络环境可能不通"""
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except Exception:
-        return False
 
 
 def _npcap_installed():
@@ -885,77 +910,14 @@ STATUS_KEY_TO_STATUS = {zh: s for zh, s in                 # "完成" → Status
 #   2. 字段缺失返回 None / [], 不抛异常 (Windows 不同版本 / 角色字段不全)
 #   3. 中文乱码字段 (cp936 解码错误) 自动 fallback 到 UTF-8
 
-@dataclass
-class NetworkAdapter:
-    """ipconfig /all 一个网络适配器 (含 VPN 虚拟适配器)"""
-    name: str                          # e.g. "WLAN", "本地连接", "VirtualBox Host-Only Network"
-    desc: str                          # e.g. "Realtek 8822CE Wireless LAN 802.11ac PCI-E NIC"
-    mac: str = ""                      # e.g. "02-4E-5A-B7-2F-A9"
-    ipv4: str | None = None
-    prefix_len: int | None = None      # ipconfig 不输出 prefix_len, 调用方用 PowerShell 补
-    ipv6: str | None = None
-    gateway: str | None = None
-    dhcp_server: str | None = None
-    dns_servers: list[str] = field(default_factory=list)
-    media_state: str = "unknown"       # "Media disconnected" / "" (connected)
-
-    @property
-    def is_up(self):
-        return "disconnected" not in self.media_state.lower()
 
 
-@dataclass
-class RouteEntry:
-    """route print 的一条 IPv4 路由项"""
-    destination: str                   # "0.0.0.0"
-    netmask: str                       # "0.0.0.0"
-    gateway: str                       # "On-link" 表示直接路由
-    interface_ip: str                  # "172.25.131.131"
-    metric: int = 0
-    is_onlink: bool = False
-
-    @property
-    def is_default(self):
-        return self.destination == "0.0.0.0" and self.netmask == "0.0.0.0"
 
 
-@dataclass
-class ArpEntry:
-    """arp -a 的一条 ARP 表项"""
-    ip: str
-    mac: str
-    interface_ip: str                  # 所属接口 IP (从 "Interface: <ip> --- 0x<n>" 段落解析)
-    type_: str                         # "dynamic" / "static"
 
 
-@dataclass
-class WifiInterface:
-    """netsh wlan show interfaces 一个 WiFi 接口"""
-    name: str                          # "WLAN"
-    state: str                         # "connected" / "disconnected"
-    ssid: str | None = None
-    bssid: str | None = None
-    signal_pct: int | None = None
-    channel: int | None = None
-    radio: str | None = None
-    physical_mac: str | None = None
-    description: str | None = None
-    guid: str | None = None
 
 
-# --- 段落正则 (中英文 Windows 段落名都匹配) ---)
-_IPCONFIG_SECTION_RE = re.compile(
-    r"^(?:Ethernet adapter|Wireless LAN adapter|无线局域网适配器|以太网适配器)"
-    r"\s*([^:]+?)\s*:\s*$",
-    re.MULTILINE,
-)
-_ARP_SECTION_RE = re.compile(
-    r"(?:Interface|接口):\s+([\d.]+)\s+---\s+0x[0-9a-fA-F]+",
-)
-_ROUTE_TABLE_RE = re.compile(
-    r"IPv4 Route Table.*?^={3,}.*?\n(.*?)(?=^={3,}|\Z)",
-    re.MULTILINE | re.DOTALL,
-)
 
 
 def _ipconfig_get(body, label):
@@ -971,185 +933,14 @@ def _ipconfig_get(body, label):
     return val if val else None
 
 
-def parse_ipconfig(raw):
-    """ipconfig /all 输出 → NetworkAdapter 列表.
-
-    段落分隔: 'Ethernet adapter X:' / 'Wireless LAN adapter Y:'
-              / '无线局域网适配器 X:' / '以太网适配器 X:' (中文 Windows)
-    字段格式: '字段名 . . . : 值' (中英文都遵循此格式)
-    """
-    adapters = []
-    # 跳过顶部全局段 (Host Name / Primary Dns Suffix 等), 第一个段落前的内容
-    sections = _IPCONFIG_SECTION_RE.split(raw)
-    # sections[0] = 顶部全局信息, [1::2] = 段落名, [2::2] = 段落 body
-    for i in range(1, len(sections), 2):
-        name = sections[i].strip()
-        body = sections[i + 1]
-        # Physical Address (英文) / 物理地址 (中文) 都试
-        mac = _ipconfig_get(body, ["Physical Address", "物理地址"])
-        ipv4 = _ipconfig_get(body, ["IPv4 Address", "IPv4 地址"])
-        ipv6 = _ipconfig_get(body, ["Link-local IPv6 Address", "本地链接 IPv6 地址",
-                                    "IPv6 Address", "IPv6 地址"])
-        gateway = _ipconfig_get(body, ["Default Gateway", "默认网关"])
-        dhcp = _ipconfig_get(body, ["DHCP Server", "DHCP 服务器"])
-        # DNS 行可能含 IPv4 + IPv6, 字符类放宽到 [\d.:a-fA-F]
-        dns_lines = re.findall(
-            r"(?:DNS Servers|DNS 服务器)[\. ]+:\s+([\d.:a-fA-F]+)", body)
-        media = _ipconfig_get(body, ["Media State", "媒体状态"]) or ""
-        desc = _ipconfig_get(body, ["Description", "描述"]) or ""
-
-        # 剥离 IPv4 后缀 (Preferred) / (Duplicate) 等注释
-        if ipv4:
-            ipv4 = ipv4.split("(")[0].strip()
-
-        adapters.append(NetworkAdapter(
-            name=name, desc=desc, mac=(mac or "").replace("-", ":").lower(),
-            ipv4=ipv4, prefix_len=None, ipv6=ipv6,
-            gateway=gateway, dhcp_server=dhcp,
-            dns_servers=[d.strip() for d in dns_lines],
-            media_state=media,
-        ))
-    return adapters
 
 
-def parse_route_print(raw):
-    """route print 输出 → RouteEntry 列表.
-
-    中英文 Windows 输出格式相同, 5 列空格分隔:
-        Network Destination  Netmask  Gateway  Interface  Metric
-    On-link 表示直接路由 (无需下一跳).
-    """
-    entries = []
-    m = _ROUTE_TABLE_RE.search(raw)
-    if not m:
-        return entries
-    table = m.group(1)
-    for line in table.splitlines():
-        line = line.strip()
-        if not line or not line[0].isdigit():
-            continue
-        parts = line.split()
-        if len(parts) < 5:
-            continue
-        dest, mask, gw, iface, metric = parts[:5]
-        try:
-            metric_int = int(metric)
-        except ValueError:
-            continue
-        entries.append(RouteEntry(
-            destination=dest, netmask=mask,
-            gateway=gw, interface_ip=iface,
-            metric=metric_int, is_onlink=(gw.lower() == "on-link"),
-        ))
-    return entries
 
 
-def parse_arp_a(raw):
-    """arp -a 输出 → ArpEntry 列表.
-
-    段落分隔: 'Interface: <ip> --- 0x<n>' (英文) / '接口: <ip> --- 0x<n>' (中文).
-    表头行 ('Internet Address' / 'Internet 地址') 靠首列必须是 IPv4 自然过滤.
-    type 保留原文小写: 英文系统 dynamic/static, 中文系统 动态/静态.
-    """
-    entries = []
-    parts = _ARP_SECTION_RE.split(raw)
-    # parts[0] = 顶部, [1::2] = interface_ip, [2::2] = body
-    for i in range(1, len(parts), 2):
-        iface_ip = parts[i]
-        body = parts[i + 1]
-        for line in body.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            cols = line.split()
-            if len(cols) >= 3 and re.match(r"^\d+\.\d+\.\d+\.\d+$", cols[0]):
-                ip, mac, type_ = cols[0], cols[1], cols[2]
-                entries.append(ArpEntry(
-                    ip=ip, mac=mac.lower(),
-                    interface_ip=iface_ip,
-                    type_=type_.lower(),
-                ))
-    return entries
 
 
-# netsh wlan show interfaces 字段名双语别名 (中文 Windows 输出中文字段名,
-# SSID/BSSID/GUID 为协议名保持原样). LinkSpeedDetector 的行内解析已按双语
-# 处理, 此表让 parser 与之口径一致, 不再分叉.
-_NETSH_WLAN_FIELD_ALIASES = {
-    "name":         ("Name", "名称"),
-    "description":  ("Description", "描述"),
-    "guid":         ("GUID",),
-    "physical_mac": ("Physical address", "物理地址"),
-    "state":        ("State", "状态"),
-    "ssid":         ("SSID",),
-    "bssid":        ("BSSID",),
-    "signal":       ("Signal", "信号"),
-    "channel":      ("Channel", "通道"),
-    "radio":        ("Radio type", "无线电类型"),
-}
 
 
-def parse_netsh_wlan_interfaces(raw):
-    """netsh wlan show interfaces → WifiInterface 列表.
-
-    中英文字段名都认 (英文 Name/State/..., 中文 名称/状态/...).
-    注意 netsh 行尾用 \\r\\r\\n (双 \\r 怪异行为), 不归一化会被 \\s+ 误判为多行.
-
-    netsh 实际格式是"每个字段单独一段" (每个字段后有空行), 不按接口分组.
-    累积所有字段为一个 interface dict. 一次调用只输出当前接口.
-    多行字段值 (如 "Hardware On\\nSoftware Off" / "硬件打开\\n软件关闭") 用 " | " 连接.
-    """
-    raw = raw.replace("\r\r\n", "\n").replace("\r\n", "\n")
-    fields = {}
-    for line in raw.splitlines():
-        line = line.strip()
-        if ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        k = k.strip()
-        if not k:
-            continue
-        # 多行字段值累积
-        if k in fields:
-            fields[k] += " | " + v.strip()
-        else:
-            fields[k] = v.strip()
-
-    def _f(canonical):
-        for alias in _NETSH_WLAN_FIELD_ALIASES[canonical]:
-            if fields.get(alias):
-                return fields[alias]
-        return None
-
-    # 没有 Name/名称 字段说明不是有效接口输出
-    # (e.g. 仅 "There is N interface" / "系统上有 N 个接口" 头部)
-    name = _f("name")
-    if not name:
-        return []
-    sig_pct = None
-    sig_raw = _f("signal")
-    if sig_raw:
-        mm = re.search(r"(\d+)%", sig_raw)
-        sig_pct = int(mm.group(1)) if mm else None
-    channel = None
-    ch_raw = _f("channel")
-    if ch_raw:
-        try:
-            channel = int(ch_raw)
-        except ValueError:
-            pass
-    return [WifiInterface(
-        name=name,
-        state=_f("state") or "",
-        ssid=_f("ssid"),
-        bssid=_f("bssid"),
-        signal_pct=sig_pct,
-        channel=channel,
-        radio=_f("radio"),
-        physical_mac=_f("physical_mac"),
-        description=_f("description"),
-        guid=_f("guid"),
-    )]
 
 
 # ============================================================
@@ -1843,7 +1634,13 @@ class DiagnosisReport:
 
 
 def _module_status_confidence(results):
-    """模块 status 基础可信度: ERROR=0.95 (高), WARNING=0.7, OK=0.4 (低)."""
+    """模块 status 基础可信度: 异常级 issue=0.95 / 警告=0.7 / OK=0.4。
+
+    v1.14.14 订正注释: 原 docstring 写 "ERROR=0.95 (高), WARNING=0.7,
+    OK=0.4 (低)" —— 但有 error 时实为 return 0.0 (探测失败无依据, 按
+    "无依据不显示" 处理), 0.95/0.7/0.4 才是三个正常分支。运行时无影响,
+    注释与实现相反, 已改。
+    """
     if not results:
         return 0.0
     err = results.get("error")
@@ -3257,11 +3054,6 @@ def _resolve_pip_mirror(explicit=None):
     return _PIP_MIRROR_RESOLVED
 
 
-def reset_pip_mirror_cache():
-    """测试用: 重置选源缓存以重新探测。"""
-    global _PIP_MIRROR_RESOLVED
-    _PIP_MIRROR_RESOLVED = None
-    _PIP_MIRROR_REACHABLE_CACHE.clear()
 
 
 def _download_file(url, dest, timeout=180):
@@ -3568,7 +3360,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.13"
+APP_VERSION = "1.14.14"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -3708,9 +3500,11 @@ def _check_update(force=False):
     latest, from_source = _fetch_latest_version()
     if latest:
         # v1.14.2 修复: 回落源说"无新版"不可信 — 不写缓存 (下次重试).
-        # v1.14.11 微调: 现回落源都是 gh-proxy (同步性接近主源), "确有新版"
-        # 或"主源成功"才锁定; 其他回落源也认定为"足够可信"写缓存 —
-        # 避免 jsDelivr 旧场必答"无新版"问题。
+        # v1.14.11 微调: gh-proxy 反代同步性接近主源, 故 "主源成功" 或
+        # "任一源报确有新版" 才写缓存。
+        # v1.14.14 订正注释: 原注释写"其他回落源也认定为足够可信写缓存",
+        # 与下面这行条件相反 —— gh-proxy 回答"已是最新"同样不写。代码对、
+        # 注释错, 已改。
         if from_source == "primary" or _version_newer(latest, APP_VERSION):
             _save_update_cache(now, latest)
         with _UPDATE_LOCK:
@@ -3734,7 +3528,7 @@ def _start_update_check(force=False):
                 if st.get("latest"):
                     src = {"primary": "GitHub API", "gh-proxy-api": "gh-proxy反代API",
                            "gh-proxy-raw": "gh-proxy拉raw", "jsdelivr": "jsDelivr",
-                           None: "本地缓存"}.get(st.get("from_source"), "?")
+                           "cache": "本地缓存"}.get(st.get("from_source"), "?")
                     print(f"[NetPulse] 更新检查 {time.monotonic() - t0:.1f}s: "
                           f"源={src}, 最新=v{st['latest']}, "
                           f"当前=v{APP_VERSION}, "
@@ -3760,8 +3554,12 @@ def _prime_update_state_from_cache():
     if cached:
         with _UPDATE_LOCK:
             if not _UPDATE_STATE.get("latest"):
+                # v1.14.14: 键名原写成 from_primary, 与其余处的 from_source
+                # (primary/gh-proxy-api/gh-proxy-raw/jsdelivr) 不一致 ——
+                # 四源全失败时状态里根本没有 from_source, debug 打印靠
+                # {None: "本地缓存"} 巧合兜对。统一键名, 缓存来源如实标为本地缓存。
                 _UPDATE_STATE.update(latest=cached, checked_at=ts,
-                                     from_primary=None,
+                                     from_source="cache",
                                      is_new=_version_newer(cached, APP_VERSION))
 
 
@@ -7469,7 +7267,17 @@ function(ctxId, datasets) {
 
 
 def _esc_html(s):
-    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    """[v1.14.14 修正 P1 安全缺陷] 测速 / iperf3 / 盯障报告族的转义入口。
+
+    历史上这里只转义 & < >, 却被拼进 `href="{...}"` (见测速报告"结果链接"行,
+    数据源是 speedtest.exe 的远端 JSON result_url) —— 引号不转义即可闭合属性
+    注入标签, 违反 AGENTS.md「属性值一律 _html_attr」铁律。
+
+    现直接委托 `_html_attr` (quote=True): 文本节点里把 " 和 ' 也转义掉不影响
+    渲染结果 (浏览器照样显示原字符), 一处改动把本族全部调用点一次性收口。
+    新代码不要再用它 —— 直接用 `_html_esc` (文本节点) / `_html_attr` (属性值)。
+    """
+    return _html_attr(s)
 
 
 def save_iperf3_report(res):
@@ -8995,7 +8803,10 @@ class PortProbeTester:
     # 默认并发度: 同时探测多少个 (host, port) 目标
     DEFAULT_MAX_CONCURRENCY = 8
 
-    def __init__(self, targets=None, proto="tcp", count=4,
+    # v1.14.14: 默认值原先写 4, 与 CONFIG["port"]["count"] / argparse 的 2
+    # 不一致 (README 也跟着错成 4), 且注册表路径总会显式传 count, 这个兜底
+    # 永远不生效 —— 现与代码唯一口径对齐为 2, 免得再被当成"真实默认值"。
+    def __init__(self, targets=None, proto="tcp", count=2,
                  max_targets=DEFAULT_MAX_TARGETS, force=False,
                  max_total_time=DEFAULT_MAX_TOTAL_TIME,
                  max_concurrency=DEFAULT_MAX_CONCURRENCY):
@@ -12267,7 +12078,7 @@ def _render_monitor_html(res):
 {_ana_rows}
 <tr><td>规格</td><td colspan=3>接口 {_esc_html(str(cap.get('iface', '—')))} · 缓冲 {cap.get('ring_bytes', 0) / 1048576:.1f}/{cap.get('ring_limit_mb', 0)}MB ·
 抓到 {cap.get('packets_captured', 0)} 包{f" · 超限挤出 {cap.get('dropped_old', 0)} 包" if cap.get('dropped_old') else ''} · 切片窗口 = 事件前后各 {cap.get('slice_before_s', 30)}s</td></tr>
-<tr><td>隐私声明</td><td colspan=3>默认仅保存诊断所需的网络元数据: DNS 查询域名 (QNAME)、HTTP Host、TLS SNI 可能被记录 (80/443 每流首 2 包 384B 头部窗口), <b>不保存普通 TCP/HTTP 应用载荷</b>; 抓包分析当前仅覆盖 IPv4;
+<tr><td>隐私声明</td><td colspan=3>默认仅保存诊断所需的网络元数据: DNS 查询域名 (QNAME)、HTTP Host、TLS SNI 可能被记录 ({"/".join(str(p) for p in CAPTURE_WEB_PORTS)} 每流首 {CAPTURE_FIRST_PKTS} 包 {CAPTURE_PAYLOAD_KEEP}B 头部窗口), <b>不保存普通 TCP/HTTP 应用载荷</b>; 抓包分析当前仅覆盖 IPv4;
 下次运行 NetPulse 时自动清理超过 {cap.get('retention_days', 7)} 天的切片 (最多保留 {cap.get('max_slice_files', 10)} 个)</td></tr>
 </table></div>"""
     return f"""<!DOCTYPE html>
@@ -12464,8 +12275,12 @@ def _capture_confirm_once(input_fn=None):
     except OSError:
         return True                    # 检查失败不拦路
     print(_c("\n  ⚠ 抓包取证首次使用确认", C_YELLOW))
+    # 端口范围直接取自 CAPTURE_WEB_PORTS (v1.14.14): 原文案写死 "80/443"
+    # 而白名单含 8080, 隐私披露口径必须与实现同源, 改端口不再漏改文案。
+    _web_ports_txt = "/".join(str(p) for p in CAPTURE_WEB_PORTS)
     for line in (
-            "     · 只保留诊断所需的网络元数据: 80/443 每条连接的前 2 个包多留 384 字节 (提取访问的域名用)",
+            f"     · 只保留诊断所需的网络元数据: {_web_ports_txt} 每条连接的前 "
+            f"{CAPTURE_FIRST_PKTS} 个包多留 {CAPTURE_PAYLOAD_KEEP} 字节 (提取访问的域名用)",
             "     · 不保存普通 TCP/HTTP 应用载荷 (账号、密码、聊天或页面内容不落盘)",
             "     · DNS 查询域名与访问域名 (QNAME/Host/SNI) 会出现在报告里 (定位故障必需)",
             "     · 抓包分析当前仅覆盖 IPv4",
@@ -12746,15 +12561,23 @@ def _capture_strip_packet(pkt, flow_state):
 
     if keep >= len(raw):
         return pkt
-    # v1.9.9 (抓包复核 P0): 截断重建后必须同步修正 L3/L4 长度字段, 否则
-    # Wireshark 按「IP 头总长 − 实际字节数」推算每段负载 → 序列空间不连续,
-    # 对成百上千个被截断的包误报 "TCP ACKed lost segment" / "Dup ACK" 等
-    # 专家提示 (实测旧 pcap 61.8% 的包 IP.len 虚高)。
-    # 纯字节操作, 延续本函数「不触 scapy 字段访问」的零工作原则。
+    # v1.14.14 (P0, 取代 v1.9.9 的长度改写方案):
+    # 截断后 **不再改写 IP/UDP 长度字段** —— 保留原始总长, 让离线分析器能
+    # 用「IP 总长 − 头长」还原每段的真实长度 (剥载荷后 bytes(payload) 恒空,
+    # 靠它判段会把数据段当纯 ACK, 信号 B/重传统计全线失效并伪报 dup-ack)。
+    #
+    # v1.9.9 当初改写长度是为了压掉 Wireshark 的 "TCP ACKed lost segment"
+    # 专家提示 —— 根因是当时 caplen==origlen==截断后长度, 却让 IP 总长宣称
+    # 1500, Wireshark 据此判定"这段有 1446B 根本没抓到"→ 序列空洞。
+    # 现在改成 pcap 记录级的标准 snaplen 截断: 包对象挂 .wirelen = 线上原始
+    # 长度, wrpcap 会据此写出 caplen < wirelen 的记录 (等价于 tcpdump -s)。
+    # 记录本身声明"线上 1514B、只抓到 54B", Wireshark 读作"该包线上更长、
+    # 抓包被 snaplen 截断" → 既不再按序列空洞误报 ACKed lost segment,
+    # 又完整保住了每段的真实长度供离线分析器还原。
     buf = bytearray(raw[:keep])
-    _patch_ip_lengths(buf, ip_off, ihl, l4_off, proto)
     trimmed = Ether(bytes(buf))
     trimmed.time = pkt.time            # 截断重建会丢时间戳, 手工带回
+    trimmed.wirelen = len(raw)         # 线上原始长度 (见下)
     return trimmed
 
 
@@ -13078,7 +12901,12 @@ class PcapAnalyzer:
                 if l4.window == 0 and "S" not in fl:
                     st["zero_win_n"] += 1
                 raw = bytes(l4.payload)
-                plen = len(raw)
+                # 段长取 **头部声明** 而非幸存下来的载荷字节数: 隐私剥除后
+                # 落盘包只剩头部, bytes(payload) 恒空 —— 拿它判"本段是否带
+                # 数据"会把数据段当成纯 ACK, 信号 B / 重传统计全线失效,
+                # 还会把正常传输伪报成 dup-ack 突发。剥除时保留了 IP 总长
+                # (且 pcap 记录带 wirelen), 头长相减即得真实段长。
+                plen = self._tcp_payload_len(ip, l4)
                 if plen == 0:
                     if "S" not in fl and "F" not in fl:
                         small_ack_n += 1
@@ -13161,6 +12989,34 @@ class PcapAnalyzer:
             st["last_ack"] = ack
             st["ack_rep"] = 0
             st["ack_flagged"] = False
+
+    @staticmethod
+    def _tcp_payload_len(ip, tcp):
+        """按 IP 总长 + TCP 头长反推该段的真实载荷长度。
+
+        v1.14.14: 隐私剥除后落盘包只剩头部, bytes(payload) 恒为 0, 但 IP 总长
+        在剥除时保留原值、TCP 头长字段也完整 —— 两者相减即真实段长, 与
+        v1.9.9 之前"直接读 payload"的口径一致。头长字段缺失/异常时返回 0
+        (退化为不判数据段, 不猜数字)。旧版 pcap (v1.9.9~v1.14.13 写的,
+        长度被改写过) 同样落到 0, 用 _migrate_pcap.py 可修。
+        """
+        try:
+            ihl = (int(ip.ihl) if ip.ihl is not None else 5) * 4
+            doff = (int(tcp.dataofs) if tcp.dataofs is not None else 5) * 4
+        except (TypeError, ValueError):
+            return 0
+        total = int(ip.len) if ip.len is not None else 0
+        if total > 0:
+            n = total - ihl - doff
+            # 剥除后 ip.len 保留原值 → 还原真实段长; 旧版 pcap (v1.9.9~
+            # v1.14.13 写的, 长度被改写过) 这里得 0, 行为与修复前一致,
+            # 用 _migrate_pcap.py 可修。
+            return n if n > 0 else 0
+        # IP 总长不可得 —— 构造态包 (未序列化时 scapy 的 len 为 None) 走实测。
+        try:
+            return len(bytes(tcp.payload))
+        except Exception:
+            return 0
 
     def _data_segment(self, d, st, ts, seq, plen):
         """重传 = 同流同方向 payload>0 且 (seq,len) 相同, 间隔 ≤1s。"""
@@ -16591,348 +16447,8 @@ def _fmt_record_table(rt, indent=2):
     return "\n".join(pad + ln for ln in lines)
 
 
-def render_report_text(report):
-    """渲染完整的纯文本报告。"""
-    if not report:
-        return "（尚无诊断数据，请先运行诊断）"
-    g = report["generated_at"].strftime("%Y-%m-%d %H:%M:%S")
-    out = []
-    out.append("=" * 64)
-    out.append(f"  {report['app']} v{report['version']}  诊断报告")
-    out.append(f"  生成时间: {g}")
-    out.append("=" * 64)
-    sys_i = report["system"]
-    out.append("【主机信息】")
-    out.append(f"  本机IP  : {sys_i.get('local_ip', '未知')}")
-    out.append(f"  默认网关: {sys_i.get('gateway', '未知')}")
-    out.append(f"  DNS     : {sys_i.get('dns', '未知')}")
-    out.append(f"  公网IP  : {sys_i.get('public_ip', '未知')}")
-    out.append("")
-    # 汇总
-    cnt = {}
-    for st in report["summary"].values():
-        cnt[st] = cnt.get(st, 0) + 1
-    out.append("【诊断汇总】")
-    order = ["完成", "警告", "异常", "错误", "超时", "未检测"]
-    parts = [f"{k} {cnt[k]}" for k in order if cnt.get(k)]
-    out.append(f"  共 {len(report['modules'])} 项: " + ", ".join(parts))
-    if parts:
-        ok_n = cnt.get("完成", 0)
-        warn_n = cnt.get("警告", 0)
-        err_n = cnt.get("异常", 0) + cnt.get("错误", 0)
-        timeout_n = cnt.get("超时", 0)
-        if err_n == 0 and warn_n == 0 and timeout_n == 0:
-            verdict = "整体健康"
-        elif err_n == 0 and timeout_n == 0:
-            verdict = "整体正常，但有警告项"
-        elif warn_n == 0 and timeout_n == 0:
-            verdict = "存在异常项，建议排查"
-        elif err_n == 0:
-            verdict = "检测未全部完成，结果仅供参考"
-        else:
-            verdict = "存在异常与警告项，建议排查"
-        tail = f"正常 {ok_n} / 警告 {warn_n} / 异常 {err_n}"
-        if timeout_n:
-            tail += f" / 超时 {timeout_n}"
-        out.append(f"  整体状态: {verdict}（{tail}）")
-    out.append("")
-    # 逐模块
-    out.append("【详细结果】")
-    for m in report["modules"]:
-        out.append("-" * 64)
-        out.append(f"◆ {m['name']}  [{m['status']}]")
-        # build_report 产出的模块字典用 "raw" 存原始结果 (没有 "result" 键),
-        # 直接 m["result"] 会 KeyError。本函数当前无调用点, 但键名必须与实际
-        # 数据结构一致, 否则哪天启用技术视图就是必崩。
-        res = m.get("raw") or {}
-        if "error" in res:
-            out.append(f"  诊断异常: {res['error']}")
-            continue
-        # 优先展示 summary
-        if res.get("summary"):
-            out.append(f"  结论: {res['summary']}")
-        if res.get("errors"):
-            for e in res["errors"]:
-                out.append(f"  ⚠ 问题: {e}")
-        # 其余字段 (去掉已展示的)
-        skip = {"summary", "errors", "timestamp", "method"}
-        extra = {k: v for k, v in res.items() if k not in skip}
-        if extra:
-            out.append("  数据:")
-            for k, v in extra.items():
-                rt = _record_table(v)
-                if rt is not None:
-                    label = ("详细测试记录" if k in DETAIL_KEYS
-                             else HEADER_MAP.get(k, k))
-                    out.append(f"    ▸ {label}:")
-                    out.append(_fmt_record_table(rt, 2))
-                else:
-                    out.append(_fmt_value({k: v}, 1))
-    out.append("=" * 64)
-    return "\n".join(out)
 
 
-def render_report_html(report):
-    """[DEPRECATED · v1.8.1] 旧版 HTML 渲染器 — export_report 已不再调用
-    (主路径为 render_report_html_customer)。仅为外部脚本兼容临时保留,
-    不再接受新功能/样式改动, 稳定版本后删除。"""
-    import html as _html
-
-    if not report:
-        return "<p>尚无诊断数据</p>"
-    g = report["generated_at"].strftime("%Y-%m-%d %H:%M:%S")
-
-    def _esc(s):
-        return _html.escape(str(s), quote=False)
-
-    # 状态 → 语义键 → (前景色, 浅底色)
-    SKEY = {"完成": "ok", "警告": "warn", "异常": "err", "错误": "fatal",
-            "超时": "timeout", "未检测": "idle"}
-    SC = {
-        "ok":    ("#0e8a4f", "#e7f6ee"),
-        "warn":  ("#b26a00", "#fdf3e3"),
-        "err":   ("#d92d20", "#fdecec"),
-        "fatal": ("#b42318", "#fbebea"),
-        "timeout": ("#334155", "#e9edf3"),
-        "idle":  ("#8a94a6", "#f1f3f7"),
-    }
-
-    def _sk(st):
-        return SKEY.get(st, "idle")
-
-    def _badge(status):
-        fg, bg = SC[_sk(status)]
-        return (f"<span class='badge' style='background:{bg};color:{fg}'>"
-                f"{_esc(status)}</span>")
-
-    def _dot(status):
-        fg, _ = SC[_sk(status)]
-        return f"<span class='dot' style='background:{fg}'></span>"
-
-    def _kv_table(pairs):
-        if not pairs:
-            return ""
-        rows = "".join(
-            f"<tr><td class='k'>{_esc(HEADER_MAP.get(k, k))}</td>"
-            f"<td class='v'>{_esc(v) if v is not None else '—'}</td></tr>"
-            for k, v in pairs)
-        return (f"<table class='tbl kv'><thead><tr>"
-                f"<th>指标</th><th>值</th></tr></thead>"
-                f"<tbody>{rows}</tbody></table>")
-
-    def _record_table_html(key, rt, is_detail=False):
-        headers, rows = rt
-        cap = ("详细测试记录（原始测量数据）" if is_detail
-               else HEADER_MAP.get(key, key))
-        head = "".join(f"<th>{_esc(h)}</th>" for h in headers)
-        body_rows = ""
-        for r in rows:
-            tds = "".join(f"<td>{_esc(x) if x is not None else '—'}</td>"
-                          for x in r)
-            body_rows += f"<tr>{tds}</tr>"
-        tbl = (f"<table class='tbl'><thead><tr>{head}</tr></thead>"
-               f"<tbody>{body_rows}</tbody></table>")
-        if is_detail:
-            return (f"<details class='detail'><summary>{_esc(cap)}"
-                    f"<span class='cnt'>{len(rows)} 条</span></summary>"
-                    f"{tbl}</details>")
-        return f"<div class='subcap'>{_esc(cap)}</div>{tbl}"
-
-    # ── 概览统计 ──
-    cnt = {}
-    for st in report["summary"].values():
-        cnt[st] = cnt.get(st, 0) + 1
-    order = ["完成", "警告", "异常", "错误", "超时", "未检测"]
-    stats = ""
-    for k in order:
-        v = cnt.get(k, 0)
-        fg, bg = SC[_sk(k)]
-        stats += (f"<div class='stat' style='background:{bg}'>"
-                  f"<div class='num' style='color:{fg}'>{v}</div>"
-                  f"<div class='lab' style='color:{fg}'>{k}</div></div>")
-    parts = []
-    for k in order:
-        if cnt.get(k):
-            fg, _ = SC[_sk(k)]
-            parts.append(f"<b style='color:{fg}'>{cnt[k]} {k}</b>")
-    health = (f"共 {len(report['modules'])} 项检测：" + "　·　".join(parts)
-              if parts else "共 0 项检测")
-
-    # ── 主机信息 ──
-    sys_i = report["system"]
-    sys_cards = "".join(
-        f"<div class='sys'><div class='lab'>{_esc(lab)}</div>"
-        f"<div class='val'>{_esc(val)}</div></div>"
-        for lab, val in [("本机 IP", sys_i.get("local_ip", "未知")),
-                         ("默认网关", sys_i.get("gateway", "未知")),
-                         ("DNS 服务器", sys_i.get("dns", "未知")),
-                         ("公网 IP", sys_i.get("public_ip", "未知"))])
-
-    # ── 模块卡片 ──
-    blocks = []
-    for m in report["modules"]:
-        # 同 render_report_text: 模块原始数据在 "raw" 键下, 不是 "result"
-        res = m.get("raw") or {}
-        fg, bg = SC[_sk(m["status"])]
-        body = ""
-        if "error" in res:
-            body += f"<div class='mod-err'>诊断异常：{_esc(res['error'])}</div>"
-        else:
-            if res.get("summary"):
-                body += (f"<div class='mod-concl' style='border-left-color:{fg};"
-                         f"background:{bg}'>"
-                         f"<b>结论</b>　{_esc(res['summary'])}</div>")
-            for e in (res.get("errors") or []):
-                body += f"<div class='mod-issue'>⚠ {_esc(e)}</div>"
-            skip = {"summary", "errors", "timestamp", "method"}
-            extra = {k: v for k, v in res.items() if k not in skip}
-            kv_pairs = []
-            for k, v in extra.items():
-                rt = _record_table(v)
-                if rt is not None:
-                    if kv_pairs:
-                        body += _kv_table(kv_pairs)
-                        kv_pairs = []
-                    body += _record_table_html(
-                        k, rt, is_detail=(k in DETAIL_KEYS))
-                else:
-                    kv_pairs.extend(_flatten_kv({k: v}))
-            if kv_pairs:
-                body += _kv_table(kv_pairs)
-        blocks.append(
-            f"<div class='mod' style='border-left-color:{fg}'>"
-            f"<div class='mod-head'>{_dot(m['status'])}"
-            f"<b class='mod-name'>{_esc(m['name'])}</b>{_badge(m['status'])}</div>"
-            f"{body}</div>")
-
-    CSS = """
-:root{
-  --bg:#f2f5f9; --card:#ffffff; --ink:#1b2437; --sub:#5a6472; --faint:#8a94a6;
-  --line:#e3e8f0; --line-soft:#eef1f6;
-  --primary:#1a56db; --primary-soft:#e8effc;
-  --ok:#0e8a4f; --ok-bg:#e7f6ee;
-  --warn:#b26a00; --warn-bg:#fdf3e3;
-  --err:#d92d20; --err-bg:#fdecec;
-  --fatal:#b42318; --fatal-bg:#fbebea;
-  --idle:#8a94a6; --idle-bg:#f1f3f7;
-  --radius:8px; --shadow:0 1px 2px rgba(15,28,51,.06);
-}
-*{box-sizing:border-box}
-body{background:var(--bg);color:var(--ink);margin:0;padding:28px 16px 64px;
-  font-family:'Segoe UI','Microsoft YaHei UI','Microsoft YaHei',sans-serif;
-  font-size:14px;line-height:1.65}
-.wrap{max-width:1000px;margin:0 auto}
-
-/* 页眉 */
-.band{background:linear-gradient(120deg,#0f1c33 0%,#1e3a5f 55%,#24548f 100%);
-  color:#fff;border-radius:10px;padding:22px 26px;display:flex;align-items:center;
-  gap:14px;flex-wrap:wrap;box-shadow:0 4px 14px rgba(15,28,51,.25)}
-.brand{font-size:21px;font-weight:800;letter-spacing:.3px;display:flex;align-items:center;gap:10px}
-.logo{width:30px;height:30px;border-radius:7px;background:linear-gradient(135deg,#4f8ef7,#1a56db);
-  display:inline-block;position:relative;flex:none}
-.logo::after{content:"";position:absolute;inset:7px;border:2px solid #fff;border-radius:3px;opacity:.9}
-.ver{font-size:12px;font-weight:600;color:#9db8e8;background:rgba(255,255,255,.12);
-  padding:2px 8px;border-radius:999px;margin-left:4px}
-.band-sub{font-size:13px;color:#c6d6f0;font-weight:500}
-.band-time{margin-left:auto;font-size:12px;color:#9db8e8;
-  font-family:'Cascadia Mono',Consolas,monospace}
-
-/* 健康度总览 */
-.health{margin:16px 2px 0;font-size:13.5px;color:var(--sub);line-height:1.9}
-.health b{font-weight:700}
-
-/* 统计卡 */
-.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:14px 0 4px}
-.stat{border-radius:10px;padding:14px 8px 12px;text-align:center;border:1px solid rgba(27,36,55,.05)}
-.stat .num{font-size:30px;font-weight:800;line-height:1.1;
-  font-family:'Cascadia Mono',Consolas,monospace}
-.stat .lab{font-size:13px;font-weight:600;margin-top:2px;opacity:.85}
-@media(max-width:640px){.stats{grid-template-columns:repeat(2,1fr)}}
-
-/* 分区标题 */
-.sec{font-size:16px;font-weight:800;margin:26px 0 10px;display:flex;align-items:center;
-  gap:8px;color:var(--ink)}
-.sec::before{content:"";width:4px;height:16px;border-radius:2px;background:var(--primary)}
-
-/* 主机信息 */
-.sys-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-.sys{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
-  padding:12px 14px;box-shadow:var(--shadow)}
-.sys .lab{font-size:12px;color:var(--faint);margin-bottom:3px}
-.sys .val{font-size:14px;font-weight:600;color:var(--ink);word-break:break-all;
-  font-family:'Cascadia Mono',Consolas,monospace}
-@media(max-width:760px){.sys-grid{grid-template-columns:repeat(2,1fr)}}
-
-/* 模块卡 */
-.mod{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--primary);
-  border-radius:var(--radius);padding:14px 18px;margin:12px 0;box-shadow:var(--shadow)}
-.mod-head{display:flex;align-items:center;gap:9px}
-.dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:none}
-.mod-name{font-size:15.5px;font-weight:700;color:var(--ink)}
-.badge{margin-left:auto;padding:3px 11px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.3px}
-
-/* 结论 / 问题 */
-.mod-concl{background:var(--primary-soft);border-left:3px solid var(--primary);
-  border-radius:6px;padding:9px 13px;margin:10px 0 4px;font-size:13.5px;color:var(--ink)}
-.mod-concl b{color:var(--primary)}
-.mod-issue{background:var(--warn-bg);border-radius:6px;padding:6px 12px;margin:6px 0;
-  font-size:13px;color:#7a4a00}
-.mod-err{background:var(--err-bg);border-radius:6px;padding:8px 12px;margin:8px 0;
-  font-size:13px;color:var(--fatal);font-weight:600}
-
-/* 表格 */
-.tbl{width:100%;border-collapse:collapse;margin:8px 0 4px;font-size:13px}
-.tbl th{background:var(--primary-soft);color:#1648a8;text-align:left;font-weight:700;
-  padding:6px 10px;border:1px solid #d8e3fb;white-space:nowrap}
-.tbl td{padding:5px 10px;border:1px solid var(--line-soft);color:var(--ink);
-  word-break:break-all;vertical-align:top}
-.tbl tbody tr:nth-child(even){background:#f8fafc}
-.tbl.kv td.k{width:38%;color:var(--sub);background:#f8fafc;font-weight:500}
-.subcap{font-size:13px;font-weight:700;color:var(--sub);margin:10px 0 4px}
-
-/* 可折叠明细 */
-.detail{margin:10px 0 2px;border:1px dashed var(--line);border-radius:6px;background:#fbfcfe}
-.detail summary{cursor:pointer;padding:8px 12px;font-size:12.5px;color:var(--faint);
-  font-weight:600;user-select:none;list-style:none;display:flex;align-items:center;gap:6px}
-.detail summary::-webkit-details-marker{display:none}
-.detail summary::before{content:"▸";color:var(--primary);transition:transform .15s}
-.detail[open] summary::before{transform:rotate(90deg)}
-.detail .cnt{background:var(--idle-bg);color:var(--idle);border-radius:999px;
-  font-size:11px;padding:1px 8px}
-.detail .tbl{margin:0 12px 12px;width:calc(100% - 24px)}
-
-footer{margin-top:32px;text-align:center;color:var(--faint);font-size:12px;
-  border-top:1px solid var(--line);padding-top:14px}
-
-/* 打印 */
-@media print{
-  body{background:#fff;padding:0;font-size:12px}
-  .band{background:#1b2437 !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
-  .mod,.sys,.stat{box-shadow:none;break-inside:avoid}
-  .mod-head{break-after:avoid}
-  .detail[open] .tbl{display:table}
-}
-"""
-    return f"""<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{_esc(report['app'])} 诊断报告</title>
-<style>{CSS}</style></head>
-<body><div class="wrap">
-<header class="band">
-  <div class="brand"><span class="logo"></span>{_esc(report['app'])}
-    <span class="ver">v{_esc(report['version'])}</span></div>
-  <span class="band-sub">网络诊断报告</span>
-  <span class="band-time">{_esc(g)}</span>
-</header>
-<div class="health">{health}</div>
-<div class="stats">{stats}</div>
-<div class="sec">主机信息</div>
-<div class="sys-grid">{sys_cards}</div>
-<div class="sec">详细结果</div>
-{''.join(blocks)}
-<footer>由 {_esc(report['app'])} v{_esc(report['version'])} 自动生成 · {_esc(g)}</footer>
-</div></body></html>"""
 
 
 def _flatten_kv(v, prefix=""):
@@ -17711,579 +17227,10 @@ def _render_wifi_channel_table(channel_analysis):
             f"<tbody>{body}</tbody></table></div>{more}")
 
 
-def render_report_html_customer(report):
-    """渲染客户版 HTML 报告。
-
-    输入: build_report() 的输出 (双视图)
-    输出: 完整可独立打开的 HTML 字符串
-    """
-    if not report:
-        return "<p>尚无诊断数据，请先运行诊断</p>"
-
-    import html as _html
-    g = report["generated_at"].strftime("%Y-%m-%d %H:%M:%S")
-    sys_i = report["system"]
-    health = report["health"]
-    counts = report["counts"]
-    modules = report["modules"]
-    by_key = {m["key"]: m for m in modules}   # 一次建索引, 下文各处复用
-
-    # 状态语义键: 引用全局唯一来源 (见 STATUS_COLORS 定义处), 不要在本函数
-    # 里再立局部映射 — 多份映射并存曾导致同一份报告出现两种「警告橙」。
-    SKEY = STATUS_KEY
-
-    # ── 顶部 hero (方案 A: 白卡 + SVG 环形健康分) ──
-    nav_html = _build_report_nav(modules)
-
-    # meta chips: 本机 / 网关 / 公网 / DNS / 出口位置 / IPv6
-    hero_meta = []
-    hero_meta.append(f"本机 <b>{_html_esc(sys_i.get('local_ip') or '?')}</b>")
-    if sys_i.get("gateway"):
-        hero_meta.append(f"网关 <b>{_html_esc(sys_i['gateway'])}</b>")
-    if sys_i.get("public_ip"):
-        hero_meta.append(f"公网 <b>{_html_esc(sys_i['public_ip'])}</b>")
-    if sys_i.get("dns"):
-        hero_meta.append(f"DNS <b>{_html_esc(sys_i['dns'])}</b>")
-    if sys_i.get("asn") or sys_i.get("geo"):
-        hero_meta.append(f"📍 <b>{_html_esc(' / '.join(x for x in (sys_i.get('geo'), sys_i.get('asn')) if x))}</b>")
-    if sys_i.get("ipv6_public_ip"):
-        hero_meta.append(f"IPv6 <b>{_html_esc(sys_i['ipv6_public_ip'])}</b>")
-    # v1.5.0: 检测耗时 + 检测范围。只跑几个模块时健康分 100 极容易被读成
-    # "23 项全正常", 必须显式写出覆盖了多少项
-    dur_txt = _fmt_duration(report.get("duration_ms"))
-    if dur_txt:
-        hero_meta.append(f"耗时 <b>{_html_esc(dur_txt)}</b>")
-    sel = report.get("selected_modules")
-    tot = report.get("total_modules")
-    if isinstance(sel, int) and isinstance(tot, int) and tot > 0:
-        if sel < tot:
-            # 部分检测: title 里说清未覆盖多少项, 避免只看到分数就下结论
-            hero_meta.append(
-                (f"检测范围 <b>{sel}/{tot}</b> 项",
-                 f"本次仅运行所选模块, 其余 {tot - sel} 项未检测"))
-        else:
-            hero_meta.append(f"检测范围 <b>{tot} 项全覆盖</b>")
-    # chip 支持 (内容, title) 二元组, 避免在 .hero .meta span 里再套一层 span
-    meta_chips = "".join(
-        (f"<span title='{_html_attr(m[1])}'>{m[0]}</span>"
-         if isinstance(m, tuple) else f"<span>{m}</span>")
-        for m in hero_meta)
-
-    score = health.get("score", 0)
-    grade_key = str(health.get("grade") or "").strip()[:1].upper()
-    lbl_fg, lbl_bg = GRADE_BADGE.get(grade_key, GRADE_BADGE["C"])
-    score_ring = _svg_health_ring(score, grade_key)
-
-    # 阶段 C · v1.3.0: 根因摘要 (hero 之后紧接, 客户第一屏直接看到主要问题)
-    # v1.5.0: 传入完整 report, 用于生成"一句话报障"
-    diagnosis_section = _render_diagnosis_section_html(
-        report.get("diagnosis", {}), report=report)
-
-    hero = f"""
-<header class="hero" id="overview">
-  <div style="flex:1;min-width:0">
-    <div class="app"><div class="mark"></div>
-      <b>{_html_esc(report['app'])}</b><span class="ver">v{_html_esc(report['version'])}</span></div>
-    <h1>网络诊断报告</h1>
-    <div class="sub">{_html_esc(health.get('verdict', ''))} · 生成于 {_html_esc(g)}</div>
-    <div class="meta">{meta_chips}</div>
-  </div>
-  <div class="gauge">
-    {score_ring}
-    <div class="in"><div class="num">{score}</div><div class="lbl" style="color:{lbl_fg};background:{lbl_bg}">{_html_esc(health.get('label', ''))}</div></div>
-  </div>
-</header>"""
-
-    # ── 信息条 (模块总数 / 豁免 / 扣分项 / 生成时间) ──
-    # 「扣分项」必须用 counts (report["counts"], 不含豁免模块的扣分口径),
-    # 与 compute_health_score 一致; 用全口径会在 100 分绿环旁边谎报扣分。
-    # all_counts (全口径) 从 report["summary"] 派生即可, 供状态分布条使用。
-    all_counts = Counter(report.get("summary", {}).values())
-    total_modules = len(modules)
-    exempt_count = report.get("exempt_count", 0) or 0
-    err_cnt = counts.get("异常", 0) + counts.get("错误", 0)
-    warn_cnt = counts.get("警告", 0)
-    timeout_cnt = counts.get("超时", 0)
-    band_bits = [f"共 <b>{total_modules}</b> 个模块"]
-    if exempt_count:
-        _exm = _exempt_names(report)
-        band_bits.append(f"评分豁免 <b>{exempt_count}</b>"
-                         + (f"（{_html_esc('、'.join(_exm))}）" if _exm else ""))
-    deduct_bits = []
-    if err_cnt:
-        deduct_bits.append(f"<b>{err_cnt}</b> 异常级")
-    if warn_cnt:
-        deduct_bits.append(f"<b>{warn_cnt}</b> 警告级")
-    if timeout_cnt:
-        deduct_bits.append(f"<b>{timeout_cnt}</b> 超时")
-    if deduct_bits:
-        band_bits.append("扣分项 " + " / ".join(deduct_bits))
-    band_html = ('<div class="band">' +
-                 '<span class="sep"></span>'.join(band_bits) + '</div>')
-
-    # ── 待办问题 ──
-    # 1) 收集所有 issue; 2) 按 (severity, text) 去重避免多模块重复同一警告;
-    # 3) 顶部列表只展示异常/错误/警告, 信息级不进顶部 (详情里仍可见)
-    todo_issues = []
-    seen_keys = {}
-    for m in modules:
-        for issue in m.get("issues", []) or []:
-            text = (issue.get("text", "") or "").strip()
-            dedup_key = (issue.get("severity", "信息"), text)
-            hit = seen_keys.get(dedup_key)
-            if hit is not None:
-                # 同样文案合并成一条卡, 但记下波及的模块数 —
-                # 否则 23 个模块同样超时会压成 1 条, 与"23 个问题模块已展开"自相矛盾
-                hit["_dup"] += 1
-                if m["name"] not in hit["_modules"]:
-                    hit["_modules"].append(m["name"])
-                continue
-            entry = {**issue, "_module": m["name"], "_status": m["status"],
-                     "_dup": 1, "_modules": [m["name"]]}
-            seen_keys[dedup_key] = entry
-            todo_issues.append(entry)
-
-    sev_order = {"异常": 0, "错误": 0, "警告": 1, "信息": 2}
-    todo_issues.sort(key=lambda i: sev_order.get(i.get("severity", "信息"), 3))
-
-    # 顶部只展示需关注条目 (异常/错误/警告), 信息级不进顶部列表; 最多展示 10 条, 溢出时给出提示
-    need_attention = [i for i in todo_issues if i.get("severity", "信息") in ("异常", "错误", "警告")]
-    top_issues = need_attention[:10]
-
-    if top_issues:
-        # 合并"同来源 + 同影响 + 同建议"的条目为一张卡 (如 IPv6 的两条异常):
-        # 标题用「；」连接多条问题, 卡片数更少、建议不重复刷屏
-        merged = []
-        merge_index = {}
-        for issue in top_issues:
-            gkey = (issue.get("_module", ""), issue.get("impact", ""),
-                    issue.get("action", ""), issue.get("severity", "信息"))
-            if gkey in merge_index:
-                hit = merged[merge_index[gkey]]
-                hit["_texts"].append(issue.get("text", ""))
-                # 合并卡片时累加波及模块数, 否则"影响 23 个模块"会被算成 1
-                hit["_dup"] = hit.get("_dup", 1) + issue.get("_dup", 1)
-                for nm in issue.get("_modules", []):
-                    if nm not in hit["_modules"]:
-                        hit["_modules"].append(nm)
-            else:
-                merge_index[gkey] = len(merged)
-                merged.append({**issue, "_texts": [issue.get("text", "")]})
-        todo_blocks = []
-        for issue in merged:
-            sev = issue.get("severity", "信息")
-            sev_class = "err" if sev in ("异常", "错误") else "warn"
-            impact = issue.get("impact", "")
-            action = issue.get("action", "")
-            text = "；".join(t for t in issue["_texts"] if t)
-            module = issue.get("_module", "")
-            raw_summary = issue.get("raw_summary", "")
-            # 把 raw_summary 也加到来源 meta 行, 让装维一眼看到原始数据
-            # (例如网关丢包: 立即看到 "20 发 / 19 收 / 1 丢", 不必展开技术细节)
-            meta_line = f"📍 来源: {_html_esc(module)}"
-            dup = issue.get("_dup", 1) or 1
-            if dup > 1:
-                # 去重后必须告诉用户波及范围, 否则顶部"1 项需要您关注"与
-                # 下方"23 个问题模块已展开"看起来互相打架
-                mods = issue.get("_modules", []) or []
-                scope = "、".join(mods[:4]) + (" 等" if len(mods) > 4 else "")
-                meta_line += (f" · ⚠ 波及 <b>{dup}</b> 个模块"
-                              f"（{_html_esc(scope)}）")
-            if raw_summary:
-                meta_line += f" · 📊 {_html_esc(raw_summary)}"
-            todo_blocks.append(f"""
-<div class="issue {sev_class}">
-  <h3><span class="sev">{_html_esc(sev)}</span>{_html_esc(text)}</h3>
-  <div class="meta">{meta_line}</div>
-  {f"<div class='impact'>📌 影响: {_html_esc(impact)}</div>" if impact else ""}
-  {f"<div class='action'>💡 建议: {_html_esc(action)}</div>" if action else ""}
-</div>""")
-        extra_bits = []
-        # 会诊引导: 存在异常级问题时提示升级路径 (现场解决不了 → 带报告回去)
-        critical_cnt = sum(1 for i in need_attention
-                           if i.get("severity") in ("异常", "错误"))
-        if critical_cnt:
-            todo_blocks.append(f"""
-<div class="issue consult">
-  <h3><span class="sev">会诊</span>{critical_cnt} 项异常级问题的现场处置指引</h3>
-  <div class="impact">📌 影响: 异常级问题按上述建议现场处理后仍存在的, 多涉及线路质量、运营商侧或设备本身缺陷, 现场手段有限</div>
-  <div class="action">💡 建议: 保留本 HTML 报告与同名 <b>.json</b> 文件带回交专家会诊 — .json 内含完整原始测量数据 (逐跳路径、时序曲线、原始统计), 供后台深入分析; 客户处可先留存 HTML 版说明</div>
-</div>""")
-        hidden_cnt = len(need_attention) - len(top_issues)
-        if hidden_cnt > 0:
-            extra_bits.append(f"顶部仅展示前 10 条, 另有 {hidden_cnt} 条见下方模块详情")
-        info_cnt = sum(1 for i in todo_issues if i.get("severity", "信息") == "信息")
-        if info_cnt > 0:
-            extra_bits.append(f"另有 {info_cnt} 条信息项可查看下方模块详情")
-        info_extra = (f" <span class='extra-count'>({'；'.join(extra_bits)})</span>"
-                      if extra_bits else "")
-        todo_section = f"""
-<div class="sec" id="todo"><h2><span class="icon">⚠</span>{len(need_attention)} 项需要您关注{info_extra}</h2></div>
-<div class="todo">{"".join(todo_blocks)}</div>"""
-    elif todo_issues:
-        todo_section = """
-<div class="sec" id="todo"><h2><span class="icon">✓</span>所有核心检测通过</h2></div>
-<div class="todo ok">
-  <div class="todo-head">✓ 网络状态良好</div>
-  <div class="impact">所有核心检测均正常, 部分提示项可在下方模块详情查看。</div>
-</div>"""
-    else:
-        todo_section = f"""
-<div class="sec" id="todo"><h2><span class="icon">✓</span>所有检测通过</h2></div>
-<div class="todo ok">
-  <div class="todo-head">✓ 网络状态良好</div>
-  <div class="impact">全部 {len(modules)} 项检测均正常, 无需特别处理。</div>
-</div>"""
-
-    # ── 统计卡片 ──
-    # 始终显示全部 6 个卡片 (含 0 值), 与 stats-grid 的 6 列布局对齐
-    stats_order = ["完成", "警告", "异常", "错误", "超时", "未检测"]
-    stat_items = [(k, counts.get(k, 0)) for k in stats_order]
-    stat_cards = "".join(
-        f"<div class='stat-card {SKEY.get(k, 'idle').replace('fatal', 'err')}'>"
-        f"<div class='count'>{v}</div>"
-        f"<div class='label'>{k}</div></div>"
-        for k, v in stat_items
-    )
-    # 模块总数 + 豁免模块数 (已在 hero 段计算 total_modules / exempt_count,
-    # 避免 stats-grid 只显示部分模块误导用户以为模块变少了)。
-    # 注意两种口径并存, 必须在文案里讲清楚, 否则并排的统计卡(扣分口径)与
-    # 状态分布条(全口径)数字不一致会让人以为算错了:
-    #   counts  = 扣分口径, 排除豁免模块  → 统计卡
-    #   summary = 全口径,   含豁免模块    → 状态分布条 / 检测结果一览
-    stats_caption = ""
-    if total_modules:
-        scored_total = sum(v for _, v in stat_items)
-        if exempt_count:
-            _exm = _exempt_names(report)
-            stats_caption = (
-                f"<div class='stats-caption'>上方为<b>扣分口径</b> {scored_total} 个模块"
-                f"（全量 {total_modules} 个, 其中 {exempt_count} 个评分豁免不计入"
-                + (f": {_html_esc('、'.join(_exm))}" if _exm else "")
-                + f"）；下方状态分布条为<b>全口径</b> "
-                f"{total_modules} 个模块</div>")
-        else:
-            stats_caption = f"<div class='stats-caption'>共 {total_modules} 个模块</div>"
-    stats_section = f"""
-<div class="sec" id="stats"><h2><span class="icon">📊</span>状态统计</h2></div>
-<div class="stats-grid">{stat_cards}</div>{stats_caption}"""
-
-    # ── 检测结果一览 ──
-    overview_items = []
-    for m in modules:
-        st = m["status"]
-        sk = SKEY.get(st, "idle")
-        # 概览行只显示"结论"前 60 字, 避免太长
-        verdict_short = m["verdict"][:60] + ("…" if len(m["verdict"]) > 60 else "")
-        overview_items.append(
-            f"<li>"
-            f"<a href='#mod-{_html_attr(m['key'])}' title='跳转到 {_html_attr(m['name'])} 详细结果'>"
-            f"<span class='dot {sk}'></span>"
-            f"<span class='name'>{_html_esc(m['name'])}</span>"
-            f"<span class='verdict'>{_html_esc(verdict_short)}</span>"
-            f"<span class='badge {sk}'>{_html_esc(st)}</span>"
-            f"</a>"
-            f"</li>"
-        )
-    overview_section = f"""
-<div class="sec" id="list"><h2><span class="icon">📋</span>检测结果一览</h2></div>
-<div class="overview"><ul>{"".join(overview_items)}</ul></div>"""
-
-    # ── 图表区 (纯 SVG, 数据不足时对应图卡自动隐藏) ──
-    chart_cards = []
-
-    gw_mod = by_key.get("gateway") or {}
-    gateway_raw = gw_mod.get("raw") or {}
-    ping_info = (gateway_raw or {}).get("ping") or {}
-    ping_rtts = ping_info.get("rtts") or []
-    ping_chart = _svg_ping_line(ping_rtts)
-    if ping_chart:
-        cap_bits = [f"共 {len(ping_rtts)} 次成功样本"]
-        if isinstance(ping_info.get("avg_ms"), (int, float)):
-            avg = ping_info["avg_ms"]
-            # Windows ping 对局域网 (<1ms) 输出整数粒度 0, 直写"平均 0ms"
-            # 会被误读成"数据有问题" — 有样本时按 <1ms 表达 (v1.9.3)
-            cap_bits.append("平均 <1ms" if (avg < 1 and ping_rtts)
-                            else f"平均 {avg:g}ms")
-        peak = max(ping_rtts) if ping_rtts else 0
-        if isinstance(peak, (int, float)) and peak > 0:
-            cap_bits.append(f"峰值 {peak:g}ms")
-        if isinstance(ping_info.get("loss_pct"), (int, float)) \
-                and ping_info.get("loss_pct", 0) > 0:
-            cap_bits.append(f"丢包 {ping_info['loss_pct']}%")
-        chart_cards.append(
-            f"<div class='chart'><h4>网关延迟时间序列 <span class='tag'>逐次 Ping</span></h4>"
-            f"{ping_chart}<div class='cap'>" + " · ".join(cap_bits) + "。</div></div>")
-
-    sp_mod = by_key.get("speedtest") or {}
-    speed_src, speed_method = _resolve_speed_chart_src(sp_mod.get("raw") or {})
-    speed_chart = _svg_speed_bars(speed_src)
-    if speed_chart:
-        cap_bits = []
-        for kk, lab in (("download_mbps", "下载"), ("upload_mbps", "上传")):
-            v = speed_src.get(kk)
-            if isinstance(v, (int, float)) and v > 0:
-                cap_bits.append(f"{lab} {format_speed(v)}")
-        chart_cards.append(
-            f"<div class='chart'><h4>宽带测速 <span class='tag'>{_html_esc(speed_method)}</span></h4>"
-            f"{speed_chart}<div class='cap'>" + " · ".join(cap_bits) + "。</div></div>")
-
-    status_chart = _svg_status_bar(all_counts)
-    if status_chart:
-        dist = " · ".join(f"{k} {v}" for k, v in all_counts.items())
-        chart_cards.append(
-            f"<div class='chart wide'><h4>状态分布 <span class='tag'>{total_modules} 模块</span></h4>"
-            f"{status_chart}<div class='cap'>" + dist
-            + ("（含评分豁免模块）" if exempt_count else "") + "</div></div>")
-
-    if chart_cards:
-        charts_section = (f'<div class="sec" id="charts"><h2><span class="icon">📈</span>关键指标图</h2></div>'
-                          f'<div class="charts">{"".join(chart_cards)}</div>')
-    else:
-        charts_section = ""
-
-    # ── 详细模块 ──
-    # v1.5.0: 模块卡默认只展开首要根因涉及的模块。23 个模块里若有 5 个异常,
-    # 旧逻辑会一次刷出 5 张巨型卡片把客户第一屏淹没 — 只留主角展开
-    root_causes = (report.get("diagnosis") or {}).get("root_causes") or []
-    primary_modules = set(root_causes[0].get("affected_modules") or []) \
-        if root_causes else set()
-
-    mod_blocks = []
-    for m in modules:
-        st = m["status"]
-        sk = SKEY.get(st, "idle")
-        # 关键指标
-        metrics = m.get("key_metrics", [])
-        if metrics:
-            metric_html = []
-            for me in metrics:
-                # 空值指标 (—/N/A/无) 没有信息量, 不占卡片格
-                if str(me.get("value", "")).strip() in ("—", "N/A", "无", ""):
-                    continue
-                level = me.get("level", "ok")
-                hint = me.get("hint", "")
-                # 指标卡保持清爽: 数字为主, 名称在下, 任何说明文字都不进卡面
-                # (包括 warn/err 也不再 inline 显示), 全部进悬停提示 —
-                # 卡面只靠颜色传达"这条需要关注", 点数超过 5 个时长说明挤
-                # 变形, 移到 title 是更可读的方案
-                # title 包含完整名/值/说明, 窄屏 ellipsis 截断后仍能看到
-                full_title = f"{me.get('label','')}: {me.get('value','')}"
-                if hint:
-                    full_title += f"\n💡 {hint}"
-                # 数值在上、名称在下 (flex-column), 长名称可换行不再截断
-                # data-hint 供触摸设备点击展开 (桌面 hover 走 title)
-                # f-string 表达式内不可有反斜杠/换行 (3.12 前 tokenizer 限制, x86 用 3.8 打包)
-                _hint_attr = (" data-hint='" + _html_attr(hint) + "'") if hint else ""
-                metric_html.append(
-                    f"<div class='metric' title='{_html_attr(full_title)}'"
-                    f"{_hint_attr}>"
-                    f"<span class='v {level}'>{_html_esc(me['value'])}</span>"
-                    f"<span class='lab'>{_html_esc(me['label'])}</span>"
-                    f"</div>"
-                )
-            metrics_html = f"<div class='metrics'>{''.join(metric_html)}</div>"
-        else:
-            metrics_html = ""
-
-        # 问题: 按 (severity, text) 去重 — 与顶部"需关注/信息项"计数口径一致
-        # (顶部按 (severity, text) 去重), 保证"计数 = 卡片实际渲染行数"。
-        # 注意: 不再按 action 去重 — 多条不同问题共享同一建议时 (如 IPv6/
-        # 多出口模块的同 action 信息项), 每条都必须可见, 否则顶部计数
-        # 与卡片内容对不上。
-        issues = m.get("issues", []) or []
-        if issues:
-            # 先按 (severity, text) 去重 (与顶部计数口径一致), 再把
-            # "同一条建议"的多条问题合并到一组: 问题列表只出现一次建议,
-            # 避免同一模块里 💡 建议重复刷屏 (如 IPv6 的两条异常共享同一建议)
-            deduped = []
-            seen_issue_keys = set()
-            for issue in issues:
-                sev = issue.get("severity", "信息")
-                text = (issue.get("text", "") or "").strip()
-                action = (issue.get("action", "") or "").strip()
-                act_key = (sev, text)
-                if not text or act_key in seen_issue_keys:
-                    continue
-                seen_issue_keys.add(act_key)
-                deduped.append((sev, text, action))
-            # 按建议分组 (保持出现顺序): {action: [(sev, text), ...]}
-            groups = []
-            group_index = {}
-            for sev, text, action in deduped:
-                if action and action in group_index:
-                    groups[group_index[action]][1].append((sev, text))
-                else:
-                    group_index[action] = len(groups)
-                    groups.append((action, [(sev, text)]))
-            issue_html = []
-            for action, items in groups:
-                for sev, text in items:
-                    sev_class = ("err" if sev in ("异常", "错误")
-                                 else "warn" if sev == "警告" else "")
-                    info_cls = sev_class if sev_class else "info"
-                    issue_html.append(
-                        f"<div class='impact-line {info_cls}'>"
-                        f"<b>[{_html_esc(sev)}]</b> {_html_esc(text)}"
-                        f"</div>"
-                    )
-                # 纯信息级的条目不带建议 (如 "假网关属设计行为" 却跟一条
-                # "联系网络管理员" 的建议, 自相矛盾且徒增噪音)
-                if action and any(s in ("异常", "错误", "警告") for s, _ in items):
-                    issue_html.append(
-                        f"<div class='action-line'>💡 {_html_esc(action)}</div>"
-                    )
-            issues_html = "".join(issue_html)
-        else:
-            issues_html = ""
-
-        # 折叠策略 (v1.5.0 收窄):
-        #   有根因 → 只自动展开"首要根因"涉及的模块, 其余问题模块折叠
-        #   无根因 → 退回旧行为, 所有问题模块展开 (规则没命中时不能把异常藏起来)
-        # 「超时」也是硬故障 (测了但没结果), 两种情况都不该被当成无关紧要的灰行
-        problem_status = st in PROBLEM_STATUSES
-        auto_open = (m["key"] in primary_modules) if primary_modules else problem_status
-        tech_html = ""
-        if m.get("has_tech_details"):
-            pres = MODULE_PRESENTATION.get(m["key"], {})
-            tech_keys = pres.get("tech_keys", [])
-            tech_html = _render_html_tech_block(
-                m["key"], m.get("raw", {}), tech_keys,
-                auto_open=auto_open)
-
-        # WiFi 等模块原始数据全空时, 给出友好提示而非空列表
-        empty_note_html = ""
-        if m["key"] == "wifi":
-            raw = m.get("raw", {}) or {}
-            nets = raw.get("networks") or []
-            chans = raw.get("channel_analysis") or []
-            if not nets and not chans:
-                empty_note_html = "<div class='impact-line warn'><b>[提示]</b> 当前未连接 Wi-Fi, 因此未扫描周边网络与信道占用 (这是正常现象, 而非故障)。</div>"
-
-        # 整个模块卡 (方案 A: details 折叠, 问题模块自动展开)
-        verdict = m.get("verdict", "")
-        # 摘要行 (折叠态) 空间受限: 截断 60 字 (与「检测结果一览」同口径),
-        # 全文走 title 悬停。v1.5.3: 只截摘要行 — 卡片正文「结论」行没有空间
-        # 约束, 打印/PDF 不显示 title, 截断会让纸质留档永久缺文
-        v_short = verdict[:60] + ("…" if len(verdict) > 60 else "")
-        v_title = f' title="{_html_attr(verdict)}"' if len(verdict) > 60 else ""
-        explain = MODULE_EXPLAINS.get(m["key"], "")
-        explain_html = (f"<div class='explain'>📖 {_html_esc(explain)}</div>"
-                        if explain else "")
-        # 模块图标
-        mod_icons = {
-            "ok": "✓",
-            "warn": "⚠",
-            "err": "✕",
-            "fatal": "✕",
-            "timeout": "⏱",
-            "idle": "○"
-        }
-        mod_icon = mod_icons.get(sk, "○")
-        open_attr = " open" if auto_open else ""
-        mod_blocks.append(f"""
-<details class="mod {sk}" id="mod-{_html_attr(m["key"])}"{open_attr}>
-  <summary>
-    <span class="ic {sk}">{mod_icon}</span>
-    <span class="nm">{_html_esc(m['name'])}</span>
-    <span class="vd"{v_title}>{_html_esc(v_short)}</span>
-    <span class="b {sk}">{_html_esc(st)}</span>
-    <a class="anchor" href="#mod-{_html_attr(m['key'])}" data-mod="mod-{_html_attr(m['key'])}"
-       title="复制本模块链接">🔗</a>
-    <span class="arr">▸</span>
-  </summary>
-  <div class="bd">
-    <div class="verdict"><span class="tag">结论</span><span>{_html_esc(verdict)}</span></div>
-    {explain_html}
-    {metrics_html}
-    {issues_html}
-    {empty_note_html}
-    {tech_html}
-  </div>
-</details>""")
-
-    # 章节标题说明当前展开策略, 避免用户以为"没展开 = 没问题"
-    problem_cnt = sum(1 for s in report["summary"].values()
-                      if s in PROBLEM_STATUSES)
-    if primary_modules:
-        open_note = (f"共 {problem_cnt} 个问题模块 · 已展开首要问题项, "
-                     f"其余点击展开")
-    else:
-        open_note = f"{problem_cnt} 个问题模块已展开 · 正常模块点击展开"
-    modules_section = f"""
-<div class="sec" id="modules"><h2><span class="icon">🔍</span>详细结果
-<span class="cnt">{_html_esc(open_note)}</span></h2></div>
-{"".join(mod_blocks)}"""
-
-    # ── 主机信息 ──
-    sys_pairs = [
-        ("本机 IP", sys_i.get("local_ip")),
-        ("默认网关", sys_i.get("gateway")),
-        ("DNS", sys_i.get("dns")),
-        ("公网 IP", sys_i.get("public_ip")),
-    ]
-    if sys_i.get("asn") or sys_i.get("geo"):
-        loc = []
-        if sys_i.get("geo"):
-            loc.append(sys_i["geo"])
-        if sys_i.get("asn"):
-            loc.append(sys_i["asn"])
-        sys_pairs.append(("出口位置", " / ".join(loc)))
-    if sys_i.get("ipv6_public_ip"):
-        sys_pairs.append(("IPv6 公网", sys_i["ipv6_public_ip"]))
-
-    host_cards = "".join(
-        f"<div class='host-card'><div class='lab'>{_html_esc(lab)}</div>"
-        f"<div class='val'>{_html_esc(val) if val else '—'}</div></div>"
-        for lab, val in sys_pairs
-    )
-    host_section = f"""
-<div class="sec" id="host"><h2><span class="icon">🖥</span>主机信息</h2></div>
-<div class="host-grid">{host_cards}</div>"""
-
-    # ── 诊断标准表 (THRESHOLDS + _metrics_linkspeed 硬编码阈值, 折叠显示) ──
-    standards_rows = []
-    for mod_key, mod_th in THRESHOLDS.items():
-        if not mod_th:
-            continue
-        mod_name = MODULE_MAP.get(mod_key, (mod_key,))[0]
-        for metric_key, cfg in mod_th.items():
-            label = cfg.get("label", metric_key)
-            warn = cfg.get("warn", "—")
-            err = cfg.get("err", "—")
-            unit = cfg.get("unit", "")
-            lower = cfg.get("lower_better", True)
-            direction = "越低越差 (≥ 触发)" if lower else "越低越好 (≤ 触发)"
-            standards_rows.append((mod_name, label, str(warn), str(err), unit, direction))
-    # 链路速率阈值在 _metrics_linkspeed 硬编码, THRESHOLDS 里是空, 补进来
-    standards_rows.append(("链路速率", "有线协商速率", "100", "1000", "Mbps", "越低越差 (≥ 触发)"))
-    standards_rows.append(("链路速率", "WiFi 协商速率", "54",  "150",  "Mbps", "越低越差 (≥ 触发)"))
-
-    std_body = "".join(
-        f"<tr><td>{_html_esc(m)}</td><td>{_html_esc(l)}</td>"
-        f"<td class='num'>{_html_esc(w)}</td><td class='num'>{_html_esc(e)}</td>"
-        f"<td>{_html_esc(u)}</td><td>{_html_esc(d)}</td></tr>"
-        for m, l, w, e, u, d in standards_rows
-    )
-    # v1.5.0: 判定阈值 / 评分规则属于工具内部实现, 对客户没有阅读价值
-    # (还会引来"为什么异常就是扣 20 分"的疑问), 统一收进默认折叠的技术附录
-    standards_section = f"""
-<div class="sec" id="appendix"><h2><span class="icon">🔧</span>技术附录
-<span class="cnt">默认折叠 · 供装维与技术人员查阅</span></h2></div>
-<details class="collapse" data-auto-open="0"><summary>查看本次诊断的判定标准与评分口径 <span class='cnt'>{len(standards_rows)} 项指标</span></summary>
-<div class="body">
-  <div class='subcap'>本节是工具内部的判定口径，<b>不影响</b>上方已列出的实测数据与结论。阈值只决定状态标签（正常 / 警告 / 异常），所有原始测量值仍完整保留在各模块的「技术细节」中。</div>
-  <div class='subcap' style='margin-top:10px'>判定规则: "越低越差"的指标 (延迟/丢包/重传/抖动), 超过<span class='kw warn'>警告阈值</span>标 ⚠️ 警告, 超过<span class='kw err'>异常阈值</span>标 ❌ 异常; "越高越好"的指标 (速率/TCP 可达数), 低于警告阈值标警告, 低于异常阈值标异常。所有阈值集中维护在 <code>THRESHOLDS</code>, 链路速率另在 <code>_metrics_linkspeed</code> 硬编码。</div>
-  <table class='tbl std'>
-    <thead><tr><th>模块</th><th>指标</th><th>警告阈值</th><th>异常阈值</th><th>单位</th><th>判定方向</th></tr></thead>
-    <tbody>{std_body}</tbody>
-  </table>
-  <div class='subcap' style='margin-top:12px'>评分规则 (健康分是用于快速排序问题优先级的规则分, 不是统计意义上的网络质量评分): 起始 100 分, 异常 -20/项, 错误 -30/项, 警告 -2/项, 未检测不扣分。<br>豁免模块 (不参与扣分): iperf3(未配置非故障), IPv6(可选), VPN/虚拟网卡(环境特性), NAT类型(运营商侧)。等级: A≥90 优秀, B≥75 良好, C≥60 一般, D≥40 欠佳, F&lt;40 严重。</div>
-</div>
-</details>"""
-
-    # ── CSS (方案 A: 晨雾浅色仪表盘) ──
-    CSS = """
+# 客户版报告 CSS (方案 A: 晨雾浅色仪表盘)。
+# v1.14.14 从 render_report_html_customer 函数体提到模块级 —— 该函数曾达
+# 927 行, 其中 191 行是这块常量; 与 CSS_BRIEF_V2 同一惯例。
+CSS_CUSTOMER_REPORT = """
 *{box-sizing:border-box;margin:0;padding:0;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 .skip-link{position:absolute;left:-9999px;top:0;z-index:9999;background:#0a1628;color:#fff;padding:8px 16px;text-decoration:none;border-radius:0 0 8px 0}
 .skip-link:focus{left:0}
@@ -18475,6 +17422,660 @@ details.collapse .subcap code{background:#fff;padding:1px 6px;border-radius:3px;
 footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-top:20px;border-top:1px solid #e6e9f0}
 """ + _DIAGNOSIS_CSS  # 阶段 C · v1.3.0: 根因摘要 CSS
 
+
+
+
+def _band_counts_band(counts, modules, report):
+    """状态分布条 (23 全口径) + 扣分项说明 (19 口径)。
+
+    两口径并存是刻意设计: 扣分项走 counts (19 扣分口径), 状态分布走
+    summary 派生的 all_counts (23 全口径), 两者并排展示时必须在文案里
+    说明差异, 否则用户看起来像算错。豁免模块数取自 report, 与统计卡同源。
+    """
+    all_counts = Counter(report.get("summary", {}).values())
+    total_modules = len(modules)
+    exempt_count = report.get("exempt_count", 0) or 0
+    err_cnt = counts.get("异常", 0) + counts.get("错误", 0)
+    warn_cnt = counts.get("警告", 0)
+    timeout_cnt = counts.get("超时", 0)
+    band_bits = [f"共 <b>{total_modules}</b> 个模块"]
+    if exempt_count:
+        _exm = _exempt_names(report)
+        band_bits.append(f"评分豁免 <b>{exempt_count}</b>"
+                         + (f"（{_html_esc('、'.join(_exm))}）" if _exm else ""))
+    deduct_bits = []
+    if err_cnt:
+        deduct_bits.append(f"<b>{err_cnt}</b> 异常级")
+    if warn_cnt:
+        deduct_bits.append(f"<b>{warn_cnt}</b> 警告级")
+    if timeout_cnt:
+        deduct_bits.append(f"<b>{timeout_cnt}</b> 超时")
+    if deduct_bits:
+        band_bits.append("扣分项 " + " / ".join(deduct_bits))
+    band_html = ('<div class="band">' +
+                 '<span class="sep"></span>'.join(band_bits) + '</div>')
+
+    # ── 待办问题 ──
+    # 1) 收集所有 issue; 2) 按 (severity, text) 去重避免多模块重复同一警告;
+
+    return (band_html, exempt_count, total_modules, all_counts,)
+
+
+def _todo_issues_section(modules):
+    """待办问题清单。
+
+    按 (severity, text) 去重避免多模块重复同一警告, 按模块聚合影响面,
+    异常/警告/错误进清单、信息级只做轻量提示。
+    """
+    todo_issues = []
+    seen_keys = {}
+    for m in modules:
+        for issue in m.get("issues", []) or []:
+            text = (issue.get("text", "") or "").strip()
+            dedup_key = (issue.get("severity", "信息"), text)
+            hit = seen_keys.get(dedup_key)
+            if hit is not None:
+                # 同样文案合并成一条卡, 但记下波及的模块数 —
+                # 否则 23 个模块同样超时会压成 1 条, 与"23 个问题模块已展开"自相矛盾
+                hit["_dup"] += 1
+                if m["name"] not in hit["_modules"]:
+                    hit["_modules"].append(m["name"])
+                continue
+            entry = {**issue, "_module": m["name"], "_status": m["status"],
+                     "_dup": 1, "_modules": [m["name"]]}
+            seen_keys[dedup_key] = entry
+            todo_issues.append(entry)
+
+    sev_order = {"异常": 0, "错误": 0, "警告": 1, "信息": 2}
+    todo_issues.sort(key=lambda i: sev_order.get(i.get("severity", "信息"), 3))
+
+    # 顶部只展示需关注条目 (异常/错误/警告), 信息级不进顶部列表; 最多展示 10 条, 溢出时给出提示
+    need_attention = [i for i in todo_issues if i.get("severity", "信息") in ("异常", "错误", "警告")]
+    top_issues = need_attention[:10]
+
+    if top_issues:
+        # 合并"同来源 + 同影响 + 同建议"的条目为一张卡 (如 IPv6 的两条异常):
+        # 标题用「；」连接多条问题, 卡片数更少、建议不重复刷屏
+        merged = []
+        merge_index = {}
+        for issue in top_issues:
+            gkey = (issue.get("_module", ""), issue.get("impact", ""),
+                    issue.get("action", ""), issue.get("severity", "信息"))
+            if gkey in merge_index:
+                hit = merged[merge_index[gkey]]
+                hit["_texts"].append(issue.get("text", ""))
+                # 合并卡片时累加波及模块数, 否则"影响 23 个模块"会被算成 1
+                hit["_dup"] = hit.get("_dup", 1) + issue.get("_dup", 1)
+                for nm in issue.get("_modules", []):
+                    if nm not in hit["_modules"]:
+                        hit["_modules"].append(nm)
+            else:
+                merge_index[gkey] = len(merged)
+                merged.append({**issue, "_texts": [issue.get("text", "")]})
+        todo_blocks = []
+        for issue in merged:
+            sev = issue.get("severity", "信息")
+            sev_class = "err" if sev in ("异常", "错误") else "warn"
+            impact = issue.get("impact", "")
+            action = issue.get("action", "")
+            text = "；".join(t for t in issue["_texts"] if t)
+            module = issue.get("_module", "")
+            raw_summary = issue.get("raw_summary", "")
+            # 把 raw_summary 也加到来源 meta 行, 让装维一眼看到原始数据
+            # (例如网关丢包: 立即看到 "20 发 / 19 收 / 1 丢", 不必展开技术细节)
+            meta_line = f"📍 来源: {_html_esc(module)}"
+            dup = issue.get("_dup", 1) or 1
+            if dup > 1:
+                # 去重后必须告诉用户波及范围, 否则顶部"1 项需要您关注"与
+                # 下方"23 个问题模块已展开"看起来互相打架
+                mods = issue.get("_modules", []) or []
+                scope = "、".join(mods[:4]) + (" 等" if len(mods) > 4 else "")
+                meta_line += (f" · ⚠ 波及 <b>{dup}</b> 个模块"
+                              f"（{_html_esc(scope)}）")
+            if raw_summary:
+                meta_line += f" · 📊 {_html_esc(raw_summary)}"
+            todo_blocks.append(f"""
+<div class="issue {sev_class}">
+  <h3><span class="sev">{_html_esc(sev)}</span>{_html_esc(text)}</h3>
+  <div class="meta">{meta_line}</div>
+  {f"<div class='impact'>📌 影响: {_html_esc(impact)}</div>" if impact else ""}
+  {f"<div class='action'>💡 建议: {_html_esc(action)}</div>" if action else ""}
+</div>""")
+        extra_bits = []
+        # 会诊引导: 存在异常级问题时提示升级路径 (现场解决不了 → 带报告回去)
+        critical_cnt = sum(1 for i in need_attention
+                           if i.get("severity") in ("异常", "错误"))
+        if critical_cnt:
+            todo_blocks.append(f"""
+<div class="issue consult">
+  <h3><span class="sev">会诊</span>{critical_cnt} 项异常级问题的现场处置指引</h3>
+  <div class="impact">📌 影响: 异常级问题按上述建议现场处理后仍存在的, 多涉及线路质量、运营商侧或设备本身缺陷, 现场手段有限</div>
+  <div class="action">💡 建议: 保留本 HTML 报告与同名 <b>.json</b> 文件带回交专家会诊 — .json 内含完整原始测量数据 (逐跳路径、时序曲线、原始统计), 供后台深入分析; 客户处可先留存 HTML 版说明</div>
+</div>""")
+        hidden_cnt = len(need_attention) - len(top_issues)
+        if hidden_cnt > 0:
+            extra_bits.append(f"顶部仅展示前 10 条, 另有 {hidden_cnt} 条见下方模块详情")
+        info_cnt = sum(1 for i in todo_issues if i.get("severity", "信息") == "信息")
+        if info_cnt > 0:
+            extra_bits.append(f"另有 {info_cnt} 条信息项可查看下方模块详情")
+        info_extra = (f" <span class='extra-count'>({'；'.join(extra_bits)})</span>"
+                      if extra_bits else "")
+        todo_section = f"""
+<div class="sec" id="todo"><h2><span class="icon">⚠</span>{len(need_attention)} 项需要您关注{info_extra}</h2></div>
+<div class="todo">{"".join(todo_blocks)}</div>"""
+    elif todo_issues:
+        todo_section = """
+<div class="sec" id="todo"><h2><span class="icon">✓</span>所有核心检测通过</h2></div>
+<div class="todo ok">
+  <div class="todo-head">✓ 网络状态良好</div>
+  <div class="impact">所有核心检测均正常, 部分提示项可在下方模块详情查看。</div>
+</div>"""
+    else:
+        todo_section = f"""
+<div class="sec" id="todo"><h2><span class="icon">✓</span>所有检测通过</h2></div>
+<div class="todo ok">
+  <div class="todo-head">✓ 网络状态良好</div>
+  <div class="impact">全部 {len(modules)} 项检测均正常, 无需特别处理。</div>
+</div>"""
+
+    # ── 统计卡片 ──
+
+    return todo_section
+
+
+def _stats_overview_sections(counts, modules, report, exempt_count, total_modules, SKEY):
+    """统计卡 + 关键指标一览。
+
+    统计卡的口径与状态分布条必须一致 (同为 23 全口径), 评分豁免模块
+    单独列出且注明「不参与扣分」。
+    """
+    stats_order = ["完成", "警告", "异常", "错误", "超时", "未检测"]
+    stat_items = [(k, counts.get(k, 0)) for k in stats_order]
+    stat_cards = "".join(
+        f"<div class='stat-card {SKEY.get(k, 'idle').replace('fatal', 'err')}'>"
+        f"<div class='count'>{v}</div>"
+        f"<div class='label'>{k}</div></div>"
+        for k, v in stat_items
+    )
+    # 模块总数 + 豁免模块数 (已在 hero 段计算 total_modules / exempt_count,
+    # 避免 stats-grid 只显示部分模块误导用户以为模块变少了)。
+    # 注意两种口径并存, 必须在文案里讲清楚, 否则并排的统计卡(扣分口径)与
+    # 状态分布条(全口径)数字不一致会让人以为算错了:
+    #   counts  = 扣分口径, 排除豁免模块  → 统计卡
+    #   summary = 全口径,   含豁免模块    → 状态分布条 / 检测结果一览
+    stats_caption = ""
+    if total_modules:
+        scored_total = sum(v for _, v in stat_items)
+        if exempt_count:
+            _exm = _exempt_names(report)
+            stats_caption = (
+                f"<div class='stats-caption'>上方为<b>扣分口径</b> {scored_total} 个模块"
+                f"（全量 {total_modules} 个, 其中 {exempt_count} 个评分豁免不计入"
+                + (f": {_html_esc('、'.join(_exm))}" if _exm else "")
+                + f"）；下方状态分布条为<b>全口径</b> "
+                f"{total_modules} 个模块</div>")
+        else:
+            stats_caption = f"<div class='stats-caption'>共 {total_modules} 个模块</div>"
+    stats_section = f"""
+<div class="sec" id="stats"><h2><span class="icon">📊</span>状态统计</h2></div>
+<div class="stats-grid">{stat_cards}</div>{stats_caption}"""
+
+    # ── 检测结果一览 ──
+    overview_items = []
+    for m in modules:
+        st = m["status"]
+        sk = SKEY.get(st, "idle")
+        # 概览行只显示"结论"前 60 字, 避免太长
+        verdict_short = m["verdict"][:60] + ("…" if len(m["verdict"]) > 60 else "")
+        overview_items.append(
+            f"<li>"
+            f"<a href='#mod-{_html_attr(m['key'])}' title='跳转到 {_html_attr(m['name'])} 详细结果'>"
+            f"<span class='dot {sk}'></span>"
+            f"<span class='name'>{_html_esc(m['name'])}</span>"
+            f"<span class='verdict'>{_html_esc(verdict_short)}</span>"
+            f"<span class='badge {sk}'>{_html_esc(st)}</span>"
+            f"</a>"
+            f"</li>"
+        )
+    overview_section = f"""
+<div class="sec" id="list"><h2><span class="icon">📋</span>检测结果一览</h2></div>
+<div class="overview"><ul>{"".join(overview_items)}</ul></div>"""
+
+
+    return (stats_section, overview_section,)
+
+
+def _chart_section(by_key, exempt_count, total_modules, all_counts):
+    """图表区: 网关延迟折线 / 速率柱状 / 状态分布。
+
+    全部纯 SVG 手绘 (报告必须能离线打开, 不引入任何在线资源)。
+    缺数据时降级为空图而非报错。
+    """
+    chart_cards = []
+
+    gw_mod = by_key.get("gateway") or {}
+    gateway_raw = gw_mod.get("raw") or {}
+    ping_info = (gateway_raw or {}).get("ping") or {}
+    ping_rtts = ping_info.get("rtts") or []
+    ping_chart = _svg_ping_line(ping_rtts)
+    if ping_chart:
+        cap_bits = [f"共 {len(ping_rtts)} 次成功样本"]
+        if isinstance(ping_info.get("avg_ms"), (int, float)):
+            avg = ping_info["avg_ms"]
+            # Windows ping 对局域网 (<1ms) 输出整数粒度 0, 直写"平均 0ms"
+            # 会被误读成"数据有问题" — 有样本时按 <1ms 表达 (v1.9.3)
+            cap_bits.append("平均 <1ms" if (avg < 1 and ping_rtts)
+                            else f"平均 {avg:g}ms")
+        peak = max(ping_rtts) if ping_rtts else 0
+        if isinstance(peak, (int, float)) and peak > 0:
+            cap_bits.append(f"峰值 {peak:g}ms")
+        if isinstance(ping_info.get("loss_pct"), (int, float)) \
+                and ping_info.get("loss_pct", 0) > 0:
+            cap_bits.append(f"丢包 {ping_info['loss_pct']}%")
+        chart_cards.append(
+            f"<div class='chart'><h4>网关延迟时间序列 <span class='tag'>逐次 Ping</span></h4>"
+            f"{ping_chart}<div class='cap'>" + " · ".join(cap_bits) + "。</div></div>")
+
+    sp_mod = by_key.get("speedtest") or {}
+    speed_src, speed_method = _resolve_speed_chart_src(sp_mod.get("raw") or {})
+    speed_chart = _svg_speed_bars(speed_src)
+    if speed_chart:
+        cap_bits = []
+        for kk, lab in (("download_mbps", "下载"), ("upload_mbps", "上传")):
+            v = speed_src.get(kk)
+            if isinstance(v, (int, float)) and v > 0:
+                cap_bits.append(f"{lab} {format_speed(v)}")
+        chart_cards.append(
+            f"<div class='chart'><h4>宽带测速 <span class='tag'>{_html_esc(speed_method)}</span></h4>"
+            f"{speed_chart}<div class='cap'>" + " · ".join(cap_bits) + "。</div></div>")
+
+    status_chart = _svg_status_bar(all_counts)
+    if status_chart:
+        dist = " · ".join(f"{k} {v}" for k, v in all_counts.items())
+        chart_cards.append(
+            f"<div class='chart wide'><h4>状态分布 <span class='tag'>{total_modules} 模块</span></h4>"
+            f"{status_chart}<div class='cap'>" + dist
+            + ("（含评分豁免模块）" if exempt_count else "") + "</div></div>")
+
+    if chart_cards:
+        charts_section = (f'<div class="sec" id="charts"><h2><span class="icon">📈</span>关键指标图</h2></div>'
+                          f'<div class="charts">{"".join(chart_cards)}</div>')
+    else:
+        charts_section = ""
+
+    # ── 详细模块 ──
+    # v1.5.0: 模块卡默认只展开首要根因涉及的模块。23 个模块里若有 5 个异常,
+
+    return charts_section
+
+
+def _module_cards_section(modules, report, SKEY):
+    """模块卡列表。
+
+    有根因时只展开首要根因涉及的模块 (首要根因 = severity 最高);
+    无根因时全部默认展开 —— 规则没命中不能把异常藏起来。
+    """
+    root_causes = (report.get("diagnosis") or {}).get("root_causes") or []
+    primary_modules = set(root_causes[0].get("affected_modules") or []) \
+        if root_causes else set()
+
+    mod_blocks = []
+    for m in modules:
+        st = m["status"]
+        sk = SKEY.get(st, "idle")
+        # 关键指标
+        metrics = m.get("key_metrics", [])
+        if metrics:
+            metric_html = []
+            for me in metrics:
+                # 空值指标 (—/N/A/无) 没有信息量, 不占卡片格
+                if str(me.get("value", "")).strip() in ("—", "N/A", "无", ""):
+                    continue
+                level = me.get("level", "ok")
+                hint = me.get("hint", "")
+                # 指标卡保持清爽: 数字为主, 名称在下, 任何说明文字都不进卡面
+                # (包括 warn/err 也不再 inline 显示), 全部进悬停提示 —
+                # 卡面只靠颜色传达"这条需要关注", 点数超过 5 个时长说明挤
+                # 变形, 移到 title 是更可读的方案
+                # title 包含完整名/值/说明, 窄屏 ellipsis 截断后仍能看到
+                full_title = f"{me.get('label','')}: {me.get('value','')}"
+                if hint:
+                    full_title += f"\n💡 {hint}"
+                # 数值在上、名称在下 (flex-column), 长名称可换行不再截断
+                # data-hint 供触摸设备点击展开 (桌面 hover 走 title)
+                # f-string 表达式内不可有反斜杠/换行 (3.12 前 tokenizer 限制, x86 用 3.8 打包)
+                _hint_attr = (" data-hint='" + _html_attr(hint) + "'") if hint else ""
+                metric_html.append(
+                    f"<div class='metric' title='{_html_attr(full_title)}'"
+                    f"{_hint_attr}>"
+                    f"<span class='v {level}'>{_html_esc(me['value'])}</span>"
+                    f"<span class='lab'>{_html_esc(me['label'])}</span>"
+                    f"</div>"
+                )
+            metrics_html = f"<div class='metrics'>{''.join(metric_html)}</div>"
+        else:
+            metrics_html = ""
+
+        # 问题: 按 (severity, text) 去重 — 与顶部"需关注/信息项"计数口径一致
+        # (顶部按 (severity, text) 去重), 保证"计数 = 卡片实际渲染行数"。
+        # 注意: 不再按 action 去重 — 多条不同问题共享同一建议时 (如 IPv6/
+        # 多出口模块的同 action 信息项), 每条都必须可见, 否则顶部计数
+        # 与卡片内容对不上。
+        issues = m.get("issues", []) or []
+        if issues:
+            # 先按 (severity, text) 去重 (与顶部计数口径一致), 再把
+            # "同一条建议"的多条问题合并到一组: 问题列表只出现一次建议,
+            # 避免同一模块里 💡 建议重复刷屏 (如 IPv6 的两条异常共享同一建议)
+            deduped = []
+            seen_issue_keys = set()
+            for issue in issues:
+                sev = issue.get("severity", "信息")
+                text = (issue.get("text", "") or "").strip()
+                action = (issue.get("action", "") or "").strip()
+                act_key = (sev, text)
+                if not text or act_key in seen_issue_keys:
+                    continue
+                seen_issue_keys.add(act_key)
+                deduped.append((sev, text, action))
+            # 按建议分组 (保持出现顺序): {action: [(sev, text), ...]}
+            groups = []
+            group_index = {}
+            for sev, text, action in deduped:
+                if action and action in group_index:
+                    groups[group_index[action]][1].append((sev, text))
+                else:
+                    group_index[action] = len(groups)
+                    groups.append((action, [(sev, text)]))
+            issue_html = []
+            for action, items in groups:
+                for sev, text in items:
+                    sev_class = ("err" if sev in ("异常", "错误")
+                                 else "warn" if sev == "警告" else "")
+                    info_cls = sev_class if sev_class else "info"
+                    issue_html.append(
+                        f"<div class='impact-line {info_cls}'>"
+                        f"<b>[{_html_esc(sev)}]</b> {_html_esc(text)}"
+                        f"</div>"
+                    )
+                # 纯信息级的条目不带建议 (如 "假网关属设计行为" 却跟一条
+                # "联系网络管理员" 的建议, 自相矛盾且徒增噪音)
+                if action and any(s in ("异常", "错误", "警告") for s, _ in items):
+                    issue_html.append(
+                        f"<div class='action-line'>💡 {_html_esc(action)}</div>"
+                    )
+            issues_html = "".join(issue_html)
+        else:
+            issues_html = ""
+
+        # 折叠策略 (v1.5.0 收窄):
+        #   有根因 → 只自动展开"首要根因"涉及的模块, 其余问题模块折叠
+        #   无根因 → 退回旧行为, 所有问题模块展开 (规则没命中时不能把异常藏起来)
+        # 「超时」也是硬故障 (测了但没结果), 两种情况都不该被当成无关紧要的灰行
+        problem_status = st in PROBLEM_STATUSES
+        auto_open = (m["key"] in primary_modules) if primary_modules else problem_status
+        tech_html = ""
+        if m.get("has_tech_details"):
+            pres = MODULE_PRESENTATION.get(m["key"], {})
+            tech_keys = pres.get("tech_keys", [])
+            tech_html = _render_html_tech_block(
+                m["key"], m.get("raw", {}), tech_keys,
+                auto_open=auto_open)
+
+        # WiFi 等模块原始数据全空时, 给出友好提示而非空列表
+        empty_note_html = ""
+        if m["key"] == "wifi":
+            raw = m.get("raw", {}) or {}
+            nets = raw.get("networks") or []
+            chans = raw.get("channel_analysis") or []
+            if not nets and not chans:
+                empty_note_html = "<div class='impact-line warn'><b>[提示]</b> 当前未连接 Wi-Fi, 因此未扫描周边网络与信道占用 (这是正常现象, 而非故障)。</div>"
+
+        # 整个模块卡 (方案 A: details 折叠, 问题模块自动展开)
+        verdict = m.get("verdict", "")
+        # 摘要行 (折叠态) 空间受限: 截断 60 字 (与「检测结果一览」同口径),
+        # 全文走 title 悬停。v1.5.3: 只截摘要行 — 卡片正文「结论」行没有空间
+        # 约束, 打印/PDF 不显示 title, 截断会让纸质留档永久缺文
+        v_short = verdict[:60] + ("…" if len(verdict) > 60 else "")
+        v_title = f' title="{_html_attr(verdict)}"' if len(verdict) > 60 else ""
+        explain = MODULE_EXPLAINS.get(m["key"], "")
+        explain_html = (f"<div class='explain'>📖 {_html_esc(explain)}</div>"
+                        if explain else "")
+        # 模块图标
+        mod_icons = {
+            "ok": "✓",
+            "warn": "⚠",
+            "err": "✕",
+            "fatal": "✕",
+            "timeout": "⏱",
+            "idle": "○"
+        }
+        mod_icon = mod_icons.get(sk, "○")
+        open_attr = " open" if auto_open else ""
+        mod_blocks.append(f"""
+<details class="mod {sk}" id="mod-{_html_attr(m["key"])}"{open_attr}>
+  <summary>
+    <span class="ic {sk}">{mod_icon}</span>
+    <span class="nm">{_html_esc(m['name'])}</span>
+    <span class="vd"{v_title}>{_html_esc(v_short)}</span>
+    <span class="b {sk}">{_html_esc(st)}</span>
+    <a class="anchor" href="#mod-{_html_attr(m['key'])}" data-mod="mod-{_html_attr(m['key'])}"
+       title="复制本模块链接">🔗</a>
+    <span class="arr">▸</span>
+  </summary>
+  <div class="bd">
+    <div class="verdict"><span class="tag">结论</span><span>{_html_esc(verdict)}</span></div>
+    {explain_html}
+    {metrics_html}
+    {issues_html}
+    {empty_note_html}
+    {tech_html}
+  </div>
+</details>""")
+
+    # 章节标题说明当前展开策略, 避免用户以为"没展开 = 没问题"
+    problem_cnt = sum(1 for s in report["summary"].values()
+                      if s in PROBLEM_STATUSES)
+    if primary_modules:
+        open_note = (f"共 {problem_cnt} 个问题模块 · 已展开首要问题项, "
+                     f"其余点击展开")
+    else:
+        open_note = f"{problem_cnt} 个问题模块已展开 · 正常模块点击展开"
+    modules_section = f"""
+<div class="sec" id="modules"><h2><span class="icon">🔍</span>详细结果
+<span class="cnt">{_html_esc(open_note)}</span></h2></div>
+{"".join(mod_blocks)}"""
+
+
+    return modules_section
+
+
+def _host_info_section(sys_i):
+    """本机信息卡。
+
+    hostname / 网段 / DNS / 公网出口, 取自 report['system']。
+    """
+    sys_pairs = [
+        ("本机 IP", sys_i.get("local_ip")),
+        ("默认网关", sys_i.get("gateway")),
+        ("DNS", sys_i.get("dns")),
+        ("公网 IP", sys_i.get("public_ip")),
+    ]
+    if sys_i.get("asn") or sys_i.get("geo"):
+        loc = []
+        if sys_i.get("geo"):
+            loc.append(sys_i["geo"])
+        if sys_i.get("asn"):
+            loc.append(sys_i["asn"])
+        sys_pairs.append(("出口位置", " / ".join(loc)))
+    if sys_i.get("ipv6_public_ip"):
+        sys_pairs.append(("IPv6 公网", sys_i["ipv6_public_ip"]))
+
+    host_cards = "".join(
+        f"<div class='host-card'><div class='lab'>{_html_esc(lab)}</div>"
+        f"<div class='val'>{_html_esc(val) if val else '—'}</div></div>"
+        for lab, val in sys_pairs
+    )
+    host_section = f"""
+<div class="sec" id="host"><h2><span class="icon">🖥</span>主机信息</h2></div>
+<div class="host-grid">{host_cards}</div>"""
+
+
+    return host_section
+
+
+def _tech_appendix_section(report):
+    """技术附录: 判定阈值表 + 评分口径说明。
+
+    默认折叠。评分规则文案必须与 compute_health_score 一致
+    (含超时 -10), 豁免模块名动态取自 _exempt_names(report)。
+    """
+    standards_rows = []
+    for mod_key, mod_th in THRESHOLDS.items():
+        if not mod_th:
+            continue
+        mod_name = MODULE_MAP.get(mod_key, (mod_key,))[0]
+        for metric_key, cfg in mod_th.items():
+            label = cfg.get("label", metric_key)
+            warn = cfg.get("warn", "—")
+            err = cfg.get("err", "—")
+            unit = cfg.get("unit", "")
+            lower = cfg.get("lower_better", True)
+            direction = "越低越差 (≥ 触发)" if lower else "越低越好 (≤ 触发)"
+            standards_rows.append((mod_name, label, str(warn), str(err), unit, direction))
+    # 链路速率阈值在 _metrics_linkspeed 硬编码, THRESHOLDS 里是空, 补进来
+    standards_rows.append(("链路速率", "有线协商速率", "100", "1000", "Mbps", "越低越差 (≥ 触发)"))
+    standards_rows.append(("链路速率", "WiFi 协商速率", "54",  "150",  "Mbps", "越低越差 (≥ 触发)"))
+
+    std_body = "".join(
+        f"<tr><td>{_html_esc(m)}</td><td>{_html_esc(l)}</td>"
+        f"<td class='num'>{_html_esc(w)}</td><td class='num'>{_html_esc(e)}</td>"
+        f"<td>{_html_esc(u)}</td><td>{_html_esc(d)}</td></tr>"
+        for m, l, w, e, u, d in standards_rows
+    )
+    # v1.5.0: 判定阈值 / 评分规则属于工具内部实现, 对客户没有阅读价值
+    # (还会引来"为什么异常就是扣 20 分"的疑问), 统一收进默认折叠的技术附录
+    standards_section = f"""
+<div class="sec" id="appendix"><h2><span class="icon">🔧</span>技术附录
+<span class="cnt">默认折叠 · 供装维与技术人员查阅</span></h2></div>
+<details class="collapse" data-auto-open="0"><summary>查看本次诊断的判定标准与评分口径 <span class='cnt'>{len(standards_rows)} 项指标</span></summary>
+<div class="body">
+  <div class='subcap'>本节是工具内部的判定口径，<b>不影响</b>上方已列出的实测数据与结论。阈值只决定状态标签（正常 / 警告 / 异常），所有原始测量值仍完整保留在各模块的「技术细节」中。</div>
+  <div class='subcap' style='margin-top:10px'>判定规则: "越低越差"的指标 (延迟/丢包/重传/抖动), 超过<span class='kw warn'>警告阈值</span>标 ⚠️ 警告, 超过<span class='kw err'>异常阈值</span>标 ❌ 异常; "越高越好"的指标 (速率/TCP 可达数), 低于警告阈值标警告, 低于异常阈值标异常。所有阈值集中维护在 <code>THRESHOLDS</code>, 链路速率另在 <code>_metrics_linkspeed</code> 硬编码。</div>
+  <table class='tbl std'>
+    <thead><tr><th>模块</th><th>指标</th><th>警告阈值</th><th>异常阈值</th><th>单位</th><th>判定方向</th></tr></thead>
+    <tbody>{std_body}</tbody>
+  </table>
+  <div class='subcap' style='margin-top:12px'>评分规则 (健康分是用于快速排序问题优先级的规则分, 不是统计意义上的网络质量评分): 起始 100 分, 异常 -20/项, 错误 -30/项, 超时 -10/项 (检测未跑完, 不是合格), 警告 -2/项, 未检测不扣分。<br>豁免模块 (不参与扣分): {_html_esc('、'.join(_exempt_names(report)) or '无')}。等级: A≥90 优秀, B≥75 良好, C≥60 一般, D≥40 欠佳, F&lt;40 严重。</div>
+</div>
+</details>"""
+
+
+    return standards_section
+def render_report_html_customer(report):
+    """渲染客户版 HTML 报告。
+
+    输入: build_report() 的输出 (双视图)
+    输出: 完整可独立打开的 HTML 字符串
+    """
+    if not report:
+        return "<p>尚无诊断数据，请先运行诊断</p>"
+
+    import html as _html
+    g = report["generated_at"].strftime("%Y-%m-%d %H:%M:%S")
+    sys_i = report["system"]
+    health = report["health"]
+    counts = report["counts"]
+    modules = report["modules"]
+    by_key = {m["key"]: m for m in modules}   # 一次建索引, 下文各处复用
+
+    # 状态语义键: 引用全局唯一来源 (见 STATUS_COLORS 定义处), 不要在本函数
+    # 里再立局部映射 — 多份映射并存曾导致同一份报告出现两种「警告橙」。
+    SKEY = STATUS_KEY
+
+    # ── 顶部 hero (方案 A: 白卡 + SVG 环形健康分) ──
+    nav_html = _build_report_nav(modules)
+
+    # meta chips: 本机 / 网关 / 公网 / DNS / 出口位置 / IPv6
+    hero_meta = []
+    hero_meta.append(f"本机 <b>{_html_esc(sys_i.get('local_ip') or '?')}</b>")
+    if sys_i.get("gateway"):
+        hero_meta.append(f"网关 <b>{_html_esc(sys_i['gateway'])}</b>")
+    if sys_i.get("public_ip"):
+        hero_meta.append(f"公网 <b>{_html_esc(sys_i['public_ip'])}</b>")
+    if sys_i.get("dns"):
+        hero_meta.append(f"DNS <b>{_html_esc(sys_i['dns'])}</b>")
+    if sys_i.get("asn") or sys_i.get("geo"):
+        hero_meta.append(f"📍 <b>{_html_esc(' / '.join(x for x in (sys_i.get('geo'), sys_i.get('asn')) if x))}</b>")
+    if sys_i.get("ipv6_public_ip"):
+        hero_meta.append(f"IPv6 <b>{_html_esc(sys_i['ipv6_public_ip'])}</b>")
+    # v1.5.0: 检测耗时 + 检测范围。只跑几个模块时健康分 100 极容易被读成
+    # "23 项全正常", 必须显式写出覆盖了多少项
+    dur_txt = _fmt_duration(report.get("duration_ms"))
+    if dur_txt:
+        hero_meta.append(f"耗时 <b>{_html_esc(dur_txt)}</b>")
+    sel = report.get("selected_modules")
+    tot = report.get("total_modules")
+    if isinstance(sel, int) and isinstance(tot, int) and tot > 0:
+        if sel < tot:
+            # 部分检测: title 里说清未覆盖多少项, 避免只看到分数就下结论
+            hero_meta.append(
+                (f"检测范围 <b>{sel}/{tot}</b> 项",
+                 f"本次仅运行所选模块, 其余 {tot - sel} 项未检测"))
+        else:
+            hero_meta.append(f"检测范围 <b>{tot} 项全覆盖</b>")
+    # chip 支持 (内容, title) 二元组, 避免在 .hero .meta span 里再套一层 span
+    meta_chips = "".join(
+        (f"<span title='{_html_attr(m[1])}'>{m[0]}</span>"
+         if isinstance(m, tuple) else f"<span>{m}</span>")
+        for m in hero_meta)
+
+    score = health.get("score", 0)
+    grade_key = str(health.get("grade") or "").strip()[:1].upper()
+    lbl_fg, lbl_bg = GRADE_BADGE.get(grade_key, GRADE_BADGE["C"])
+    score_ring = _svg_health_ring(score, grade_key)
+
+    # 阶段 C · v1.3.0: 根因摘要 (hero 之后紧接, 客户第一屏直接看到主要问题)
+    # v1.5.0: 传入完整 report, 用于生成"一句话报障"
+    diagnosis_section = _render_diagnosis_section_html(
+        report.get("diagnosis", {}), report=report)
+
+    hero = f"""
+<header class="hero" id="overview">
+  <div style="flex:1;min-width:0">
+    <div class="app"><div class="mark"></div>
+      <b>{_html_esc(report['app'])}</b><span class="ver">v{_html_esc(report['version'])}</span></div>
+    <h1>网络诊断报告</h1>
+    <div class="sub">{_html_esc(health.get('verdict', ''))} · 生成于 {_html_esc(g)}</div>
+    <div class="meta">{meta_chips}</div>
+  </div>
+  <div class="gauge">
+    {score_ring}
+    <div class="in"><div class="num">{score}</div><div class="lbl" style="color:{lbl_fg};background:{lbl_bg}">{_html_esc(health.get('label', ''))}</div></div>
+  </div>
+</header>"""
+
+    # ── 信息条 (模块总数 / 豁免 / 扣分项 / 生成时间) ──
+    # 「扣分项」必须用 counts (report["counts"], 不含豁免模块的扣分口径),
+    # 与 compute_health_score 一致; 用全口径会在 100 分绿环旁边谎报扣分。
+    # all_counts (全口径) 从 report["summary"] 派生即可, 供状态分布条使用。
+    band_html, exempt_count, total_modules, all_counts = _band_counts_band(
+        counts, modules, report)
+    # 3) 顶部列表只展示异常/错误/警告, 信息级不进顶部 (详情里仍可见)
+    todo_section = _todo_issues_section(modules)
+    # 始终显示全部 6 个卡片 (含 0 值), 与 stats-grid 的 6 列布局对齐
+    stats_section, overview_section = _stats_overview_sections(
+        counts, modules, report, exempt_count, total_modules, SKEY)
+    # ── 图表区 (纯 SVG, 数据不足时对应图卡自动隐藏) ──
+    charts_section = _chart_section(by_key, exempt_count, total_modules, all_counts)
+    # 旧逻辑会一次刷出 5 张巨型卡片把客户第一屏淹没 — 只留主角展开
+    modules_section = _module_cards_section(modules, report, SKEY)
+    # ── 主机信息 ──
+    host_section = _host_info_section(sys_i)
+    # ── 诊断标准表 (THRESHOLDS + _metrics_linkspeed 硬编码阈值, 折叠显示) ──
+    standards_section = _tech_appendix_section(report)
+    # ── CSS (方案 A: 晨雾浅色仪表盘) ──
+    CSS = CSS_CUSTOMER_REPORT
+
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -18655,17 +18256,27 @@ def _json_default(o):
 def render_report_json(report, indent=2):
     """渲染 JSON 报告 (技术员/脚本用)。
 
-    顶层结构对齐 schema/netpulse-result-v1.1.json (阶段 D · D1):
+    顶层结构对齐 **schema/netpulse-result-v1.2.json** (v1.14.14 更正: 本
+    docstring 原先写 v1.1, 早已过期):
     app / version / schema_version / generated_at / system / health /
     counts / summary / diagnosis / modules 为必填字段, 可直接用仓库自带的
-    schema 文件校验。meta 为旧解析器兼容视图 (schema 允许未知字段)。
+    schema 文件校验。additionalProperties=false, 导出字段与 schema 必须
+   严格一致 —— 由 tests/test_schema_export_consistency.py 锁住 (v1.14.14 新增,
+    此前 schema 声明 duration_ms/selected_modules/total_modules 却从不导出,
+    又漏声明 site_check/site_note/meta_manual/meta, 全仓无校验所以没人发现)。
 
       - health: 健康评分 (score, grade, label, verdict) + counts
+      - duration_ms / selected_modules / total_modules: 检测耗时与覆盖范围
+        (只跑部分模块时健康分容易被误读为「全部正常」)
       - modules: 客户视图 (verdict + key_metrics + issues)
       - diagnosis: 根因分析 (root_causes + 置信度, 阶段 C 引入)
       - tech.raw_results: 每个模块的原始 result 字典 (含 30 个 RTT 全序列等)
+      - tech.evidence: 模块自证证据 (Schema 1.2 一等结构)
       - tech.thresholds: 阈值定义 (为啥这个值是"异常"的依据)
       - tech.module_presentation: 每个模块的客户视图配置 key
+      - site_check / site_note / meta_manual: 现场检测模式手输数据
+        (普通模式为空值)
+      - meta: 兼容视图 (v1.4.0 之前的消费方读 meta.host / meta.app)
     """
     if not report:
         return "{}"
@@ -18678,11 +18289,16 @@ def render_report_json(report, indent=2):
         "health": report["health"],
         "counts": report["counts"],
         "exempt_count": report.get("exempt_count", 0),
+        # v1.14.14: 这三个字段 v1.5.0 起就在 build_report 里算好了, schema 也
+        # 声明了, 但本函数一直没导出 —— 技术员拿不到耗时与覆盖范围。
+        "duration_ms": int(report.get("duration_ms") or 0),
+        "selected_modules": int(report.get("selected_modules") or 0),
+        "total_modules": int(report.get("total_modules") or 0),
         "summary": report["summary"],
         "diagnosis": report["diagnosis"],
         "modules": report["modules"],
         "tech": report["tech"],
-        # v1.13.0: 现场检测模式手输数据 (普通模式为空值; schema 允许未知字段)
+        # v1.13.0: 现场检测模式手输数据 (普通模式为空值)
         "site_check": report.get("site_check", {}),
         "site_note": report.get("site_note", ""),
         "meta_manual": report.get("meta_manual", {}),
@@ -19401,7 +19017,11 @@ def render_report_html_brief_v2(report):
             f'<span class="lab">[待整改]</span>'
             f'<b>{_html_esc(bad_row["nm"])}</b> '
             f'<span class="lab">问题</span>{_html_esc(bad_row["issue"])} '
-            f'<span class="lab">建议</span>{_html_esc(bad_row["advice"])}'
+            # v1.14.14: 机房建议此前只 _html_esc 不截断, 而 _BRIEF_CLIP 里
+            # 专门留了 site_advice=24 却被全仓 0 引用 —— 建议文案一超 24 字
+            # 就静默破掉"恒单行"的一页高度锁 (现有测试只挡常量, 挡不住渲染)。
+            f'<span class="lab">建议</span>'
+            f'{_html_esc(_brief_clip(bad_row["advice"], _BRIEF_CLIP["site_advice"]))}'
             f'</div>')
     site_note_html = ""
     if site_note:
@@ -20413,7 +20033,12 @@ def _scene_menu(install=False, pip_mirror=None):
         if choice == "a":
             # 一键提权重启: 提权成功 → sys.exit(0) (不会走到这里); 失败/取消
             # → 落回菜单继续 (不藏退路)
+            # v1.14.14: 原先不传 args_tail → 提权后空参数启动, `--no-scapy`
+            # / `--verbose` / `--pip-mirror` 等全部丢失, 与 README「UAC 确认后
+            # 接续当前意图」不符 (scapy 与抓包两条路径都透传了, 只有这里漏网)。
+            # argv 为空 (双击 exe) 时传空列表, 行为与原先一致。
             _offer_elevation_relaunch(
+                list(sys.argv[1:]),
                 reason="抓包取证、Npcap 安装等功能需要管理员权限")
             continue
         if choice == "9":
@@ -20809,7 +20434,8 @@ def main():
                         choices=["slice", "full"], default=None, metavar="MODE",
                         help="盯障期间抓包取证 (需 Npcap + 管理员; 默认关闭): "
                              "slice=事件触发落盘前后 30s 切片, full=全程落一个 "
-                             "pcap。仅保留包头 + 80/443 每流首 2 包 384B (提 "
+                             f"pcap。仅保留包头 + {'/'.join(str(p) for p in CAPTURE_WEB_PORTS)} "
+                             f"每流首 {CAPTURE_FIRST_PKTS} 包 {CAPTURE_PAYLOAD_KEEP}B (提 "
                              "Host/SNI), 不存应用内容; 配合 --monitor 使用")
     parser.add_argument("--capture-mb", type=int, default=CAPTURE_DEFAULT_MB,
                         metavar="N",
@@ -20930,6 +20556,9 @@ def main():
         # 不 return: 继续走到底部的交互菜单
     # 按场景 Profile 诊断 (阶段 C · v1.3.0 引入): 跑 profile 模块后追加根因分析
     if args.diagnose:
+        # v1.14.14: 同上 — --site 与 --diagnose 也是互斥顶层模式, 不再静默吞掉。
+        if args.site:
+            print(_c("  提示: --site 与 --diagnose 是互斥的顶层模式, 本次已忽略 --site", C_YELLOW))
         profile = args.diagnose
         keys = DIAGNOSE_PROFILES[profile]
         print(_c(f"  按场景诊断: {profile} "
@@ -20954,6 +20583,11 @@ def main():
     if args.capture and not args.monitor:
         print(_c("  提示: --capture 仅在 --monitor 盯障模式下生效, 本次已忽略", C_YELLOW))
     if args.monitor:
+        # v1.14.14: --site / --monitor 是两个独立顶层模式, 互斥。原先 --site
+        # 排在 --monitor 之后, 组合使用时被静默吞掉 (用户以为跑了现场检测,
+        # 实际跑的是盯障) —— 与 --capture 的忽略提示保持一致, 明确告知。
+        if args.site:
+            print(_c("  提示: --site 与 --monitor 是互斥的顶层模式, 本次已忽略 --site", C_YELLOW))
         # v1.7.0 (PR-F0): 主动负载 opt-in — --monitor-load 用默认 CDN 大文件,
         # --load-url 可覆盖地址; 两者都没给则不制造流量
         if args.monitor_load or args.load_url:

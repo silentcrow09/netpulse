@@ -127,7 +127,14 @@ class TestCaptureStripPacket(unittest.TestCase):
         out = N._capture_strip_packet(p, {})
         self.assertIs(out, p)
 
-    # ---- v1.9.9: 截断包长度字段修正 (Wireshark 满屏红底修复) ----
+    # ---- v1.14.14: 截断包长度字段 **保留原值** + pcap 记录级 snaplen 截断 ----
+    # v1.9.9 曾把 IP/UDP 长度改写成"截断后长度"来压 Wireshark 的
+    # "TCP ACKed lost segment" 假阳性 —— 代价是离线分析器再也无法还原每段
+    # 的真实长度 (剥载荷后 bytes(payload) 恒空), 导致信号 B / 重传统计全线
+    # 失效并伪报 dup-ack (见 tests/test_pcap_pipeline_e2e.py)。
+    # 现在: 头部一个字节都不改 (校验和天然保持有效), 长度保留原值,
+    # 由 pcap 记录的 caplen < wirelen 表达 snaplen 截断 —— Wireshark 读作
+    # "该包线上更长、被 snaplen 截断", 既不误报序列空洞, 又保住段长。
 
     @staticmethod
     def _ip_checksum_valid(ip_bytes):
@@ -140,49 +147,72 @@ class TestCaptureStripPacket(unittest.TestCase):
             total = (total & 0xFFFF) + (total >> 16)
         return total == 0xFFFF
 
-    def test_trimmed_tcp_ip_len_consistent(self):
-        """截断后 IP Total Length 必须等于实际字节数 (否则 Wireshark 假阳性)。"""
+    def test_trimmed_tcp_ip_len_preserved(self):
+        """截断后 IP Total Length 必须保留**原始值** (分析器据此还原段长)。"""
+        src = _pkt(dport=22)
+        out = N._capture_strip_packet(src, {})
+        self.assertLess(len(bytes(out)), len(bytes(src)), "包未被截断")
+        self.assertEqual(out[IP].len, len(bytes(src[IP])),
+                         "IP 总长被改写 —— 离线分析器无法反推真实段长")
+        self.assertEqual(getattr(out, "wirelen", None), len(bytes(src)),
+                         ".wirelen 必须挂上线上原始长度")
+
+    def test_trimmed_tcp_ip_checksum_still_valid(self):
+        """不再改 IP 头 → 校验和天然保持有效 (Wireshark 不会报 checksum 错)。"""
         out = N._capture_strip_packet(_pkt(dport=22), {})
-        ipb = bytes(out[IP])
-        self.assertEqual(out[IP].len, len(ipb),
-                         f"IP.len={out[IP].len} 实际={len(ipb)} — 必须一致")
+        self.assertTrue(self._ip_checksum_valid(bytes(out[IP])))
 
-    def test_trimmed_tcp_ip_checksum_recomputed(self):
+    def test_trimmed_web_first_pkt_len_preserved(self):
+        """每流前 2 包保留 384B 的截断路径同样保留原始长度。"""
+        src = _pkt(dport=443)
+        out = N._capture_strip_packet(src, {})
+        self.assertEqual(out[IP].len, len(bytes(src[IP])))
+        self.assertEqual(getattr(out, "wirelen", None), len(bytes(src)))
+        self.assertTrue(self._ip_checksum_valid(bytes(out[IP])))
+
+    def test_quic_ip_len_and_udp_fields_preserved(self):
+        """UDP (QUIC) 截断: IP.len 与 UDP length 均保留原值, 头部不改。"""
+        src = _pkt(payload=b"Q" * 400, dport=443, proto=UDP)
+        out = N._capture_strip_packet(src, {})
+        self.assertEqual(out[IP].len, len(bytes(src[IP])))
+        self.assertEqual(out[UDP].len, len(bytes(src[UDP])))
+        self.assertTrue(self._ip_checksum_valid(bytes(out[IP])))
+        self.assertEqual(getattr(out, "wirelen", None), len(bytes(src)))
+
+    def test_written_record_is_snaplen_truncated(self):
+        """落盘记录必须是 caplen < wirelen (等价 tcpdump -s) —— 这是让
+        Wireshark 把截断包读作"截断"而非"丢段"的唯一标准表达。"""
+        import struct
+        from scapy.all import wrpcap
         out = N._capture_strip_packet(_pkt(dport=22), {})
-        ipb = bytes(out[IP])
-        self.assertTrue(self._ip_checksum_valid(ipb),
-                        "改 IP.len 后校验和必须重算, 否则 Wireshark 报 checksum 错")
-
-    def test_trimmed_web_first_pkt_len_consistent(self):
-        """每流前 2 包保留 384B 的截断路径同样修正长度。"""
-        out = N._capture_strip_packet(_pkt(dport=443), {})
-        ipb = bytes(out[IP])
-        self.assertEqual(out[IP].len, len(ipb))
-        self.assertTrue(self._ip_checksum_valid(ipb))
-
-    def test_quic_ip_len_and_udp_fields_fixed(self):
-        """UDP (QUIC) 截断: IP.len + UDP length 修正, UDP checksum 置 0。"""
-        out = N._capture_strip_packet(_pkt(payload=b"Q" * 400, dport=443,
-                                           proto=UDP), {})
-        ipb = bytes(out[IP])
-        self.assertEqual(out[IP].len, len(ipb))
-        self.assertTrue(self._ip_checksum_valid(ipb))
-        self.assertEqual(out[UDP].len, 8 + 16,
-                         f"UDP length 应=头+保留 16B, 实际 {out[UDP].len}")
-        self.assertEqual(out[UDP].chksum, 0,
-                         "载荷已剥, UDP checksum 应置 0 (未计算)")
+        with tempfile.NamedTemporaryFile(suffix=".pcap", delete=False) as tf:
+            tpath = tf.name
+        try:
+            wrpcap(tpath, [out])
+            with open(tpath, "rb") as f:
+                data = f.read()
+            _, _, incl, orig = struct.unpack("<IIII", data[24:40])
+            self.assertLess(incl, orig,
+                            f"caplen={incl} wirelen={orig} —— 截断信息没写进记录")
+        finally:
+            try:
+                os.unlink(tpath)
+            except OSError:
+                pass
 
     def test_roundtrip_ip_len_stable(self):
-        """写盘重读后字段保持一致 (wrpcap/rdpcap 不再改长度)。"""
+        """写盘重读后 IP 总长保持原始值 (wrpcap/rdpcap 不改长度)。"""
         from scapy.all import wrpcap, rdpcap
-        out = N._capture_strip_packet(_pkt(dport=22), {})
+        src = _pkt(dport=22)
+        out = N._capture_strip_packet(src, {})
         with tempfile.NamedTemporaryFile(suffix=".pcap",
                                          delete=False) as tf:
             tpath = tf.name
         try:
             wrpcap(tpath, [out])
             back = rdpcap(tpath)[0]
-            self.assertEqual(back[IP].len, len(bytes(back[IP])))
+            self.assertEqual(back[IP].len, len(bytes(src[IP])))
+            self.assertLess(len(bytes(back[IP])), int(back[IP].len))
         finally:
             try:
                 os.unlink(tpath)

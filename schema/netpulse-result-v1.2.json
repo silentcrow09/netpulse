@@ -389,6 +389,47 @@
           }
         }
       }
+    },
+    "site_check": {
+      "type": "object",
+      "description": "v1.13.0 现场检测模式: 机房 6 项勾选结果 (白名单校验后)。普通模式为空对象。",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "site_note": {
+      "type": "string",
+      "description": "现场备注 (装维手填)。普通模式为空串。"
+    },
+    "meta_manual": {
+      "type": "object",
+      "description": "现场检测模式手输元数据 (客户名/检测时间/签约带宽)。普通模式为空对象。",
+      "additionalProperties": true
+    },
+    "meta": {
+      "type": "object",
+      "description": "兼容视图: v1.4.0 之前的消费方读 meta.host / meta.app。",
+      "required": [
+        "app",
+        "version",
+        "generated_at",
+        "host"
+      ],
+      "properties": {
+        "app": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "generated_at": {
+          "type": "string"
+        },
+        "host": {
+          "type": "object"
+        }
+      }
     }
-  }
+  },
+  "additionalProperties": false
 }

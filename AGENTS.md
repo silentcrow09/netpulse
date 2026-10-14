@@ -38,8 +38,10 @@
 ## 报告渲染
 
 - `export_report` 只调用 `render_report_html_customer`（客户视图）
-- `render_report_html`（技术视图）和 `render_report_text`（纯文本）**当前零调用点**，
-  属于死代码；修改后不会被线上路径覆盖，启用前需自行验证
+- `render_report_html`（技术视图）和 `render_report_text`（纯文本）曾长期零调用，
+  **v1.14.14 已连同其专属 helper（`_fmt_value` / `_fmt_record_table` / `_flatten_kv`
+  / `DETAIL_KEYS`）一并删除**（共 352 行，AST 级零 Load 引用验证 + 报告输出逐行
+  diff 验证零回归）。需要技术视图请重新实现并补测试
 - 报告须**可离线打开**：全部用系统字体，不引入任何在线资源，图表用纯 SVG 手绘
 - **HTML 属性转义**（v1.5.0 P0）：文本节点用 `_html_esc(s)`（`quote=False`），
   **属性值一律用 `_html_attr(s)`**（`quote=True`）—— `_html_esc` 不能进属性拼接。
@@ -47,10 +49,34 @@
   恶意 SSID / DNS 名 / hostname 可闭合属性注入标签
 - **根因证据链**（v1.5.0）：`RootCause.evidence_ids` 不直接渲染（B 阶段 `Evidence` 实体
   全仓只在 gateway 模块构造 4 处，覆盖率极低）。改为按"规则判定条件 → 证据项"生成——
-  `_RC_EVIDENCE_BUILDERS` 里 6 条规则各对应一个 builder，只读规则验证过的字段，缺失即跳过，
+  `_RC_EVIDENCE_BUILDERS` 里 8 条规则各对应一个 builder（v1.14.14 更正：本文早前写"6 条"，
+  实际注册 8 条，与 8 条诊断规则一一对应），只读规则验证过的字段，缺失即跳过，
   不伪造数字
 - **模块折叠**（v1.5.0）：有根因时**只展开首要根因**涉及的模块（首要根因 = severity 最高，v1.5.3 起 `diagnose()` 按严重度降序保证）；**无根因时退回旧行为**
   （规则没命中时不能把异常藏起来）
+- **渲染器结构**（v1.14.14）：`render_report_html_customer` 曾是 927 行单体函数
+  （289 个调用点 / 529 个字符串块）。现拆为 **268 行编排层 + 7 个章节 helper**：
+  `_band_counts_band`（状态分布条）/ `_todo_issues_section`（待办清单）/
+  `_stats_overview_sections`（统计卡 + 指标一览）/ `_chart_section`（图表）/
+  `_module_cards_section`（模块卡，178 行）/ `_host_info_section`（本机信息）/
+  `_tech_appendix_section`（技术附录）。191 行 CSS 提成模块常量
+  `CSS_CUSTOMER_REPORT`（与 `CSS_BRIEF_V2` 同一惯例）。
+  **拆分零回归验证方式**（改渲染代码后照做）：用固定 LAST_RUN fixture 渲染
+  customer/brief/brief_v2 三份 HTML 落盘，改前改后 `Compare-Object` 逐行比对，
+  必须完全一致。
+
+## JSON Schema 必须与导出一致 (v1.14.14)
+
+`schema/netpulse-result-v1.2.json` 漂移了两年没人发现——schema 声明了
+`duration_ms` / `selected_modules` / `total_modules` 但 `render_report_json`
+从不导出（技术员拿不到耗时与覆盖范围），而导出里的 `site_check` / `site_note` /
+`meta_manual` / `meta` schema 一个都没声明；schema 又没设
+`additionalProperties: false`，拿标准校验器去验也不会报错。
+
+- 现根级设了 `additionalProperties: false`，`render_report_json` 补齐那 3 个字段。
+- **`tests/test_schema_export_consistency.py` 双向锁住**（6 用例，不依赖
+  `jsonschema` 包）。增删导出字段时必须同步 schema，否则该测试红。
+- `schema/` 下的 v1.1 是留档，不要改。
 - **诊断标准**（v1.5.0）已归入统一「技术附录」折叠区块，原章节文案移除
 
 ## 收口阶段规则（v1.8.1 起，源自 2026-09 专家审计）
@@ -86,6 +112,38 @@
   概率，UI 不做伪精确百分比；JSON 保留原始数值。旧结果包装的 `Issue.confidence=None`
   （无依据不显示），不要回填统一数字。
 
+## 抓包分析必须走生产管线 (v1.14.14 · 教训)
+
+**剥载荷发生在 sniffer 回调里**（`_PcapCaptureSession.start` 的 `_prn`），环形缓冲、
+事件切片、`PcapAnalyzer` 全都只见过"剥掉载荷的包"。任何"拿 payload 字节数当段长"
+的分析逻辑在生产上恒为 0：
+
+- v1.14.14 之前 `PcapAnalyzer` 用 `bytes(tcp.payload)` 判段长 → 数据段被当成纯 ACK，
+  **信号 B（full-size 段同序号停滞）永不触发**，对外主推的「A 或 B∧C 判 PMTU 黑洞」
+  实际只剩 A；重传统计恒 0；`LOSS_MIN_SEGS` 门槛不可达；被剥载荷的数据段还会喂进
+  `_dup_ack` 把正常传输**伪报成 dup-ack 突发**。
+- 之所以长期没被发现：`test_pcap_analyzer.py` 用**未剥离**的合成包直接喂分析器，
+  从不经过 `_capture_strip_packet` —— 测的是错误的对象。
+
+**规矩**：
+
+1. 段长一律走 `_tcp_payload_len(ip, tcp)`（IP 总长 − 头长），**不要**用 `bytes(payload)`。
+   剥除保留原始总长正是为了这个。
+2. 任何分析逻辑的测试必须走 `剥载荷 → 环形缓冲 → _write_pcap → 读回分析` 全链路，
+   见 `tests/test_pcap_pipeline_e2e.py`。直接构造包喂 `analyze()` 的单测只验证了
+   分析器的一半输入形态。
+3. 隐私白名单 `CAPTURE_WEB_PORTS = (80, 443, 8080)`，用户可见文案（抓包确认弹窗 /
+   盯障报告隐私声明 / `--capture` 帮助）必须**从常量生成**，不要写死端口串——
+   v1.14.14 前三处都写 "80/443" 而白名单含 8080。
+
+## 控制台编码 (v1.14.14)
+
+面向中文 Windows 装维机，默认代码页 cp936 编不了 ✓ ✗ ⚠ 🔴 等符号。模块加载时
+`_ensure_console_safe()` 把 stdout/stderr 的 **errors 降级为 replace**（只改 errors
+不改 encoding，`--json` 字节与管道语义不受影响）。新增终端符号前不必再担心崩溃；
+`tests/test_console_encoding.py` 锁住该行为。**注意：不要用 `PYTHONIOENCODING=utf-8`
+"解决"本地测试失败**——那正是真实用户会遇到的那个 bug。
+
 ## 现场检测模式 (v1.13.0)
 
 - **入口**：场景菜单 `[6]` / CLI `--site`（`--customer` 预填客户名）。
@@ -118,18 +176,28 @@
 
 ```bash
 for f in tests/test_*.py; do python "$f"; done
-#   单元/回归套件 (24 文件 / 497 用例): parsers/diagnosis/诊断矩阵/丢包口径/
-#   XSS 转义/pcap 分析与取证 (含 v1.9.9 截断长度字段修正)/probes/redaction/
-#   场景菜单/盯障统计/scapy 懒加载 (v1.9.7 PR-2)/自提权重启 (v1.9.7 PR-3)/
-#   管理员修复命令一键执行 (v1.9.8)/全量口径与 tcpcc 多目标轮转 (v1.10.0)/
-#   自动检查更新 (v1.12.0)/现场检测模式 (v1.13.0: 白名单/截断/一页版渲染)/
-#   一页版问题区回退与豁免说明 (v1.13.1)/现场模式自动 PDF (v1.14.0)
-#   注意: 壳环境 `python` 可能指向未装 scapy 的解释器 → test_pcap_capture
-#   模块级 proto=TCP NameError; 用装了 scapy 的系统 Python 跑
-python _smoke_report.py          # 262 项断言: 图表/导航/折叠/打印/复制/超时扣分 + v1.5.0 转义/证据链/折叠策略/技术附录/报障卡 + v1.5.2 盯障抖动窗口 + v1.5.3 判据修正 6 项 + v1.10.0 全量口径/多目标轮转 6 项 + v1.11.0 网卡错误暴增 2 项 + v1.12.0 更新检查 4 项 + v1.13.0 一页客户报告 8 项
-# 抓包取证: 截断存储会剥载荷 — v1.9.9 起截断时同步修正 IP/UDP 长度字段,
-# 避免 Wireshark 专家误报 (ACKed lost 满屏)。旧文件用根目录 _migrate_pcap.py 修正
+#   单元/回归套件 (v1.14.14: 27 文件 / 517 用例): diagnosis/诊断矩阵/丢包口径/
+#   XSS 转义 (含测速报告族 href 属性注入回归)/抓包离线分析/pcap 分析与取证/
+#   **抓包生产管线端到端 (v1.14.14 新增, 最重要的一条)**/控制台编码兜底 (v1.14.14)/
+#   **JSON Schema ↔ 导出一致性 (v1.14.14 新增)**/probes/redaction/场景菜单/
+#   盯障统计/scapy 懒加载 (v1.9.7 PR-2)/自提权重启/管理员修复命令一键执行/
+#   全量口径与 tcpcc 多目标轮转 (v1.10.0)/自动检查更新 (v1.12.0)/
+#   现场检测模式 (v1.13.0)/一页版问题区回退 (v1.13.1)/现场模式自动 PDF (v1.14.0)
+#   v1.14.14 已删 tests/test_parsers.py: 那 29 个用例测的 4 个解析器
+#   (parse_ipconfig / parse_route_print / parse_arp_a / parse_netsh_wlan_interfaces)
+#   **生产代码一次都没调用** —— ARPAnalyzer/RouteAnalyzer/WifiAnalyzer 都是各自
+#   内联解析。测试绿着但测的是不运行的代码, 属假覆盖, 已连同解析器一并删除。
+#   注意: 壳环境 `python` 可能指向未装 scapy 的解释器; 且 `test_pcap_capture.py`
+#   的 TestPcapRingBuffer 2 个用例需要本机装有 Npcap (无 Npcap 时 scapy 解析不出
+#   \Device\NPF_Loopback → ValueError), 这是环境依赖不是代码缺陷。
+# 抓包取证 (v1.14.14 改了长度口径): 剥载荷时**不再改写 IP/UDP 长度字段**,
+# 改为保留原始总长 + 给包挂 .wirelen, 落盘写出 caplen < wirelen 的标准 snaplen
+# 截断记录 (等价 tcpdump -s)。Wireshark 读作"线上更长、被截断", 既不误报
+# ACKed lost segment, 又保住段长供离线分析器还原。旧文件用 _migrate_pcap.py 修。
 ```
+
+> ⚠️ `_smoke_report.py` 不在版本库里（被 gitignore），新克隆者跑不了上面那条
+> 262 项断言命令。v1.14.14 已从本文移除该引用；如需恢复请把它纳入版本控制。
 
 `tests/fixtures/windows/` 为**脱敏** fixture（MAC 用 02/06 本地管理前缀、IPv6 用
 RFC 3849 文档前缀、假 hostname/GUID）；真实抓包或含隐私的本地 fixture 放

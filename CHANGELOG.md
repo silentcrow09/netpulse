@@ -7,6 +7,121 @@
 
 ## [Unreleased]
 
+## [1.14.14] - 2026-10-14
+
+代码审查后的修复批次。核心是**一个对外主推却从未真正生效的功能**和**一个让中文
+Windows 用户直接崩溃的问题**，外加一处可利用的 HTML 属性注入。
+
+### 修复
+
+- **P0 · PMTU 黑洞「信号 B」在生产路径上永不触发**：剥载荷发生在 sniffer 回调里，
+  环形缓冲 / 事件切片 / `PcapAnalyzer` 全都只见过剥后包，而分析器用
+  `bytes(tcp.payload)` 判段长（恒为 0）。后果是数据段被当成纯 ACK，
+  **信号 B 恒 False**（对外宣称的「A 或 B∧C 判 PMTU 黑洞」实际只剩 A）、
+  重传统计恒 0、`LOSS_MIN_SEGS` 门槛不可达，且被剥载荷的数据段喂进 `_dup_ack`
+  把正常传输**伪报成 dup-ack 突发**。
+  - 修法：剥除时**不再改写 IP/UDP 长度字段**（保留原始总长），改为给包挂
+    `.wirelen` = 线上原始长度，落盘写出 `caplen < wirelen` 的**标准 snaplen
+    截断**记录（等价 `tcpdump -s`）。Wireshark 读作「线上更长、被截断」，
+    既不再误报 `ACKed lost segment`，又完整保住段长。
+    这取代了 v1.9.9 的「改写长度字段」方案（`_patch_ip_lengths` 现仅供
+    `_migrate_pcap.py` 修旧文件）。
+  - 分析器新增 `_tcp_payload_len(ip, tcp)`：按 `IP 总长 − 头长` 反推真实段长；
+    IP 总长不可得时（构造态包）回落实测载荷。
+  - 之所以长期没发现：`test_pcap_analyzer.py` 用**未剥离**的合成包直接喂分析器，
+    从不经过 `_capture_strip_packet` —— 测的是错误的对象。
+- **P0 · 中文 Windows（cp936）控制台崩溃**：全文件 133 行含 GBK 编不了的字符，
+  其中 49 行在 `print()` 内，无任何兜底 → `UnicodeEncodeError` 让进程崩在诊断中途。
+  `test_elevation.py` / `test_v160_scene.py` / `test_v196_menu_entry.py` 三个文件
+  因此长期挂掉（设 `PYTHONIOENCODING=utf-8` 才绿）。
+  - 修法：模块加载时 `_ensure_console_safe()` 把 stdout/stderr 的 **errors 降级为
+    replace**（只改 errors 不改 encoding，`--json` 字节与管道语义不受影响）。
+- **P1 · 测速报告 `href` 属性注入**：测速/iperf3/盯障报告族的 `_esc_html` 只转义
+  `& < >`、**不转义引号**，却被拼进 `href="{...}"`；数据源是 speedtest.exe 的远端
+  JSON `result_url`（配合用户可选的 `--speedtest-node`）。违反 AGENTS.md
+  「属性值一律 `_html_attr`」铁律。现 `_esc_html` 委托 `_html_attr`，一处改动把
+  本族约 40 个调用点一次性收口。
+- **P1 · 报告内评分说明漏写「超时 -10」**：实际扣 -10，技术附录却只列
+  异常/错误/警告/未检测 → 分数下降却在报告里找不到依据（AGENTS.md 明确要求扣）。
+  同处豁免模块名改为 `_exempt_names(report)` 动态生成（原先硬编码 4 个，
+  现场模式实际只有 3 个参与）。
+- **P1 · 隐私声明端口范围与实现不符**：`CAPTURE_WEB_PORTS = (80, 443, 8080)`，
+  而抓包确认弹窗 / 盯障报告隐私声明 / `--capture` 帮助三处都写「80/443」。
+  现三处均从常量生成，杜绝再漂移。
+- **P1 · `tests/test_v194_layout.py` 在任何别的机器上都跑不了**：硬编码
+  `sys.path.insert(0, "d:/Work/Projects/NetPulse")` 并从该路径读源码，
+  会打断 AGENTS.md 的全量测试循环。改为从 `__file__` 推导。
+- **P1 · 菜单 `[A]` 提权不透传 argv**：README 称「UAC 确认后接续当前意图」，
+  实际传 `args_tail=None`，`--no-scapy` / `--verbose` / `--pip-mirror` 全丢
+  （scapy 与抓包两条路径都透传了，只有菜单漏网）。现传 `list(sys.argv[1:])`。
+- **P2 · 机房建议缺渲染期截断**：`_BRIEF_CLIP["site_advice"] = 24` 全仓 0 引用，
+  建议文案一超 24 字就静默破掉一页版「恒单行」的高度锁。
+- **P2 · `--site` 被 `--monitor` / `--diagnose` 静默吞掉**：两个互斥顶层模式组合
+  使用时用户以为跑了现场检测、实际跑的是盯障。现与 `--capture` 一样给出忽略提示。
+- **P2 · 键名笔误与注释与实现相反**：`_prime_update_state_from_cache` 写
+  `from_primary`（其余处一律 `from_source`）；更新缓存写入条件的注释说
+  「其他回落源也写缓存」与代码相反；`_module_status_confidence` docstring 说
+  `ERROR=0.95` 而实为 `0.0`。均已订正。
+
+### 清理
+
+- **删除 586 行死代码**（AST 级零 Load 引用验证 + 三类 HTML 报告逐行 diff
+  验证零回归）：
+  - `render_report_html`(261) / `render_report_text`(79) / `_net_ok`(7) /
+    `reset_pip_mirror_cache`(5) —— 生产零调用，无测试引用
+  - `parse_ipconfig` / `parse_route_print` / `parse_arp_a` /
+    `parse_netsh_wlan_interfaces` 及伴生 `ArpEntry` / `NetworkAdapter` /
+    `RouteEntry` / `WifiInterface` 与专属正则 —— 这 4 个解析器**生产代码一次都
+    没调用**（ARPAnalyzer / RouteAnalyzer / WifiAnalyzer 都是各自内联解析），
+    但 `tests/test_parsers.py` 的 29 个用例全在测它们：**测试绿着，测的是不运行的
+    代码**，属假覆盖，一并移除
+- **拆分 `render_report_html_customer`（927 → 268 行 + 7 个章节 helper）**：
+  该函数曾是全仓最大单体（289 个调用点 / 529 个字符串块）。现按章节拆为
+  `_band_counts_band`（状态分布条）/ `_todo_issues_section`（待办清单）/
+  `_stats_overview_sections`（统计卡 + 指标一览）/ `_chart_section`（图表）/
+  `_module_cards_section`（模块卡，178 行）/ `_host_info_section`（本机信息）/
+  `_tech_appendix_section`（技术附录），191 行 CSS 提成模块常量
+  `CSS_CUSTOMER_REPORT`（与 `CSS_BRIEF_V2` 同一惯例）。章节边界与 helper 签名
+  由 AST 自由变量分析得出，不靠肉眼；**三类 HTML 报告逐行 diff 验证输出零变化**。
+
+### 修复（补充）
+
+- **JSON Schema 与实际导出漂移了两年**：schema 声明 `duration_ms` /
+  `selected_modules` / `total_modules` 三个字段而 `render_report_json` 从不导出
+  （技术员拿不到检测耗时与覆盖范围）；反过来导出里的 `site_check` / `site_note` /
+  `meta_manual` / `meta` schema 一个都没声明；schema 未设
+  `additionalProperties: false`，全仓又无 `jsonschema` 校验 —— 所以从没被发现。
+  现补齐 3 个导出字段、4 个 schema 声明，根级设 `additionalProperties: false`，
+  并新增双向一致性测试锁死。`render_report_json` 的 docstring 原先写「对齐 v1.1」
+  也已订正为 v1.2。
+
+### 文档同步
+
+- AGENTS.md 新增「抓包分析必须走生产管线」「控制台编码」「JSON Schema 必须与导出一致」
+  三节（记录本轮教训与规矩）、补渲染器拆分结构说明、证据链 builder 6→8、
+  测试口径 24 文件/497 用例→27 文件/517 用例、
+  移除已不在版本库的 `_smoke_report.py` 引用
+- README 行数、A4 双页、PDF 适用范围、`--port-count` 默认值（4→2）、24h 频控描述
+
+### 测试
+
+- 新增 `tests/test_pcap_pipeline_e2e.py`（5 用例）：锁住
+  `剥载荷 → 环形缓冲 → 落盘 → 离线分析` 全链路——信号 B 恢复、正常流量不再被
+  伪报 dup-ack、记录为标准 snaplen 截断、IP 总长保留、时间戳不丢。
+  **这是本次最重要的一条测试**，任何一环退回「按幸存载荷判段长」都会红。
+- 新增 `tests/test_console_encoding.py`（5 用例）：锁住 cp936 窄流不再崩溃、
+  只改 errors 不改 encoding、幂等、StringIO 安全跳过。
+- 新增 `tests/test_schema_export_consistency.py`（6 用例）：双向比对 schema 声明
+  与实际导出的字段集（根级 + tech），不依赖 `jsonschema` 包。
+- 改写 `test_pcap_capture.py` 的 5 个长度相关用例：v1.9.9 断言的是「IP 总长 ==
+  实际字节数」（旧契约），现改为断言「IP 总长保留原值 + `.wirelen` 已挂 +
+  落盘记录 caplen < wirelen」。
+- `test_elevation.py` 补 `test_admin_key_carries_original_argv`；补一条断言菜单
+  `[A]` 提权透传原始 argv 的用例。
+- `test_html_escape.py` 新增 `TestSpeedtestReportEscape`（2 用例）：把
+  Ookla `result_url` 的属性闭合向量灌进测速报告渲染。
+- 删除 `tests/test_parsers.py`（29 用例，全部指向死代码）。
+
 ## [1.14.13] - 2026-09-30
 
 ### 新增

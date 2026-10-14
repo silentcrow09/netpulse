@@ -226,16 +226,39 @@ class TestSceneMenuAdminKey(unittest.TestCase):
     def test_admin_key_offers_relaunch_then_falls_back(self):
         offers = []
 
-        def fake_offer(reason="", **kw):
-            offers.append(reason)
+        def fake_offer(args_tail=None, reason="", **kw):
+            offers.append((args_tail, reason))
             # 模拟用户取消: 正常返回 (不 sys.exit)
 
+        fake_argv = ["netpulse.py", "--no-scapy", "--verbose"]
         with mock.patch("builtins.input", side_effect=["a", "0"]), \
+             mock.patch.object(sys, "argv", fake_argv), \
              mock.patch.object(N, "_menu_clear", return_value=None), \
              mock.patch.object(N, "_offer_elevation_relaunch",
                                side_effect=fake_offer):
             self.assertFalse(N._scene_menu(), "取消提权后 [0] 仍应正常退出")
         self.assertEqual(len(offers), 1, "[A] 必须触发一次提权提议")
+
+    def test_admin_key_carries_original_argv(self):
+        """v1.14.14: 菜单 [A] 提权必须透传原始 argv。
+
+        原先不传 args_tail → 提权后空参数启动, `--no-scapy` 等全丢, 与
+        README「UAC 确认后接续当前意图」不符 (scapy / 抓包两条路径都透传)。
+        """
+        seen = {}
+
+        def fake_offer(args_tail=None, reason="", **kw):
+            seen["tail"] = args_tail
+
+        fake_argv = ["netpulse.py", "--no-scapy", "--pip-mirror", "https://x"]
+        with mock.patch("builtins.input", side_effect=["a", "0"]), \
+             mock.patch.object(sys, "argv", fake_argv), \
+             mock.patch.object(N, "_menu_clear", return_value=None), \
+             mock.patch.object(N, "_offer_elevation_relaunch",
+                               side_effect=fake_offer):
+            N._scene_menu()
+        self.assertEqual(seen.get("tail"), fake_argv[1:],
+                         "菜单 [A] 提权丢了原始参数")
 
 
 # ============================================================

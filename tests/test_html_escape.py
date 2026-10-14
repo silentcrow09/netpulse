@@ -20,6 +20,7 @@ X_TAG_IMG = "'><img src=x onerror=alert(1)>"          # SSID 形态
 X_ATTR = '" onmouseover="alert(1)'                    # 属性闭合形态
 X_SCRIPT = "<script>alert('xss')</script>"            # DNS 域名形态
 X_SVG = "'><svg/onload=alert(1)>"                     # URL/redirect 形态
+X_URL_ATTR = 'https://x" onmouseover="alert(1)'      # Ookla result_url 形态 (属性闭合)
 
 # 渲染产物中绝不允许出现的原始序列 (页面自身 <script> 不受影响)。
 # 只查"标签注入"向量: 文本节点通道 (_html_esc, quote=False) 不转义引号,
@@ -115,6 +116,46 @@ class TestHtmlEscape(unittest.TestCase):
         # 渲染嵌入时必须转义 (customer renderer 的 ticket_html 路径)
         self.assertIn(_h.escape(X_SCRIPT)[:20],
                       np.render_report_html_customer(report))
+
+
+class TestSpeedtestReportEscape(unittest.TestCase):
+    """v1.14.14 P1: 测速报告族 (speedtest / iperf3 / 盯障) 的本地 `_esc_html`
+    历史上只转义 & < >, 被拼进 href="..." 时可闭合属性注入。
+
+    数据源是 speedtest.exe 的**远端 JSON** (result_data["result"]["url"]),
+    配合用户可选的 --speedtest-node, 不是纯自造输入。
+    """
+
+    @staticmethod
+    def _res():
+        return {
+            "download": 100.0, "upload": 20.0, "latency": 10.0,
+            "jitter_ms": 1.0, "packet_loss_pct": 0.0,
+            "server": "上海电信", "history": [],
+            # Ookla 对照结果走 res["speedtest"], 且需 download_mbps 才渲染面板
+            "speedtest": {
+                "valid": True, "note": "", "server": "上海电信 3633",
+                "isp": "China Telecom", "download_mbps": 101.0,
+                "upload_mbps": 21.0, "latency_ms": 9.0,
+                "jitter_ms": 0.8, "packet_loss_pct": 0.0,
+                "result_url": X_URL_ATTR,
+            },
+        }
+
+    def test_result_url_cannot_close_href_attribute(self):
+        html = np._render_speedtest_html(self._res())
+        self.assertNotIn(X_URL_ATTR, html,
+                         "Ookla 结果链接以原始形态进了 HTML —— 属性被闭合注入")
+        self.assertIn("&quot; onmouseover=&quot;", html,
+                      "引号未被转义 (应在 _html_attr 通道)")
+        for raw in ("<img src=x", "<script>alert", "onerror=alert(1)>"):
+            self.assertNotIn(raw, html)
+
+    def test_esc_html_now_escapes_quotes(self):
+        """_esc_html 必须与 _html_attr 同口径 (文本节点里多转义引号无害)。"""
+        out = np._esc_html(X_URL_ATTR)
+        self.assertNotIn('"', out)
+        self.assertIn("&quot;", out)
 
 
 if __name__ == "__main__":
