@@ -224,7 +224,7 @@ class TestRuleWifiWeak(unittest.TestCase):
 
 
 class TestRuleBufferbloat(unittest.TestCase):
-    """规则 4: Bufferbloat 严重."""
+    """规则 4: Bufferbloat (v1.15.0 审查 P0-2 起改绝对增量口径)."""
 
     def test_a_grade_no_fire(self):
         """健康网络 (真实键名+真实等级文案) 绝不能触发."""
@@ -266,6 +266,134 @@ class TestRuleBufferbloat(unittest.TestCase):
         r["bufferbloat"] = {"error": "模块执行超时 (120s)"}
         report = N.diagnose(r)
         self.assertNotIn("bufferbloat", [rc.id for rc in report.root_causes])
+
+    # ---- v1.15.0 审查 P0-2: 比值判据造成的假根因 ----
+
+    def test_b_grade_no_fire(self):
+        """P0-2 原始复现: idle=0.4 / loaded=5.4 (bloat 仅 5ms, 模块评 B 良好).
+
+        旧判据用比值 (loaded >= idle*3 → 13.5 倍) 触发 HIGH「Bufferbloat
+        严重」, 与模块自身「bloat<30 不记 issue」的口径打架。
+        """
+        r = _healthy_full()
+        r["bufferbloat"] = {"idle_rtt_ms": 0.4, "loaded_rtt_ms": 5.4,
+                             "bloat_ms": 5.0, "grade": "B (良好)",
+                             "load_warning": False, "issues": []}
+        report = N.diagnose(r)
+        self.assertNotIn("bufferbloat", [rc.id for rc in report.root_causes],
+                         "绝对增量仅 5ms —— 不构成 Bufferbloat 根因")
+
+    def test_ratio_only_no_fire(self):
+        """比值再大也不算: 绝对增量没到 30ms 一律不触发."""
+        r = _healthy_full()
+        r["bufferbloat"] = {"idle_rtt_ms": 1.0, "loaded_rtt_ms": 30.0,
+                             "bloat_ms": 29.0, "grade": "B (良好)",
+                             "load_warning": False, "issues": []}
+        report = N.diagnose(r)
+        self.assertNotIn("bufferbloat", [rc.id for rc in report.root_causes])
+
+    def test_missing_bloat_ms_derived_no_fire(self):
+        """bloat_ms 缺失时按 loaded-idle 推导, 同样受 30ms 门槛约束."""
+        r = _healthy_full()
+        r["bufferbloat"] = {"idle_rtt_ms": 0.4, "loaded_rtt_ms": 5.4,
+                             "grade": "B (良好)", "load_warning": False,
+                             "issues": []}
+        report = N.diagnose(r)
+        self.assertNotIn("bufferbloat", [rc.id for rc in report.root_causes])
+
+    def test_false_bufferbloat_does_not_steal_top_slot(self):
+        """假根因不得顶掉真故障: 网关丢包 (HIGH) 必须仍是 root_causes[0].
+
+        根因按严重度降序、同级按注册表顺序, bufferbloat 注册在
+        gateway_loss 之前 —— 旧版假 HIGH 会稳占首位, 真实网关丢包被折叠。
+        """
+        r = _healthy_full()
+        r["gateway"] = {"ping": {"loss_pct": 8.0, "avg_ms": 40, "jitter_ms": 9},
+                        "issues": []}
+        r["bufferbloat"] = {"idle_rtt_ms": 0.4, "loaded_rtt_ms": 5.4,
+                             "bloat_ms": 5.0, "grade": "B (良好)",
+                             "load_warning": False, "issues": []}
+        report = N.diagnose(r)
+        ids = [rc.id for rc in report.root_causes]
+        self.assertNotIn("bufferbloat", ids)
+        self.assertIn("gateway_loss", ids)
+        self.assertEqual(report.root_causes[0].id, "gateway_loss",
+                         "真实网关丢包被假 Bufferbloat 顶掉了")
+
+    def test_c_grade_fires_medium(self):
+        """C 档 (30~60ms) 属警告级根因, 不得与真实故障同级抢首位."""
+        r = _healthy_full()
+        r["bufferbloat"] = {"idle_rtt_ms": 8, "loaded_rtt_ms": 53,
+                             "bloat_ms": 45.0, "grade": "C (一般)",
+                             "load_warning": False, "issues": []}
+        report = N.diagnose(r)
+        bb_rc = next((rc for rc in report.root_causes if rc.id == "bufferbloat"), None)
+        self.assertIsNotNone(bb_rc)
+        self.assertEqual(bb_rc.severity, N.Severity.MEDIUM)
+
+    def test_threshold_boundary(self):
+        """门槛边界: 29.9ms 不触发, 30.0ms 触发."""
+        for bloat, should_fire in ((29.9, False), (30.0, True)):
+            r = _healthy_full()
+            r["bufferbloat"] = {"idle_rtt_ms": 8, "loaded_rtt_ms": 8 + bloat,
+                                 "bloat_ms": bloat, "grade": "C (一般)",
+                                 "load_warning": False, "issues": []}
+            report = N.diagnose(r)
+            fired = "bufferbloat" in [rc.id for rc in report.root_causes]
+            self.assertEqual(fired, should_fire, f"bloat={bloat}")
+
+    def test_title_matches_band(self):
+        """标题按档位措辞: 不再自称「严重」却写 B 档."""
+        for bloat, grade, word in ((45.0, "C (一般)", "一般"),
+                                   (92.0, "D (较差)", "较差"),
+                                   (192.0, "F (很差)", "严重")):
+            r = _healthy_full()
+            r["bufferbloat"] = {"idle_rtt_ms": 8, "loaded_rtt_ms": 8 + bloat,
+                                 "bloat_ms": bloat, "grade": grade,
+                                 "load_warning": False, "issues": []}
+            report = N.diagnose(r)
+            bb_rc = next((rc for rc in report.root_causes if rc.id == "bufferbloat"), None)
+            self.assertIsNotNone(bb_rc)
+            self.assertIn(word, bb_rc.title, f"bloat={bloat} title={bb_rc.title}")
+            if word != "严重":
+                self.assertNotIn("严重", bb_rc.title,
+                                 f"bloat={bloat} 不该自称严重")
+
+    def test_non_numeric_bloat_falls_back_to_derived(self):
+        """脏 bloat_ms 不得把诊断打崩: 回退到 loaded-idle (与模块同源)."""
+        r = _healthy_full()
+        r["bufferbloat"] = {"idle_rtt_ms": 8, "loaded_rtt_ms": 53,
+                             "bloat_ms": "unknown", "grade": "C (一般)",
+                             "load_warning": False, "issues": []}
+        report = N.diagnose(r)
+        bb_rc = next((rc for rc in report.root_causes if rc.id == "bufferbloat"), None)
+        self.assertIsNotNone(bb_rc)            # 推导值 45ms → 触发
+        self.assertEqual(bb_rc.severity, N.Severity.MEDIUM)
+
+    def test_non_numeric_rtt_no_fire(self):
+        """idle/loaded 不是数字时无法判定, 不触发 (也不崩)."""
+        r = _healthy_full()
+        r["bufferbloat"] = {"idle_rtt_ms": "n/a", "loaded_rtt_ms": "n/a",
+                             "grade": "C (一般)", "load_warning": False,
+                             "issues": []}
+        report = N.diagnose(r)
+        self.assertNotIn("bufferbloat", [rc.id for rc in report.root_causes])
+
+    def test_rule_fires_iff_module_reports_issue(self):
+        """口径一致性契约: 规则触发 ⇔ 模块自身记 issue (不再各判各的)."""
+        for bloat in (0.0, 4.9, 29.9, 30.0, 45.0, 59.9, 60.0, 99.9,
+                      100.0, 192.0):
+            res = {"idle_rtt_ms": 8, "loaded_rtt_ms": 8 + bloat,
+                   "bloat_ms": bloat, "grade": "C (一般)",
+                   "load_warning": False, "issues": []}
+            module_has_issue = bool(N._issues_bufferbloat(res))
+            base = _healthy_full()
+            base["bufferbloat"] = res
+            report = N.diagnose(base)
+            rule_fired = "bufferbloat" in [rc.id for rc in report.root_causes]
+            self.assertEqual(rule_fired, module_has_issue,
+                             f"bloat={bloat}: 规则({rule_fired}) 与模块 issue "
+                             f"({module_has_issue}) 口径不一致")
 
 
 class TestRuleGatewayLoss(unittest.TestCase):

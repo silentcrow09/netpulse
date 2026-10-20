@@ -1775,7 +1775,21 @@ def _rule_wifi_weak(results_dict):
 
 
 def _rule_bufferbloat(results_dict):
-    """Bufferbloat: loaded_rtt / idle_rtt 比值过大."""
+    """Bufferbloat: 负载下延迟的**绝对增量**超阈值.
+
+    v1.15.0 (代码审查 P0-2) 改判据: 旧版用比值 (loaded >= idle * 3) 且门槛
+    不与模块自身对齐 —— idle=0.4ms / loaded=5.4ms (绝对增量仅 5ms, 模块
+    自己评 B 档「良好」, 也不记 issue) 竟能触发 HIGH「Bufferbloat 严重」。
+    由于根因按严重度降序、同级按注册表顺序 (bufferbloat 在 gateway_loss
+    之前), 这个假根因稳占 root_causes[0], 把真实网关丢包折叠隐藏。
+
+    现口径 (与模块自身完全一致):
+      - BufferbloatTester 记 issue 的门槛: bloat > 30ms
+      - THRESHOLDS["bufferbloat"]["bloat_ms"]: warn 30 / err 100
+      - 规则触发门槛: bloat >= 30ms (模块记 issue ⇔ 规则触发)
+      - 严重度: >=100 → CRITICAL / >=60 → HIGH / >=30 → MEDIUM
+        (旧版一律 HIGH, 且 C 档「一般」会和真实网关丢包同级抢首位)
+    """
     bb = results_dict.get("bufferbloat", {})
     if not bb or bb.get("error"):
         return None
@@ -1783,21 +1797,28 @@ def _rule_bufferbloat(results_dict):
         return None  # 测速源不可用, 负载未建立, 结果不可信
     idle = bb.get("idle_rtt_ms")
     loaded = bb.get("loaded_rtt_ms")
-    if idle is None or loaded is None:
+    if not isinstance(idle, (int, float)) or not isinstance(loaded, (int, float)):
         return None
     bloat = bb.get("bloat_ms")
-    if bloat is None:
+    if not isinstance(bloat, (int, float)):
         bloat = loaded - idle
-    # BufferbloatTester 的 grade 是带说明的中文串, 取首字母判定档位
-    grade = bb.get("grade", "") or ""
-    grade_letter = grade[:1].upper()
-    if grade_letter not in ("D", "F") and (idle <= 0 or loaded < idle * 3):
+    bloat = float(bloat)
+    # 绝对增量 < 30ms: 与模块自身「无 issue」判定一致, 不报根因
+    if bloat < 30:
         return None
+    grade = bb.get("grade", "") or ""
+    if not grade:
+        grade, _ = bufferbloat_grade(idle, loaded)   # 与模块同源生成
+    if bloat >= 100:
+        severity, band = Severity.CRITICAL, "严重"
+    elif bloat >= 60:
+        severity, band = Severity.HIGH, "较差"
+    else:
+        severity, band = Severity.MEDIUM, "一般"
     confidence = _rule_confidence([(bb, 1.0)], base=0.7)
-    severity = Severity.CRITICAL if grade_letter == "F" else Severity.HIGH
     return RootCause(
         id="bufferbloat", category="Bufferbloat", severity=severity,
-        title=f"Bufferbloat 严重 (等级 {grade}, 延迟增加 {bloat:.0f}ms)",
+        title=f"Bufferbloat {band} (等级 {grade}, 延迟增加 {bloat:.0f}ms)",
         description="网络空闲时延迟正常, 加载下载时延迟飙升; 是上游带宽/路由器缓存调优差.",
         confidence=confidence,
         evidence_ids=["bufferbloat.grade", "bufferbloat.loaded_rtt_ms",
@@ -2648,6 +2669,22 @@ def _render_diagnosis_section_html(diagnosis_dict, report=None):
         return ""
     root_causes = diagnosis_dict.get("root_causes") or []
     if not root_causes:
+        # v1.15.0 (审查 P1-15): 「无根因」有两种含义 —— 真的没问题, 或者
+        # **没测出来** (模块超时/错误 → 规则无证据可判)。后者若照样显示
+        # 「✓ 无故障」, 会与 0 分 F 级 / 「23 个模块未完成检测」直接打架
+        # (实测全超时报告: 顶部写"无故障"而健康分是 0 分)。必须区分口径。
+        unfinished = 0
+        if report:
+            unfinished = sum(1 for st in (report.get("summary") or {}).values()
+                             if st in ("超时", "错误"))
+        if unfinished:
+            return ('<section class="diagnosis healthy" id="diagnosis">'
+                    '<div class="dhead">'
+                    '<span class="dbadge warn">⚠ 未定位到根因</span>'
+                    f'<span class="dconf">{unfinished} 个模块未完成检测, '
+                    '现有结论仅供参考; 请先让未完成模块跑完再判断</span>'
+                    '</div></div>'
+                    '</section>')
         # 健康时显示一行轻提示
         return ('<section class="diagnosis healthy" id="diagnosis">'
                 '<div class="dhead">'
@@ -2848,13 +2885,24 @@ def _redact_text_value(value):
     return _mask_public_ipv6_text(_mask_public_ipv4_text(value))
 
 
-# 需要值级文本打码的字段 (文案里常嵌公网 IP:port, 如 NAT summary 的映射地址)
-_REDACT_TEXTY_KEYS = {"summary", "message", "detail", "action", "description",
-                      "error", "assessment", "verdict", "note", "title", "text"}
+# 值级 MAC 掩码: 形如 AA:BB:CC:DD:EE:FF / AA-BB-CC-DD-EE-FF 的值
+_MAC_VALUE_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")
+
+
+def _mask_mac_text(text):
+    """把文本里的 MAC 地址打码 (xx:xx:xx:xx:xx:xx)。"""
+    return _MAC_VALUE_RE.sub("XX:XX:XX:XX:XX:XX", text)
 
 
 def _redact_value(key, value):
-    """脱敏单个字段值. 命中隐私字段返回 mask, 否则原样返回."""
+    """脱敏单个字段值. 命中隐私字段返回 mask, 否则值级打码后返回.
+
+    v1.15.0 (审查 P1-10): 兜底改为**值级**打码 —— 旧版只按 key 命中,
+    未知 key 里的公网地址原样落盘 (traceroute[].ip / detail[].resolved_ip /
+    path_mtus[].target), 而调试包 log 声明「公网 IPv4+IPv6 已脱敏」——
+    承诺与行为不符。现在任何字符串值都会做公网 IP + MAC 掩码, 幂等
+    (已打码的值不会被二次改写); 内网/回环/链路本地地址照旧保留。
+    """
     key_l = key.lower()
     # STUN 映射端口 (int): 与 mapped_ip 组合即出口身份, 一并打码
     if "mapped_port" in key_l:
@@ -2881,9 +2929,18 @@ def _redact_value(key, value):
             return f"{parts[0]}.{parts[1]}.X.X"
         if ":" in value:
             return _mask_public_ipv6_text(value)
-    # 文案字段: 值级打码 (嵌在中文句子里的公网 ip:port / IPv6)
-    if key_l in _REDACT_TEXTY_KEYS:
-        return _redact_text_value(value)
+    # 兜底值级打码: 嵌在字符串里的公网 ip:port / IPv6 / MAC (不依赖 key 命中)
+    return _mask_mac_text(_redact_text_value(value))
+
+
+def _redact_any(value):
+    """脱敏任意结构 (dict / list / 标量), 供调试包逐模块使用."""
+    if isinstance(value, dict):
+        return _redact_dict(value)
+    if isinstance(value, list):
+        return [_redact_any(x) for x in value]
+    if isinstance(value, str):
+        return _mask_mac_text(_redact_text_value(value))
     return value
 
 
@@ -2923,8 +2980,10 @@ def _export_debug_bundle(out_dir):
     # 2. 脱敏
     try:
         sys_info_redacted = _redact_dict(dict(LAST_RUN.get("system", {})))
-        diag_redacted = {k: _redact_dict(v) if isinstance(v, dict)
-                         else v for k, v in LAST_RUN.get("results", {}).items()}
+        # v1.15.0 (审查 P1-10): results 的值不一定是 dict (可能是 list/标量),
+        # 旧版 `isinstance(v, dict) else v` 会让 list 原样落盘 → 漏脱敏。
+        diag_redacted = {k: _redact_any(v)
+                         for k, v in (LAST_RUN.get("results") or {}).items()}
         ev_redacted = _redact_dict(dict(LAST_RUN.get("evidence") or {}))
     except Exception as e:
         print(_c(f"  ✗ 脱敏失败: {e}", C_RED))
@@ -2951,6 +3010,8 @@ def _export_debug_bundle(out_dir):
         f.write(f"NetPulse v{APP_VERSION} debug bundle\n")
         f.write(f"Generated at: {datetime.now().isoformat()}\n")
         f.write("Redacted: SSID / MAC / 公网 IPv4+IPv6 / STUN 映射地址 / hostname\n")
+        f.write("Redaction scope: 值级掩码 (任意字段里的公网地址都会被掩码, 幂等); "
+                "内网 / 回环 / 链路本地地址保留 (排障需要)\n")
         f.write(f"Schema version: {SCHEMA_VERSION}\n")
         f.write("-" * 60 + "\n")
         f.write("模块运行状态:\n")
@@ -3360,7 +3421,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.14.14"
+APP_VERSION = "1.15.0"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -3846,19 +3907,29 @@ def estimate_bandwidth(download_mbps, upload_mbps=None):
     """由实测速率预估签约宽带带宽档位 (Mbps)。
 
     思路 (市面测速软件口径): 实测值通常比签约值低 5-15% (协议开销/服务器
-    瓶颈), 乘 1.1 修正后向上就近取运营商档位; 上行做交叉校验提示非对称。
+    瓶颈), 所以实测值应落在「签约档位 × 1.1」这个带内。取**能容纳该实测值
+    的最小档位** (measured <= tier * 1.1), 上行做交叉校验提示非对称。
+
+    v1.15.0 修正 (代码审查 P0-1): 此前写成 "乘 1.1 后向上取第一个 >= 修正值
+    的档位" (measured*1.1 <= tier), 1.1 修正与"向上取档"叠加 = 双重上偏 ——
+    实测 100 Mbps 报 "约 200 兆"、实测 1000 Mbps 报 "约 2000 兆", 整整高一档。
+    该字符串进客户报告的**绿色**指标 (「预估宽带」), 装维照着它跟客户说档位,
+    属信任级错误。
     返回 dict 或 None (无有效下行数据时)。
     """
     if not download_mbps or download_mbps <= 0:
         return None
-    adj = download_mbps * 1.1
-    tier = next((t for t in BANDWIDTH_TIERS if adj <= t), None)
+    measured = float(download_mbps)
+    adj = measured * 1.1
+    # 档位带判据: 该档位的 1.1 倍仍 >= 实测值 → 这个档位能解释该实测值。
+    # 取满足条件的最小档位, 于是实测 100 → 100 兆 (不是 200), 实测 95 → 100 兆。
+    tier = next((t for t in BANDWIDTH_TIERS if measured <= t * 1.1), None)
     if tier is None:
         tier = BANDWIDTH_TIERS[-1]
     result = {
         "tier_mbps": tier,
         "text": f"约 {tier} 兆",
-        "basis_download_mbps": round(download_mbps, 1),
+        "basis_download_mbps": round(measured, 1),
         "adjusted_mbps": round(adj, 1),
     }
     # 上行交叉校验: 家宽常见非对称比例 5:1 ~ 20:1; 上行异常低时给出提示
@@ -4238,10 +4309,16 @@ def run_cmd(cmd, timeout=30, shell=True, use_cache=True):
         的半截输出被后续正常 timeout 调用误用。
       - use_cache=False 可强制重跑 (例如 _pip_install_scapy 这类带副作用的)。
 
+    cmd 可以是字符串 (shell=True 走 cmd.exe) 或参数数组 (shell=False,
+    不经过 shell 解析 —— 任何来自用户/配置的可变片段都应走这条路,
+    见 v1.15.0 审查 P1-7 iperf3 命令注入)。
+
     编码处理 (与 P1#7 一致):
       - 按「系统 ANSI codepage → gbk → utf-8」顺序, 首次成功编码缓存。
     """
-    cache_key = (cmd, timeout) if use_cache else None
+    # 缓存 key: 参数数组 (list) 不可哈希 → 转 tuple
+    cache_key = (tuple(cmd) if isinstance(cmd, (list, tuple)) else cmd, timeout) \
+        if use_cache else None
     if cache_key is not None:
         cached = _CMD_CACHE.get(cache_key)
         if cached is not None:
@@ -4255,7 +4332,9 @@ def run_cmd(cmd, timeout=30, shell=True, use_cache=True):
         stdout = result.stdout
         stderr = result.stderr
         # 编码缓存按 cmd 维度 (不同命令互不污染)
-        cache_cmd = cmd if isinstance(cmd, str) else None
+        cache_cmd = cmd if isinstance(cmd, str) else (
+            " ".join(str(x) for x in cmd)
+            if isinstance(cmd, (list, tuple)) else None)
         stdout_str, stderr_str = _decode_bytes_pair(cache_cmd, stdout, stderr)
         rc, so, se = result.returncode, stdout_str, stderr_str
     except subprocess.TimeoutExpired:
@@ -6474,6 +6553,91 @@ class SpeedTester:
         return results
 
 
+# ── iperf3 服务器地址校验 (v1.15.0 审查 P1-7) ──
+# 服务器地址由用户输入 (CLI --iperf3-server / 交互菜单), 会进命令行。
+# 旧实现把 host 直接拼进字符串命令、用 shell=True 执行 → 命令注入:
+#   --iperf3-server "127.0.0.1 & echo INJECTED > f"  会真的建出标记文件。
+# 现在两道防线: ①地址只允许 IP 字面量或合法主机名; ②命令用参数数组 +
+# shell=False 执行 (不经 shell 解析)。
+
+def _valid_iperf3_host(host):
+    """校验 iperf3 服务器地址: 只接受 IP 字面量或合法主机名。
+
+    挡掉 shell 元字符 (& | > < ; ` $ ( ) " ' 与空格/换行/控制字符)、
+    路径分隔符、以及超长输入 —— 这些一旦进了命令行, 等于把 cmd.exe 交出去。
+    """
+    if not isinstance(host, str):
+        return False
+    host = host.strip()
+    if not host or len(host) > 253:
+        return False
+    try:                                   # IP 字面量 (v4/v6) 直接放行
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if host.endswith("."):                # FQDN 结尾的根点
+        host = host[:-1]
+    if not host:
+        return False
+    for label in host.split("."):
+        if not label or len(label) > 63:
+            return False
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", label):
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+    return True
+
+
+def _valid_iperf3_port(port):
+    """iperf3 端口必须是 1..65535 的整数。"""
+    try:
+        p = int(port)
+    except (TypeError, ValueError):
+        return False
+    return 1 <= p <= 65535
+
+
+def _parse_iperf3_server(spec, default_port=5201):
+    """解析 iperf3 服务器规格 → (host, port) 或 None (非法)。
+
+    支持 "HOST" / "HOST:PORT" / "[IPv6]" / "[IPv6]:PORT"。
+    非法输入 (空、含 shell 元字符、非法端口) 一律返回 None —— 解析与校验
+    合一, 垃圾字符串不会再流到命令行。
+    """
+    if not isinstance(spec, str):
+        return None
+    spec = spec.strip()
+    if not spec:
+        return None
+    host, port = spec, default_port
+    if spec.startswith("["):                      # [IPv6] / [IPv6]:PORT
+        end = spec.find("]")
+        if end < 0:
+            return None
+        host = spec[1:end]
+        rest = spec[end + 1:]
+        if rest:
+            if not rest.startswith(":"):
+                return None
+            port_s = rest[1:]
+            if not port_s.isdigit():
+                return None
+            port = int(port_s)
+    elif spec.count(":") == 1:                    # HOST:PORT
+        host, _, port_s = spec.partition(":")
+        if port_s:
+            if not port_s.isdigit():
+                return None
+            port = int(port_s)
+    elif spec.count(":") > 1:                     # 裸 IPv6 字面量
+        host = spec
+    if not _valid_iperf3_host(host) or not _valid_iperf3_port(port):
+        return None
+    return (host, port)
+
+
 class Iperf3Tester:
     """iperf3 点对点吞吐测试 (到指定服务器的链路吞吐, 非互联网宽带)。
 
@@ -6585,14 +6749,17 @@ class Iperf3Tester:
         mode = "UDP 抖动/丢包" if udp else "吞吐"
         if callback:
             callback(f"iperf3 {label}测速 ({mode}, 到 {server}:{port}, {duration}s)...")
-        cmd = f'"{iperf3_path}" -c {server} -p {port} -t {duration}'
+        # v1.15.0 (审查 P1-7): 参数数组 + shell=False —— server 不再拼进
+        # 字符串命令, cmd.exe 不参与解析 (拼接 + shell=True 会被注入)。
+        cmd = [str(iperf3_path), "-c", str(server), "-p", str(int(port)),
+               "-t", str(int(duration))]
         if reverse:
-            cmd += " -R"
+            cmd.append("-R")
         if udp:
             # 1 Mbps 固定发包率: 测质量 (抖动/丢包) 不测吞吐, 不打满链路
-            cmd += " -u -b 1M"
-        cmd += " -J"
-        _, out, err = run_cmd(cmd, timeout=duration + 15)
+            cmd += ["-u", "-b", "1M"]
+        cmd.append("-J")
+        _, out, err = run_cmd(cmd, timeout=duration + 15, shell=False)
         parsed = self._parse_iperf3_json(out, "download" if reverse else "upload",
                                          udp=udp)
         if "error" in parsed and err and err.strip():
@@ -6613,6 +6780,18 @@ class Iperf3Tester:
                          "或用 CLI: netpulse.py iperf3 --iperf3-server HOST[:PORT]",
                 "method": "iperf3",
             }
+            self.results = res
+            return res
+        # v1.15.0 (审查 P1-7): 地址合法性硬闸 —— 非法地址直接拒绝, 绝不进命令行
+        if not _valid_iperf3_host(server):
+            res = {"error": f"iperf3 服务器地址非法 ({server!r}): "
+                            f"只接受 IP 地址或主机名 (字母/数字/连字符)",
+                   "method": "iperf3"}
+            self.results = res
+            return res
+        if not _valid_iperf3_port(port):
+            res = {"error": f"iperf3 端口非法 ({port!r}): 需为 1-65535 的整数",
+                   "method": "iperf3"}
             self.results = res
             return res
         iperf3_path = self._find_iperf3()
@@ -8702,13 +8881,12 @@ def _prompt_for_iperf3():
         return None
     if not spec:
         return None
-    # 解析 host:port
-    if ':' in spec:
-        host, _, port_s = spec.rpartition(':')
-        port = int(port_s) if port_s.isdigit() else 5201
-    else:
-        host = spec
-        port = 5201
+    # v1.15.0 (审查 P1-7): 地址会进命令行 → 解析+校验合一, 非法直接拒
+    parsed = _parse_iperf3_server(spec)
+    if parsed is None:
+        print(_c(f"  ! server 地址非法: {spec!r} (只接受 IP 地址或主机名)", C_RED))
+        return None
+    host, port = parsed
     if not host:
         print(_c("  ! server 为空, 已跳过 iperf3", C_YELLOW))
         return None
@@ -11101,7 +11279,14 @@ def _detect_monitor_events(snap, t0, ended_at):
     # 只有 NIC 计数器能暴露)。典型: LAN 内某台机器大流量上传时千兆自协商
     # 兼容性/双工不匹配发作, 错包污染整个广播域 (其他设备全断)。
     nq = snap.get("nic_quality") or {}
-    if (nq.get("err_delta") or 0) >= MonitorSession.NIC_ERR_BURST_MIN_DELTA:
+    # v1.15.0 (审查 P1-11): 两级门槛 —— 会话总增量够 **且** 存在单区间集中
+    # 增量 (max_window_delta)。旧版只判总增量, 而「集中区间」判据失效
+    # (max_window_delta 恒 == err_delta), 于是渐进噪声 (每 30s 涨 1~2 个,
+    # 累计过 20) 也会被当成暴增, 并给出「强制百兆全双工」这种要改客户
+    # 网络配置的建议。
+    if ((nq.get("err_delta") or 0) >= MonitorSession.NIC_ERR_BURST_MIN_DELTA
+            and (nq.get("max_window_delta") or 0)
+            >= MonitorSession.NIC_ERR_BURST_WINDOW_MIN):
         bs, be = nq.get("burst_start_s"), nq.get("burst_end_s")
         if bs is not None:
             s0, s1 = t0 + bs, t0 + be
@@ -11215,10 +11400,19 @@ def _monitor_conclusion(events, stats, snap):
         verdict = "stable"
         gw_pct = stats["gw"]["loss_pct"] if stats["gw"] else 0
         ext_pct = stats["ext"]["loss_pct"] if stats["ext"] else 0
-        text_bits.append(f"监测期内未复现掉线 (网关丢包 {gw_pct:.1f}% / "
-                         f"外网丢包 {ext_pct:.1f}%)")
-        advice_bits.append("本次未复现: 建议在故障高发时段再盯 (如 --monitor 1800), "
-                           "或请客户记录掉线时刻后与本报告时间轴对齐")
+        # v1.15.0 (审查 P0-5): 统计层已如实报出丢包率 (不再 0 成功时报 0%),
+        # 结论文案必须与之自洽 —— 有丢包时不得再自称「未复现掉线」。
+        if gw_pct > 0 or ext_pct > 0:
+            text_bits.append(f"监测期内有丢包但未形成连续中断 (网关丢包 "
+                             f"{gw_pct:.1f}% / 外网丢包 {ext_pct:.1f}%)")
+            advice_bits.append("有丢包但未形成连续中断: 建议在故障高发时段再盯 "
+                               "(如 --monitor 1800), 或请客户记录掉线时刻后与本报告"
+                               "时间轴对齐")
+        else:
+            text_bits.append(f"监测期内未复现掉线 (网关丢包 {gw_pct:.1f}% / "
+                             f"外网丢包 {ext_pct:.1f}%)")
+            advice_bits.append("本次未复现: 建议在故障高发时段再盯 (如 --monitor 1800), "
+                               "或请客户记录掉线时刻后与本报告时间轴对齐")
     # v1.7.0 (PR-F0): MTU / 传输层追加式结论 — 与任何 verdict 并存, stable 时升级
     mtu_evs = has("mtu_mismatch")
     rt_evs = has("tcp_retrans_burst")
@@ -11578,6 +11772,14 @@ class MonitorSession:
         burst 判定: 会话错误增量 ≥ NIC_ERR_BURST_MIN_DELTA 且存在单区间
         增量 ≥ NIC_ERR_BURST_WINDOW_MIN 的采样段 — 两级阈值滤掉日常
         +1/+2 的计数噪声。样本不足 2 个 (会话太短/PS 失败) 返回空口径。
+
+        v1.15.0 (审查 P1-11): 「集中区间」改真正的**单采样区间**判定 ——
+        旧实现取「最早最小值 → 其后最大值」的最大跨度, 而错误计数单调递增,
+        该跨度恒等于会话总增量 (max_window_delta 恒 == err_delta), 两级
+        阈值实际只剩一级: 渐进噪声 (每 30s 涨 1~2 个) 累计够多也会被当成
+        暴增, 并给出「强制百兆全双工」这种要改客户网络配置的建议。
+        现取**相邻两次采样**的最大增量, burst 区间 = 该区间; 渐进噪声的
+        单区间增量很小, 自然被第二级门槛滤掉。
         """
         with self._probe_lock:
             series = list(self._nicstat_samples)
@@ -11598,17 +11800,13 @@ class MonitorSession:
         nq["err_delta"] = err_delta
         nq["discarded_delta"] = max(0, disc_delta)
         nq["series"] = [[round(t - self._t0, 1), e, d] for t, e, d in series]
-        # 错误最集中的连续区间: 累计计数单调增, 最大跨度增量 = 全局最小值
-        # (最早) 与其后最大值 (最晚) 之差 — 单遍 O(n)。
-        min_err, min_i = series[0][1], 0
-        best = None           # (max_incr, i, j)
-        for j in range(1, len(series)):
-            e = series[j][1]
-            if e < min_err:                 # 计数回绕保护: 重置基线
-                min_err, min_i = e, j
-                continue
-            if e - min_err > (best[0] if best else 0):
-                best = (e - min_err, min_i, j)
+        # 错误最集中的**单采样区间**: 相邻两次采样的增量最大者 (计数已确认
+        # 单调不降, 增量恒 ≥0)。取最大者所在区间作为 burst 时段。
+        best = None           # (delta, i, j)
+        for i in range(1, len(series)):
+            d = series[i][1] - series[i - 1][1]
+            if best is None or d > best[0]:
+                best = (d, i - 1, i)
         if best and best[0] >= self.NIC_ERR_BURST_WINDOW_MIN:
             nq["max_window_delta"] = best[0]
             nq["burst_start_s"] = round(series[best[1]][0] - self._t0, 1)
@@ -11617,9 +11815,17 @@ class MonitorSession:
 
     @staticmethod
     def _stream_stats(stream):
+        """ping 流统计 (v1.15.0 审查 P0-5 修分母).
+
+        旧写法 `total = ok_vals and len(ok_vals) + loss_n`: ok_vals 为空时
+        `and` 短路取到空列表 (falsy) → 走早退分支返回 loss=0 / loss_pct=0.0,
+        于是「全程不通」反而报「0% 丢包」—— 假绿 (报告里还会写「未复现掉线」)。
+        改为直接求和: 0 成功 + N 次丢包 = 100% 丢包; 只有「一个样本都没有」
+        才走早退分支 (那才是真的无数据)。
+        """
         ok_vals = [s[2] for s in stream if s[0] == "ok" and s[2] is not None]
         loss_n = sum(1 for s in stream if s[0] == "loss")
-        total = ok_vals and len(ok_vals) + loss_n
+        total = len(ok_vals) + loss_n
         if not total:
             return {"ok": 0, "loss": 0, "loss_pct": 0.0, "avg_ms": None,
                     "p50_ms": None, "p95_ms": None, "max_ms": None}
@@ -11873,6 +12079,12 @@ def _render_monitor_html(res):
     gw = _downsample(samples.get("gw_rtt") or [])
     ext = _downsample(samples.get("ext_rtt") or [])
 
+    # 隐私声明端口文案必须与实现同源 (v1.15.0 审查 P0-6):
+    # 载荷保留端口 (CAPTURE_PAYLOAD_PORTS, 只含 TLS) 与明文端口分开表述。
+    _payload_ports_txt = "/".join(str(p) for p in CAPTURE_PAYLOAD_PORTS)
+    _plaintext_txt = "/".join(str(p) for p in CAPTURE_WEB_PORTS
+                              if p not in CAPTURE_PAYLOAD_PORTS)
+
     def _rate_series(probe_samples, bucket_s=30):
         buckets = defaultdict(lambda: [0, 0])
         for item in probe_samples:
@@ -12078,7 +12290,7 @@ def _render_monitor_html(res):
 {_ana_rows}
 <tr><td>规格</td><td colspan=3>接口 {_esc_html(str(cap.get('iface', '—')))} · 缓冲 {cap.get('ring_bytes', 0) / 1048576:.1f}/{cap.get('ring_limit_mb', 0)}MB ·
 抓到 {cap.get('packets_captured', 0)} 包{f" · 超限挤出 {cap.get('dropped_old', 0)} 包" if cap.get('dropped_old') else ''} · 切片窗口 = 事件前后各 {cap.get('slice_before_s', 30)}s</td></tr>
-<tr><td>隐私声明</td><td colspan=3>默认仅保存诊断所需的网络元数据: DNS 查询域名 (QNAME)、HTTP Host、TLS SNI 可能被记录 ({"/".join(str(p) for p in CAPTURE_WEB_PORTS)} 每流首 {CAPTURE_FIRST_PKTS} 包 {CAPTURE_PAYLOAD_KEEP}B 头部窗口), <b>不保存普通 TCP/HTTP 应用载荷</b>; 抓包分析当前仅覆盖 IPv4;
+<tr><td>隐私声明</td><td colspan=3>默认仅保存诊断所需的网络元数据: DNS 查询域名 (QNAME)、TLS SNI 可能被记录; HTTPS ({_payload_ports_txt}) 每流首 {CAPTURE_FIRST_PKTS} 包保留 {CAPTURE_PAYLOAD_KEEP}B 加密握手窗口 (只含访问域名), 明文 HTTP ({_plaintext_txt}) 一律不保存应用载荷 —— <b>账号、密码、Cookie、聊天内容均不落盘</b>; 抓包分析当前仅覆盖 IPv4;
 下次运行 NetPulse 时自动清理超过 {cap.get('retention_days', 7)} 天的切片 (最多保留 {cap.get('max_slice_files', 10)} 个)</td></tr>
 </table></div>"""
     return f"""<!DOCTYPE html>
@@ -12230,7 +12442,7 @@ chart('retransChart',
 # BPF: `ip and (...)` 显式排除 IPv6 (裸 `tcp` 在 libpcap 语义下同时匹配
 # v4/v6; 本期分析器只处理 v4)。tcp 已涵盖 tcp/53; udp 443 = QUIC 头部计数。
 CAPTURE_BPF_FILTER = "ip and (icmp or udp port 53 or tcp or udp port 443)"
-CAPTURE_PAYLOAD_KEEP = 384     # 80/443/8080 前 2 包保留的 payload 字节数
+CAPTURE_PAYLOAD_KEEP = 384     # TLS(443) 前 2 包保留的 payload 字节数 (加密握手)
 CAPTURE_FIRST_PKTS = 2         # 每流每方向保留 payload 的包数 (提 Host/SNI)
 CAPTURE_DEFAULT_MB = 64        # ring buffer 上限 (MB)
 CAPTURE_SLICE_BEFORE_S = 30    # 事件切片: 事件开始前保留秒数
@@ -12241,6 +12453,15 @@ CAPTURE_TRIGGER_TYPES = ("outage", "jitter_burst", "tcp_fail",
 CAPTURE_RETENTION_DAYS = 7     # 切片保留天数 (下次运行时清理)
 CAPTURE_MAX_FILES = 10         # 切片最大个数 (超删最旧)
 CAPTURE_WEB_PORTS = (80, 443, 8080)
+# v1.15.0 (代码审查 P0-6): **实际保留 payload 字节的端口** — 只留 TLS (443),
+# 内容已加密, 保留的握手字节里只有访问域名 (SNI), 无任何凭据。
+# 明文 HTTP (80/8080) 一律截到 TCP 头: 此前三个端口都留 384B 应用载荷,
+# 而 80/8080 是明文 —— 实测一个 271B 的 `POST /api/login` 原样落盘,
+# Authorization / Cookie / password 全在包里。pcap 正是要交给运营商的附件,
+# 弹窗与报告却都写着「账号、密码…不落盘」—— 承诺不实。
+# 诊断能力损失可忽略: 报告里展示的访问域名来自 TLS SNI 与 DNS QNAME
+# (http_hosts 虽被提取但从未渲染), TCP 层分析只用头部的 seq/ack/flags。
+CAPTURE_PAYLOAD_PORTS = (443,)
 
 
 def _captures_dir():
@@ -12275,14 +12496,19 @@ def _capture_confirm_once(input_fn=None):
     except OSError:
         return True                    # 检查失败不拦路
     print(_c("\n  ⚠ 抓包取证首次使用确认", C_YELLOW))
-    # 端口范围直接取自 CAPTURE_WEB_PORTS (v1.14.14): 原文案写死 "80/443"
-    # 而白名单含 8080, 隐私披露口径必须与实现同源, 改端口不再漏改文案。
-    _web_ports_txt = "/".join(str(p) for p in CAPTURE_WEB_PORTS)
+    # 端口范围直接取自常量 (v1.14.14 起): 隐私披露口径必须与实现同源,
+    # 改端口不再漏改文案。v1.15.0: 载荷保留端口与"有应用层信息的端口"已拆开
+    # (CAPTURE_PAYLOAD_PORTS 只含 TLS), 文案按"实际保留什么"重写。
+    _payload_ports_txt = "/".join(str(p) for p in CAPTURE_PAYLOAD_PORTS)
+    _plaintext_txt = "/".join(str(p) for p in CAPTURE_WEB_PORTS
+                              if p not in CAPTURE_PAYLOAD_PORTS)
     for line in (
-            f"     · 只保留诊断所需的网络元数据: {_web_ports_txt} 每条连接的前 "
-            f"{CAPTURE_FIRST_PKTS} 个包多留 {CAPTURE_PAYLOAD_KEEP} 字节 (提取访问的域名用)",
-            "     · 不保存普通 TCP/HTTP 应用载荷 (账号、密码、聊天或页面内容不落盘)",
-            "     · DNS 查询域名与访问域名 (QNAME/Host/SNI) 会出现在报告里 (定位故障必需)",
+            "     · 只保留诊断所需的网络元数据: DNS 查询域名 (QNAME)、TLS SNI 可能被记录",
+            f"     · 仅 HTTPS ({_payload_ports_txt}) 每条连接的前 {CAPTURE_FIRST_PKTS} "
+            f"个包多留 {CAPTURE_PAYLOAD_KEEP} 字节 (加密握手, 只含访问域名)",
+            f"     · 明文 HTTP ({_plaintext_txt}) 不保存任何应用载荷 — "
+            "账号、密码、Cookie、聊天内容均不落盘",
+            "     · DNS 查询域名与访问域名 (QNAME/SNI) 会出现在报告里 (定位故障必需)",
             "     · 抓包分析当前仅覆盖 IPv4",
             f"     · 切片超过 {CAPTURE_RETENTION_DAYS} 天或 {CAPTURE_MAX_FILES} 个, 下次运行 NetPulse 时自动清理",
             "     · 文件在本机 reports/captures/ 下, 可随时手动删除",
@@ -12490,8 +12716,11 @@ def _capture_strip_packet(pkt, flow_state):
 
     - ICMP / UDP 53 (DNS): 整包 (小, 分析需要)
     - UDP 443 (QUIC): 头 + 16B (仅计数/速率, 不解析)
-    - TCP 80/443/8080: 每流**每方向**前 CAPTURE_FIRST_PKTS 包保留头 +
-      CAPTURE_PAYLOAD_KEEP (提 Host/SNI); 之后截到 TCP 头
+    - TCP 443 (TLS): 每流**每方向**前 CAPTURE_FIRST_PKTS 包保留头 +
+      CAPTURE_PAYLOAD_KEEP (加密握手, 只含 SNI); 之后截到 TCP 头
+    - TCP 80/8080 (明文 HTTP): **一律截到 TCP 头** (v1.15.0 审查 P0-6 —
+      此前也留 384B 应用载荷, 明文的 Authorization/Cookie/密码会随 pcap
+      落盘, 而 pcap 正是交给运营商的附件)
     - 其他 TCP: 截到 TCP 头 (重传/dup-ack/zero-window 判定只需 seq/ack/win/flags)
 
     flow_state: dict[(sport, dport)] -> 已见包数。key 含方向 (src→dst 的
@@ -12546,7 +12775,7 @@ def _capture_strip_packet(pkt, flow_state):
         sport = (raw[l4_off] << 8) | raw[l4_off + 1]
         dport = (raw[l4_off + 2] << 8) | raw[l4_off + 3]
         hdr_end = l4_off + thl
-        if sport in CAPTURE_WEB_PORTS or dport in CAPTURE_WEB_PORTS:
+        if sport in CAPTURE_PAYLOAD_PORTS or dport in CAPTURE_PAYLOAD_PORTS:
             key = (sport, dport)
             n = flow_state.get(key, 0)
             flow_state[key] = n + 1
@@ -13034,7 +13263,13 @@ class PcapAnalyzer:
         ent[0] = ts
 
     def _l7_extract(self, d, key, raw):
-        """仅限首 2 包 384B 窗口内的 Host / SNI (方案 §5.2 隐私设计)。"""
+        """仅限首 2 包 384B 窗口内的 Host / SNI (方案 §5.2 隐私设计)。
+
+        v1.15.0 (审查 P0-6): 明文 HTTP (80/8080) 已不再保留应用载荷, 故
+        Host 分支实际只在"抓包文件里恰好还有明文 HTTP 头"时才会命中
+        (旧文件 / 手工放入的文件)。该字段仅用于诊断留档, 从未在报告里渲染,
+        因此丢弃明文 HTTP 载荷不影响对外展示的访问域名 (走 SNI + DNS QNAME)。
+        """
         dport = key[3]
         head = raw[:CAPTURE_PAYLOAD_KEEP] if len(raw) > CAPTURE_PAYLOAD_KEEP else raw
         if dport in CAPTURE_WEB_PORTS and head.startswith(self._HTTP_STARTS):
@@ -13410,7 +13645,7 @@ def run_monitor_mode(duration_s, ext_target=None, load_url=None,
 # ============================================================
 
 # 模块注册表 (key, 显示名, 检测器类)
-# 顺序 = 装维工作流分类顺序 (先看 → 再测 → 后查), 序号 1-19 全局连续,
+# 顺序 = 装维工作流分类顺序 (先看 → 再测 → 后查), 序号 1-23 全局连续,
 # CLI/菜单的序号解析与此保持一致。
 MODULE_REGISTRY = [
     # ── 基础信息: 环境快照 ──
@@ -13549,10 +13784,11 @@ def _columnize(cells, columns=2, gap=3):
     返回字符串列表, 调用方自行加缩进后打印。
 
     实现细节:
-      - _pad_disp 用全角空格 (1 char = 2 disp) 补齐, 与汉字同比例, 避免
-        ASCII 空格 (1 char = 1 disp) 在中英混排 cell 上 pad 出多余的
-        "字符数", 导致行间 char 位置不齐。
-      - gap 仍用 ASCII 空格 (1 char = 1 disp), 保持列间距紧凑。
+      - _pad_disp 按**显示宽度**补 ASCII 空格 (1 char = 1 disp, 理由见
+        _pad_disp 的 docstring) —— 中英混排 cell 的对齐靠"按显示宽算差几个
+        空格"完成, 不是靠全角空格 (全角空格在 Consolas 下只有 ~0.37 倍
+        ASCII 宽, 用它补齐反而会漂)。
+      - gap 用 ASCII 空格 (1 char = 1 disp), 保持列间距紧凑。
         视觉对齐靠"所有 cell 1 显示宽 = max_width"保证。
     """
     if not cells:
@@ -13675,13 +13911,15 @@ def _cli_print_result(res, verbose=False, as_json=False, key=None):
     默认模式: 只显示 ① 一句话结论 (verdict) ② 关键指标 (metrics, 按阈值着色)
     ③ 问题/警告清单。原始字段不进命令行 — 细节在 HTML/JSON 报告里。
     --verbose 打印全部原始字段 (调试用); --json 输出完整 JSON。
+
+    v1.15.0 (审查 P1-12): --json 模式**不再逐模块 print**, 改为返回该模块
+    的 JSON 载荷, 由 run_diagnostics 汇总成一个 JSON 文档写 stdout ——
+    stdout 必须是纯 JSON (人读输出已改走 stderr), 否则脚本 json.loads 失败。
     """
     if as_json:
         # v1.9.2 (审查修复): _evidence 是 runner 内部过渡键, 不进机器可读输出
         # (LAST_RUN 装配时才摘出, 打印发生在此之前)
-        out = {k: v for k, v in res.items() if k not in ("callback", "_evidence")}
-        print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
-        return
+        return {k: v for k, v in res.items() if k not in ("callback", "_evidence")}
     # 1. 一句话结论 (客户视图 verdict 优先, 兜底 summary)
     text = None
     if key:
@@ -13703,12 +13941,25 @@ def _cli_print_result(res, verbose=False, as_json=False, key=None):
         if mfn:
             try:
                 metrics = mfn(res)
-                for label, value, level in metrics:
-                    code = {"ok": C_GREEN, "warn": C_YELLOW,
-                            "err": C_RED}.get(level, C_WHITE)
-                    print(f"    {_c(label, C_GRAY)}: {_c(value, code)}")
             except Exception:
-                pass
+                metrics = []
+            # v1.15.0 (审查 P1-8): 指标元数兼容 2/3/4 (与报告层 _present_module
+            # 同口径): (label, value) / (label, value, level) / (label, value,
+            # level, hint)。旧写法 `for label, value, level in metrics` 遇到
+            # 2 元组直接抛 ValueError, 又被外层 `except: pass` 吞掉 ——
+            # 结果整个模块的指标行全消失 (实测 netpulse.py arp 一行不显示)。
+            for m in metrics or []:
+                if not isinstance(m, (tuple, list)) or len(m) < 2:
+                    continue
+                label, value = m[0], m[1]
+                level = (m[2] or "ok") if len(m) >= 3 else "ok"
+                hint = (m[3] or "") if len(m) >= 4 else ""
+                code = {"ok": C_GREEN, "warn": C_YELLOW,
+                        "err": C_RED}.get(level, C_WHITE)
+                line = f"    {_c(label, C_GRAY)}: {_c(value, code)}"
+                if hint:
+                    line += f"  ({hint})"
+                print(line)
     # 3. 问题列表 (最重要的可操作信息)
     issues = res.get("issues")
     if isinstance(issues, list) and issues:
@@ -13738,7 +13989,7 @@ def _cli_print_result(res, verbose=False, as_json=False, key=None):
 
 
 def _print_module_list():
-    """打印所有可用诊断模块 (按三大类分组展示, 序号全局连续 1-19, 双列排版)。
+    """打印所有可用诊断模块 (按三大类分组展示, 序号全局连续 1-23, 双列排版)。
 
     与 interactive_menu 同款: 全局 nameMax (按 _disp_width) 让所有 cell
     模块名右端对齐到同一列, 行内两 cell 起点也一致。
@@ -13833,7 +14084,8 @@ def compute_exit_code(statuses):
       1 = 有警告 (warning) — 网络有可关注项, 但不阻塞
       2 = 检测出问题 (异常/错误/超时) — 客户网络真有问题
       3 = 工具执行失败 (Python 异常) — 工具自己崩了
-      4 = 参数错 (argparse 已处理, 此处不返回 4)
+      4 = 参数错 (由 main 里的显式 sys.exit(4) 产生: 子命令冲突 / 未知 profile /
+          非法 iperf3 地址 / 未知模块名 / 缺 --port-target 等; 本函数只返 0~3)
       5 = 权限不足 (管理员权限缺失, --no-scapy 已处理)
     """
     statuses = set(statuses.values() if isinstance(statuses, dict) else statuses)
@@ -13861,6 +14113,25 @@ def _exit_with_status():
         sys.exit(compute_exit_code(LAST_RUN["status"]))
 
 
+def _restore_stdout_on_exit(fn):
+    """装饰器: 函数结束 (正常返回或抛异常) 都把 sys.stdout 还原。
+
+    v1.15.0 (审查 P1-12): --json 模式把 stdout 临时改道 stderr (stdout 只留
+    纯 JSON), 异常路径也必须还原 —— 否则 traceback / 收尾输出会跟着跑到
+    stderr, 且后续同进程内的输出全跑错地方。
+    """
+    def wrapper(*args, **kwargs):
+        orig = sys.stdout
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            sys.stdout = orig
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
+@_restore_stdout_on_exit
 def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
                    banner=True, install=False, parallel=False, max_workers=4,
                    pip_mirror=None):
@@ -13882,6 +14153,18 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
     # 依赖预检: DHCP 完整检测需要 scapy (+Npcap)
     if "dhcp" in keys and not SCAPY_AVAILABLE and not FORCE_NO_SCAPY:
         ensure_scapy(auto_yes=install, mirror=pip_mirror)
+
+    # v1.15.0 (审查 P1-12): --json 的 stdout 必须是**纯 JSON**
+    # (README 承诺「以 JSON 输出完整结果 (便于脚本解析)」)。
+    # 旧版 banner / 系统信息 / 进度行 / 模块标题 / 尾部汇总全打 stdout,
+    # 机器读到的是「banner + ANSI + 每模块一个 JSON 对象 + 汇总」,
+    # json.loads 直接失败。现在: 人读输出整体改道 stderr, stdout 只留
+    # 一个 JSON 文档 {模块 key: 该模块完整结果}。
+    _json_payload = {}
+    _orig_stdout = sys.stdout
+    IS_TTY = _orig_stdout.isatty()
+    if as_json:
+        sys.stdout = sys.stderr
 
     if banner:
         bar = "=" * 60
@@ -13947,7 +14230,7 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
         print(_c(f"  系统信息获取失败: {e}", C_GRAY))
     print(_c("-" * 60, C_GRAY))
 
-    IS_TTY = sys.stdout.isatty()
+    # IS_TTY 已在 stdout 改道前取好 (基于真实 stdout, 不是 stderr)
     # 单独运行测速模块时启用终端实时可视化 (多模块/JSON/verbose/非 TTY 时关闭)
     SPEEDTEST_CONFIG["live_ui"] = (len(keys) == 1 and keys[0] == "speedtest"
                                    and IS_TTY and not as_json and not verbose)
@@ -13962,6 +14245,12 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
         results, full = _run_diagnostics_sequential(
             keys, is_tty=IS_TTY)
 
+    # v1.15.0 (审查 P1-13): 状态归一前置 —— 「未配置」不是故障。
+    # 在这里改写后, 模块标题行 / CLI 汇总 / LAST_RUN["status"] / 报告计数 /
+    # verdict / 退出码 全部共用同一份 summary (旧版只改客户视图, 计数与退出码
+    # 仍看到「错误」→ 100 分 A 级却报「含 1 个异常」+ 退出码 2)。
+    results = _normalize_module_statuses(results, full)
+
     # 详细结果 (按 keys 顺序, 避免 parallel 模式输出乱序)
     for key in keys:
         res = full.get(key, {"error": "未执行"})
@@ -13973,7 +14262,11 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
         else:
             pass  # 顺序模式也已经在 detect() 前/后打了
         print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge(status))
-        _cli_print_result(res, verbose=verbose, as_json=as_json, key=key)
+        if as_json:
+            # 人读输出已改道 stderr; 这里只收集载荷, 末尾统一写 stdout
+            _json_payload[key] = _cli_print_result(res, as_json=True, key=key)
+        else:
+            _cli_print_result(res, verbose=verbose, key=key)
 
     # 汇总
     print()
@@ -14016,6 +14309,14 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
         "duration_ms": int((time.time() - _run_t0) * 1000),
         "total_modules": len(MODULE_MAP),
     }
+    if as_json:
+        # stdout 只留这一个 JSON 文档 (P1-12): 人读输出全程在 stderr,
+        # 脚本/AI Agent 可直接 json.loads(stdout)。
+        sys.stdout = _orig_stdout
+        sys.stdout.write(json.dumps(_json_payload, ensure_ascii=False,
+                                    indent=2, default=str))
+        sys.stdout.write("\n")
+        sys.stdout.flush()
     return results
 
 
@@ -14253,8 +14554,15 @@ def _run_diagnostics_parallel(keys, max_workers, total):
     completed_lock = threading.Lock()
 
     def _run_one(key):
-        name, cls = MODULE_MAP[key]
-        status, res = _run_module_with_timeout(key, lambda msg: None)
+        # v1.15.0 (审查 P1-14): 与顺序模式 (_run_diagnostics_sequential) 同构的
+        # try/except —— 旧版这里没有, 一次异常会从 worker 冒到主线程
+        # (fut.result() 重新抛出) → 整轮诊断中断, 现场模式等于白跑一趟。
+        # 单模块异常降级为 ("错误", {...}), 其余模块照跑, 报告照出。
+        name = MODULE_MAP.get(key, (key, key))[0]
+        try:
+            status, res = _run_module_with_timeout(key, lambda msg: None)
+        except Exception as e:
+            status, res = "错误", {"error": str(e)}
         # 存结果, 不立即打 (主线程按 keys 顺序统一打)
         with completed_lock:
             completed[key] = (name, status, res)
@@ -14275,7 +14583,12 @@ def _run_diagnostics_parallel(keys, max_workers, total):
     with ThreadPoolExecutor(max_workers=max(1, min(max_workers, total))) as ex:
         futs = [ex.submit(_run_one, k) for k in normal_keys]
         for fut in as_completed(futs):
-            fut.result()  # 等待, 不打印
+            # 双保险: _run_one 内部已兜住异常, 这里再兜一层, 保证「一个模块
+            # 出问题绝不中断整轮」在 worker 侧也成立 (P1-14)。
+            try:
+                fut.result()
+            except Exception:
+                pass
 
     # 独占阶段: 测速/Bufferbloat/iperf3/TCP 并发逐个跑
     for key in solo_keys:
@@ -16008,6 +16321,42 @@ METRIC_HINTS = {
 }
 
 
+def _module_failure_issue(status, raw_result, module_name):
+    """超时/错误模块的合成 issue (v1.15.0 审查 P1-15)。
+
+    为什么必须有这个: 探测失败时 res 里只有 {"error": ...} 一个键, 而各模块的
+    issues_fn 大多只认 issues/warnings 字段 —— 于是**失败模块一条 issue 都
+    不产出**。实测 23 个模块全超时时, 待办清单里只有 1 条 (gateway 的
+    issues_fn 碰巧认得 error 键), 顶部写「1 项需要您关注 / 来源: 网关检测」,
+    而健康分是 0 分 F 级、verdict 写「23 个模块未完成检测」—— 三处互相打架,
+    且把「整机 23 个模块都没测出来」说成「网关有问题」, 装维会查错方向。
+
+    文案约束: 超时文案必须与模块无关 —— 各模块超时阈值不同 (120~180 秒),
+    把秒数写进文案会让 23 条 issue 互不相同, 去重失效 → 刷屏 23 张卡。
+    具体阈值在模块详情/JSON 报告里能查到, 待办卡只讲"没测出来"这件事。
+    错误分支保留原文: 错误原因不同本就该分开看, 不该被合并成一条。
+    """
+    err = ""
+    if isinstance(raw_result, dict):
+        err = str(raw_result.get("error", "") or "").strip()
+    if status == "超时":
+        return {
+            "severity": "异常",
+            "text": "模块执行超时, 本次未取得该模块检测结果",
+            "impact": f"{module_name} 未在超时阈值内完成, 相关指标与结论均不可信",
+            "action": "现场排查后重新运行本模块; 反复超时请保留本报告 (HTML+JSON) 带回会诊",
+        }
+    # 错误原文可能很长 (含异常栈), 截断避免撑爆待办卡标题
+    if len(err) > 120:
+        err = err[:120] + "…"
+    return {
+        "severity": "异常",
+        "text": f"模块执行失败: {err or '未取得错误详情'}",
+        "impact": f"{module_name} 未完成检测, 相关指标与结论均不可信",
+        "action": "按错误提示现场排查后重跑; 无法定位请保留本报告 (HTML+JSON) 带回会诊",
+    }
+
+
 def _present_module(key, raw_result, status):
     """把单个模块的 raw result 转成客户视图。"""
     pres = MODULE_PRESENTATION.get(key, {})
@@ -16095,6 +16444,20 @@ def _present_module(key, raw_result, status):
         # 插到列表首位, 让这条解释最先被看到
         issues = [arp_auto_inject] + list(issues)
 
+    # v1.15.0 (审查 P1-15): 超时/错误模块必须自己出现在待办清单里 ——
+    # 失败时 res 只有 {"error": ...}, 各模块 issues_fn 大多不认这个形状,
+    # 于是 23 个模块全超时时待办清单几乎是空的 (见 _module_failure_issue)。
+    if status in ("超时", "错误"):
+        fail_issue = _module_failure_issue(status, raw_result, name)
+        if status == "超时":
+            # 超时的 res 必是 {"error": ...} 单一形状, 模块自身 issue 全部是
+            # "把 error 当空数据解读"的误判 (如 linkspeed → "检测到 0 个网卡") → 整份替换
+            issues = [fail_issue]
+        else:
+            # 错误时 res 可能带部分实测数据 (wrap 型 probe 失败仍保留 metrics),
+            # 模块自身的 issue 是真实发现 → 保留, 只保证失败本身也被登记
+            issues = list(issues) + [fail_issue]
+
     # 检查是否有实际的技术细节数据（而非仅检查配置）
     has_tech = False
     if pres.get("tech_keys") and raw_result:
@@ -16124,7 +16487,8 @@ def _present_module(key, raw_result, status):
 
 
 # 健康评分: 0-100
-# 异常-20, 错误-30, 警告-5, 未检测-2, 扣到 0 为止
+# 异常-20, 错误-30, 警告-2, 超时-10, 未检测 0 (不扣分), 扣到 0 为止
+# 口径与 compute_health_score 的实现一致 (改这里必须同步改那里)。
 HEALTH_GRADE_TABLE = [
     (90, "A", "优秀"),
     (75, "B", "良好"),
@@ -16145,9 +16509,10 @@ def compute_health_score(counts, text_counts=None):
     评分口径: 异常 -20 / 错误 -30 (硬故障), 警告 -2 (仅提示, 不压垮总分),
     超时 -10 (检测未跑完, 结果不可信, 严重程度介于警告与异常之间),
     未检测不扣分 (环境缺测如无 WiFi 网卡不应被记过)。
-    「超时」必须扣分: 超时模块会被 _issues_* 登记成 severity="异常" 的 issue,
-    若评分不认它, 就会出现"23 个模块全超时 → 100 分 A 级 '网络良好, 无问题'"、
-    而同一份报告的待办清单与详细结果却说有问题的自相矛盾。
+    「超时」必须扣分: 超时模块会被 _module_failure_issue 登记成 severity="异常"
+    的 issue (v1.15.0 审查 P1-15 起), 若评分不认它, 就会出现"23 个模块全超时
+    → 100 分 A 级 '网络良好, 无问题'"、而同一份报告的待办清单与详细结果却
+    说有问题的自相矛盾。
     verdict 口径: 按模块状态计数 — 按实际 issue 条目计数会把同一模块的
     多条 issue 算成多项异常, 与一览徽章数对不上。
     """
@@ -16228,6 +16593,10 @@ SITE_CHECK_BY_KEY = {it["key"]: it for it in SITE_CHECK_ITEMS}
 # 豁免 = 不扣分, 但状态徽章照常展示 (全口径), 报告需说明这层差异。
 SCORE_EXEMPT_MODULES = ("iperf3", "ipv6", "proxy", "nattype")
 
+# 「未配置」类模块: 模块返回 error, 但那是「没测」而不是「测出问题」。
+# 状态改写为「未检测」, 客户看红色错误会误以为网络坏了 (v1.15.0 审查 P1-13)。
+_STATUS_NOT_CONFIGURED = {"iperf3": "未指定 iperf3"}
+
 
 def _exempt_names(report):
     """实际参检的评分豁免模块中文名 (按 summary 实跑集合, 非硬编码全名单)。
@@ -16258,6 +16627,29 @@ def _normalize_site_check(site_check):
         v = v.strip()
         if v and v in it["options"]:
             out[k] = v
+    return out
+
+
+def _normalize_module_statuses(statuses, results=None):
+    """把「未配置」类模块的状态从「错误」改写为「未检测」。
+
+    v1.15.0 (审查 P1-13): 这层改写原本只做在 build_report 的客户视图里,
+    而且在状态计数**之后** —— 同一份数据因此出现三种口径:
+      - 健康分 100 分 / A 级 (iperf3 属评分豁免模块, 不扣分)
+      - verdict「优秀 · 1 个模块需关注 (含 1 个异常)」(文案口径数到了「错误」)
+      - 退出码 2 (按 LAST_RUN["status"] 里的「错误」)
+    现在改写前置到状态层: 报告计数 / verdict / 退出码共用同一份 summary。
+    """
+    out = dict(statuses or {})
+    if not results:
+        return out
+    for key, marker in _STATUS_NOT_CONFIGURED.items():
+        if key not in out:
+            continue
+        res = results.get(key)
+        if (isinstance(res, dict) and "error" in res
+                and marker in str(res.get("error", ""))):
+            out[key] = "未检测"
     return out
 
 
@@ -16304,13 +16696,18 @@ def build_report(rule_filter=None, diagnosis=None, site_check=None,
         return None
     run = LAST_RUN
 
+    # v1.15.0 (审查 P1-13): 状态归一前置 —— 「未配置」不是故障, 计数 / verdict /
+    # 退出码必须共用同一份 summary (旧版改写只做在客户视图且在计数之后,
+    # 于是出现「100 分 A 级 + 含 1 个异常 + 退出码 2」三套口径)。
+    status_map = _normalize_module_statuses(run["status"], run.get("results"))
+
     # 状态计数 (按模块状态)
     # 豁免模块不参与扣分: iperf3(未配置不是故障), ipv6(可选), proxy/VPN(环境特性), nattype(运营商侧)
     EXEMPT_MODULES = set(SCORE_EXEMPT_MODULES)
     counts = {}          # 扣分口径: 不含豁免模块
     all_counts = {}      # 文案口径: 全部模块 (与"检测结果一览"的徽章一致)
     exempt_count = 0
-    for key, st in run["status"].items():
+    for key, st in status_map.items():
         all_counts[st] = all_counts.get(st, 0) + 1
         if key in EXEMPT_MODULES:
             exempt_count += 1
@@ -16322,12 +16719,7 @@ def build_report(rule_filter=None, diagnosis=None, site_check=None,
     for key in run["keys"]:
         name = MODULE_MAP.get(key, (key, key))[0]
         res = run["results"].get(key, {})
-        status = run["status"].get(key, "未检测")
-        # iperf3 未配置服务器不是故障: 显示"未检测"而非"错误",
-        # 避免客户看到红色错误误以为网络有问题
-        if (key == "iperf3" and "error" in res
-                and "未指定" in str(res.get("error", ""))):
-            status = "未检测"
+        status = status_map.get(key, "未检测")
         modules.append(_present_module(key, res, status))
 
     # 健康分: 扣分只用 counts (不含豁免, 可选/环境/运营商问题不压总分);
@@ -16381,145 +16773,9 @@ def build_report(rule_filter=None, diagnosis=None, site_check=None,
     }
 
 
-def _try_unjson(v):
-    """若 v 是 JSON 字符串则解析为对象, 否则原样返回 (渲染前兜底, 避免裸 JSON)。"""
-    if isinstance(v, str) and len(v) >= 2 and v.lstrip()[:1] in ("{", "["):
-        try:
-            return json.loads(v)
-        except Exception:
-            return v
-    return v
-
-
-def _fmt_value(v, indent=0, max_len=160):
-    """将结果值格式化为可读文本 (紧凑风格: 列表合并、dict 内联, 避免 YAML/JSON 感)。"""
-    v = _try_unjson(v)
-    pad = "  " * indent
-    if isinstance(v, dict):
-        lines = []
-        for k, val in v.items():
-            label = HEADER_MAP.get(k, k)
-            val = _try_unjson(val)
-            if isinstance(val, (dict, list)):
-                sub = _fmt_value(val, 0, max_len)
-                lines.append(f"{pad}{label}: {sub}")
-            else:
-                lines.append(f"{pad}{label}: {val}")
-        return "\n".join(lines)
-    if isinstance(v, list):
-        if not v:
-            return f"{pad}(空)"
-        if all(not isinstance(item, (dict, list)) for item in v):
-            s = ", ".join("" if item is None else str(item) for item in v)
-            if len(s) > max_len:
-                s = s[:max_len] + "…"
-            return f"{pad}{s}"
-        lines = []
-        for item in v:
-            if isinstance(item, dict):
-                inner = ", ".join(
-                    f"{HEADER_MAP.get(k, k)}: {_fmt_value(x, 0, max_len)}"
-                    for k, x in item.items())
-                lines.append(f"{pad}- {inner}")
-            else:
-                lines.append(f"{pad}- {_fmt_value(item, 0, max_len)}")
-        return "\n".join(lines)
-    return f"{pad}{v}"
-
-
-def _fmt_record_table(rt, indent=2):
-    """将记录表 (headers, rows) 格式化为等宽对齐的文本表格。"""
-    headers, rows = rt
-    pad = "  " * indent
-    cols = len(headers)
-    widths = [max(len(str(h)),
-                  *(len(str(r[i])) for r in rows if i < len(r)))
-              for i, h in enumerate(headers)]
-    widths = [min(w, 36) for w in widths]
-
-    def _row(cells):
-        return " | ".join(str(c)[:widths[i]].ljust(widths[i])
-                          for i, c in enumerate(cells))
-    lines = [_row(headers),
-             pad + "-+-".join("-" * widths[i] for i in range(cols))]
-    for r in rows:
-        lines.append(_row(r))
-    return "\n".join(pad + ln for ln in lines)
 
 
 
-
-
-
-def _flatten_kv(v, prefix=""):
-    """将嵌套 dict/list 扁平化为 (key, value) 列表，便于表格展示。
-
-    - 标量值: 直接成一行。
-    - 基本值列表 (如 system_dns): 在父键下一行逗号分隔。
-    - dict of primitives (如 multi_ip_macs): 内联为 "子键: 值, ..." 一行。
-    - 复杂嵌套: 仍递归展开 (外层报告渲染器优先用 _record_table 渲染成多列表格)。
-    """
-    v = _try_unjson(v)
-    rows = []
-
-    def _is_primitive_list(x):
-        return isinstance(x, list) and x and all(
-            not isinstance(item, (dict, list)) for item in x)
-
-    if isinstance(v, dict):
-        for k, val in v.items():
-            nk = f"{prefix}{k}"
-            val = _try_unjson(val)
-            if isinstance(val, dict):
-                # dict 的所有值都是标量/基本值列表 -> 内联成一行
-                if all(not isinstance(x, (dict,)) and
-                       (not isinstance(x, list) or _is_primitive_list(x))
-                       for x in val.values()):
-                    subs = []
-                    for sk, sv in val.items():
-                        if _is_primitive_list(sv):
-                            subs.append(f"{sk}: "
-                                        + ", ".join(str(i) for i in sv))
-                        else:
-                            subs.append(f"{sk}: {sv}")
-                    rows.append((nk, "； ".join(subs)))
-                else:
-                    rows.append((nk, ""))
-                    rows.extend(_flatten_kv(val, prefix + "  "))
-            elif _is_primitive_list(val):
-                joined = ", ".join("" if item is None else str(item)
-                                   for item in val)
-                rows.append((nk, joined))
-            elif isinstance(val, list) and not val:
-                rows.append((nk, "(空)"))
-            elif isinstance(val, list):
-                rows.append((nk, ""))
-                rows.extend(_flatten_kv(val, prefix + "  "))
-            else:
-                rows.append((nk, "" if val is None else str(val)))
-    elif isinstance(v, list):
-        if not v:
-            rows.append((prefix + "列表", "(空)"))
-        elif all(not isinstance(item, (dict, list)) for item in v):
-            joined = ", ".join("" if item is None else str(item) for item in v)
-            rows.append((prefix + "列表", joined))
-        else:
-            for i, item in enumerate(v):
-                if isinstance(item, (dict, list)):
-                    rows.extend(_flatten_kv(item, prefix + f"[{i+1}] "))
-                else:
-                    rows.append((prefix + "项",
-                                 "" if item is None else str(item)))
-    else:
-        rows.append((prefix, "" if v is None else str(v)))
-    return rows
-
-
-# 报告排版约定:
-#  - 形如 [ {k:v,...}, ... ] 的「同构字典列表」视为一张记录表, 应渲染为真正的多列表格,
-#    而不是逐条拍平成 指标/值 两列 (那样会产生上百行难以阅读的内容)。
-#  - DETAIL_KEYS 中的顶层键视为「详细测试记录」(原始测量数据), 在报告中弱化处理。
-DETAIL_KEYS = {"detail", "details", "raw", "records"}
 
 # 常用字段名 -> 中文表头 (命中则报告使用中文列名, 否则用原字段名)
 HEADER_MAP = {
@@ -17493,6 +17749,17 @@ def _todo_issues_section(modules):
     need_attention = [i for i in todo_issues if i.get("severity", "信息") in ("异常", "错误", "警告")]
     top_issues = need_attention[:10]
 
+    # 波及模块数 (去重后): 同一文案在 N 个模块出现时只出 1 张卡, 标题必须说清
+    # 涉及几个模块, 否则「1 项需要您关注」与下方「23 个问题模块已展开」互相
+    # 打架 (v1.15.0 审查 P1-15: 23 个模块全超时的实测表现)。
+    involved_mods = []
+    for i in need_attention:
+        for nm in (i.get("_modules") or []):
+            if nm and nm not in involved_mods:
+                involved_mods.append(nm)
+    scope_suffix = (f"（涉及 {len(involved_mods)} 个模块）"
+                    if len(involved_mods) > len(need_attention) else "")
+
     if top_issues:
         # 合并"同来源 + 同影响 + 同建议"的条目为一张卡 (如 IPv6 的两条异常):
         # 标题用「；」连接多条问题, 卡片数更少、建议不重复刷屏
@@ -17543,7 +17810,9 @@ def _todo_issues_section(modules):
 </div>""")
         extra_bits = []
         # 会诊引导: 存在异常级问题时提示升级路径 (现场解决不了 → 带报告回去)
-        critical_cnt = sum(1 for i in need_attention
+        # 异常级问题数按「条目 × 波及模块」计: 同一文案在 N 个模块出现 = N 个
+        # 问题。否则 23 个模块全超时会写成「1 项异常级问题」(v1.15.0 审查 P1-15)。
+        critical_cnt = sum(len(i.get("_modules") or [1]) for i in need_attention
                            if i.get("severity") in ("异常", "错误"))
         if critical_cnt:
             todo_blocks.append(f"""
@@ -17561,7 +17830,7 @@ def _todo_issues_section(modules):
         info_extra = (f" <span class='extra-count'>({'；'.join(extra_bits)})</span>"
                       if extra_bits else "")
         todo_section = f"""
-<div class="sec" id="todo"><h2><span class="icon">⚠</span>{len(need_attention)} 项需要您关注{info_extra}</h2></div>
+<div class="sec" id="todo"><h2><span class="icon">⚠</span>{len(need_attention)} 项需要您关注{scope_suffix}{info_extra}</h2></div>
 <div class="todo">{"".join(todo_blocks)}</div>"""
     elif todo_issues:
         todo_section = """
@@ -17822,8 +18091,11 @@ def _module_cards_section(modules, report, SKEY):
                 auto_open=auto_open)
 
         # WiFi 等模块原始数据全空时, 给出友好提示而非空列表
+        # v1.15.0 (审查 P1-15): 超时/错误时 raw 里根本没有 networks 字段 ——
+        # 那不是"当前未连接 Wi-Fi", 而是"这个模块没测出来"。两者混同会让
+        # 装维以为 WiFi 正常, 实际该模块根本没跑 (超时已在结论行显示)。
         empty_note_html = ""
-        if m["key"] == "wifi":
+        if m["key"] == "wifi" and st not in ("超时", "错误"):
             raw = m.get("raw", {}) or {}
             nets = raw.get("networks") or []
             chans = raw.get("channel_analysis") or []
@@ -18313,9 +18585,12 @@ def render_report_json(report, indent=2):
     return json.dumps(out, ensure_ascii=False, indent=indent, default=_json_default)
 
 
-# 老的 render_report_text 保留, 但 export_report 默认不再导出
-# (客户报告走 HTML/JSON, TXT 是 legacy 模式; 仍可手工调用)
-# 已存在的 render_report_text / render_report_html 保留代码, 不再被 export_report 调用
+# 报告渲染出口 (现网只有这四个, 旧的 render_report_text / render_report_html
+# 已于 v1.14.x 删除 —— 不要再按老注释去调不存在的函数):
+#   render_report_html_customer  完整客户报告 (HTML)
+#   render_report_html_brief     一页客户报告 (HTML, 现场模式出口)
+#   render_report_html_brief_v2  模板D 极简报款 (HTML, 现场模式出口)
+#   render_report_json           原始数据 (JSON)
 
 
 def _report_dir():
@@ -18368,6 +18643,27 @@ def _brief_clip(text, limit):
     """一页版文本截断: 折叠空白 + 超长加省略号 (手输文案同样过这里)。"""
     text = " ".join(str(text or "").split())
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _first_rootcause_advice(rc):
+    """取根因的首条整改建议 (纯函数, 两个 brief 渲染器共用)。
+
+    v1.15.0 (代码审查 P0-3): `RootCause.to_dict()` 的建议键是
+    **recommendations (列表)**, 此前 brief_v2 读的是 `action`/`recommendation`
+    (这两个键根本不存在) → 建议恒为空串 → 一页版客户报告的「主要发现」只说
+    "出了什么问题"、永远不说 "该做什么"。旧 brief v1 读
+    `rc.get("recommendations")[0]` 才是对的 —— v1.14.10 切模板 D 时引入的回归。
+
+    这里对三种可能的键形态都做兜底, 避免以后再因键名漂移丢建议。
+    """
+    for key in ("action", "recommendation"):
+        v = rc.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    for r in (rc.get("recommendations") or []):
+        if isinstance(r, str) and r.strip():
+            return r
+    return ""
 
 
 _BRIEF_CSS = """
@@ -18607,7 +18903,7 @@ def render_report_html_brief(report):
     # 异常/警告不触发根因规则 → 前文"未发现故障"、检测覆盖却有红黄徽章,
     # 自相矛盾 (真实现场首跑暴露)。回退: 无根因时逐条列出模块级问题。
     todo = []
-    _seen = set()
+    _seen = {}
     for m in modules:
         for iss in m.get("issues") or []:
             sev = iss.get("severity", "信息")
@@ -18615,12 +18911,28 @@ def render_report_html_brief(report):
             if sev not in ("异常", "错误", "警告") or not text:
                 continue
             k = (sev, text)
-            if k in _seen:
+            nm = m.get("name", "")
+            hit = _seen.get(k)
+            if hit is not None:
+                # 同一文案在多个模块出现 (如 23 个模块全超时) → 记下波及模块,
+                # 否则标题的「1 项」会被读成「只有 1 个模块有问题」
+                # (v1.15.0 审查 P1-15)
+                if nm and nm not in hit["_mods"]:
+                    hit["_mods"].append(nm)
                 continue
-            _seen.add(k)
-            todo.append({"severity": sev, "text": text,
-                         "module": m.get("name", "")})
+            entry = {"severity": sev, "text": text, "module": nm,
+                     "_mods": [nm] if nm else []}
+            _seen[k] = entry
+            todo.append(entry)
     todo.sort(key=lambda i: 0 if i["severity"] in ("异常", "错误") else 1)
+    # 波及模块数 (去重后): 标题要说明这几项问题一共涉及几个模块
+    _inv = []
+    for i in todo:
+        for nm in i.get("_mods") or []:
+            if nm and nm not in _inv:
+                _inv.append(nm)
+    todo_scope = (f"（涉及 {len(_inv)} 个模块）"
+                  if len(_inv) > len(todo) else "")
 
     verdict_txt = str(health.get("verdict") or "").strip()
     if rcs:
@@ -18679,17 +18991,28 @@ def render_report_html_brief(report):
     elif todo:
         # v1.13.1: 无根因回退 — 模块级 issue 行 (最多 4 条, 溢出折叠)
         shown_t, hidden_t = todo[:4], todo[4:]
+
+        def _brief_src(i):
+            """来源列: 同一文案涉及多个模块时标明总数, 别只报第一个模块 ——
+            只写「链路速率」会被读成"链路速率有问题", 实际是 23 个模块全超时
+            (v1.15.0 审查 P1-15)。"""
+            mods = i.get("_mods") or []
+            base = _brief_clip(i.get("module", ""), 12)
+            if len(mods) > 1:
+                return f"{base} 等 {len(mods)} 个模块"
+            return base
+
         rows = "".join(
             f'<div class="irow"><span class="sev">{_html_esc(i["severity"])}</span>'
             f'<span class="tx">{_html_esc(_brief_clip(i["text"], _BRIEF_CLIP["desc"]))}</span>'
-            f'<span class="src">{_html_esc(_brief_clip(i["module"], 12))}</span></div>'
+            f'<span class="src">{_html_esc(_brief_src(i))}</span></div>'
             for i in shown_t)
         if hidden_t:
             rows += (f'<div class="irow"><span class="sev">…</span>'
                      f'<span class="tx">另有 {len(hidden_t)} 项，详见随附完整报告</span>'
                      f'<span class="src"></span></div>')
         sec_head = ('<div class="bsec">一、网络实测问题 '
-                    f'<span class="cnt">{len(todo)} 项</span>'
+                    f'<span class="cnt">{len(todo)} 项{todo_scope}</span>'
                     '<span class="rd">由 NetPulse 自动检测判定</span></div>')
         problems_html = (sec_head
                          + f'<div class="bissues">{rows}</div>')
@@ -18921,6 +19244,33 @@ def render_report_html_brief_v2(report):
         try: return f"{float(v):.1f}"
         except (TypeError, ValueError): return None
 
+    # Windows ping 对局域网 (<1ms) 输出整数粒度 0, 直写 "0ms" 会被误读
+    # (与 brief v1 / 完整版 v1.9.3 同一口径): 0 或 <1 一律表达为 "<1"
+    def _ms(v):
+        try: v = float(v)
+        except (TypeError, ValueError): return None
+        return "<1" if v < 1 else f"{v:g}"
+
+    # v1.15.0 (审查 P1-9): 网关延迟档位按**实测值**分档, 不再硬编码。
+    # 原写法无论实测多少都写「优秀(<10ms)」—— 真实产物里同一格是
+    # 「0.0 ms / 优秀(<10ms) · 丢包 5.0%」, 自相矛盾, 客户一眼看穿不可信。
+    # 档位阈值取 THRESHOLDS["gateway"]["ping.avg_ms"] (warn 10 / err 30),
+    # 与完整版报告「判定标准」表同源 (不另立阈值)。
+    _gw_th = THRESHOLDS["gateway"]["ping.avg_ms"]
+    _gw_warn, _gw_err = _gw_th["warn"], _gw_th["err"]
+    if not isinstance(g_avg, (int, float)):
+        gw_band = "未测"
+    elif g_avg < _gw_warn:
+        gw_band = f"优秀(<{_gw_warn}ms)"
+    elif g_avg < _gw_err:
+        gw_band = f"一般({_gw_warn}-{_gw_err}ms)"
+    else:
+        gw_band = f"偏高(≥{_gw_err}ms)"
+    gw_lat_val = _ms(g_avg)
+    gw_lat_delta = _html_esc(gw_band)
+    if isinstance(g_loss, (int, float)) and g_loss > 0:
+        gw_lat_delta += f" · 丢包 {_html_esc(_fmt_pct(g_loss))}%"
+
     dl = _fmt_mbps(spd_download)
     ul = _fmt_mbps(spd_upload)
     plan_ok = (plan_mbps and spd_download and spd_download / plan_mbps >= 0.9)
@@ -18946,8 +19296,8 @@ def render_report_html_brief_v2(report):
         title = _brief_clip(rc.get("title", ""), _BRIEF_CLIP["title"])
         sev = (rc.get("severity") or "low").lower()
         desc = _brief_clip(rc.get("description", ""), _BRIEF_CLIP["desc"])
-        act = _brief_clip(rc.get("action") or rc.get("recommendation") or "",
-                          _BRIEF_CLIP["advice"])
+        # v1.15.0 (审查 P0-3): 建议键是 recommendations (列表), 见 _first_rootcause_advice
+        act = _brief_clip(_first_rootcause_advice(rc), _BRIEF_CLIP["advice"])
         findings.append({"sev": sev, "title": title, "desc": desc, "act": act})
     if _exm and exempt_bad:
         findings.append({
@@ -18983,10 +19333,23 @@ def render_report_html_brief_v2(report):
             "stat_class": stat_color.get(st, "ok"),
         })
 
-    def sev_class(s): return {"high": "high", "mid": "mid"}.get(s, "low")
-    def sev_pill(s):
-        return {"high": ("异常", "high"), "mid": ("警告", "mid"),
-                "exempt": ("豁免", "exempt")}.get(s, ("", ""))
+    # v1.15.0 (审查 P0-4): `Severity` 枚举值是 info/low/medium/high/critical,
+    # 此前只认 high/mid/exempt —— **critical 根因** (网关丢包>=20% / WAN 中断 /
+    # F 级 bufferbloat) 落到默认值 → 空徽章 + low 样式, 即"最严重的根因在交
+    # 客户的一页版里看起来最不严重"。改为按 Severity 全量映射:
+    #   critical 复用 high 的红色样式 (不新增 CSS 规则, 不影响 A4 高度锁)
+    #   low/info 用 mute 灰底 (配 .f.low .badge 规则), 不再出现透明空徽章
+    _SEV_PILL = {
+        "critical": ("严重", "high"),
+        "high":     ("异常", "high"),
+        "medium":   ("警告", "mid"),
+        "low":      ("提示", "low"),
+        "info":     ("提示", "low"),
+        "exempt":   ("豁免", "exempt"),
+    }
+
+    def sev_class(s): return _SEV_PILL.get(s, ("提示", "low"))[1]
+    def sev_pill(s): return _SEV_PILL.get(s, ("提示", "low"))
 
     findings_html = ""
     for i, f in enumerate(findings, 1):
@@ -19123,8 +19486,8 @@ def render_report_html_brief_v2(report):
       <div class="value num">{_html_esc(ul or "—")}<small>Mbps</small></div>
       <div class="delta">{_html_esc(spd_method)}</div></div>
     <div><div class="label">网关延迟</div>
-      <div class="value num">{_fmt_pct(g_avg) or "—"}<small>ms</small></div>
-      <div class="delta">优秀(&lt;10ms){f" · 丢包 {_fmt_pct(g_loss)}%" if g_loss else ""}</div></div>
+      <div class="value num">{_html_esc(gw_lat_val) if gw_lat_val else "—"}<small>ms</small></div>
+      <div class="delta">{gw_lat_delta}</div></div>
     <div><div class="label">出口重传率</div>
       <div class="value num">{_fmt_pct(retrans_rate) or "—"}<small>%</small></div>
       <div class="delta">{'偏高(&lt;2% 优)' if (retrans_rate and retrans_rate > 2) else '正常'}</div></div>
@@ -19339,6 +19702,8 @@ CSS_BRIEF_V2 = """
   .f.high .badge { background: var(--red); }
   .f.mid .badge { background: var(--amber); }
   .f.exempt .badge { background: var(--mute); }
+  /* v1.15.0 (审查 P0-4): low/info 根因此前无背景色 → 徽章透明 (看不见) */
+  .f.low .badge { background: var(--mute); }
   .f .obs { font-size: 10.5px; color: var(--dim); margin-top: .8mm; line-height: 1.55; }
   .f .act { font-size: 10.5px; color: var(--navy); margin-top: .8mm; font-weight: 600; }
   .f .act .lbl { font-weight: 700; }
@@ -19404,7 +19769,8 @@ def export_report(path, rule_filter=None, report=None, layout="full"):
     打印或另存为 PDF (打印样式已内置: 技术细节全部展开、去阴影配色)。
 
     老的 .txt 报告 (拍平所有数据) 已废弃, 导出 .txt 现在会返回错误提示。
-    如需旧格式, 请手动调用 render_report_text()。
+    旧的 render_report_text / render_report_html 已删除, 没有可手工调用的
+    旧格式入口 —— 需要数据请用 .json, 需要纸质留档用浏览器打印 HTML。
     """
     path = _normalize_report_path(path)
     if report is None:
@@ -20134,7 +20500,7 @@ def _module_menu(install=False, pip_mirror=None):
             # key 长度参差 (3-11 字符) 后 cell 实际像素宽差异过大, pad
             # 整数 ASCII 空格无法在 Consolas 下做到像素级行间对齐, 故
             # 移除 (key) 段以减小 cell 宽差异 (现仅 0.06 字符位, 肉眼看不出)。
-            # 用户仍可通过序号 (1-19) 或分类字母 (a/b/c) 选模块, 不受影响。
+            # 用户仍可通过序号 (1-23) 或分类字母 (a/b/c) 选模块, 不受影响。
             name_max_w = name_max_w_global
             for k in keys:
                 idx += 1
@@ -20434,9 +20800,10 @@ def main():
                         choices=["slice", "full"], default=None, metavar="MODE",
                         help="盯障期间抓包取证 (需 Npcap + 管理员; 默认关闭): "
                              "slice=事件触发落盘前后 30s 切片, full=全程落一个 "
-                             f"pcap。仅保留包头 + {'/'.join(str(p) for p in CAPTURE_WEB_PORTS)} "
-                             f"每流首 {CAPTURE_FIRST_PKTS} 包 {CAPTURE_PAYLOAD_KEEP}B (提 "
-                             "Host/SNI), 不存应用内容; 配合 --monitor 使用")
+                             f"pcap。仅保留包头 + HTTPS({'/'.join(str(p) for p in CAPTURE_PAYLOAD_PORTS)}) "
+                             f"每流首 {CAPTURE_FIRST_PKTS} 包 {CAPTURE_PAYLOAD_KEEP}B 加密握手 (提 "
+                             f"SNI), 明文 HTTP({'/'.join(str(p) for p in CAPTURE_WEB_PORTS if p not in CAPTURE_PAYLOAD_PORTS)}) "
+                             "不存应用内容 (账号/密码/Cookie 不落盘); 配合 --monitor 使用")
     parser.add_argument("--capture-mb", type=int, default=CAPTURE_DEFAULT_MB,
                         metavar="N",
                         help=f"抓包缓冲上限 MB (默认 {CAPTURE_DEFAULT_MB}, 最小 8); "
@@ -20499,16 +20866,14 @@ def main():
 
     # 测速参数 -> 全局配置 (runner -> SpeedTester.detect 读取)
     if args.iperf3_server:
-        spec = args.iperf3_server.strip()
-        if ":" in spec:
-            host, _, port = spec.rpartition(":")
-            if host and port.isdigit():
-                SPEEDTEST_CONFIG["iperf3_server"] = host
-                SPEEDTEST_CONFIG["iperf3_port"] = int(port)
-            else:
-                SPEEDTEST_CONFIG["iperf3_server"] = spec
-        else:
-            SPEEDTEST_CONFIG["iperf3_server"] = spec
+        # v1.15.0 (审查 P1-7): 服务器地址进命令行, 必须先过合法性校验
+        parsed_iperf3 = _parse_iperf3_server(args.iperf3_server)
+        if parsed_iperf3 is None:
+            print(_c(f"  错误: --iperf3-server 地址非法: {args.iperf3_server!r}", C_RED))
+            print(_c("  只接受 IP 地址或主机名, 形如 1.2.3.4 / host.example.com / "
+                     "host:5201 / [2400::1]:5201", C_GRAY))
+            sys.exit(4)   # D2: 参数错
+        SPEEDTEST_CONFIG["iperf3_server"], SPEEDTEST_CONFIG["iperf3_port"] = parsed_iperf3
     SPEEDTEST_CONFIG["use_speedtest_net"] = bool(args.speedtest_net)
     SPEEDTEST_CONFIG["node"] = getattr(args, "speedtest_node", None) or None
     # --speedtest-node 传数字 ID 时, 同时设为 Ookla 服务器 ID (覆盖默认 3633)

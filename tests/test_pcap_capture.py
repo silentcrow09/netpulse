@@ -76,7 +76,8 @@ class TestCaptureStripPacket(unittest.TestCase):
         out = N._capture_strip_packet(_pkt(dport=22, proto=TCP), {})
         self.assertEqual(len(bytes(out)), 14 + 20 + 20)   # Ether+IP+TCP 头
 
-    def test_web_port_first_two_pkts_keep_384(self):
+    def test_tls_port_first_two_pkts_keep_384(self):
+        """443 (TLS) 每流前 2 包保留 384B 加密握手窗口 (提 SNI)。"""
         fs = {}
         p = _pkt(dport=443)
         sizes = [len(bytes(N._capture_strip_packet(p, fs))) for _ in range(3)]
@@ -88,13 +89,21 @@ class TestCaptureStripPacket(unittest.TestCase):
         rev = N._capture_strip_packet(_pkt(sport=443, dport=5000), fs)
         self.assertEqual(len(bytes(rev)), 54 + 384)
 
-    def test_port_80_8080_same_policy(self):
+    def test_plaintext_ports_truncated_to_tcp_header(self):
+        """明文 HTTP (80/8080) 一律截到 TCP 头 (v1.15.0 审查 P0-6)。
+
+        旧行为: 80/8080 与 443 同策略, 每流前 2 包保留 384B **明文**应用
+        载荷 —— 实测一个 271B 的 `POST /api/login` 原样落盘 (Authorization /
+        Cookie / password 全在包里), 而弹窗与报告都承诺「账号密码不落盘」。
+        现改为: 只有 TLS(443) 保留载荷字节, 明文端口不留任何应用字节。
+        回归细节见 tests/test_v1150_capture_privacy.py。
+        """
         for port in (80, 8080):
             fs = {}
             a = len(bytes(N._capture_strip_packet(_pkt(dport=port), fs)))
             b = len(bytes(N._capture_strip_packet(_pkt(dport=port), fs)))
             c = len(bytes(N._capture_strip_packet(_pkt(dport=port), fs)))
-            self.assertEqual((a, b, c), (54 + 384, 54 + 384, 54), f"port {port}")
+            self.assertEqual((a, b, c), (54, 54, 54), f"port {port}")
 
     def test_dns_kept_whole(self):
         p = _pkt(payload=b"D" * 200, sport=53, dport=5000, proto=UDP)

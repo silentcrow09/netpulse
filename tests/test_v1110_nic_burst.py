@@ -89,13 +89,31 @@ class TestNicQuality(unittest.TestCase):
         return s
 
     def test_burst_detected(self):
-        # 全程单调涨: 最大跨度增量 = 首(100)→尾(146) = 46
+        # v1.15.0 (审查 P1-11): 「集中区间」= 相邻采样的最大增量所在区间。
+        # 本例: 增量序列 0 / 5 / 40 / 1 → 最大 40 落在 60s~150s 这一段。
         s = self._sess([(0, 100, 1), (30, 100, 1), (60, 105, 2),
                         (150, 145, 3), (300, 146, 3)])
         nq = s._nic_quality()
         self.assertEqual(nq["err_delta"], 46)
-        self.assertEqual(nq["max_window_delta"], 46)      # 146-100
-        self.assertEqual((nq["burst_start_s"], nq["burst_end_s"]), (0.0, 300.0))
+        self.assertEqual(nq["max_window_delta"], 40)      # 145-105, 不是总增量
+        self.assertEqual((nq["burst_start_s"], nq["burst_end_s"]), (60.0, 150.0))
+
+    def test_max_window_delta_not_equal_to_err_delta(self):
+        """回归: max_window_delta 恒等于 err_delta 是旧 bug (集中区间判据失效)."""
+        s = self._sess([(0, 100, 1), (30, 100, 1), (60, 105, 2),
+                        (150, 145, 3), (300, 146, 3)])
+        nq = s._nic_quality()
+        self.assertNotEqual(nq["max_window_delta"], nq["err_delta"])
+
+    def test_gradual_noise_no_burst(self):
+        """渐进噪声 (每 30s 涨 1~2 个) 累计够多也不判集中区间."""
+        samples = [(i * 30, 100 + i * 2, i) for i in range(20)]   # 总增量 38
+        s = self._sess(samples)
+        nq = s._nic_quality()
+        self.assertEqual(nq["err_delta"], 38)
+        self.assertLess(nq["max_window_delta"], N.MonitorSession.NIC_ERR_BURST_WINDOW_MIN)
+        self.assertIsNone(nq["burst_start_s"])
+        self.assertIsNone(nq["burst_end_s"])
 
     def test_below_threshold_no_burst(self):
         s = self._sess([(0, 100, 0), (300, 105, 1)])      # 增量 5 < 20
@@ -132,7 +150,17 @@ class TestDetectNicEvent(unittest.TestCase):
         self.assertIn("抓包看不到", ev["detail"])
 
     def test_event_without_burst_window(self):
+        """v1.15.0 (审查 P1-11): 无集中区间 → 不出事件 (渐进噪声不再被当暴增).
+
+        旧版只判会话总增量 (err_delta >= 20), 渐进噪声也会出事件并给出
+        「强制百兆全双工」这种要改客户网络配置的建议。
+        """
         evs = _events(_snap(nic_quality=_nq(25, None, 0)))
+        self.assertEqual([e for e in evs if e["type"] == "nic_error_burst"], [])
+
+    def test_event_with_legacy_shape_still_reports(self):
+        """防御: 有 max_window_delta 但缺 burst 区间 (旧快照形状) 仍出事件."""
+        evs = _events(_snap(nic_quality=_nq(50, None, 40)))
         ev = next(e for e in evs if e["type"] == "nic_error_burst")
         self.assertIn("无明显集中区间", ev["detail"])
         self.assertEqual((ev["start_ts"], ev["end_ts"]), (T0, T0 + 600.0))

@@ -390,5 +390,84 @@ class TestMonitorSessionContractV17(unittest.TestCase):
         self.assertIn("load_url", params)
 
 
+class TestStreamStatsLossPct(unittest.TestCase):
+    """v1.15.0 审查 P0-5: 盯障丢包率不得假绿。
+
+    旧实现 `total = ok_vals and len(ok_vals) + loss_n`: ok_vals 为空时
+    `and` 短路取到空列表 (falsy) → 走早退分支返回 loss=0 / loss_pct=0.0,
+    于是「链路全程不通」反而报「0% 丢包」, 报告里还会写「未复现掉线」。
+    """
+
+    def test_all_loss_reports_100pct(self):
+        st = N.MonitorSession._stream_stats(
+            [("loss", T0 + i, None) for i in range(10)])
+        self.assertEqual(st["ok"], 0)
+        self.assertEqual(st["loss"], 10)
+        self.assertEqual(st["loss_pct"], 100.0,
+                         "全程不通必须报 100% 丢包, 不能报 0%")
+        self.assertIsNone(st["avg_ms"])
+
+    def test_empty_stream_is_no_data(self):
+        st = N.MonitorSession._stream_stats([])
+        self.assertEqual(st["loss_pct"], 0.0)
+        self.assertEqual(st["ok"], 0)
+        self.assertEqual(st["loss"], 0)
+
+    def test_mixed_loss_pct(self):
+        st = N.MonitorSession._stream_stats(
+            [("ok", T0 + i, 5.0) for i in range(8)] +
+            [("loss", T0 + 100 + i, None) for i in range(2)])
+        self.assertEqual(st["ok"], 8)
+        self.assertEqual(st["loss"], 2)
+        self.assertEqual(st["loss_pct"], 20.0)
+
+    def test_all_ok_zero_loss(self):
+        st = N.MonitorSession._stream_stats(
+            [("ok", T0 + i, 5.0) for i in range(10)])
+        self.assertEqual(st["loss_pct"], 0.0)
+        self.assertEqual(st["ok"], 10)
+
+    def test_ok_without_value_not_counted(self):
+        """ok 但无 RTT 值的样本不算成功 —— 分母不得虚增."""
+        st = N.MonitorSession._stream_stats(
+            [("ok", T0, None), ("ok", T0 + 1, 5.0), ("loss", T0 + 2, None)])
+        self.assertEqual(st["ok"], 1)
+        self.assertEqual(st["loss"], 1)
+        self.assertEqual(st["loss_pct"], 50.0)
+
+    def test_conclusion_not_claim_no_outage_when_loss_exists(self):
+        """统计层如实报出丢包后, 结论文案不得再自称「未复现掉线」."""
+        stats = {"gw": {"loss_pct": 100.0}, "ext": {"loss_pct": 100.0}}
+        _v, text, _advice = N._monitor_conclusion([], stats, _snap())
+        self.assertNotIn("未复现掉线", text)
+        self.assertIn("丢包", text)
+
+    def test_conclusion_stable_text_unchanged_when_no_loss(self):
+        """健康会话文案不受影响 (口径没变的那一半必须原样保留)."""
+        verdict, text, _advice = N._monitor_conclusion([], _stats_ok(), _snap())
+        self.assertEqual(verdict, "stable")
+        self.assertIn("监测期内未复现掉线", text)
+
+    def test_report_summary_not_fake_green(self):
+        """端到端: 全程不通的盯障, 报告摘要不得写「0% 丢包」."""
+        sess = N.MonitorSession(30, ext_target="223.5.5.5")
+        sess._t0 = T0
+        sess._gw_ip = "192.168.1.1"
+        sess._dns_server = "223.5.5.5"
+        sess._ext_ip_resolved = "223.5.5.5"
+        loss_stream = [("loss", T0 + i, None) for i in range(10)]
+        snap = {"gw_stream": list(loss_stream), "ext_stream": list(loss_stream),
+                "tcp": [], "dns": []}
+        with mock.patch.object(N.MonitorSession, "snapshot",
+                               return_value=snap), \
+             mock.patch("netpulse.get_local_ip", return_value="192.168.1.5"):
+            r = sess.build_result()
+        self.assertEqual(r["stats"]["gw"]["loss_pct"], 100.0)
+        self.assertEqual(r["stats"]["ext"]["loss_pct"], 100.0)
+        self.assertIn("网关丢包 100.0%", r["summary"])
+        self.assertIn("外网丢包 100.0%", r["summary"])
+        self.assertNotIn("未复现掉线", r["conclusion_text"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

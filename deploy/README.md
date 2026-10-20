@@ -17,7 +17,7 @@ irm https://.../v1/install.ps1 | iex -- all --export report.html
 
 引导脚本 `install.ps1` 自动完成：
 1. 拉 `index.json` 拿版本号 + SHA256
-2. 检测 Python 3.8+ → 有则用 `.py` (300KB)，无则用 `.exe` (25MB)
+2. 检测 Python 3.8+ → 有则用 `.py` (300KB)，无则用 `.exe` (18MB)
 3. SHA256 校验，不一致立即中止
 4. 透传参数并执行
 

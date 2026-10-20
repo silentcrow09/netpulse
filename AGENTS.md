@@ -39,9 +39,11 @@
 
 - `export_report` 只调用 `render_report_html_customer`（客户视图）
 - `render_report_html`（技术视图）和 `render_report_text`（纯文本）曾长期零调用，
-  **v1.14.14 已连同其专属 helper（`_fmt_value` / `_fmt_record_table` / `_flatten_kv`
-  / `DETAIL_KEYS`）一并删除**（共 352 行，AST 级零 Load 引用验证 + 报告输出逐行
-  diff 验证零回归）。需要技术视图请重新实现并补测试
+  **v1.14.14 已删除这两个入口函数**（报告输出逐行 diff 验证零回归）。
+  **v1.15.0 更正（本文件早前写"连同其专属 helper 一并删除"是错的）**：那两个入口删掉时，
+  它们的专属 helper（`_fmt_value` / `_fmt_record_table` / `_flatten_kv` / `DETAIL_KEYS`
+  / `_try_unjson`）**漏删**，一直零引用地留在文件里，直到 v1.15.0 审查 P2 才真正清掉。
+  需要技术视图请重新实现并补测试
 - 报告须**可离线打开**：全部用系统字体，不引入任何在线资源，图表用纯 SVG 手绘
 - **HTML 属性转义**（v1.5.0 P0）：文本节点用 `_html_esc(s)`（`quote=False`），
   **属性值一律用 `_html_attr(s)`**（`quote=True`）—— `_html_esc` 不能进属性拼接。

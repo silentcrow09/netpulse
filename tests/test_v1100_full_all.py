@@ -165,5 +165,57 @@ class TestRunLadderRoundRobin(unittest.TestCase):
         self.assertEqual(set(seen), {("10.0.0.9", 53)})
 
 
+class TestParallelModuleException(unittest.TestCase):
+    """v1.15.0 审查 P1-14: 并行模式单模块异常不得中断整轮。
+
+    旧版 `_run_one` 没有 try/except —— 一次异常从 worker 冒到主线程
+    (fut.result() 重新抛出) → 整轮诊断中断, 现场模式等于白跑一趟。
+    顺序模式早有同构的降级 (status="错误"), 并行模式必须一致。
+    """
+
+    def _fake(self, boom_key, msg="boom"):
+        def _fn(key, cb):
+            if key == boom_key:
+                raise RuntimeError(msg)
+            return "完成", {"summary": f"{key} ok"}
+        return _fn
+
+    def _run_parallel(self, keys, boom_key, msg="boom"):
+        with mock.patch("netpulse._run_module_with_timeout",
+                        side_effect=self._fake(boom_key, msg)), \
+             mock.patch("netpulse._print_cols"):
+            return np._run_diagnostics_parallel(keys, 4, len(keys))
+
+    def test_single_module_exception_does_not_abort_round(self):
+        results, full = self._run_parallel(["gateway", "dns", "wifi"], "dns")
+        self.assertEqual(results.get("dns"), "错误")
+        self.assertIn("boom", str(full["dns"].get("error", "")))
+        self.assertEqual(results.get("gateway"), "完成")
+        self.assertEqual(results.get("wifi"), "完成")
+        self.assertEqual(len(results), 3, "其余模块的结果必须保留")
+
+    def test_solo_module_exception_does_not_abort_round(self):
+        """独占模块 (测速等) 异常也不得中断整轮。"""
+        results, full = self._run_parallel(["gateway", "speedtest"], "speedtest",
+                                           "solo-boom")
+        self.assertEqual(results.get("speedtest"), "错误")
+        self.assertIn("solo-boom", str(full["speedtest"].get("error", "")))
+        self.assertEqual(results.get("gateway"), "完成")
+
+    def test_same_degradation_as_sequential(self):
+        """并行与顺序模式的降级口径必须一致 (都是 错误 + error 文案)."""
+        _, par_full = self._run_parallel(["gateway", "dns"], "dns")
+        with mock.patch("netpulse._run_module_with_timeout",
+                        side_effect=self._fake("dns")), \
+             mock.patch("netpulse.print"), \
+             mock.patch("netpulse.sys.stdout"):
+            seq_results, seq_full = np._run_diagnostics_sequential(
+                ["gateway", "dns"], False)
+        self.assertEqual(par_full["dns"].get("error"),
+                         seq_full["dns"].get("error"))
+        self.assertEqual(seq_results.get("dns"), "错误")
+        self.assertEqual(seq_results.get("gateway"), "完成")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

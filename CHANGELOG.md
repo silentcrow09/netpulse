@@ -7,6 +7,133 @@
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-10-20
+
+全仓代码审查（4 路子进程逐模块 + 父进程逐条实跑复核）的修复批次，共 17 项：
+6 个 P0、9 个 P1、2 个 P2。每一项都配了回归测试，且新测试必须对**修复前**的代码
+跑出失败才算数（否则视为假覆盖）。完整清单见 `REVIEW_TODO_2026-10-20.md`。
+
+**本批的行为变更（升级注意）**：抓包只保留 443 端口的 payload 字节（80 / 8080 一律
+截到 TCP 头）；`--json` 的 stdout 现在是**单个 JSON 文档**，人读输出全部改走 stderr；
+iperf3 服务器地址改为白名单校验；所有模块超时时报告会显式列出「涉及 N 个模块」。
+
+### 修复 · P0
+
+- **预估带宽档位系统性高报一档**：实测 100 Mbps 报「约 200 兆」、1000 Mbps 报
+  「约 2000 兆」，而这条数字会进客户报告的**绿色**指标。
+  - 修法：取「≥ 实测值的最小档位」，1.1 只用作跨档容差，不再向上取整到下一档。
+- **Bufferbloat 规则误报并顶掉真故障**：`idle=0.4 / loaded=5.4 / grade="B (良好)"`
+  触发 HIGH「Bufferbloat 严重」——与模块自身 `bloat>30ms` 才记 issue 的口径打架；
+  又因排序稳定而抢到 `root_causes[0]`，把真实的网关丢包折叠隐藏。
+  - 修法：①改**绝对增量**口径 `bloat >= 30ms` 触发，与 `BufferbloatTester` 记 issue
+    的门槛、`THRESHOLDS["bufferbloat"]["bloat_ms"]`（warn 30 / err 100）三方一致，
+    比值判据作废；②严重度分档 `>=100 → CRITICAL` / `>=60 → HIGH` / `>=30 → MEDIUM`；
+    ③标题按档位措辞，不再自称「严重」却写 B 档；④脏数据回退 `loaded-idle`。
+- **一页版客户报告永久丢失整改建议**：`RootCause.to_dict()` 只有 `recommendations`
+  （列表），brief_v2 却读 `action` / `recommendation` → 恒空。真实交付物
+  `reports/2026-10-12/…160554.html` 已带此缺陷。
+  - 修法：新增 `_first_rootcause_advice` 统一取首条建议，保留渲染期截断。
+- **一页版根因严重度徽章表不匹配**：`Severity` 取值是 `info/low/medium/high/critical`，
+  而 `sev_pill` 只认 `high/mid/exempt` → `critical` 根因落到**空徽章 + low 样式**，
+  即「最严重的根因在一页版里看起来最不严重」。
+  - 修法：按 `Severity` 全量映射，`critical` 复用红色样式（不新增 CSS 规则，
+    不影响 A4 高度锁），`low/info` 用灰底（补 `.f.low .badge` 规则，不再出现透明空徽章）。
+- **抓包隐私声明不实，明文凭据落盘**：`CAPTURE_WEB_PORTS` 含 80 → 明文 HTTP 每流
+  前 2 包保留 384B 载荷；实跑 271B 明文 `POST /api/login` 原样落盘
+  （Authorization / Cookie / password）。
+  - 修法（**比原计划更严**）：新增 `CAPTURE_PAYLOAD_PORTS = (443,)` 作为「唯一保留
+    payload 字节的端口」；`CAPTURE_WEB_PORTS` 保留但降级为「有应用层信息的端口」
+    （供 `_l7_extract` 识 Host/SNI）。**80 与 8080 均一律截到 TCP 头**（原计划只
+    收窄 80，但 8080 同为明文，同样会落盘凭据）。弹窗 / 盯障报告 / `--capture`
+    help 三处文案改从常量生成。
+  - 诊断能力损失可忽略：报告里的访问域名走 TLS SNI + DNS QNAME。
+- **盯障报告丢包率假绿**：`total = ok_vals and len(ok_vals) + loss_n` → 0 成功时
+  `total=[]` 走早退 → `loss_pct=0.0`。链路 100% 不通，报告却说 0% 丢包且「未复现掉线」。
+  - 修法：`total = len(ok_vals) + loss_n`（只有「一个样本都没有」才走早退）；
+    结论文案按真实丢包率分叉，有丢包时不再自称「未复现掉线」（无丢包的健康会话
+    文案逐字不变）。
+
+### 修复 · P1
+
+- **iperf3 命令注入**：`--iperf3-server` / 菜单输入只校验端口不校验 host。实跑
+  `127.0.0.1 & echo INJECTED > f` → 标记文件被创建。
+  - 修法（两道防线）：①**地址白名单** `_valid_iperf3_host` / `_valid_iperf3_port` /
+    `_parse_iperf3_server` —— 只放行 IP 字面量与合法主机名；②**不经 shell**，命令改
+    参数数组 + `shell=False`；③`detect()` 内再设硬闸，CLI 入口按「参数错」退出码 4。
+- **CLI 关键指标被静默吞掉**：`_cli_print_result` 只解包 3 元组 + `except: pass`，
+  2/4 元组直接抛 ValueError 被吞。实测 23 个模块中 **10 个的指标受损**
+  （arp / bufferbloat / linkspeed / route / tcpstats / wifi 整行消失，另有 4 个尾部丢失）。
+  - 修法：兼容 2/3/4 元组；`metrics_fn` 自身抛异常时只放弃指标、不连带崩掉模块打印。
+- **一页版网关延迟 KPI 自相矛盾**：`优秀(<10ms)` 硬编码，真实产物同一格显示
+  「0.0 ms / 优秀(<10ms) · 丢包 5.0%」。
+  - 修法：档位按**实测值**分档，阈值取 `THRESHOLDS["gateway"]["ping.avg_ms"]`
+    （warn 10 / err 30，与完整版同源）；数值沿用 brief v1 的 `<1` 口径。
+- **调试包脱敏声明与实际不符**：包内 log 声明「公网 IPv4+IPv6 已脱敏」，但
+  traceroute / resolved_ip 的公网 IP 原样落盘。
+  - 修法：`_redact_value` 兜底改**值级**掩码（公网 IPv4/IPv6 + MAC），不再依赖 key 命中；
+    非 dict 结果（list / 标量）也走脱敏；log 增写一行「Redaction scope」说明范围与保留项。
+- **并行模式单模块异常中断整轮**：`_run_one` 无 try/except（顺序模式有）→ 现场模式
+  一次异常 = 上门白跑。
+  - 修法：单模块降级为 `("错误", {...})`，其余模块照跑；主线程 `fut.result()` 再兜一层。
+- **健康分 verdict 与分数口径不一致**：iperf3 未配置 → 「优秀 · 1 个模块需关注（含 1 个异常）」
+  配 100 分 / A 级，退出码还是 2 —— 根因是「未配置不是故障」的状态改写只做在
+  `build_report` 的客户视图里，且在状态计数**之后**，于是报告计数 / verdict / 退出码 /
+  `LAST_RUN["status"]` 四套口径各说各话。
+  - 修法：新增 `_normalize_module_statuses` 做状态层归一，并**前置**到 runner，
+    四处共用同一份 summary。
+- **NIC 暴增「集中区间」判据失效**：`max_window_delta` 恒等于 `err_delta`（错误计数单调
+  递增，首尾差 ≡ 会话总增量）→ 两级阈值实际只剩一级，渐进噪声也出事件并强制
+  「改客户网络配置」的建议。
+  - 修法：「集中区间」改**相邻采样**的最大增量所在区间；事件门槛取
+    `会话总增量 >= 20` **且** `单区间集中增量 >= 10`。
+- **`--json` stdout 非纯 JSON**：stdout = banner + ANSI + 每模块一个 JSON 对象 + 汇总
+  → `json.loads` 失败，README 承诺的「便于脚本解析」此前根本做不到。
+  - 修法：json 模式下 stdout 整体改道 stderr，stdout 只留**一个** JSON 文档
+    `{模块key: 完整结果}`；加 `_restore_stdout_on_exit` 装饰器保证异常路径也还原。
+- **超时/错误模块不进待办清单**（实测比审查结论更严重）：探测失败时 res 里只有
+  `{"error": ...}` 一个键，而各模块 `_issues_*` 大多只认 `issues` / `warnings` 字段
+  → **失败模块一条 issue 都不产出**。23 个模块全超时时，同一份报告里有四处互相打架：
+  1. 待办清单只有 1 条，且是 gateway 的 `_issues_gateway` 碰巧认得 `error` 键那条
+     → 顶部写「1 项需要您关注 / 来源: 网关检测」，把「整机 23 个模块都没测出来」
+     说成「网关有问题」，装维照着查错方向；
+  2. 根因摘要区写「✓ 无故障」，而健康分是 0 分 F 级、verdict 写「23 个模块未完成检测」；
+  3. 会诊卡片写「1 项异常级问题」，与「23 个问题模块已展开」打架；
+  4. WiFi 模块超时却显示「[提示] 当前未连接 Wi-Fi … 这是正常现象, 而非故障」
+     → 把「没测出来」说成「没连 WiFi」。
+  - 修法：①新增 `_module_failure_issue`，超时/错误模块各自产出一条 `severity=异常`
+    的 issue（超时文案**与模块无关**，各模块超时阈值不同，写进文案会让 23 条 issue
+    无法去重、待办区刷屏 23 张卡）；②超时**整份替换**模块自身 issue（那些是「把 error
+    当空数据解读」的误判），错误时**保留**部分实测 issue 只额外登记失败本身；
+    ③待办区标题加「（涉及 N 个模块）」、会诊卡片按「条目 × 波及模块」计数；
+    ④有未完成模块时根因摘要区改「⚠ 未定位到根因」；⑤WiFi 的「未连接」友好提示在
+    超时/错误时不出现。同步修 brief v1（现网现场交付主文档）。
+
+### 修复 · P2
+
+- **死代码清理**（AST 验证零外部引用后删除）：`_fmt_value` / `_fmt_record_table` /
+  `_flatten_kv` / `DETAIL_KEYS`，并连带清掉删完即零引用的 `_try_unjson`（否则等于
+  用一个死代码换另一个死代码）。`HEADER_MAP`（10 次引用）与 `_record_table`（1 次）
+  仍存活，保留。
+- **注释/文档漂移 6 处**：评分注释「警告-5 / 未检测-2」实为 -2 / 0；「序号 1-19」
+  共 3 处实为 1-23；`_columnize` docstring 说「用全角空格补齐」与 `_pad_disp` 自己的
+  docstring 自相矛盾（实为 ASCII 空格）；`compute_exit_code` docstring 说「4 = 参数错
+  (argparse 已处理)」实际是 main 里 8 处显式 `sys.exit(4)`；`render_report_text` /
+  `render_report_html` 两处引用仍让读者去调已删除的函数；`compute_health_score`
+  docstring 说超时模块由 `_issues_*` 登记异常 issue（实际由 `_module_failure_issue` 登记）。
+- **AGENTS.md 更正**：该文件早前声称 v1.14.14「连同其专属 helper 一并删除」
+  `_fmt_value` / `_fmt_record_table` / `_flatten_kv` / `DETAIL_KEYS` —— **事实相反**：
+  v1.14.14 只删了两个入口函数，这批 helper 漏删、一直零引用地留在文件里，
+  直到本次才真正清掉。已改为事实描述并标注更正。
+
+### 验证
+
+- 全量测试 **34 个文件全绿**（新增 `tests/test_v1150_*.py` 7 个 + 改写 8 个既有文件）。
+- **零回归验证**：固定 fixture 渲染 customer / brief / brief_v2 三份 HTML，与修复前
+  逐行 `Compare-Object` —— customer 与 brief **完全一致**，brief_v2 仅 8 行差异
+  （全部是本批次 P0-3 / P0-4 的已知改动）。
+- 每一项新测试都对**修复前**的代码跑出失败（闸门有效性检验），避免「只会 ✅ 的
+  闸门等于没闸门」。
+
 ## [1.14.14] - 2026-10-14
 
 代码审查后的修复批次。核心是**一个对外主推却从未真正生效的功能**和**一个让中文
@@ -1331,5 +1458,6 @@ v1.4.0 代码审查修复：v1.2.0–v1.4.0 有多项路线图标 [x] 但未真�
 - HTML / JSON 报告导出，支持浏览器打印/另存为 PDF
 - 国内网络优化：默认使用国内 DNS（AliDNS / DNSPod / 114）与公网 IP 服务
 
-[Unreleased]: https://github.com/henu_09/netpulse/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/silentcrow09/netpulse/compare/v1.15.0...HEAD
+[1.15.0]: https://github.com/silentcrow09/netpulse/compare/v1.14.14...v1.15.0
 [1.0.0]: https://github.com/henu_09/netpulse/releases/tag/v1.0.0

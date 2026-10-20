@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.14.14
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.15.0
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -10,7 +10,7 @@
 
 **最新稳定版见 [Releases 页面](https://github.com/silentcrow09/netpulse/releases/latest)**
 
-直接下载 `NetPulse.exe`（约 25 MB，单文件可执行，免安装），双击即可运行。
+直接下载 `NetPulse.exe`（约 18 MB，单文件可执行，免安装），双击即可运行。老机器 / 32 位系统下 `NetPulse_x86.exe`（约 12 MB，最后一个支持 Win7 的版本）同样在 Releases 里。
 
 > SHA256 见 [Releases 页面](https://github.com/silentcrow09/netpulse/releases/latest)，下载后可对照 `*.sha256.txt` 校验。
 
@@ -82,7 +82,7 @@ python netpulse.py dhcp gateway dns
 python netpulse.py a
 python netpulse.py a c --export report.html
 
-# 以 JSON 输出完整结果 (便于脚本解析)
+# 以 JSON 输出完整结果 (便于脚本解析: stdout 是单个 JSON 文档, 人读输出走 stderr)
 python netpulse.py all --json
 
 # 导出报告 (支持 html / json, 逗号分隔多种格式)
@@ -160,7 +160,7 @@ python netpulse.py --install
 |------|------|
 | `modules` | 要运行的模块 key、序号或分类字母 `a/b/c`；`all` 表示全部；省略则进入交互菜单 |
 | `--list` | 列出所有可用模块后退出 |
-| `--json` | 以 JSON 格式输出每个模块的完整结果 |
+| `--json` | 以 JSON 输出各模块的完整结果（stdout 只有一个 JSON 文档 `{模块key: 完整结果}`，人读输出走 stderr，可直接 `json.loads` 解析） |
 | `--verbose` | 显示完整原始字段（默认仅显示结论 + 关键指标 + 问题清单，细节保存在 HTML/JSON 报告中） |
 | `--no-color` | 禁用彩色输出（兼容老旧终端） |
 | `--install` | 自动安装缺失依赖 |

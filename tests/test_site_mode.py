@@ -412,6 +412,59 @@ class TestBriefV2NoPlan(unittest.TestCase):
             self.assertFalse(os.path.exists(path))
 
 
+class TestBriefV2GatewayLatencyBand(unittest.TestCase):
+    """v1.15.0 审查 P1-9: 一页版网关延迟 KPI 不得硬编码「优秀(<10ms)」。
+
+    原写法无论实测多少都写「优秀(<10ms)」—— 真实产物同格是
+    「0.0 ms / 优秀(<10ms) · 丢包 5.0%」, 自相矛盾。
+    档位阈值取 THRESHOLDS["gateway"]["ping.avg_ms"] (warn 10 / err 30),
+    与完整版报告「判定标准」表同源; 数值沿用 brief v1 的 <1ms 口径。
+    """
+
+    def _kpi(self, avg_ms, loss_pct=0):
+        r = _fake_report()
+        gw = r["modules"][0]
+        gw["raw"]["ping"]["avg_ms"] = avg_ms
+        gw["raw"]["ping"]["loss_pct"] = loss_pct
+        html = N.render_report_html_brief_v2(r)
+        i = html.find("网关延迟")
+        self.assertGreater(i, 0, "渲染里找不到网关延迟 KPI")
+        return html[i:i + 320]
+
+    def test_excellent_latency_says_excellent(self):
+        kpi = self._kpi(3.2)
+        self.assertIn("优秀(&lt;10ms)", kpi)
+
+    def test_mid_latency_not_called_excellent(self):
+        """10~30ms 属「一般」, 不得再自称优秀."""
+        kpi = self._kpi(18.0)
+        self.assertNotIn("优秀", kpi)
+        self.assertIn("一般(10-30ms)", kpi)
+
+    def test_high_latency_not_called_excellent(self):
+        """≥30ms 属「偏高」, 不得再自称优秀 (审查原始复现)."""
+        kpi = self._kpi(45.0, loss_pct=5.0)
+        self.assertNotIn("优秀", kpi)
+        self.assertIn("偏高", kpi)
+
+    def test_sub_ms_latency_uses_lt1(self):
+        """局域网 <1ms 一律表达为 <1 (与 brief v1 同口径), 不写 0.0."""
+        kpi = self._kpi(0.0)
+        self.assertIn("&lt;1", kpi)
+        self.assertNotIn("0.0", kpi)
+
+    def test_loss_shown_next_to_latency(self):
+        kpi = self._kpi(45.0, loss_pct=5.0)
+        self.assertIn("丢包 5.0%", kpi)
+
+    def test_missing_latency_does_not_crash(self):
+        r = _fake_report()
+        r["modules"][0]["raw"]["ping"] = {}
+        html = N.render_report_html_brief_v2(r)
+        self.assertIn("网关延迟", html)
+        self.assertIn("未测", html)
+
+
 class tempfile_dir:
     """最小临时目录上下文 (避免引入 tempfile 之外的依赖语义)."""
 
