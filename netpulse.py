@@ -21,6 +21,7 @@ from __future__ import annotations
 
 # 抑制 scapy 导入时的 cryptography DH 弃用警告 (scapy 内部问题，不影响功能)
 import warnings
+import traceback
 warnings.filterwarnings("ignore", message=".*Diffie-Hellman over finite fields.*deprecated.*")
 
 import subprocess
@@ -374,6 +375,34 @@ def _offer_elevation_relaunch(args_tail=None, reason="", input_fn=None):
 _ADMIN_NETSH_RE = re.compile(r"netsh\s+(.+?)\s*\(管理员\)")
 _ADMIN_PS_RE = re.compile(r"powershell\s+(.+?)\s*\(管理员\)")
 
+# v1.15.0 (审查 P1-19): 修复命令是经 **cmd.exe** 解释的 ("cmd /k netsh ..."),
+# 且以管理员权限运行。命令体里的接口名来自本机探测结果, 而 Windows 的网络
+# 连接名是**用户可自定义**的 —— 含 & 或 " 的名字完全合法, 拼进去就能闭合
+# 引号、串联出第二条命令 (提权执行)。
+# 两道防线 (与 iperf3 白名单同一思路):
+#   ①源头: 接口名插值前过白名单 (_safe_iface_name)
+#   ②执行端: 命令体出现 shell 元字符一律拒绝执行
+# 合法命令只需 字母/数字/中文/空格/点/连字符/下划线/等号/引号/冒号/斜杠/
+# 星号/逗号/反斜杠 —— 星号是 PowerShell 注册表关键字通配符 (*SpeedDuplex) 必需。
+# cmd.exe 的元字符 (& | < > ^ % ! $ ` ; ( )) 一律不在白名单内;
+# 空白只放行**普通空格** (换行/制表符在 cmd 里会截断命令)。
+_SAFE_CMD_CHARS_RE = re.compile(
+    r'[A-Za-z0-9_\-\.=:\"\\/\*\u4e00-\u9fff, ]+')
+_SAFE_IFACE_RE = re.compile(r"[\w \-.()\[\]]{1,64}", re.UNICODE)
+
+
+def _safe_iface_name(name):
+    """校验网络接口名能否安全插值进命令行。非法返回 None (调用方退化成占位)。
+
+    白名单: 字母/数字/下划线/普通空格/点/连字符/圆括号/方括号 (含中文,
+    因为 \\w 在 Python re 下匹配 Unicode 字母数字)。**不含**引号、& | ; 等
+    shell 元字符, 也不含换行/制表符 —— 网络连接名是用户可自定义的。
+    """
+    s = (name or "").strip()
+    if not s or not _SAFE_IFACE_RE.fullmatch(s):
+        return None
+    return s
+
 
 def _extract_admin_fix_commands(root_causes):
     """从根因建议里提取带 "(管理员)" 标记的命令 (去重保序)。
@@ -433,6 +462,11 @@ def _offer_admin_fix_shell(commands, input_fn=None):
                 picked.append(c)
     launched = 0
     for kind, cmd in picked:
+        # v1.15.0 (审查 P1-19): 执行端兜底 —— 命令体含 shell 元字符就不执行。
+        # cmd.exe 会把 & | < > 等当命令分隔符, 提权窗口里执行 = 任意命令。
+        if not _SAFE_CMD_CHARS_RE.fullmatch(cmd):
+            print(_c(f"  ✘ 已跳过: 命令含不可安全执行的字符 ({kind})", C_YELLOW))
+            continue
         try:
             if kind == "powershell":
                 inner = f"powershell -NoProfile -ExecutionPolicy Bypass -Command {cmd}"
@@ -1964,7 +1998,11 @@ def _rule_mtu_blackhole(results_dict):
     confidence = 0.92 if corroborated else 0.75
     # 建议里的"接口名"程序已能拿到 (egress/最大 MTU 项), 直接填真实名字,
     # 不再让用户自己对着 netsh 帮助找接口名 (v1.9.3)。
-    if_name_part = f"\"{if_name}\"" if if_name else "\"接口名\""
+    # v1.15.0 (审查 P1-19): 该名字会被插值进**提权执行**的 netsh 命令
+    # (经 cmd.exe 解释), 而网络连接名用户可自定义 → 先过白名单, 非法就退化成
+    # 「接口名」占位 (让用户自己填), 绝不带脏字符进命令。
+    safe_if = _safe_iface_name(if_name)
+    if_name_part = f"\"{safe_if}\"" if safe_if else "\"接口名\""
     return RootCause(
         id="mtu_blackhole", category="MTU", severity=Severity.HIGH,
         title=f"MTU 不匹配 (路径 {path_min} < 接口 {if_max}, 差 {diff})",
@@ -3421,7 +3459,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.15.1"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -4026,6 +4064,11 @@ def _upload_speed_multi(host_port, threads=4, duration=8.0, chunk_size=256 * 102
     total_uploaded = [0]
     bytes_lock = threading.Lock()
     errors = [0]
+    # 最后一次成功 send 的时刻 (v1.15.0 审查 P1-20): 有效传输时长的基准。
+    # 不能用 join 之后的墙钟 —— worker 线程跑满 duration 后才退出, 而
+    # join(timeout=5) 还要再等最多 5 秒, 于是 elapsed = duration + 5,
+    # 速率被低估最多 38% (8/(8+5))。
+    last_send = [0.0]
 
     def worker():
         conn = None
@@ -4041,6 +4084,7 @@ def _upload_speed_multi(host_port, threads=4, duration=8.0, chunk_size=256 * 102
                 conn.send(payload)
                 with bytes_lock:
                     total_uploaded[0] += len(payload)
+                    last_send[0] = time.time()
         except Exception:
             with bytes_lock:
                 errors[0] += 1
@@ -4078,7 +4122,14 @@ def _upload_speed_multi(host_port, threads=4, duration=8.0, chunk_size=256 * 102
 
     for t in ts:
         t.join(timeout=5)
-    elapsed = time.time() - start
+    # v1.15.0 (审查 P1-20): 有效传输时长 = 「最后一个字节发出」到「开始传输」。
+    # 旧版用 join 之后的墙钟 (duration + 最多 5 秒 join 等待), 上行速率被低估
+    # 最多 38% —— 客户拿到的上行数字与实测对不上, 会误判宽带不达标。
+    with bytes_lock:
+        elapsed = (last_send[0] - start) if last_send[0] else 0.0
+    if elapsed <= 0:
+        # 兜底: 一个字节都没成功发出 (或时钟异常) → 用墙钟, 但不除以 0
+        elapsed = max(time.time() - start, 1e-6)
     total = total_uploaded[0]
     if total <= 0:
         return None
@@ -4364,16 +4415,35 @@ def _system_ansi_codepage():
 
 
 def _build_decode_order():
-    """构造编码尝试顺序: ANSI codepage > GBK > UTF-8 (去重保序)。"""
+    """构造编码尝试顺序: UTF-8 > ANSI codepage > GBK (去重保序)。
+
+    v1.15.0 (审查 P2): 旧版是 **ANSI > GBK > UTF-8** —— 在中文 Windows
+    (ANSI=cp936) 上, netsh / PowerShell 7 / 部分 WMI 命令输出的是 UTF-8,
+    而 GBK 双字节表覆盖极广 → 这些字节按 cp936 解码**几乎不抛异常**, 于是
+    得到满屏乱码; 更糟的是这个错误编码会被 _DECODE_CACHE 永久缓存,
+    之后每次跑同一命令都是乱码 (「输出版本乱码且被永久缓存」的根因)。
+
+    改 UTF-8 优先的理由: UTF-8 是**自校验**编码 —— 合法 UTF-8 字节流用
+    strict 模式必然成功, 而 GBK 字节流按 UTF-8 strict 解码几乎必然失败。
+    所以「先试 utf-8, 失败再退 ANSI/GBK」既能正确分流, 又不会误伤
+    纯 ASCII 输出 (两种编码结果相同)。
+    """
     seen = set()
     order = []
-    for enc in (_system_ansi_codepage(), "gbk", "utf-8"):
+    for enc in ("utf-8", _system_ansi_codepage(), "gbk"):
         if enc and enc not in seen:
             seen.add(enc)
             order.append(enc)
     if not order:
         order = ["utf-8"]
     return order
+
+
+def _strip_bom(text):
+    """去掉 UTF-8 BOM (解码后残留的 U+FEFF 会在报告/终端里显示成乱码)。"""
+    if text and text.startswith("\ufeff"):
+        return text[1:]
+    return text
 
 
 def _decode_bytes_pair(cmd, stdout, stderr):
@@ -4393,7 +4463,7 @@ def _decode_bytes_pair(cmd, stdout, stderr):
             try:
                 so = stdout.decode(cached) if stdout else ""
                 se = stderr.decode(cached) if stderr else ""
-                return so, se
+                return _strip_bom(so), _strip_bom(se)
             except (UnicodeDecodeError, AttributeError):
                 pass  # 本轮输出与上次不同, 回退到通用序列
 
@@ -4404,7 +4474,7 @@ def _decode_bytes_pair(cmd, stdout, stderr):
             se = stderr.decode(enc) if stderr else ""
             if cmd:
                 _DECODE_CACHE[cmd] = enc
-            return so, se
+            return _strip_bom(so), _strip_bom(se)
         except (UnicodeDecodeError, AttributeError):
             continue
 
@@ -4413,7 +4483,7 @@ def _decode_bytes_pair(cmd, stdout, stderr):
     se = stderr.decode("utf-8", errors="replace") if stderr else ""
     if cmd:
         _DECODE_CACHE[cmd] = "utf-8-replace"
-    return so, se
+    return _strip_bom(so), _strip_bom(se)
 
 
 def run_ps(script, timeout=30):
@@ -4578,20 +4648,45 @@ def get_local_ip():
 
 
 def get_dns_servers():
-    """获取系统配置的 DNS 服务器"""
+    """获取系统配置的 DNS 服务器。
+
+    v1.15.0 (审查 P1-21): ipconfig /all 的多 DNS 是「首行带 'DNS Servers' 标签 +
+    后续缩进续行」的格式 (每网卡一段), 例如:
+        DNS Servers . . . . . . . . . . . . . : 223.5.5.5
+                                          119.29.29.29
+    旧版只认带标签的那一行 → 第 2/3 个 DNS 全丢, DNS 诊断里「系统 DNS 列表」
+    比实际少一半, 装维据此判断「只有 1 个 DNS 配了」就会漏看主备配置。
+    """
     code, out, _ = run_cmd("ipconfig /all")
     dns_servers = []
-    for line in out.split("\n"):
+    in_dns_block = False
+
+    def _add(ip):
+        ip = (ip or "").strip()
+        if not ip or ip in dns_servers:
+            return
+        try:
+            ipaddress.IPv4Address(ip)
+        except Exception:
+            return
+        dns_servers.append(ip)
+
+    for raw in out.split("\n"):
+        line = raw.rstrip()
         if "DNS Servers" in line or "DNS 服务器" in line:
+            # 进入 DNS 块: 首行带标签, 冒号后是第一个 DNS
+            in_dns_block = True
             parts = line.split(":", 1)
             if len(parts) == 2:
-                ip = parts[1].strip()
-                try:
-                    ipaddress.IPv4Address(ip)
-                    if ip not in dns_servers:
-                        dns_servers.append(ip)
-                except Exception:
-                    pass
+                _add(parts[1])
+            continue
+        if in_dns_block:
+            s = line.strip()
+            # 续行 = 缩进 + 纯 IP (不含冒号); 遇到下一段 (含冒号) 退出 DNS 块
+            if s and ":" not in s:
+                _add(s)
+                continue
+            in_dns_block = False
     return dns_servers
 
 
@@ -12597,8 +12692,13 @@ def _prompt_for_capture(input_fn=None, resume_tail=None):
 
 
 def _cleanup_old_captures(cap_dir=None):
-    """启动时清理切片: 超过 CAPTURE_RETENTION_DAYS 天或总数超 CAPTURE_MAX_FILES
-    (删最旧)。返回删除的文件数; 失败静默 (清理不是主路径)。"""
+    """清理切片: 超过 CAPTURE_RETENTION_DAYS 天或总数超 CAPTURE_MAX_FILES
+    (删最旧)。返回删除的文件数; 失败静默 (清理不是主路径)。
+
+    v1.15.0 (审查 P2): 调用点从「仅抓包启动时」扩到「**每次运行 NetPulse**
+    启动时」(main() 入口) —— 弹窗与盯障报告两处都写着「下次运行 NetPulse 时
+    自动清理」, 旧版实际只在**下次再抓包**时才清理。
+    """
     cap_dir = cap_dir or _captures_dir()
     try:
         files = [os.path.join(cap_dir, f) for f in os.listdir(cap_dir)
@@ -13543,9 +13643,20 @@ def run_monitor_mode(duration_s, ext_target=None, load_url=None,
     全文件唯一在长循环外层捕获 KeyboardInterrupt 的地方: Ctrl+C 提前结束
     也必须走统一的报告落盘路径 (装维随时可停, 数据不丢)。"""
     duration_s = max(30, min(86400, int(duration_s or 600)))
+    # v1.15.0 (审查 P2): 进度行用 ANSI 转义刷新 (\\r\\033[K), 旧版没开 VT →
+    # 老 conhost 会把转义序列当字面字符打出来 (满屏 [K)。与 run_diagnostics
+    # 同口径, 进模式先确认 VT 可用。
+    _cli_enable_vt()
     session = MonitorSession(duration_s, ext_target, load_url=load_url)
     if not session.start():
         print(_c("  ✗ 外网 ping 启动失败, 无法开始监测 (检查 ping 命令可用性)", C_RED))
+        # v1.15.0 (审查 P2): start() 失败时网关侧的 LatencyMonitor 可能已经
+        # 起来了 (start 内部先建网关再试外网) —— 不清理会留下**孤儿 ping.exe
+        # 进程**直到本机重启。stop() 幂等, 这里补一次清理。
+        try:
+            session.stop()
+        except Exception:
+            pass
         return None
     tg = session  # noqa: F841 (保留引用便于将来扩展)
     print(_c(f"  盯障开始: 时长 {duration_s}s · 网关 {session._gw_ip or '—'} · "
@@ -13930,8 +14041,14 @@ def _cli_print_result(res, verbose=False, as_json=False, key=None):
                 text = vfn(res)
             except Exception:
                 text = None
-    if not text:
-        text = res.get("summary") or res.get("error") or ""
+    # v1.15.0 (审查 P1-15 同源, CLI 侧): 超时/错误时 verdict_fn 会把
+    # {"error": ...} 当空数据解读, 给出与故障无关的结论 (实测 linkspeed 超时 →
+    # "检测到 0 个适配器, 无在线网卡")。报告层 _present_module 早已改成
+    # 「一律以 error 原文为准」, CLI 层没跟上 → 同一份数据两种口径。
+    if res.get("error"):
+        text = str(res["error"])
+    elif not text:
+        text = res.get("summary") or ""
     if text:
         print(_c("  " + text, C_WHITE))
     # 2. 关键指标 (客户视图 metrics, 按 ok/warn/err 着色)
@@ -14045,6 +14162,12 @@ def _parse_keys(tokens, *, strict=True):
         elif m.lower() in MODULE_LETTER_KEYS:
             # 分类字母 (a/b/c): 展开为该分类下全部模块
             keys.extend(MODULE_LETTER_KEYS[m.lower()])
+        elif m.lower() in ("all", "*", "0"):
+            # v1.15.0 (审查 P2): --list 的收尾行明说「all / 0 / * 运行全部」,
+            # 交互菜单 (parse_choice) 也认这三个, 但 CLI 的 _parse_keys 只认
+            # key/序号/中文名/分类字母 → 输 0 或 * 直接报「未知模块」。
+            # 此处统一展开, 与菜单同口径 (full_module_keys = 含压力级 tcpcc)。
+            keys.extend(full_module_keys())
         elif m.isdigit() and 1 <= int(m) <= len(MODULE_REGISTRY):
             keys.append(MODULE_REGISTRY[int(m) - 1][0])
         else:
@@ -14506,9 +14629,10 @@ def _run_diagnostics_sequential(keys, is_tty):
         if is_tty:
             sys.stdout.write("\r\033[K")
             sys.stdout.flush()
-        if status in ("错误", "超时"):
-            print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge(status))
-            print(_c(f"  {res.get('error', status)}", C_RED))
+        # v1.15.0 (审查 P2): 错误/超时模块**不在这里**打标题+详情 ——
+        # run_diagnostics 的统一结果循环会打一遍 (与并行模式同构), 旧版这里
+        # 先打一遍、那边再打一遍 → 顺序模式下标题与错误文本各出现两次。
+        # 结果循环的结论行已用 error 原文 (见 _cli_print_result), 信息不丢。
         results[key] = status
         full[key] = res
     return results, full
@@ -19941,6 +20065,36 @@ def _html_to_pdf(chrome_exe, html_path, pdf_path, timeout=90):
         return f"调用 Chrome 失败: {exc}"
 
 
+def _site_report_base(cust, report_dir=None):
+    """现场检测报告的文件名前缀: 客户名消毒 + 按路径预算截断。
+
+    v1.15.0 (审查 P1-17): 客户名可能很长 (粘贴整段合同/地址), 直接进文件名
+    会超 Windows MAX_PATH(260) → 落盘直接失败, 三份交付物全丢 (现场白跑)。
+    按**完整路径预算**截断 (报告目录自身也可能很深), 留 20 字符余量:
+    最长后缀是 "_完整版.html" (10) + 时间戳 (15) + "现场检测_" (11)。
+    """
+    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", str(cust or "")).strip("_") or "客户"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_dir = report_dir if report_dir is not None else _report_dir()
+    budget = 240 - len(report_dir) - len(os.sep) - len("现场检测_") \
+        - len("_") - len(ts) - len("_完整版.html")
+    limit = max(4, min(60, budget))     # 60 = 可读性上限; budget = 硬上限
+    if len(safe) > limit:
+        safe = safe[:limit].rstrip("_")
+    return os.path.join(report_dir, f"现场检测_{safe}_{ts}")
+
+
+def _warn_ignored_mode(kept, dropped):
+    """顶层模式互斥提示 (统一口径, 免得各处文案漂移)。
+
+    v1.15.0 (审查 P1-18): --diagnose / --monitor / --site / --capture 是互斥的
+    顶层模式, 组合使用时必须**明确告知**被忽略了谁 —— 静默吞掉会让用户以为
+    跑了某个模式、实际没跑 (白等一场)。
+    """
+    print(_c(f"  提示: --{dropped} 与 --{kept} 是互斥的顶层模式, "
+             f"本次已忽略 --{dropped}", C_YELLOW))
+
+
 def run_site_visit(customer=None, install=False, pip_mirror=None):
     """现场检测模式 (v1.13.0): 上门全量诊断 + 机房 6 项勾选 → 一页客户报告。
 
@@ -20036,9 +20190,9 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
     if not report:
         print(_c("  报告构建失败 (无诊断数据)。", C_RED))
         return
-    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", cust).strip("_") or "客户"
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = os.path.join(_report_dir(), f"现场检测_{safe}_{ts}")
+    # v1.15.0 (审查 P1-17): 客户名过长会让文件名超 MAX_PATH → 落盘失败,
+    # 三份交付物全丢。消毒 + 路径预算截断见 _site_report_base。
+    base = _site_report_base(cust)
     outs = [(base + ".html", "brief_v2", "一页客户报告 (浏览器打开 Ctrl+P 打印交客户)"),
             (base + "_完整版.html", "full", "完整版报告 (带回 / 上传专家会诊)"),
             (base + ".json", None, "原始数据 JSON (后台深入分析)")]
@@ -20810,6 +20964,16 @@ def main():
                              "超限挤掉最旧包并如实报告; 配合 --capture 使用")
     args = parser.parse_args()
 
+    # v1.15.0 (审查 P2): 抓包切片的保留期清理在**每次运行**都做, 不只在下次
+    # 抓包时做 —— 旧版只在 _PcapCaptureSession.start() 里调, 于是「下次运行
+    # NetPulse 时自动清理」的承诺 (弹窗 / 盯障报告两处文案都这么写) 实际是
+    # 「下次再抓包时才清理」: 用户半年不抓包, 旧的 pcap 就一直躺在磁盘上
+    # (pcap 是要交给运营商的附件, 留着有隐私面)。
+    try:
+        _cleanup_old_captures()
+    except Exception:
+        pass
+
     # `netpulse diagnose <profile>` 子命令形式 (与 README/CHANGELOG 文档口径
     # 一致): 等价转写为 --diagnose <profile>, 剩余 token 仍按模块名处理
     if args.modules and args.modules[0] == "diagnose":
@@ -20923,7 +21087,13 @@ def main():
     if args.diagnose:
         # v1.14.14: 同上 — --site 与 --diagnose 也是互斥顶层模式, 不再静默吞掉。
         if args.site:
-            print(_c("  提示: --site 与 --diagnose 是互斥的顶层模式, 本次已忽略 --site", C_YELLOW))
+            _warn_ignored_mode("diagnose", "site")
+        # v1.15.0 (审查 P1-18): --monitor 与 --diagnose 同样是互斥顶层模式。
+        # diagnose 分支在 monitor 分支**之前** return, 旧版连提示都没有 ——
+        # 用户下了 "netpulse --diagnose gaming --monitor 300" 以为在盯障,
+        # 实际只跑了一次场景诊断就退出, 白等一场。
+        if args.monitor:
+            _warn_ignored_mode("diagnose", "monitor")
         profile = args.diagnose
         keys = DIAGNOSE_PROFILES[profile]
         print(_c(f"  按场景诊断: {profile} "
@@ -20946,13 +21116,15 @@ def main():
         return
     # 盯障模式: 独立顶层运行模式 (与模块诊断互斥)
     if args.capture and not args.monitor:
+        # --capture 是 --monitor 的**子选项** (不是顶层模式), 措辞与下面的
+        # 顶层模式互斥提示不同, 不共用 _warn_ignored_mode。
         print(_c("  提示: --capture 仅在 --monitor 盯障模式下生效, 本次已忽略", C_YELLOW))
     if args.monitor:
         # v1.14.14: --site / --monitor 是两个独立顶层模式, 互斥。原先 --site
         # 排在 --monitor 之后, 组合使用时被静默吞掉 (用户以为跑了现场检测,
         # 实际跑的是盯障) —— 与 --capture 的忽略提示保持一致, 明确告知。
         if args.site:
-            print(_c("  提示: --site 与 --monitor 是互斥的顶层模式, 本次已忽略 --site", C_YELLOW))
+            _warn_ignored_mode("monitor", "site")
         # v1.7.0 (PR-F0): 主动负载 opt-in — --monitor-load 用默认 CDN 大文件,
         # --load-url 可覆盖地址; 两者都没给则不制造流量
         if args.monitor_load or args.load_url:
@@ -20969,7 +21141,10 @@ def main():
                        pip_mirror=args.pip_mirror)
         return
     if args.modules:
-        is_all_only = (args.modules == ["all"])
+        # v1.15.0 (审查 P2): all / 0 / * 三者同义 (--list 收尾行就是这么写的),
+        # 旧版只特判恰好 ["all"], 输 0 或 * 走 _parse_keys 报「未知模块」。
+        is_all_only = (len(args.modules) == 1
+                       and str(args.modules[0]).strip().lower() in ("all", "0", "*"))
         if is_all_only:
             keys = full_module_keys()
             if not args.json:      # JSON 输出不掺人读文本
@@ -21011,5 +21186,63 @@ def main():
     interactive_menu(install=args.install, pip_mirror=args.pip_mirror)
 
 
+def _write_crash_log(exc):
+    """把未预期异常的完整 traceback 写到报告目录, 供现场回传排查。
+
+    返回日志路径; 写不进去返回 None (不能因为写日志失败而二次崩溃)。
+    """
+    try:
+        base = os.path.dirname(_report_dir())      # <程序目录>/reports
+        path = os.path.join(base, "netpulse_error.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n===== {datetime.now().isoformat()} =====\n")
+            traceback.print_exc(file=f)
+        return path
+    except Exception:
+        return None
+
+
+def _cli_entry():
+    """main() 的外层保护: 未预期异常不再抛裸 traceback。
+
+    v1.15.0 (审查 P2): 现场崩了就白跑一趟 —— 诊断跑了 2 分钟, 报告还没落盘,
+    装维只看到一屏 Python 栈, 既看不懂也不知道该重跑还是换环境。
+    这里兜住未预期异常: 打印一行可读原因 + 退出码 3 (与 compute_exit_code 的
+    「工具执行失败」同码), 并把完整 traceback 写到 reports/netpulse_error.log。
+
+    不改动的: SystemExit (argparse 的退出码 2/4 等) 原样抛出;
+    KeyboardInterrupt 单独处理 (Ctrl+C 不是错误, 退出码 130)。
+    """
+    try:
+        main()
+    except KeyboardInterrupt:
+        try:
+            print(_c("\n  已取消 (Ctrl+C)。", C_YELLOW))
+        except Exception:
+            pass
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        name = type(exc).__name__
+        try:
+            print(_c(f"\n  ✗ 发生未预期错误 ({name}): {exc}", C_RED))
+        except Exception:
+            pass
+        log_path = _write_crash_log(exc)
+        if log_path:
+            try:
+                print(_c(f"    完整错误信息已写入: {log_path}", C_GRAY))
+                print(_c("    可连同该文件一起回传, 便于排查。", C_GRAY))
+            except Exception:
+                pass
+        else:
+            try:
+                print(_c("    (错误日志写入失败, 请改用 --verbose 重跑一次)", C_GRAY))
+            except Exception:
+                pass
+        sys.exit(3)     # 3 = 工具执行失败 (与 compute_exit_code 口径一致)
+
+
 if __name__ == "__main__":
-    main()
+    _cli_entry()

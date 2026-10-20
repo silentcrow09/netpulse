@@ -7,6 +7,94 @@
 
 ## [Unreleased]
 
+## [1.15.1] - 2026-10-21
+
+审查清单剩余项的修复批次（12 项：5 个 P1 + 7 个 P2）。每一项都配了回归测试，
+且新测试必须对**修复前**的代码跑出失败才算数。
+
+**行为变更（升级注意）**：
+
+- 错误/超时模块在 CLI 里的标题与错误文本现在**只出现一次**（旧版顺序模式打两遍），
+  且结论行一律用 error 原文（不再出现「检测到 0 个适配器」这类与故障无关的文案）。
+- 命令解码顺序改为 **UTF-8 优先**（旧版 ANSI 优先）。中文 Windows（cp936）上
+  netsh / PowerShell 7 的 UTF-8 输出不再乱码。
+- **每次运行** NetPulse 都会清理超期抓包切片（旧版只有「下次再抓包时」才清）。
+- 崩溃不再抛裸 traceback：打印一行可读原因，退出码 3，完整 traceback 写到
+  `reports/netpulse_error.log`。
+- `netpulse 0` / `netpulse *` 现在与 `netpulse all` 等价（`--list` 早就这么写着）。
+
+### 修复 · P1
+
+- **上行测速速率被低估最多 38%**：`_upload_speed_multi` 的 `elapsed` 在
+  `join(timeout=5)` **之后**才取 —— worker 跑满 duration 后才退出，join 还要再等最多
+  5 秒，于是 `elapsed = duration + 5`，客户拿到的上行数字与实测对不上。
+  - 修法：记录**最后一个字节发出的时刻**，`elapsed = last_send - start`（有效传输窗口）。
+- **DNS 列表漏掉第 2/3 个 DNS**：`ipconfig /all` 的多 DNS 是「首行带标签 + 后续缩进
+  续行」的格式，旧版只认带标签那一行 → 系统 DNS 列表比实际少一半。
+  - 修法：识别 DNS 块状态，块内无冒号的纯 IP 行一并收集，遇到下一段退出块。
+- **客户名过长导致报告落盘全丢**：客户名整段进文件名，超 260 字符时
+  `OSError` → **三份交付物全没**，现场白跑一趟。
+  - 修法：抽 `_site_report_base()` —— 非法文件名字符替换 + 按**完整路径预算**截断
+    （报告目录自身也可能很深），留 20 字符余量。
+- **`--diagnose` + `--monitor` 静默吞并**：diagnose 分支在 monitor 分支之前 return，
+  连提示都没有 → 用户以为在盯障，实际只跑了一次场景诊断就退出。
+  - 修法：新增 `_warn_ignored_mode()`，统一 site / diagnose / monitor 三处互斥提示口径。
+- **管理员修复命令可被接口名注入**：MTU 建议把**本机探测到的接口名**插值进要提权执行的
+  netsh 命令（经 cmd.exe 解释），而 Windows 的网络连接名是**用户可自定义**的 ——
+  含 `&` 或 `"` 就能闭合引号、在提权窗口里串联出第二条命令。
+  - 修法（两道防线，与 iperf3 同思路）：①源头 `_safe_iface_name()` 白名单，非法接口名
+    退化成「接口名」占位；②执行端 `_SAFE_CMD_CHARS_RE` 兜底，命令体含 cmd 元字符
+    一律不执行。
+
+### 修复 · P2
+
+- **顺序模式错误/超时模块标题打印两次**：`_run_diagnostics_sequential` 打一遍，
+  统一结果循环再打一遍 → 标题与错误文本各出现两次。
+  - 修法：顺序模式不再即时打印，统一由结果循环输出（与并行模式同构）。
+- **CLI 结论用误导性 verdict**：超时/错误时 `verdict_fn` 会把 `{"error": ...}` 当空数据
+  解读（实测 linkspeed 超时 → 「检测到 0 个适配器, 无在线网卡」）。报告层早已改成
+  「一律以 error 原文为准」，CLI 层没跟上 → 同一份数据两种口径。
+  - 修法：`_cli_print_result` 同样以 error 原文覆盖结论。
+- **`--list` 宣称 `all / 0 / *` 但 CLI 只认 `all`**：交互菜单三个都认，CLI 侧 `0` / `*`
+  直接报「未知模块」（`all` 靠 main() 里恰好等于 `["all"]` 的特判）。
+  - 修法：`_parse_keys` 支持三个别名，展开为 `full_module_keys()`（与菜单同口径）。
+- **Win11 UTF-8 输出乱码且被永久缓存**：解码顺序是 `ANSI > GBK > UTF-8`，而 GBK 双字节表
+  覆盖广 → UTF-8 字节按 cp936 解码**不抛异常**但得到乱码，这个错误编码还被
+  `_DECODE_CACHE` 永久缓存，之后每次跑同一命令都是乱码。
+  - 修法：改 **UTF-8 优先**（UTF-8 自校验：合法 UTF-8 strict 解必然成功，GBK 字节按
+    UTF-8 解几乎必然失败），失败再退 ANSI/GBK；另去 UTF-8 BOM。
+- **抓包保留期「下次运行清理」实为「下次再抓包时清理」**：清理只在
+  `_PcapCaptureSession.start()` 里调，而弹窗与盯障报告两处文案都写着「下次运行
+  NetPulse 时自动清理」。
+  - 修法：`_cleanup_old_captures()` 上移到 `main()` 入口 → 每次运行都清。
+- **盯障进度行没开 VT**：进度行用 `\r\033[K` 刷新，旧 conhost 会把转义序列当字面字符
+  打出来（满屏 `[K`）。
+  - 修法：`run_monitor_mode` 进模式先 `_cli_enable_vt()`（与 `run_diagnostics` 同口径）。
+- **盯障启动失败留下孤儿 ping.exe**：`MonitorSession.start()` 先建网关 monitor 再试外网，
+  外网失败时直接 `return False`，已启动的网关 ping 进程没人 terminate，残留到关机。
+  - 修法：`start()` 失败时补 `session.stop()` 清理（幂等，安全）。
+- **崩溃是裸 traceback 且零交付物**：`main()` 零 try/except → 现场崩了就是一屏
+  Python 栈，既看不懂也不知道该重跑还是换环境。
+  - 修法：新增 `_cli_entry()` 外层保护 —— 未预期异常打印一行可读原因 + 退出码 3
+    （与 `compute_exit_code` 的「工具执行失败」同码），完整 traceback 写到
+    `reports/netpulse_error.log` 供回传；`SystemExit` 原样透传，`Ctrl+C` 单独处理
+    （退出码 130）。
+
+### 测试
+
+- 全量测试 **35 个测试文件全绿**（新增 `tests/test_v1150_backlog.py`，28 用例）。
+- **零回归**：固定 fixture 渲染 customer / brief / brief_v2 三份 HTML，与修复前逐行
+  `Compare-Object` —— **三份全部完全一致**。
+- **闸门有效性**：28 个新用例对修复前的代码全部跑红（24 个直接红，其余因新增 API
+  不存在而 error），旧用例 0 红。
+
+### 已知未修（清单已记录理由）
+
+P1-16（调试包直读 `LAST_RUN`）、P1-22（抓包授权标记）、P1-15b（`wan_interruption`
+误报）、P1-15c（brief_v2 主要发现不列超时）、测速报告族另立状态色、LAN 扫描 MAC
+发第三方、公网 IP/geo 明文 HTTP、Npcap 安装器签名校验 —— 后四项需要新增开关/披露
+功能（收口期冻结），前四项需单独排期。
+
 ## [1.15.0] - 2026-10-20
 
 全仓代码审查（4 路子进程逐模块 + 父进程逐条实跑复核）的修复批次，共 17 项：
@@ -1458,6 +1546,7 @@ v1.4.0 代码审查修复：v1.2.0–v1.4.0 有多项路线图标 [x] 但未真�
 - HTML / JSON 报告导出，支持浏览器打印/另存为 PDF
 - 国内网络优化：默认使用国内 DNS（AliDNS / DNSPod / 114）与公网 IP 服务
 
-[Unreleased]: https://github.com/silentcrow09/netpulse/compare/v1.15.0...HEAD
+[Unreleased]: https://github.com/silentcrow09/netpulse/compare/v1.15.1...HEAD
+[1.15.1]: https://github.com/silentcrow09/netpulse/compare/v1.15.0...v1.15.1
 [1.15.0]: https://github.com/silentcrow09/netpulse/compare/v1.14.14...v1.15.0
 [1.0.0]: https://github.com/henu_09/netpulse/releases/tag/v1.0.0
