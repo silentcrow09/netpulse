@@ -196,7 +196,7 @@ class TestDebugBundleRedactionEndToEnd(unittest.TestCase):
         }
         d = tempfile.mkdtemp(prefix="np_bundle_test_")
         try:
-            N._export_debug_bundle(d)
+            N._export_debug_bundle(d, N.LAST_RUN)
             zips = [f for f in os.listdir(d) if f.endswith(".zip")]
             self.assertTrue(zips, "没生成 zip")
             blob = ""

@@ -177,7 +177,7 @@ class TestModuleMenuDebugKey(unittest.TestCase):
              mock.patch("netpulse._report_dir", return_value=self._tmp), \
              mock.patch("netpulse._export_debug_bundle") as m_exp:
             np._module_menu()
-        m_exp.assert_called_once_with(self._tmp)
+        m_exp.assert_called_once_with(self._tmp, np.LAST_RUN)
 
 
 class TestWebTargetsPrompt(unittest.TestCase):

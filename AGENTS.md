@@ -35,6 +35,28 @@
 不要在各渲染函数里另立映射（曾因三份映射并存出现过两种「警告橙」）。
 `PROBLEM_STATUSES` 决定哪些状态会被标红 + 默认展开。
 
+**v1.15.2 补充（色值审查结论，勿回退）**：
+
+- **按语义轴分层**。全仓约 550 处 hex，但它们分属**不同语义轴**，不能一锅端塞进
+  `STATUS_COLORS`：
+  - **状态语义轴**（完成/警告/异常/错误/超时/未检测）→ 归 `STATUS_COLORS`。
+    客户版 CSS 里那 11 处 `.dot.*` / `.stat-card.*` 已改为引用（拆成
+    `_CSS_DOT_COLORS` / `_CSS_STAT_COUNT_COLORS` 片段 + `%` 格式化 ——
+    **不要**把整块 CSS 改成 f-string，里面全是 `{{ }}` 双花括号，逐个转义风险高）
+  - **数据轴身份轴**（测速/iperf3 的下行蓝 `#0a84ff` / 上行橙 `#ff9500` /
+    延迟绿 `#34c759`）→ **不进 `STATUS_COLORS`**。这两族报告页脚自己写着
+    「仅为客观测速数据, 不包含达标判定」—— 把「延迟轴」标成 `ok`（正常绿）
+    是语义错配（把「测的是哪条曲线」偷换成「好不好」）
+  - **等级轴**（A–F）→ `GRADE_COLORS` / `GRADE_BADGE`
+  - **严重度轴**（critical/high/medium/low）→ `_DIAGNOSIS_CSS`
+- **已修真 bug**：`_DIAGNOSIS_CSS` 的 `.dbadge.warn` 曾是红底红字 `#fee2e2/#991b1b`，
+  与客户版 `.badge.err` **逐字节相同** —— 同一份报告里「警告」和「错误」渲染出来
+  一模一样。现已与 `.badge.warn` 同口径（橙底棕字）。
+- **仍待排期**：盯障族（`#0e8a4f`/`#b26a00`/`#b42318`）与 brief v1
+  （`#0e8a4f`/`#d92d20`/`#b26a00`）归位到 `STATUS_COLORS`。这两族是**纯状态语义轴**，
+  归位正确但会**改变用户可见颜色**（盯障报告是运维长时间盯的产物，色变影响判读习惯），
+  且 6 处引用里有 3 处在含大量 `{{}}` 转义的 f-string/CSS/JS 里 → 需人工视觉确认后单独做。
+
 ## 报告渲染
 
 - `export_report` 只调用 `render_report_html_customer`（客户视图）
@@ -206,11 +228,40 @@
 - Release 正文里 `[CHANGELOG.md](./CHANGELOG.md)` 的相对链接，GitHub 会自动重写成
   `/{owner}/{repo}/blob/{tag}/CHANGELOG.md`，可用（已实测 v1.15.1 渲染结果）。
 
+## 隐私开关与环境变量 (v1.15.2 起)
+
+项目对外**有第三方查询**（公网 IP / 出口位置 / LAN 厂商补查），每个都有开关：
+
+| 变量 | 作用 | 覆盖的调用点 |
+|---|---|---|
+| `NP_OFFLINE=1` | 完全关闭公网 IP / IPv6 / 地理 / ASN 查询 | `get_public_ip` / `get_public_ipv6` / `get_ip_geo` / egress 模块自带的 IP 服务池 —— **四个入口都要各自判**，只在 `run_diagnostics` 层判断会漏掉 nattype 与 egress |
+| `NP_NO_ONLINE_OUI=1` | 关闭 LAN 厂商在线补查（不把 MAC 发给第三方） | `_oui_vendor_online` |
+
+- 两个开关**默认都不设置**（行为与以前一致）；`NETWORK_CONFIG["offline"]` / `_OUI_ONLINE_ENABLED`
+  是**模块级常量**（环境变量在 import 时读一次），测试里要 mock 常量而不是改环境变量。
+- `_env_flag(name)` 统一判定：值非空且不为 `0/false/no/off` 即为真。
+- **披露必须从常量生成**（AGENTS.md 既有硬规则）：第三方服务清单是
+  `PUBLIC_IP_SERVICES` / `_IPV6_SERVICES` / `_EGRESS_IP_SERVICES` / `IP_GEO_SERVICE` /
+  `OUI_ONLINE_SERVICE`，披露文案里的域名一律用 `_public_ip_service_domains()` 取，
+  **不要在文案里另写一份域名**（改了一处漏一处 = 新的文案漂移）。
+- geo 查询**必须走 HTTPS**：旧版用明文 HTTP 的 ip-api.com，把公网 IP 躺在 URL path 里，
+  路径上任何一跳都能读到。ip-api 免费版不支持 HTTPS（实测 403），已换 ipwho.is
+  （`?lang=zh-CN` 中文返回，字段与旧服务对齐）。
+
+## 抓包授权标记 (v1.15.2)
+
+`.capture_ack` 写 `{"ts": ISO时间, "fp": 白名单指纹}`，判读时校验三件事：
+时间戳可解析 / 未超 `CAPTURE_ACK_VALID_DAYS`（30 天）/ 白名单指纹仍一致
+（指纹 = `CAPTURE_WEB_PORTS` + `CAPTURE_PAYLOAD_PORTS` + `CAPTURE_PAYLOAD_KEEP` +
+`CAPTURE_FIRST_PKTS` + `CAPTURE_RETENTION_DAYS` + `CAPTURE_MAX_FILES` 的哈希）。
+任一不满足 → 重新征求授权。**旧格式（只有一行时间戳）判无效** —— 否则老用户永远
+不会被新白名单约束。读文件失败（权限/只读目录）保持「不拦路」语义。
+
 ## 验证
 
 ```bash
 for f in tests/test_*.py; do python "$f"; done
-#   单元/回归套件 (v1.14.14: 27 文件 / 517 用例): diagnosis/诊断矩阵/丢包口径/
+#   单元/回归套件 (v1.15.2: 41 文件): diagnosis/诊断矩阵/丢包口径/
 #   XSS 转义 (含测速报告族 href 属性注入回归)/抓包离线分析/pcap 分析与取证/
 #   **抓包生产管线端到端 (v1.14.14 新增, 最重要的一条)**/控制台编码兜底 (v1.14.14)/
 #   **JSON Schema ↔ 导出一致性 (v1.14.14 新增)**/probes/redaction/场景菜单/

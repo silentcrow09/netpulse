@@ -31,6 +31,7 @@ import socket
 import struct
 import time
 import json
+import hashlib
 import os
 import re
 import sys
@@ -41,7 +42,7 @@ import ipaddress
 import shutil
 import zipfile
 from bisect import bisect_left
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict, Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.request import urlopen, Request
@@ -1766,6 +1767,29 @@ def _rule_wan_interruption(results_dict):
     if tcp_total <= 0 or tcp_ok > 0:
         return None  # 至少一个目标 TCP 可达 / 无目标数据, 不算 WAN 中断
     confidence = _rule_confidence([(ext_res, 1.0), (gw, 0.3)], base=0.7)
+    # v1.15.2 (审查 P1-15b): 分段归因 —— 「TCP 全不通」有两种成因, 旧版一律
+    # 断言「运营商链路故障」, 让装维白跑一趟运营商:
+    #   ① 目标真不可达 (unreachable_count > 0) → 运营商侧链路故障
+    #   ② 目标主机 ping 得通、TCP 被拦 (tcp_blocked, unreachable_count == 0)
+    #      → 阻断点在本机/企业防火墙/代理, 不是运营商上联
+    # unreachable_count 缺失时**回落旧行为** (不凭空断言, 也不误伤旧数据)。
+    unreachable = ext_res.get("unreachable_count")
+    if unreachable is not None and int(unreachable) <= 0:
+        return RootCause(
+            id="wan_interruption", category="WAN", severity=Severity.HIGH,
+            title="出网 TCP 全不通 (目标可达, 疑似本机/出口侧拦截)",
+            description="网关可达、目标主机也 ping 得通, 但 TCP 连接全部失败 —— "
+                        "更像本机/企业侧防火墙或代理拦截, 不是运营商链路故障。",
+            confidence=confidence,
+            evidence_ids=["external.tcp_ok", "external.tcp_total",
+                          "external.unreachable_count", "gateway.ping.loss_pct"],
+            affected_modules=["external", "gateway"],
+            recommendations=[
+                "1. 跑 proxy 模块确认是否走了代理, 直连是否被拦",
+                "2. 检查本机/企业防火墙出站策略 (443/80 是否放行)",
+                "3. 确认无代理无拦截后, 再联系运营商核对出口策略",
+            ],
+        )
     return RootCause(
         id="wan_interruption", category="WAN", severity=Severity.CRITICAL,
         title="WAN 中断 (运营商链路故障)",
@@ -2180,6 +2204,13 @@ def _ev_wan_interruption(results, evd=None):
         gw_loss = ping.get("loss_pct") if ping else None
     if isinstance(gw_loss, (int, float)) and gw_loss < 5:
         excludes.append(_ev("本机网卡与网线 / WiFi 链路无丢包", True))
+    # v1.15.2 (审查 P1-15b): 与规则同步 —— 目标主机 ICMP 可达但 TCP 全被拦时,
+    # 阻断点在本机/出口侧, 不是运营商上联。旧版排除项全是「本机侧没问题」,
+    # 没有任何一条能排除运营商侧, 撑不住「故障点在运营商」这个断言。
+    unreachable = ext.get("unreachable_count")
+    if unreachable is not None and int(unreachable) <= 0:
+        excludes.append(_ev(
+            "目标主机 ICMP 可达, TCP 全部被拦 — 阻断点在本机/出口侧, 非运营商上联", True))
     return supports, excludes
 
 
@@ -2819,7 +2850,11 @@ _DIAGNOSIS_CSS = """
 .diagnosis.healthy .dbadge.ok { font-size: 14px; padding: 5px 14px; }
 .diagnosis .dbadge { padding: 4px 10px; border-radius: 4px; font-weight: 600; font-size: 13px; }
 .diagnosis .dbadge.ok { background: #dcfce7; color: #166534; }
-.diagnosis .dbadge.warn { background: #fee2e2; color: #991b1b; }
+/* v1.15.2 (审查 P2 · 两种警告色): 旧版 .dbadge.warn 用的是红底红字
+   (#fee2e2/#991b1b) —— 与客户版 .badge.err 逐字节相同, 同一份报告里
+   「警告」和「错误」渲染出来一模一样。现与客户版 .badge.warn 同口径
+   (橙底棕字), 警告/错误一眼可分。 */
+.diagnosis .dbadge.warn { background: #fef3c7; color: #9a3412; }
 .diagnosis .dconf { color: #64748b; font-size: 13px; }
 .diagnosis .rcard { padding: 12px 16px; border-left: 4px solid #94a3b8; margin-bottom: 12px; background: #f8fafc; border-radius: 0 6px 6px 0; }
 .diagnosis .rcard.severity-critical { border-color: #dc2626; background: #fef2f2; }
@@ -2998,31 +3033,37 @@ def _redact_dict(d):
     return out
 
 
-def _export_debug_bundle(out_dir):
+def _export_debug_bundle(out_dir, run=None):
     """阶段 D · v1.4.0: 生成脱敏调试包.
 
     流程:
-      1. 跑一次全诊断 (若 LAST_RUN 不存在)
+      1. 跑一次全诊断 (调用方未传 run 时)
       2. 脱敏 (SSID / MAC / 公网 IP / hostname)
       3. 写 system.json + diagnostic.json + evidence.json + netpulse.log
       4. 打包 zip, 输出到 out_dir
+
+    v1.15.2 (审查 P1-16 · 收口规则): 本函数原先直读全局 LAST_RUN (8 处),
+    改为**显式传参** —— 数据流向 runner → report → renderer, 导出层不再依赖
+    全局可变状态 (AGENTS.md 收口规则明令点名 Debug Bundle)。
+    run=None 时兜底跑一次全诊断 (CLI --debug-bundle 路径, 保持原有行为:
+    串行 22 个模块, 不含压力级 tcpcc), 取 run_diagnostics 的返回值, 同样不读全局。
     """
     # 1. 确保有诊断数据
-    if not LAST_RUN:
+    if not run:
         print(_c("  首次生成 debug-bundle, 跑全诊断 (不含压力级 tcpcc, 约 30-120 秒)...",
                  C_GRAY))
-        run_diagnostics(all_module_keys())
-    if not LAST_RUN:
+        run = run_diagnostics(all_module_keys())
+    if not run:
         print(_c("  ✗ 跑诊断失败, 无法生成 debug-bundle", C_RED))
         return
     # 2. 脱敏
     try:
-        sys_info_redacted = _redact_dict(dict(LAST_RUN.get("system", {})))
+        sys_info_redacted = _redact_dict(dict(run.get("system", {})))
         # v1.15.0 (审查 P1-10): results 的值不一定是 dict (可能是 list/标量),
         # 旧版 `isinstance(v, dict) else v` 会让 list 原样落盘 → 漏脱敏。
         diag_redacted = {k: _redact_any(v)
-                         for k, v in (LAST_RUN.get("results") or {}).items()}
-        ev_redacted = _redact_dict(dict(LAST_RUN.get("evidence") or {}))
+                         for k, v in (run.get("results") or {}).items()}
+        ev_redacted = _redact_dict(dict(run.get("evidence") or {}))
     except Exception as e:
         print(_c(f"  ✗ 脱敏失败: {e}", C_RED))
         return
@@ -3053,10 +3094,10 @@ def _export_debug_bundle(out_dir):
         f.write(f"Schema version: {SCHEMA_VERSION}\n")
         f.write("-" * 60 + "\n")
         f.write("模块运行状态:\n")
-        for k, st in (LAST_RUN.get("status") or {}).items():
+        for k, st in (run.get("status") or {}).items():
             f.write(f"  [{st}] {k}\n")
-        f.write(f"运行模块: {', '.join(LAST_RUN.get('keys') or [])}\n")
-        for k, res in (LAST_RUN.get("results") or {}).items():
+        f.write(f"运行模块: {', '.join(run.get('keys') or [])}\n")
+        for k, res in (run.get("results") or {}).items():
             err = res.get("error") if isinstance(res, dict) else None
             if err:
                 f.write(f"  ERROR {k}: {_redact_text_value(str(err)[:200])}\n")
@@ -3169,29 +3210,138 @@ def _download_file(url, dest, timeout=180):
         return False, f"下载失败: {e}"
 
 
+# ── Npcap 安装器: 下载来源与完整性基线 (v1.15.2 审查 P2) ──
+# 实测基线 (2026-10-21, 官方 https://npcap.com/dist/npcap-1.80.exe):
+#   1,202,472 字节
+#   SHA256 = ac4f26d7d9f994d6f04141b2266f02682def51af63c09c96a7268552c94a6535
+#   Authenticode 签名者 CN=Nmap Software LLC, O=Nmap Software LLC (DigiCert 链,
+#   证书有效期 2024-07-25 ~ 2027-06-10, 带 DigiCert 时间戳)
+# 厂商换版本时 SHA256 会变 —— 此时退到 Authenticode 签名校验放行 (见 _install_npcap),
+# 而不是硬性拒绝, 避免把用户卡在「装不上 Npcap → DHCP 完整检测不可用」。
+NPCAP_INSTALL_URL = "https://npcap.com/dist/npcap-1.80.exe"
+NPCAP_SHA256 = "ac4f26d7d9f994d6f04141b2266f02682def51af63c09c96a7268552c94a6535"
+# 认可的签名者关键词 (Subject 里出现任一即认可; 全小写比较)
+NPCAP_SIGNER_KEYWORDS = ("nmap software llc",)
+
+
+def _file_sha256(path, chunk=1 << 16):
+    """文件 SHA256 (小写 hex)。读不到返回 None。"""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(chunk)
+                if not b:
+                    break
+                h.update(b)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _verify_authenticode_signer(path, keywords=None, timeout=45):
+    """校验文件的 Authenticode 签名。返回 (ok, detail)。
+
+    用 PowerShell 的 Get-AuthenticodeSignature (Windows PowerShell 5.1 自带,
+    找不到时退到 pwsh)。**文件路径经环境变量传给 PowerShell, 不拼进命令行** ——
+    临时路径含空格/引号时拼命令既会炸, 又是命令注入面。
+
+    返回 detail 形如 "CN=Nmap Software LLC, ..." (通过) 或失败原因 (不通过)。
+    """
+    keywords = tuple(k.lower() for k in (keywords or NPCAP_SIGNER_KEYWORDS))
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "$s = Get-AuthenticodeSignature -LiteralPath $env:NP_SIGN_TARGET;"
+        "Write-Output ('STATUS=' + $s.Status);"
+        "if ($s.SignerCertificate) "
+        "{ Write-Output ('SUBJECT=' + $s.SignerCertificate.Subject) }"
+    )
+    env = dict(os.environ)
+    env["NP_SIGN_TARGET"] = path
+    last_err = ""
+    for exe in ("powershell", "pwsh"):
+        try:
+            proc = subprocess.run(
+                [exe, "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True, text=True, timeout=timeout, env=env)
+        except FileNotFoundError:
+            last_err = f"{exe} 不存在"
+            continue
+        except Exception as e:
+            last_err = f"{exe} 调用失败: {e}"
+            continue
+        status, subject = "", ""
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            if line.startswith("STATUS="):
+                status = line[7:].strip()
+            elif line.startswith("SUBJECT="):
+                subject = line[8:].strip()
+        if not status:
+            last_err = f"{exe} 无输出 (退出码 {proc.returncode})"
+            continue
+        if status.lower() != "valid":
+            return False, f"签名状态 {status}"
+        if not any(k in subject.lower() for k in keywords):
+            return False, f"签名者不匹配: {subject or '(无证书主体)'}"
+        return True, subject
+    return False, last_err or "签名校验不可用"
+
+
 def _install_npcap():
     """下载并以静默方式安装 Npcap (需管理员权限)。返回 (ok, msg)。
 
     v1.9.7 PR-3: 保留管理员守卫 (函数语义不变)。交互路径的「一键提权重启」
     在调用方 ensure_scapy 的失败分支里做 (_offer_elevation_relaunch)。
+
+    v1.15.2 (审查 P2 · 安装器完整性):
+      旧版把下载到的 exe 存到**固定**路径 `%TEMP%\\npcap-install.exe`, 中间
+      既无哈希校验也无签名校验, 随后**以管理员权限直接执行** —— 同机其它进程
+      可在下载与执行之间抢先替换该文件 (TOCTOU), 且下载被截断/被劫持也会照跑。
+      现改为: 唯一临时目录 + SHA256 基线钉死; 基线不命中时退到 Authenticode
+      签名校验 (签名者须为 Nmap Software LLC)。两者都不通过 → **拒绝执行**,
+      并给出手动下载链接兜底。
     """
     if _npcap_installed():
         return True, "Npcap 已安装"
     if not _is_admin():
         return False, ("需要管理员权限才能安装 Npcap。请右键\"以管理员身份运行\"本程序后重试，"
                        "或手动下载安装: https://npcap.com/#download")
-    url = "https://npcap.com/dist/npcap-1.80.exe"
-    tmp = os.path.join(tempfile.gettempdir(), "npcap-install.exe")
-    ok, msg = _download_file(url, tmp)
-    if not ok:
-        return False, f"{msg}\n可手动下载: https://npcap.com/#download"
+    # 唯一临时目录: 避免固定文件名被同机其它进程替换 (TOCTOU)
     try:
-        proc = subprocess.run([tmp, "/S"], capture_output=True, text=True, timeout=300)
+        tmp_dir = tempfile.mkdtemp(prefix="netpulse-npcap-")
+    except Exception as e:
+        return False, f"创建临时目录失败: {e}"
+    tmp = os.path.join(tmp_dir, "npcap-install.exe")
+    try:
+        ok, msg = _download_file(NPCAP_INSTALL_URL, tmp)
+        if not ok:
+            return False, f"{msg}\n可手动下载: https://npcap.com/#download"
+        digest = _file_sha256(tmp)
+        if digest == NPCAP_SHA256:
+            pass  # 哈希命中内置基线 —— 字节完全一致, 比签名更强
+        else:
+            # 基线未命中 (厂商可能已更新安装器): 退到签名校验再决定放不放过
+            signed, detail = _verify_authenticode_signer(tmp)
+            if not signed:
+                return False, (
+                    "安装器校验未通过, 已拒绝执行。\n"
+                    f"  期望 SHA256: {NPCAP_SHA256}\n"
+                    f"  实际 SHA256: {digest or '(读取失败)'}\n"
+                    f"  签名校验: {detail}\n"
+                    "可手动下载安装: https://npcap.com/#download")
+            print(_c(f"  ⚠ Npcap 安装器版本已更新 (哈希与内置基线不符), "
+                     f"已通过厂商签名校验放行: {detail}", C_YELLOW))
+        try:
+            proc = subprocess.run([tmp, "/S"], capture_output=True, text=True, timeout=300)
+        except Exception as e:
+            return False, f"Npcap 安装异常: {e}"
         if proc.returncode != 0:
             return False, f"Npcap 安装返回错误码 {proc.returncode}"
         return True, "Npcap 安装完成 (可能需要重启后生效)"
-    except Exception as e:
-        return False, f"Npcap 安装异常: {e}"
+    finally:
+        # 装完即清 (安装器自解包子进程可能还占着文件 → ignore_errors 兜住)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _run_install_npcap_entry():
@@ -3459,7 +3609,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.15.1"
+APP_VERSION = "1.16.0"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -4732,6 +4882,81 @@ def _get_local_subnet(local_ip):
         return None
 
 
+# 公网 IP 查询服务 (国内 + 国际, 并发取首个成功)
+# v1.15.2 (审查 P2): 服务清单提为常量 —— 隐私披露文案要按**实际发出去的域名**
+# 生成, 不能在文案里另写一份 (曾出现「文案说 80/443 而白名单含 8080」那类漂移)。
+PUBLIC_IP_SERVICES = (
+    ("https://qifu-api.baidubce.com/ip/local/geo/v1/district", "json"),
+    ("https://myip.ipip.net", "text"),
+    ("https://ddns.oray.com/checkip", "text"),
+    ("https://api.ipify.org", "text"),
+    ("https://ifconfig.me/ip", "text"),
+    ("https://ip.sb", "text"),
+)
+
+# IPv6 公网 IP 服务 (国内访问不稳, 失败容错)
+_IPV6_SERVICES = (
+    "https://api64.ipify.org",      # ipify IPv6 版, 国际稳定
+    "https://ipv6.icanhazip.com",   # icanhazip IPv6 版
+    "https://v6.ident.me",          # ident.me IPv6
+)
+
+# egress 模块自带的 IP 服务池 (与上面的池有重叠, 但多一个 cip.cc)
+_EGRESS_IP_SERVICES = (
+    ("https://qifu-api.baidubce.com/ip/local/geo/v1/district", "json"),
+    ("https://myip.ipip.net", "text"),
+    ("https://www.cip.cc", "text"),
+)
+
+# 地理/ASN 查询服务。
+# v1.15.2 (审查 P2): 旧版用**明文 HTTP** 的 ip-api.com —— 免费版不支持 HTTPS
+# (实测 https 返回 403), 且公网 IP 明文躺在 URL path 里, 路径上任何一跳
+# (公共 WiFi 的 AP、运营商透明代理) 都能直接读到用户公网 IP。
+# 改用 ipwho.is: HTTPS + lang=zh-CN 中文返回, 字段与旧服务对齐
+# (country/region/city 顶层, isp/asn 在 connection 里)。
+IP_GEO_SERVICE = "https://ipwho.is/{ip}?lang=zh-CN"
+
+
+def _env_flag(name):
+    """环境变量开关: 值非空且不为 0/false/no/off 时为真。"""
+    v = (os.environ.get(name) or "").strip().lower()
+    return v not in ("", "0", "false", "no", "off")
+
+
+# v1.15.2 (审查 P2): 离线开关。NP_OFFLINE=1 → 不做任何公网 IP / 地理查询
+# (公网 IP、出口位置、ASN 留空, 其余检测照常跑)。默认关闭 → 行为不变。
+# 三个调用点都要认这个开关: run_diagnostics 的系统信息块、nattype 模块的独立
+# 调用、egress 模块自带的 IP 服务池。
+NETWORK_CONFIG = {"offline": _env_flag("NP_OFFLINE")}
+
+
+def _public_ip_service_domains():
+    """实际会请求的第三方域名清单 (隐私披露用), 一律从服务常量生成。"""
+    hosts = []
+    for url, _mode in PUBLIC_IP_SERVICES:
+        hosts.append(urlsplit(url).netloc)
+    for url in _IPV6_SERVICES:
+        hosts.append(urlsplit(url).netloc)
+    for url, _mode in _EGRESS_IP_SERVICES:
+        hosts.append(urlsplit(url).netloc)
+    hosts.append(urlsplit(IP_GEO_SERVICE.replace("{ip}", "1.1.1.1")).netloc)
+    seen, out = set(), []
+    for h in hosts:
+        if h and h not in seen:
+            seen.add(h)
+            out.append(h)
+    return out
+
+
+def _public_ip_disclosure():
+    """公网 IP / 出口位置的第三方查询披露文案 (域名从服务清单生成)。"""
+    if NETWORK_CONFIG.get("offline"):
+        return ""
+    domains = "、".join(_public_ip_service_domains())
+    return (f"公网 IP、出口位置与运营商由第三方服务查询 (域名: {domains}); "
+            f"这些服务会看到你的公网 IP。设 NP_OFFLINE=1 可完全关闭这类查询。")
+
+
 def get_public_ip():
     """获取公网 IPv4 (国内 + 国际服务池, 并发请求, 首个成功即返回)。
 
@@ -4740,17 +4965,12 @@ def get_public_ip():
       - 国际 (ip.sb / ifconfig.me / api.ipify.org): 出口链路国际访问异常时
         国内服务可能拿不到真实公网 IP, 用国际服务对比
     4s 单服务超时, 整体跑完不会超过 6s (并发)。
+
+    v1.15.2: NP_OFFLINE=1 时直接返回 None —— 不发任何外网请求。
     """
-    services = [
-        # 国内
-        ("https://qifu-api.baidubce.com/ip/local/geo/v1/district", "json"),
-        ("https://myip.ipip.net", "text"),
-        ("https://ddns.oray.com/checkip", "text"),
-        # 国际
-        ("https://api.ipify.org", "text"),
-        ("https://ifconfig.me/ip", "text"),
-        ("https://ip.sb", "text"),
-    ]
+    if NETWORK_CONFIG.get("offline"):
+        return None
+    services = list(PUBLIC_IP_SERVICES)
 
     def _probe(url, mode):
         try:
@@ -4775,18 +4995,18 @@ def get_public_ip():
 
 
 # IPv6 公网 IP 服务 (国内访问不稳, 失败容错)
-_IPV6_SERVICES = [
-    "https://api64.ipify.org",      # ipify IPv6 版, 国际稳定
-    "https://ipv6.icanhazip.com",   # icanhazip IPv6 版
-    "https://v6.ident.me",          # ident.me IPv6
-]
+# (服务清单已提为模块常量, 见 PUBLIC_IP_SERVICES 上方)
 
 
 def get_public_ipv6():
     """获取公网 IPv6 地址, 失败返回 None。
 
     国内运营商很多没开通 IPv6, 拿到 None 是正常结果 (不代表出错)。
+
+    v1.15.2: NP_OFFLINE=1 时直接返回 None —— 不发任何外网请求。
     """
+    if NETWORK_CONFIG.get("offline"):
+        return None
     def _probe(url):
         try:
             req = Request(url, headers={"User-Agent": "NetPulse/1.0"})
@@ -4813,33 +5033,40 @@ def get_public_ipv6():
 
 
 # IP 归属地查询 (ASN/地理位置), 拿公网 IP 后调用
-# 用 ip-api.com (免费, 限速 45 req/min, HTTP, 支持 IPv6)
 def get_ip_geo(ip):
     """查询 IP 的归属地 (国家/省/城市/ASN/运营商)。
 
     返回 dict 形如:
-      {"country": "中国", "region": "浙江", "city": "杭州",
-       "isp": "中国电信", "asn": "AS4134 Chinanet", "org": "Chinanet"}
+      {"country": "中国", "region": "江苏", "city": "南京",
+       "isp": "中国电信", "asn": "AS137702", "org": "China Telecom"}
     任何字段缺失时为空字符串。失败返回 None。
+
+    v1.15.2 (审查 P2): 原用明文 HTTP 的 ip-api.com —— 免费版不支持 HTTPS
+    (实测 403), 且公网 IP 明文躺在 URL path 里, 路径上任何一跳都能直接读到。
+    改用 IP_GEO_SERVICE (ipwho.is, HTTPS + 中文返回)。
     """
+    if NETWORK_CONFIG.get("offline"):
+        return None
     if not ip:
         return None
     try:
-        # ip-api.com: lang=zh-CN 中文国家/省/市, fields=... 只取要用的
-        url = f"http://ip-api.com/json/{ip}?lang=zh-CN&fields=status,country,regionName,city,isp,org,as"
+        url = IP_GEO_SERVICE.replace("{ip}", str(ip))
         req = Request(url, headers={"User-Agent": "NetPulse/1.0"})
         resp = urlopen(req, timeout=6)
         raw = resp.read().decode("utf-8", "ignore")
         data = json.loads(raw)
-        if data.get("status") != "success":
+        if data.get("success") is False:
             return None
+        conn = data.get("connection") or {}
+        asn_raw = conn.get("asn") or data.get("asn") or ""
+        asn = ("AS%s" % asn_raw) if str(asn_raw).isdigit() else str(asn_raw)
         return {
             "country": data.get("country", "") or "",
-            "region":  data.get("regionName", "") or "",
+            "region":  data.get("region", "") or "",
             "city":    data.get("city", "") or "",
-            "isp":     data.get("isp", "") or "",
-            "org":     data.get("org", "") or "",
-            "asn":     data.get("as", "") or "",
+            "isp":     conn.get("isp") or data.get("organization", "") or "",
+            "org":     conn.get("org") or data.get("organization", "") or "",
+            "asn":     asn,
         }
     except Exception:
         return None
@@ -7789,14 +8016,11 @@ class MultiEgressDetector:
             })
 
         # 3. 检查公网 IP (多个服务并发, 冗余避免单一服务挂掉)
+        # v1.15.2: NP_OFFLINE=1 时跳过 —— 不发任何外网请求
         if callback:
             callback("检测公网出口 IP...")
         public_ips = []
-        ip_services = [
-            ("https://qifu-api.baidubce.com/ip/local/geo/v1/district", "json"),
-            ("https://myip.ipip.net", "text"),
-            ("https://www.cip.cc", "text"),
-        ]
+        ip_services = list(_EGRESS_IP_SERVICES) if not NETWORK_CONFIG.get("offline") else []
 
         def _probe_pub(url, mode):
             try:
@@ -7812,10 +8036,11 @@ class MultiEgressDetector:
             except Exception:
                 return ""
 
-        with ThreadPoolExecutor(max_workers=len(ip_services)) as ex:
-            for ip in ex.map(lambda t: _probe_pub(*t), ip_services):
-                if ip and ip not in public_ips:
-                    public_ips.append(ip)
+        if ip_services:
+            with ThreadPoolExecutor(max_workers=len(ip_services)) as ex:
+                for ip in ex.map(lambda t: _probe_pub(*t), ip_services):
+                    if ip and ip not in public_ips:
+                        public_ips.append(ip)
 
         # 4. 通过 tracert 到不同目标，比较第一跳 (并发)
         if callback:
@@ -9454,6 +9679,14 @@ _OUI_ONLINE_LOCK = threading.Lock()
 _BMCX_TIMEOUT = 6               # 单次查询超时 (秒)
 _BMCX_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+# v1.15.2 (审查 P2): 补查服务地址提为常量 —— 披露文案要按**实际发出去的域名**
+# 生成, 不在文案里另写一份。
+OUI_ONLINE_SERVICE = "https://mac.bmcx.com/{mac}__mac/"
+# 在线补查开关: NP_NO_ONLINE_OUI=1 → 不发任何厂商补查请求 (厂商显示「未知」)。
+# 补查会把**完整 MAC** 发给第三方 (OUI 级去重后每个未知前缀 1 个), 此前既无
+# 披露也无开关。默认仍开启 (行为不变), 但报告里会披露, 且可一键关掉。
+_OUI_ONLINE_ENABLED = not _env_flag("NP_NO_ONLINE_OUI")
+_OUI_ONLINE_SENT = {"n": 0}     # 本次运行实际发出的补查请求数 (披露用)
 
 
 def _oui_vendor_online(mac):
@@ -9462,8 +9695,12 @@ def _oui_vendor_online(mac):
     - 200 + 组织名称   -> 缓存厂商名
     - 404 (未收录)     -> 缓存空串, 不再重查
     - 网络异常         -> 不缓存 (下次可重试)
+
+    v1.15.2: NP_NO_ONLINE_OUI=1 时直接返回空串 —— 不发任何外网请求。
     """
     if not mac:
+        return ""
+    if not _OUI_ONLINE_ENABLED:
         return ""
     prefix = mac.replace("-", "").replace(":", "").upper()[:6]
     if prefix in _OUI_ONLINE_CACHE:
@@ -9471,7 +9708,8 @@ def _oui_vendor_online(mac):
     vendor = ""
     cached = False
     try:
-        url = f"https://mac.bmcx.com/{mac}__mac/"
+        url = OUI_ONLINE_SERVICE.replace("{mac}", mac)
+        _OUI_ONLINE_SENT["n"] += 1
         with _urlopen_with_proxy(url, timeout=_BMCX_TIMEOUT, ua=_BMCX_UA) as resp:
             status = getattr(resp, "status", 200)
             if status == 404:
@@ -9581,6 +9819,15 @@ class LANDeviceScanner:
 
         # 评估
         issues = []
+        # v1.15.2 (审查 P2): 厂商补查会把完整 MAC 发给第三方 —— 此前**无任何
+        # 披露**。这里按实际发出的请求数披露 (没补查就不提, 免得刷屏),
+        # 域名从服务常量生成。
+        if _OUI_ONLINE_SENT["n"] > 0:
+            _oui_host = urlsplit(
+                OUI_ONLINE_SERVICE.replace("{mac}", "0")).netloc
+            issues.append(
+                f"{_OUI_ONLINE_SENT['n']} 个未知厂商前缀经 {_oui_host} 在线补查 "
+                f"(只发该设备的 MAC 地址); 设 NP_NO_ONLINE_OUI=1 可关闭")
         if not devices:
             issues.append("未发现任何局域网设备 (扫描可能受防火墙/权限限制)")
             assessment = "扫描无结果"
@@ -12557,6 +12804,9 @@ CAPTURE_WEB_PORTS = (80, 443, 8080)
 # 诊断能力损失可忽略: 报告里展示的访问域名来自 TLS SNI 与 DNS QNAME
 # (http_hosts 虽被提取但从未渲染), TCP 层分析只用头部的 seq/ack/flags。
 CAPTURE_PAYLOAD_PORTS = (443,)
+# v1.15.2 (审查 P1-22): 抓包授权标记的有效期。旧版标记只判「文件存在」→
+# 永久有效, 且隐私白名单变了也不重新征求授权。现改为「带指纹 + 有效期」。
+CAPTURE_ACK_VALID_DAYS = 30
 
 
 def _captures_dir():
@@ -12578,19 +12828,76 @@ def _capture_ack_path():
     return os.path.join(_captures_dir(), ".capture_ack")
 
 
+def _capture_policy_fingerprint():
+    """隐私白名单指纹: 用户看到的承诺所依赖的全部常量。
+
+    指纹变了 = 承诺变了 → 旧授权对新承诺无效, 必须重新征求确认。
+    与弹窗/报告里的隐私文案同源 (文案本身就是从这些常量生成的)。
+    """
+    payload = "|".join([
+        f"web={CAPTURE_WEB_PORTS}",
+        f"payload={CAPTURE_PAYLOAD_PORTS}",
+        f"keep={CAPTURE_PAYLOAD_KEEP}",
+        f"first={CAPTURE_FIRST_PKTS}",
+        f"retention={CAPTURE_RETENTION_DAYS}",
+        f"maxfiles={CAPTURE_MAX_FILES}",
+    ])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _capture_ack_valid(ack):
+    """授权标记是否仍然有效。返回 (valid, reason)。
+
+    v1.15.2 (审查 P1-22): 旧版只判 os.path.exists(ack) → 标记**永久有效**,
+    且隐私白名单变了也不重新确认 (内容压根没被读过)。现在校验三件事:
+      ① 能解析出时间戳  ② 未超过有效期  ③ 隐私白名单指纹仍一致。
+    旧格式 (只有一行时间戳) 与损坏内容一律判无效 → 重新征求授权。
+    """
+    try:
+        with open(ack, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return False, "标记读取失败"
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return False, "标记格式已过期"
+    if not isinstance(data, dict):
+        return False, "标记格式已过期"
+    ts = data.get("ts")
+    if not ts:
+        return False, "标记缺少时间戳"
+    try:
+        when = datetime.fromisoformat(str(ts))
+    except (ValueError, TypeError):
+        return False, "标记时间戳无法解析"
+    if (datetime.now() - when) > timedelta(days=CAPTURE_ACK_VALID_DAYS):
+        return False, f"授权已超过 {CAPTURE_ACK_VALID_DAYS} 天"
+    if data.get("fp") != _capture_policy_fingerprint():
+        return False, "隐私白名单已变更, 需重新确认"
+    return True, ""
+
+
 def _capture_confirm_once(input_fn=None):
-    """首次 --capture 的隐私确认 (方案 §8.5): 只问一次, 确认后落标记文件。
+    """--capture 的隐私授权确认: 落标记文件, 在有效期内不再重复问。
 
     非交互环境 (无 TTY) 不阻塞 — --capture 本身已是显式授权, 直接放行并落
-    标记。返回 True=继续抓包; False=用户拒绝 (降级为仅统计层)。"""
+    标记。返回 True=继续抓包; False=用户拒绝 (降级为仅统计层)。
+
+    v1.15.2 (审查 P1-22): 授权不再是「永久有效的一次性记录」—— 标记带隐私
+    白名单指纹与有效期 (CAPTURE_ACK_VALID_DAYS 天), 白名单变更或过期后需重新确认。
+    """
     input_fn = input_fn or input
     ack = _capture_ack_path()
     try:
         if os.path.exists(ack):
-            return True
+            valid, why = _capture_ack_valid(ack)
+            if valid:
+                return True
+            print(_c(f"  (抓包授权需重新确认: {why})", C_GRAY))
     except OSError:
         return True                    # 检查失败不拦路
-    print(_c("\n  ⚠ 抓包取证首次使用确认", C_YELLOW))
+    print(_c("\n  ⚠ 抓包取证授权确认", C_YELLOW))
     # 端口范围直接取自常量 (v1.14.14 起): 隐私披露口径必须与实现同源,
     # 改端口不再漏改文案。v1.15.0: 载荷保留端口与"有应用层信息的端口"已拆开
     # (CAPTURE_PAYLOAD_PORTS 只含 TLS), 文案按"实际保留什么"重写。
@@ -12607,6 +12914,7 @@ def _capture_confirm_once(input_fn=None):
             "     · 抓包分析当前仅覆盖 IPv4",
             f"     · 切片超过 {CAPTURE_RETENTION_DAYS} 天或 {CAPTURE_MAX_FILES} 个, 下次运行 NetPulse 时自动清理",
             "     · 文件在本机 reports/captures/ 下, 可随时手动删除",
+            f"     · 本次授权 {CAPTURE_ACK_VALID_DAYS} 天内有效; 隐私规则变更时会重新征求确认",
     ):
         print(_c(line, C_GRAY))
     if not sys.stdin.isatty():
@@ -12624,10 +12932,16 @@ def _capture_confirm_once(input_fn=None):
 
 
 def _write_capture_ack(ack):
+    """落授权标记: {"ts": ISO 时间, "fp": 隐私白名单指纹}。
+
+    v1.15.2 (审查 P1-22): 旧版只写一行时间戳, 判读时也只看文件是否存在 ——
+    永久有效, 白名单变了也不重新确认。现在写入指纹, 由 _capture_ack_valid 校验。
+    """
     try:
         os.makedirs(os.path.dirname(ack), exist_ok=True)
         with open(ack, "w", encoding="utf-8") as f:
-            f.write(datetime.now().isoformat())
+            json.dump({"ts": datetime.now().isoformat(),
+                       "fp": _capture_policy_fingerprint()}, f)
     except OSError:
         pass                           # 标记写不进 (只读目录): 下次再问一次
 
@@ -14258,7 +14572,13 @@ def _restore_stdout_on_exit(fn):
 def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
                    banner=True, install=False, parallel=False, max_workers=4,
                    pip_mirror=None):
-    """执行指定模块并打印结果与汇总。返回 {key: status}。
+    """执行指定模块并打印结果与汇总。返回本次运行的完整数据 dict。
+
+    v1.15.2 (审查 P1-16 · 收口规则): 返回值由 `{key: status}` 改为**完整 run
+    dict** (LAST_RUN 的同一份对象, 含 system/status/results/evidence/keys/
+    duration_ms/total_modules)。语义向后兼容 —— 旧返回值的所有内容都在新返回值的
+    `status` 键里 —— 目的是让下游 (报告/导出层) 能**显式拿数据**而不必直读
+    全局 LAST_RUN。仓库内 6 个调用点原本都忽略返回值, 改契约零影响。
 
     parallel: True 时多个模块并发执行 (--parallel)。共享状态 (LAST_RUN,
               _CMD_CACHE 等) 已为线程安全, 但 print() 通过 _safe_print 同步。
@@ -14440,7 +14760,7 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
                                     indent=2, default=str))
         sys.stdout.write("\n")
         sys.stdout.flush()
-    return results
+    return LAST_RUN
 
 
 # ── 模块级超时 ──
@@ -17610,7 +17930,29 @@ def _render_wifi_channel_table(channel_analysis):
 # 客户版报告 CSS (方案 A: 晨雾浅色仪表盘)。
 # v1.14.14 从 render_report_html_customer 函数体提到模块级 —— 该函数曾达
 # 927 行, 其中 191 行是这块常量; 与 CSS_BRIEF_V2 同一惯例。
-CSS_CUSTOMER_REPORT = """
+#
+# v1.15.2 (审查 P2 · 状态色单一来源): 状态语义色一律取自 STATUS_COLORS。
+# 旧版这里抄了一份字面量 (与 STATUS_COLORS 逐字符相同) —— 改一处漏一处就会
+# 出现「两种警告色」(AGENTS.md 记的历史问题)。拆成独立片段是为了**不必**把
+# 整块 CSS 改成 f-string (整块含大量 {{ }} 双花括号, 逐个转义风险高);
+# 片段用 % 格式化, 渲染出的 CSS 逐字节不变 (零回归可验证)。
+_CSS_DOT_COLORS = (
+    ".dot.ok{background:%s}.dot.warn{background:%s}.dot.err{background:%s}"
+    ".dot.fatal{background:%s}.dot.timeout{background:%s}.dot.idle{background:%s}"
+) % (STATUS_COLORS["ok"], STATUS_COLORS["warn"], STATUS_COLORS["err"],
+     STATUS_COLORS["fatal"], STATUS_COLORS["timeout"], STATUS_COLORS["idle"])
+
+_CSS_STAT_COUNT_COLORS = (
+    ".stat-card.ok .count{color:%s}.stat-card.warn .count{color:%s}"
+    ".stat-card.err .count,.stat-card.danger .count{color:%s}"
+    ".stat-card.timeout .count{color:%s}"
+    # .stat-card.info 保持字面量: STATUS_COLORS 没有 info 键
+    # (Status.INFO 枚举存在, 但语义键表只覆盖 6 种可评状态)
+    ".stat-card.info .count{color:#6b7280}"
+) % (STATUS_COLORS["ok"], STATUS_COLORS["warn"], STATUS_COLORS["err"],
+     STATUS_COLORS["timeout"])
+
+CSS_CUSTOMER_REPORT = ("""
 *{box-sizing:border-box;margin:0;padding:0;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 .skip-link{position:absolute;left:-9999px;top:0;z-index:9999;background:#0a1628;color:#fff;padding:8px 16px;text-decoration:none;border-radius:0 0 8px 0}
 .skip-link:focus{left:0}
@@ -17698,7 +18040,7 @@ body{background:#eef1f6;color:#1e293b;font:14px/1.65 -apple-system,BlinkMacSyste
 .stats-caption{text-align:center;font-size:11.5px;color:#94a3b8;margin-bottom:24px}
 .stat-card{background:#fff;border:1px solid #e6e9f0;border-radius:14px;padding:14px 8px;text-align:center}
 .stat-card .count{font-size:30px;font-weight:800;font-variant-numeric:tabular-nums}
-.stat-card.ok .count{color:#16a34a}.stat-card.warn .count{color:#d97706}.stat-card.err .count,.stat-card.danger .count{color:#dc2626}.stat-card.timeout .count{color:#334155}.stat-card.info .count{color:#6b7280}
+%%STAT_COUNT_COLORS%%
 .stat-card .label{font-size:11.5px;color:#94a3b8;margin-top:2px}
 /* 图表区 */
 .charts{display:grid;grid-template-columns:1.1fr .9fr;gap:14px}
@@ -17725,7 +18067,7 @@ body{background:#eef1f6;color:#1e293b;font:14px/1.65 -apple-system,BlinkMacSyste
 .badge.idle,.b.idle{background:#e2e8f0;color:#475569}
 .badge.timeout,.b.timeout{background:#cbd5e1;color:#1e293b}
 .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
-.dot.ok{background:#16a34a}.dot.warn{background:#d97706}.dot.err{background:#dc2626}.dot.fatal{background:#7f1d1d}.dot.timeout{background:#334155}.dot.idle{background:#94a3b8}
+%%DOT_COLORS%%
 /* 模块卡 (details 折叠, 问题模块自动展开) */
 details.mod{background:#fff;border:1px solid #e6e9f0;border-radius:16px;margin-bottom:12px;overflow:hidden;box-shadow:0 1px 2px rgba(15,23,42,.04);scroll-margin-top:16px}
 details.mod[open]{border-color:#c7cbd8}
@@ -17787,6 +18129,8 @@ details.collapse p.muted{color:#94a3b8;font-size:11.5px;margin-top:6px}
 .host-card{background:#fff;border:1px solid #e6e9f0;border-radius:12px;padding:12px 16px}
 .host-card .lab{font-size:11px;color:#94a3b8;margin-bottom:3px;font-weight:500}
 .host-card .val{font-size:13px;font-weight:600;font-family:Cascadia Mono,Consolas,monospace;color:#0f172a;cursor:pointer;word-break:break-all}.host-card .val:hover{color:#2563eb;background:#f1f5f9}.host-card .val.copied{color:#16a34a !important}
+/* v1.15.2 (审查 P2): 公网 IP / 出口位置的第三方查询披露 */
+.host-note{font-size:11px;color:#94a3b8;margin-top:8px;line-height:1.5}
 /* 诊断标准表 */
 .tbl.std{font-size:12px}
 .tbl.std th{background:#1e293b;color:#f1f5f9;font-weight:600;padding:7px 10px}
@@ -17800,7 +18144,8 @@ details.collapse .subcap code{background:#fff;padding:1px 6px;border-radius:3px;
 @media(max-width:960px){.nav{display:none}.main{margin:0 14px}.hero{flex-wrap:wrap}.gauge{margin:0}.charts{grid-template-columns:1fr}}
 @media print{body{background:#fff;padding:0;font-size:12px}.nav,.sec .cnt,.chart .tag{display:none}.main{margin:0}.hero,.stat-card,.chart,.mod,.todo,.overview,.host-card{box-shadow:none}.hero{background:#f8fafc !important;border:1px solid #ddd !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.mod,.host-card,.todo{break-inside:avoid}details.mod>summary .arr,details.collapse>summary::before{display:none}details.mod>summary{cursor:default}details.mod,details.collapse{border-style:solid}}
 footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-top:20px;border-top:1px solid #e6e9f0}
-""" + _DIAGNOSIS_CSS  # 阶段 C · v1.3.0: 根因摘要 CSS
+""".replace("%%STAT_COUNT_COLORS%%", _CSS_STAT_COUNT_COLORS)
+   .replace("%%DOT_COLORS%%", _CSS_DOT_COLORS)) + _DIAGNOSIS_CSS  # 阶段 C · v1.3.0: 根因摘要 CSS
 
 
 
@@ -18311,9 +18656,12 @@ def _host_info_section(sys_i):
         f"<div class='val'>{_html_esc(val) if val else '—'}</div></div>"
         for lab, val in sys_pairs
     )
+    # v1.15.2 (审查 P2): 披露公网 IP / 出口位置是第三方查的, 域名从服务常量生成
+    _disc = _public_ip_disclosure()
+    _note = f"<div class='host-note'>{_html_esc(_disc)}</div>" if _disc else ""
     host_section = f"""
 <div class="sec" id="host"><h2><span class="icon">🖥</span>主机信息</h2></div>
-<div class="host-grid">{host_cards}</div>"""
+<div class="host-grid">{host_cards}</div>{_note}"""
 
 
     return host_section
@@ -19415,15 +19763,99 @@ def render_report_html_brief_v2(report):
         cap += (f'其中 {_html_esc("、".join(exempt_bad))} '
                 f'本次有异常/警告显示, 按豁免规则不计分。')
 
+    # v1.15.2 (审查 P1-15c): 无根因时「主要发现」区不得空着 ——
+    # 23 个模块全超时时根因列表为空, 该区只留一个空标题, 与「健康分 0 分 F 级」
+    # 直接打架 (完整版早有「⚠ 未定位到根因」, 旧 brief v1 早有模块级问题回退,
+    # 只有 brief_v2 缺)。口径与完整版/brief v1 对齐:
+    #   ① 有根因           → 列根因 (维持现状)
+    #   ② 无根因但有模块级问题 → 逐条列问题 (最多 2 条 + 1 行溢出提示, A4 高度预算)
+    #   ③ 两者皆无但有未完成模块 → 「未定位到根因」提示
+    #   ④ 全都没有         → 「未发现明确故障」
+    _todo = []
+    _seen = {}
+    for m in modules:
+        for iss in m.get("issues") or []:
+            sev = iss.get("severity", "信息")
+            text = (iss.get("text") or "").strip()
+            if sev not in ("异常", "错误", "警告") or not text:
+                continue
+            k = (sev, text)
+            nm = m.get("name", "")
+            hit = _seen.get(k)
+            if hit is not None:
+                # 同一文案在多个模块出现 (如 23 个模块全超时) → 记下波及模块,
+                # 否则会被读成「只有 1 个模块有问题」 (v1.15.0 审查 P1-15)
+                if nm and nm not in hit["_mods"]:
+                    hit["_mods"].append(nm)
+                continue
+            entry = {"severity": sev, "text": text, "module": nm,
+                     "_mods": [nm] if nm else []}
+            _seen[k] = entry
+            _todo.append(entry)
+    _todo.sort(key=lambda i: 0 if i["severity"] in ("异常", "错误") else 1)
+    _inv = []
+    for i in _todo:
+        for nm in i.get("_mods") or []:
+            if nm and nm not in _inv:
+                _inv.append(nm)
+    _todo_scope = (f"（涉及 {len(_inv)} 个模块）"
+                   if len(_inv) > len(_todo) else "")
+    # 未完成检测的模块数 (与完整版「⚠ 未定位到根因」同口径: summary 全量状态)
+    _unfinished = sum(1 for st in (report.get("summary") or {}).values()
+                       if st in ("超时", "错误"))
+
     findings = []
-    for rc in rcs[:4]:
-        title = _brief_clip(rc.get("title", ""), _BRIEF_CLIP["title"])
-        sev = (rc.get("severity") or "low").lower()
-        desc = _brief_clip(rc.get("description", ""), _BRIEF_CLIP["desc"])
-        # v1.15.0 (审查 P0-3): 建议键是 recommendations (列表), 见 _first_rootcause_advice
-        act = _brief_clip(_first_rootcause_advice(rc), _BRIEF_CLIP["advice"])
-        findings.append({"sev": sev, "title": title, "desc": desc, "act": act})
-    if _exm and exempt_bad:
+    _fallback = False
+    if rcs:
+        for rc in rcs[:4]:
+            title = _brief_clip(rc.get("title", ""), _BRIEF_CLIP["title"])
+            sev = (rc.get("severity") or "low").lower()
+            desc = _brief_clip(rc.get("description", ""), _BRIEF_CLIP["desc"])
+            # v1.15.0 (审查 P0-3): 建议键是 recommendations (列表), 见 _first_rootcause_advice
+            act = _brief_clip(_first_rootcause_advice(rc), _BRIEF_CLIP["advice"])
+            findings.append({"sev": sev, "title": title, "desc": desc, "act": act})
+    elif _todo:
+        for i in _todo[:2]:
+            mods = i.get("_mods") or []
+            src = i.get("module", "") or ""
+            if len(mods) > 1:
+                src = f"{src} 等 {len(mods)} 个模块"
+            findings.append({
+                "sev": "high" if i["severity"] in ("异常", "错误") else "medium",
+                "title": _brief_clip(i["text"], _BRIEF_CLIP["title"]),
+                "desc": _brief_clip(f"来源: {src}{_todo_scope}",
+                                    _BRIEF_CLIP["desc"]),
+                "act": "详见随附完整报告的待办清单",
+            })
+        if len(_todo) > 2:
+            findings.append({
+                "sev": "low",
+                "title": f"另有 {len(_todo) - 2} 项模块级问题",
+                "desc": "详见随附完整报告",
+                "act": "",
+            })
+        _fallback = True
+    elif _unfinished:
+        findings.append({
+            "sev": "medium",
+            "title": "未定位到根因",
+            "desc": _brief_clip(
+                f"{_unfinished} 个模块未完成检测, 现有结论仅供参考。",
+                _BRIEF_CLIP["desc"]),
+            "act": "请先让未完成模块跑完再判断",
+        })
+        _fallback = True
+    else:
+        findings.append({
+            "sev": "low",
+            "title": "未发现明确故障",
+            "desc": "本次实测未发现明确故障, 网络状态良好。",
+            "act": "",
+        })
+    # 豁免卡: 根因存在时或真健康时照常显示; 有回退卡时**让位** ——
+    # 否则 23 模块全超时时, 客户在「主要发现」区唯一看到的是
+    # 「豁免项显示异常(不计分)」, 极易被读成「本次只发现豁免项有问题」。
+    if _exm and exempt_bad and not _fallback:
         findings.append({
             "sev": "exempt",
             "title": _brief_clip("豁免项显示异常(不计分)", _BRIEF_CLIP["title"]),
@@ -20618,6 +21050,9 @@ def _module_menu(install=False, pip_mirror=None):
     返回语义 (v1.9.3): r = 返回场景层主菜单 → True; q / Ctrl+C / EOF → False
     (通知场景层结束整个程序)。
     """
+    # v1.15.2 (审查 P1-16): 最近一次诊断的完整数据。run_diagnostics 现在返回
+    # run dict, 这里存成局部变量供下游显式取用 (调试包等), 避免再直读全局。
+    last_run = None
     while True:
         _menu_clear()
         bar = "=" * 60
@@ -20714,7 +21149,10 @@ def _module_menu(install=False, pip_mirror=None):
             else:
                 print(_c("  → 打包: system.json + diagnostic.json + evidence.json"
                          " + netpulse.log (SSID/MAC/公网IP/主机名 已脱敏)", C_GRAY))
-                _export_debug_bundle(_report_dir())
+                # v1.15.2 (审查 P1-16): 显式传 run。菜单里 last_run (run_diagnostics
+                # 的返回值) 与全局 LAST_RUN 是同一份对象; last_run 为空时回落全局
+                # (兼容不经菜单跑诊断的路径)。
+                _export_debug_bundle(_report_dir(), last_run if last_run else LAST_RUN)
                 print(_c("  → 请将 zip 文件发给后端/厂商支持, 无需手工截图。", C_GRAY))
             try:
                 input(_c("  按 Enter 返回菜单...", C_GRAY))
@@ -20811,7 +21249,7 @@ def _module_menu(install=False, pip_mirror=None):
         # 菜单模式: 多模块默认并发 (与 CLI `all --parallel` 对齐)。
         # run_diagnostics 内部 `parallel and len(keys) > 1` 会自动避免
         # 单模块走并发 (无意义且会浪费线程开销)。
-        run_diagnostics(keys, banner=False, parallel=True, max_workers=4)
+        last_run = run_diagnostics(keys, banner=False, parallel=True, max_workers=4)
         if sys.stdout.isatty():
             # 单独跑测速时跳过"生成综合诊断报告"询问: 测速已自动保存独立的
             # 专业测速报告 (HTML+JSON), 再问会产生冗余的 netdiag_report_*
