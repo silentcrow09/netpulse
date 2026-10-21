@@ -7,6 +7,16 @@
 
 ## [Unreleased]
 
+### 文档
+
+- **发版流程更正**：本仓库有 GitHub Actions（`.github/workflows/release.yml`），
+  **推 `v*.*.*` tag 即自动构建 x64+x86 双架构 exe、计算 SHA256、创建 GitHub Release
+  并上传 6 个资源**，不需要人工上传 exe 产物或手工算哈希。此前文档与审查清单里
+  「Release 需手动上传 exe 产物 + SHA256，属另一个人工步骤」的说法有误，已更正。
+- 补充说明：Actions 产物与本地 `build_exe.bat` 产物**不是同一份二进制**
+  （构建环境不同，字节数不同），Release 正文的 SHA256 只对应 Actions 那份；
+  本地重打 exe 仅用于自测。
+
 ## [1.15.1] - 2026-10-21
 
 审查清单剩余项的修复批次（12 项：5 个 P1 + 7 个 P2）。每一项都配了回归测试，

@@ -174,6 +174,38 @@
 - **截断锁高**：一页版问题卡 标题≤26/现象≤41/建议≤36 字（恒 3 行）、
   机房建议≤24 字（恒单行）—— 字号改动必须重推 `_BRIEF_CLIP`。
 
+## 发版流程（GitHub Actions 自动出包）
+
+**推 tag 即自动发布 Release，不需要手工上传 exe、不需要手工算 SHA256。**
+`.github/workflows/release.yml` 在推 `v[0-9]+.[0-9]+.[0-9]+` 形式的 tag 时自动触发
+（`on.push.tags`），跑 `windows-latest`：
+
+| 步骤 | 说明 |
+|---|---|
+| x64 构建 | Python **3.13**（`actions/setup-python`）→ `pyinstaller NetPulse.spec` → `dist/NetPulse.exe` |
+| Ookla 依赖 | `speedtest/` 被 gitignore，仓库里没有 `speedtest.exe`；Actions 自己从 Ookla 官方下载放进去（仅 x64，Ookla 无 win32 版） |
+| x86 构建 | Python **3.8 x86** + 环境变量 `NETPULSE_ARCH=x86` → `dist/NetPulse_x86.exe`。**必须 3.8**：3.9+ 打的 exe 在 Win7 启动报缺 `api-ms-win-core-path-l1-1-0.dll`（该 API Set 是 Win8+ 才有） |
+| 校验 | 两个 exe 都存在才继续；构建日志无论成败都上传成 artifact |
+| SHA256 | 对两个 exe 各算一次，写进 Release 正文 |
+| Release | `softprops/action-gh-release@v2` + `generate_release_notes: true` 自动建 Release、上传 **6 个资源**：`NetPulse.exe` / `NetPulse.zip` / `NetPulse.exe.sha256.txt` ×（x64、x86 各一套） |
+
+- **改完 `netpulse.py` 不必本地重打 exe**。正式发布只做：版本号三处同步
+  （`APP_VERSION` + `version.json` + README 头部）→ 写 CHANGELOG → commit →
+  打带注释 tag → **把 tag 推给 `github` remote**。只有推 tag 才触发（推 master 不触发）；
+  tag 推到内网 Gitea（`origin`）不会触发。
+- **本地重打 exe 只用于自测**（`build_exe.ps1` / `build_exe.bat` → `dist/NetPulse.exe`），
+  或 Actions 构建失败时人工兜底。打包完清掉 `build/` 工作区。
+- ⚠️ **本地 exe 与线上 exe 字节数不同，不要互相核对**。构建环境不同（Python 小版本、
+  PyInstaller 版本、是否内嵌 Ookla exe）→ 同一份代码两次构建可差几十万字节。
+  实测 v1.15.1：本地 19,229,389 B vs Actions 19,487,819 B。
+  **Release 正文里的 SHA256 只对应 Actions 那份产物**，拿本地 exe 去校验必然对不上。
+- 发完确认：`https://github.com/silentcrow09/netpulse/actions` 看 build job 是否绿；
+  `https://github.com/silentcrow09/netpulse/releases` 看 Release 与 6 个资源是否齐。
+- **tag 发布后不可改**。Actions 失败可在 Actions 页面「Re-run failed jobs」重跑同一个
+  tag；彻底失败才追加版本号（如 v1.15.2）重发。
+- Release 正文里 `[CHANGELOG.md](./CHANGELOG.md)` 的相对链接，GitHub 会自动重写成
+  `/{owner}/{repo}/blob/{tag}/CHANGELOG.md`，可用（已实测 v1.15.1 渲染结果）。
+
 ## 验证
 
 ```bash
@@ -239,6 +271,8 @@ RFC 3849 文档前缀、假 hostname/GUID）；真实抓包或含隐私的本地
 - **发版清单 (v1.12.0 起)**：版本号**三处同步**——`netpulse.py` 的
   `APP_VERSION` + 仓库根 `version.json`（jsDelivr 回落源读它，漏更会让
   国内用户永远检查不到新版本）+ README 头部；然后 tag + 双 remote 推送
+  （**推 tag 到 `github` remote 会自动触发 Actions 出 Release**，见
+  「发版流程（GitHub Actions 自动出包）」节）
 - **自动检查更新 (v1.12.0)**：`_start_update_check()` 在 main() 参数解析
   后开 daemon 线程（**不阻塞启动**，失败静默）；双源
   `UPDATE_CHECK_API`(GitHub Releases) → `UPDATE_CHECK_FALLBACK`(jsDelivr
@@ -255,9 +289,11 @@ RFC 3849 文档前缀、假 hostname/GUID）；真实抓包或含隐私的本地
   启动检查线程）；菜单首帧前 `_prime_update_state_from_cache()` 预填
   缓存 + `join(2.0)` 等首次检查结果（否则线程总输给首帧渲染，
   新版提示“永远下一屏才出现”）
-- 打包：`build_exe.bat` 或 `build_exe.ps1` → `dist/NetPulse.exe`（64 位默认；
-  `-Arch x86` 出 32 位 `NetPulse_x86.exe`，需另装 32 位 Python，Ookla exe 不随包）。
-  改了 `netpulse.py` 后需重新打包，否则 exe 落后于代码
+- 打包（**仅本地自测用**）：`build_exe.bat` 或 `build_exe.ps1` → `dist/NetPulse.exe`
+  （64 位默认；`-Arch x86` 出 32 位 `NetPulse_x86.exe`，需另装 32 位 Python，
+  Ookla exe 不随包）。改了 `netpulse.py` 后本地 exe 会落后于代码，自测前要重打；
+  **正式发布的 exe 由 GitHub Actions 自动构建，不需要本地打包上传**，
+  见「发版流程（GitHub Actions 自动出包）」节
 - 根目录 `nul` 是 Windows 保留设备名误产生的 54B 垃圾文件，
   常规删除方式（`rm` / PowerShell / Python）都会被解析成设备路径而失败，已在 `.gitignore` 忽略
 - `_smoke_report.py`、`reports/`、`.codefree/`、`speedtest/` 均已 gitignore

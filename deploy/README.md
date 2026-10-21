@@ -27,7 +27,7 @@ irm https://.../v1/install.ps1 | iex -- all --export report.html
 |---|------|------|
 | 1 | 阿里云 OSS 控制台建 bucket `netpulse-dist`，**读写权限 = 公共读** | （控制台操作）|
 | 2 | 装阿里云 CLI 并配置 AccessKey | `winget install Alibaba.AliyunCLI` → `aliyun configure` |
-| 3 | 打包 EXE（首次或改了 .py 后） | `build_exe.bat` |
+| 3 | 取 EXE（首次或改了 .py 后） | 优先从 **GitHub Release** 下载（Actions 自动构建，见仓库 AGENTS.md「发版流程」节）；也可用 `build_exe.bat` 本地打包 |
 | 4 | 上传文件到 OSS（手动） | 详见下方 |
 | 5 | 自测 | `irm https://<bucket>.oss-cn-hangzhou.aliyuncs.com/netpulse/v1/install.ps1 \| iex -- --list` |
 
@@ -45,6 +45,11 @@ oss://<bucket>/netpulse/v1/
 ```
 
 **生成 `index.json`**（PowerShell 一行搞定）：
+
+> ⚠️ `index.json` 里的 SHA256 **必须按你实际上传到 OSS 的那个文件算**。本地
+> `build_exe.bat` 打出来的 exe 与 GitHub Release 里 Actions 构建的 exe
+> **不是同一份二进制**（构建环境不同，字节数可差几十万），两者 SHA256 不同。
+> 下了哪个就传哪个、就算哪个的哈希。
 
 ```powershell
 $pySha = (Get-FileHash netpulse.py -Algorithm SHA256).Hash.ToLower()
@@ -91,8 +96,8 @@ irm https://<bucket>.oss-cn-hangzhou.aliyuncs.com/netpulse/v1-beta/install.ps1 |
 
 ```
 1. 改 netpulse.py
-2. 跑 build_exe.bat (可选, 重新生成 EXE)
+2. 取 EXE（可选, 重新生成 EXE）—— 从 GitHub Release 下载, 或本地 build_exe.bat
 3. 跑上面那段 PowerShell 生成新的 index.json (改 version 字段)
-4. 上传 3 个文件覆盖 OSS 上的旧版本
+4. 上传 4 个文件覆盖 OSS 上的旧版本 (netpulse.py / exe / x86 exe / index.json)
 ```
 
