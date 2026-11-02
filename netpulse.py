@@ -27,6 +27,7 @@ warnings.filterwarnings("ignore", message=".*Diffie-Hellman over finite fields.*
 import subprocess
 import threading
 import ctypes
+import platform
 import socket
 import struct
 import time
@@ -323,11 +324,29 @@ def _relaunch_elevated(args_tail=None):
 
     返回 (ok, msg): ok=True 表示已成功发起提权启动, 调用方应尽快
     sys.exit(0) 让位; ok=False 表示用户取消或系统拒绝, msg 给提示文案。
+
+    v1.16.1 (现场反馈 · 提权窗口秒退):
+      必须置 PYINSTALLER_RESET_ENVIRONMENT=1, 否则新实例会复用旧实例的
+      _MEI 解包目录 (PyInstaller 6.9+ 语义: 同 exe 派生的子进程默认被当成
+      "同一实例的 worker 子进程"), 旧实例随后的 sys.exit(0) 触发 bootloader
+      清理该目录 -> 新实例在 bootstrap 阶段读 base_library.zip 报
+      FileNotFoundError 直接死掉 (用户现场: 输入 [A] 后新窗口闪退)。
+      该变量随进程环境继承传给新实例 (含经 wt.exe 中转), 已实测。
     """
     try:
         lp_file, lp_params = _build_elevated_launch(args_tail)
-        ret = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", lp_file, lp_params, None, 1)  # SW_SHOWNORMAL
+        # 提权重启 = "新独立实例", 必须让 bootloader 重新解包而非复用旧目录。
+        # 只在发起瞬间置位, 避免污染当前进程后续的所有子进程。
+        prev_reset = os.environ.get("PYINSTALLER_RESET_ENVIRONMENT")
+        os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        try:
+            ret = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", lp_file, lp_params, None, 1)  # SW_SHOWNORMAL
+        finally:
+            if prev_reset is None:
+                os.environ.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+            else:
+                os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = prev_reset
         if ret > 32:
             return True, "已发起管理员权限启动"
         return False, (f"Windows 拒绝提权 (ShellExecuteW 返回 {ret}): "
@@ -645,11 +664,15 @@ def _npcap_installed():
     return False
 
 
-def _urlopen_with_proxy(url, timeout=120, ua="NetPulse/1.0"):
+def _urlopen_with_proxy(url, timeout=120, ua="NetPulse/1.0", data=None,
+                       method=None, headers=None):
     """带环境变量代理支持的下载 (兼容企业代理网络)。
 
     ua: User-Agent 字符串, 默认 "NetPulse/1.0"。个别站点 (如 mac.bmcx.com)
     对非浏览器 UA 响应异常, 调用方可传入浏览器 UA。
+
+    v1.17.0: 支持 data/method/headers —— 崩溃上报要 POST JSON 到 GitHub API,
+    复用本函数才能同样吃到企业代理支持 (客户机常走代理)。
     """
     import urllib.request as ur
     proxies = {}
@@ -660,7 +683,10 @@ def _urlopen_with_proxy(url, timeout=120, ua="NetPulse/1.0"):
             proxies[scheme] = val
     handlers = [ur.ProxyHandler(proxies)] if proxies else []
     opener = ur.build_opener(*handlers)
-    req = Request(url, headers={"User-Agent": ua})
+    hdrs = {"User-Agent": ua}
+    if headers:
+        hdrs.update(headers)
+    req = Request(url, data=data, method=method, headers=hdrs)
     return opener.open(req, timeout=timeout)
 
 
@@ -3609,7 +3635,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.16.0"
+APP_VERSION = "1.17.0"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -3786,8 +3812,11 @@ def _start_update_check(force=False):
                 else:
                     print(f"[NetPulse] 更新检查 {time.monotonic() - t0:.1f}s: "
                           f"四源全部失败 (被墙/quota/超时), 本次静默", file=sys.stderr)
-        except Exception:
-            pass
+        except Exception as e:
+            # v1.17.0: 原先 `except Exception: pass` —— 四源全失败时连
+            # NP_UPDATE_DEBUG 的输出都没有, 完全静默。
+            _emit_thread_failure(e, "线程:update-check",
+                                 detail="更新检查线程异常")
     t = threading.Thread(target=_worker, name="update-check", daemon=True)
     t.start()
     return t
@@ -4021,8 +4050,11 @@ class LatencyMonitor:
                 elif self._LOSS_RE.search(line):
                     with self._lock:
                         self._loss_events.append(now)
-        except Exception:
-            pass
+        except Exception as e:
+            # v1.17.0: 原先静默 pass —— ping 输出解析线程死掉 → 0 样本,
+            # 报告呈现「无丢包」假象, 用户与厂商都看不出来。
+            _emit_thread_failure(e, "线程:latency-read",
+                                 detail="ping 输出解析线程异常")
 
     def wait_samples(self, count, timeout=6.0):
         """等待收集到至少 count 个样本, 返回这些样本的 rtt 列表 (按时间序)。"""
@@ -4235,9 +4267,13 @@ def _upload_speed_multi(host_port, threads=4, duration=8.0, chunk_size=256 * 102
                 with bytes_lock:
                     total_uploaded[0] += len(payload)
                     last_send[0] = time.time()
-        except Exception:
+        except Exception as e:
             with bytes_lock:
                 errors[0] += 1
+            # v1.17.0: 原先只计数, 异常类型/消息/栈全丢 —— 上行测速失败时
+            # 用户只见「上行测速失败: host」, 厂商无从判断是网络还是代码问题。
+            _emit_thread_failure(e, "线程:upload-speed",
+                                 detail="上行测速 worker 异常")
         finally:
             if conn:
                 try:
@@ -11930,8 +11966,11 @@ class MonitorSession:
                 ms2 = _tcping_ms(f"{self._ext_ip_resolved}:53", timeout=3.0)
                 with self._probe_lock:
                     self._tcp_samples.append((time.time(), ms2))
-            except Exception:
-                pass
+            except Exception as e:
+                # v1.17.0: 原先静默 pass —— 探测循环每轮都失败时报告呈现
+                # 「0 丢包」假象, 用户与厂商都看不出来。
+                _emit_thread_failure(e, "线程:monitor-probe",
+                                     detail="探测循环异常")
             if first:
                 first = False
                 continue                      # 首轮后立即进入节拍
@@ -11949,12 +11988,15 @@ class MonitorSession:
                     path_mtus.append(r)
         except Exception as e:
             err = f"MTU 探测线程异常: {e}"
+            _emit_thread_failure(e, "线程:monitor-mtu",
+                                 detail="MTU 路径探测异常")
         local_if_mtu, local_if_name = None, ""
         if not err:
             try:
                 local_if_mtu, local_if_name = _default_route_if_mtu()
-            except Exception:
-                pass
+            except Exception as e:
+                _emit_thread_failure(e, "线程:monitor-mtu",
+                                     detail="本机接口 MTU 读取失败")
         self._mtu_result = {
             "path_mtus": path_mtus,
             "local_if_mtu": local_if_mtu,
@@ -11977,15 +12019,19 @@ class MonitorSession:
                 if sent is not None and retrans is not None:
                     with self._probe_lock:
                         self._tcpstat_samples.append((t, sent, retrans))
-            except Exception:
-                pass
+            except Exception as e:
+                # v1.17.0: 原先静默 pass —— 重传统计采样失败 → 报告里重传率
+                # 恒为 0/None, 链路层问题被静默掩盖。
+                _emit_thread_failure(e, "线程:monitor-tcpstat",
+                                     detail="TCP 重传统计采样失败")
             try:
                 errs, disc = _nic_err_snapshot()
                 if errs is not None:
                     with self._probe_lock:
                         self._nicstat_samples.append((time.time(), errs, disc))
-            except Exception:
-                pass
+            except Exception as e:
+                _emit_thread_failure(e, "线程:monitor-nicstat",
+                                     detail="网卡错误计数采样失败")
             self._stop.wait(self.TCPSTAT_INTERVAL_S)
 
     def _load_worker(self):
@@ -12010,6 +12056,8 @@ class MonitorSession:
                       f"{n_bytes / 1048576:.1f} MB (仅制造流量, 未落盘)")
         except Exception as e:
             self.note(f"主动负载失败: {e}")
+            _emit_thread_failure(e, "线程:monitor-load",
+                                 detail="主动负载失败")
 
     def maybe_recheck_gateway(self, elapsed):
         """每 60s 复查网关 (用户切 WiFi/换路由时旧网关会永久假丢包)。"""
@@ -14590,6 +14638,9 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
     global _C_NOCOLOR, LAST_RUN
     _C_NOCOLOR = no_color
     _cli_enable_vt()
+    # v1.17.0: 重置单轮上报预算 (客户网络全断时 23 个模块会集体失败,
+    # 不设预算就是几十条齐飞; 见 _emit_probe_failure)。
+    _LOG_RUN_STATE["sent"] = 0
     # 报告「检测耗时」起点 (含系统信息采集, 与用户体感一致)
     _run_t0 = time.time()
 
@@ -14851,6 +14902,9 @@ def _run_module_with_timeout(key, callback):
                 box["result"] = probe_fn(callback=callback)
             except Exception as e:
                 box["err"] = e
+                # v1.17.0: 立刻取 traceback —— 出了这个 except 块异常对象就只剩
+                # 一句 str(e), 异常类型与栈永久丢失 (旧路径的核心缺陷)。
+                box["tb"] = traceback.format_exc()
 
         t = threading.Thread(target=_work_v2, daemon=True)
         t.start()
@@ -14858,7 +14912,11 @@ def _run_module_with_timeout(key, callback):
         if t.is_alive():
             return "超时", {"error": f"模块执行超时（超过 {timeout:.0f} 秒）"}
         if "err" in box:
-            return "错误", {"error": str(box["err"])}
+            exc = box["err"]
+            tb_text = box.get("tb") or ""
+            _emit_probe_failure(key, exc, tb_text)
+            return "错误", {"error": str(exc),
+                            "_exc": _exc_meta("模块:%s" % key, exc)}
         result = box["result"]
         # probe 失败 (error 非 None) 时: 状态用「错误」且错误文案回填 res —
         # 与旧 Tester 路径 determine_status({'error':…})='错误' 零差异
@@ -14945,7 +15003,11 @@ def _run_diagnostics_sequential(keys, is_tty):
         try:
             status, res = _run_module_with_timeout(key, _cb)
         except Exception as e:
-            status, res = "错误", {"error": str(e)}
+            # v1.17.0: 调度层异常 —— 保住 traceback 与异常类型, 不再只留 str(e)。
+            tb_text = traceback.format_exc()
+            _emit_probe_failure(key, e, tb_text, detail="模块调度异常")
+            status, res = "错误", {"error": str(e),
+                                   "_exc": _exc_meta("模块:%s" % key, e)}
         if is_tty:
             sys.stdout.write("\r\033[K")
             sys.stdout.flush()
@@ -15006,7 +15068,11 @@ def _run_diagnostics_parallel(keys, max_workers, total):
         try:
             status, res = _run_module_with_timeout(key, lambda msg: None)
         except Exception as e:
-            status, res = "错误", {"error": str(e)}
+            # v1.17.0: 与顺序模式同构 —— 保住 traceback 与异常类型。
+            tb_text = traceback.format_exc()
+            _emit_probe_failure(key, e, tb_text, detail="模块调度异常")
+            status, res = "错误", {"error": str(e),
+                                   "_exc": _exc_meta("模块:%s" % key, e)}
         # 存结果, 不立即打 (主线程按 keys 顺序统一打)
         with completed_lock:
             completed[key] = (name, status, res)
@@ -15031,8 +15097,16 @@ def _run_diagnostics_parallel(keys, max_workers, total):
             # 出问题绝不中断整轮」在 worker 侧也成立 (P1-14)。
             try:
                 fut.result()
-            except Exception:
-                pass
+            except Exception as e:
+                # v1.17.0: 原先 `except Exception: pass` —— 该模块会从 completed
+                # 里整个消失, 结果/报告/健康分里都不出现, 用户无从察觉。
+                # 这里不改变报告口径 (仍不补模块), 但**不再静默**: 写日志 + 推送。
+                try:
+                    _emit_runtime_event_async(
+                        "error", e, "并行调度:%s" % key,
+                        detail="worker 抛异常, 该模块未进入结果")
+                except Exception:
+                    pass
 
     # 独占阶段: 测速/Bufferbloat/iperf3/TCP 并发逐个跑
     for key in solo_keys:
@@ -20948,6 +21022,78 @@ def _perm_badge():
     return _c("    [管理员模式]" if _is_admin() else "    [普通权限]", C_GRAY)
 
 
+def _log_notice_shown():
+    """首次告知是否已弹过 (用户知情权的依据: 告知一次即可, 不反复打扰)。"""
+    return bool(_load_log_config().get("notice_shown", False))
+
+
+def _mark_log_notice_shown():
+    cfg = _load_log_config()
+    cfg["notice_shown"] = True
+    cfg["updated_at"] = datetime.now().isoformat()
+    _save_log_config(cfg)
+
+
+def _log_notice_text():
+    """首次告知文案 (说明上报什么 / 不含什么 / 怎么关)。"""
+    return [
+        "  NetPulse 会把程序自身的异常上报到开发者日志服务器, 便于快速修复。",
+        "",
+        "  上报内容: 异常类型、完整错误栈、发生在哪个模块/线程、操作系统与",
+        "            版本、NetPulse 版本。",
+        "  不含: 网络诊断结果、公网 IP、MAC、SSID、账号等任何网络数据。",
+        "  用户目录名与机器名会被替换为 <user> / <host>。",
+        "",
+        "  可随时用菜单 [C] 关闭; 关闭后仅写本地日志, 不再联网。",
+    ]
+
+
+def _offer_log_reporting_notice():
+    """首次运行告知异常上报并征询同意。返回 True = 保持开启。
+
+    非 TTY (管道/--json/自动化) 静默跳过 —— 不污染机器可读输出。
+    告知过一次不再打扰 (告知与同意分离: 告知一次, 之后用 [C] 自行开关)。
+    """
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return _log_reporting_enabled()
+    if _log_notice_shown():
+        return _log_reporting_enabled()
+    try:
+        print(_c("\n  ┌─ 异常自动上报 ─────────────────────────────", C_CYAN))
+        for line in _log_notice_text():
+            print(_c("  │ " + line if line else "  │", C_GRAY))
+        print(_c("  └──────────────────────────────────────────────", C_CYAN))
+        ans = input(_c("  是否保持开启上报? [Y=开启 / N=关闭]: ", C_GREEN)).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return _log_reporting_enabled()
+    enabled = ans not in ("n", "no")
+    _set_log_reporting_enabled(enabled)
+    _mark_log_notice_shown()
+    print(_c("  ✓ 异常上报已开启（如需关闭，菜单按 [C]）" if enabled
+             else "  ✓ 异常上报已关闭，仅写本地日志", C_GRAY))
+    return enabled
+
+
+def _toggle_log_reporting_menu():
+    """菜单 [C]: 切换异常上报开关。"""
+    cur = _log_reporting_enabled()
+    print(_c(f"  异常自动上报当前状态: {'已开启' if cur else '已关闭'}", C_GRAY))
+    try:
+        ans = input(_c("  切换为 [Y=开启 / N=关闭]: ", C_GREEN)).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if ans in ("y", "yes"):
+        _set_log_reporting_enabled(True)
+        print(_c("  ✓ 异常上报已开启", C_GRAY))
+    elif ans in ("n", "no"):
+        _set_log_reporting_enabled(False)
+        print(_c("  ✓ 异常上报已关闭，仅写本地日志", C_GRAY))
+    else:
+        print(_c("  未做修改。", C_GRAY))
+
+
 def _scene_menu(install=False, pip_mirror=None):
     """场景层首页 (PR-A · v1.6.0): 中文场景标签 + 数字回车。
 
@@ -20972,16 +21118,24 @@ def _scene_menu(install=False, pip_mirror=None):
         print(f"    {_c('[6]', C_CYAN)} 现场检测（客户报告）")
         print(f"    {_c('[7]', C_CYAN)} 持续盯障（输入分钟数）")
         print(f"    {_c('[9]', C_CYAN)} 高级选项（工程师用）   "
-              f"{_c('[A]', C_CYAN)} 管理员模式   {_c('[0]', C_CYAN)} 退出")
+              f"{_c('[A]', C_CYAN)} 管理员模式")
         print(_c("     (管理员模式 = 以管理员身份重启, 抓包取证/Npcap 安装需要)", C_GRAY))
+        # v1.17.0: 异常上报开关。退出项只出现一次 —— 之前这行自带一个
+        # "[0] 退出", 与上一行的退出项重复, 菜单看着像有两个退出口。
+        print(_c(f"    {_c('[C]', C_CYAN)} 异常上报: "
+              f"{'已开启' if _log_reporting_enabled() else '已关闭'}"
+              f"    {_c('[0]', C_CYAN)} 退出", C_GRAY))
         print(_c("-" * 60, C_GRAY))
         try:
-            choice = input(_c("  选择 [0-9A]: ", C_GREEN)).strip().lower()
+            choice = input(_c("  选择 [0-9AC]: ", C_GREEN)).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return False
         if choice in ("0", "q", "quit", "exit"):
             return False
+        if choice == "c":
+            _toggle_log_reporting_menu()
+            continue
         if choice == "a":
             # 一键提权重启: 提权成功 → sys.exit(0) (不会走到这里); 失败/取消
             # → 落回菜单继续 (不藏退路)
@@ -21039,6 +21193,11 @@ def interactive_menu(install=False, pip_mirror=None):
     SPEEDTEST_CONFIG["use_speedtest_net"] = True
     if not SPEEDTEST_CONFIG.get("ookla_server_id"):
         SPEEDTEST_CONFIG["ookla_server_id"] = OOKLA_DEFAULT_SERVER_ID
+    # v1.17.0: 首次运行告知异常自动上报 (征询同意; 非 TTY 静默跳过)
+    try:
+        _offer_log_reporting_notice()
+    except Exception:
+        pass
     if not _scene_menu(install=install, pip_mirror=pip_mirror):
         return
 
@@ -21283,6 +21442,10 @@ def main():
     parser.add_argument("--no-update-check", action="store_true",
                         help="跳过启动时的自动检查更新 (v1.12.0; 检查本身"
                              "为后台静默, 失败无感知)")
+    parser.add_argument("--log-report", choices=["on", "off"], default=None,
+                        help="异常自动上报开关 (v1.17.0): on=开启, off=关闭。"
+                             "默认开启, 首次运行弹窗征询; 交互菜单按 [C] 随时切换。"
+                             "off 等价于设 NETPULSE_LOG_REPORT=0")
     parser.add_argument("--diagnose", metavar="PROFILE",
                         choices=sorted(list(DIAGNOSE_PROFILES.keys())),
                         help="按场景 Profile 诊断 (阶段 C · v1.3.0 引入). "
@@ -21452,6 +21615,13 @@ def main():
     elif sys.stdout.isatty():
         _prime_update_state_from_cache()
         _start_update_check(force=True).join(2.0)
+
+    # v1.17.0: 异常上报开关 (CLI 显式指定优先于配置文件; 自动化场景用)。
+    # 置位后同时跳过首次告知弹窗 —— 用户已用参数表过态, 不再打扰。
+    _log_opt = getattr(args, "log_report", None)
+    if _log_opt in ("on", "off"):
+        _set_log_reporting_enabled(_log_opt == "on")
+        _mark_log_notice_shown()
 
     # 端口探测参数 -> 全局配置 (run_diagnostics 读取)
     # 注意: args.port_target 已经是 argparse action="append" 后的 list,
@@ -21624,20 +21794,530 @@ def main():
     interactive_menu(install=args.install, pip_mirror=args.pip_mirror)
 
 
-def _write_crash_log(exc):
-    """把未预期异常的完整 traceback 写到报告目录, 供现场回传排查。
+def _write_error_log(level, exc, tb_text=None):
+    """把事件的完整 traceback 追加写到报告目录, 供现场回传排查。
 
     返回日志路径; 写不进去返回 None (不能因为写日志失败而二次崩溃)。
     """
     try:
         base = os.path.dirname(_report_dir())      # <程序目录>/reports
         path = os.path.join(base, "netpulse_error.log")
+        if tb_text is None:
+            tb_text = "".join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__))
         with open(path, "a", encoding="utf-8") as f:
-            f.write(f"\n===== {datetime.now().isoformat()} =====\n")
-            traceback.print_exc(file=f)
+            f.write("\n===== %s [%s] %s =====\n" % (
+                datetime.now().isoformat(), str(level).upper(),
+                type(exc).__name__))
+            f.write(tb_text)
         return path
     except Exception:
         return None
+
+
+# ── 远程日志上报 (v1.17.0) ─────────────────────────────────────
+# 现场问题闭环: 程序跑在客户机器上, 出问题只有本机日志, 厂商拿不到 -> 只能等
+# 用户截图/回传, 复现率极低 (v1.16.1 的提权重启崩溃就是这样才暴露出来的)。
+# 这里把**软件自身的问题**推送到统一日志服务器, 让优化闭环不依赖用户配合。
+#
+# 上报范围 (已确认): 只报软件自身问题 —— 崩溃 / 模块异常 / 后台线程静默死亡 /
+# 内部降级。**不含任何客户网络诊断数据** (不碰公网 IP / MAC / SSID / 丢包率 /
+# 延迟 / 诊断结论 / 客户名)。
+#
+# 设计取舍:
+#  - 渠道: 统一日志服务 (POST JSON)。客户机上零配置 —— 端点与 token 内置在
+#    exe 里; 换服务器用环境变量覆盖, 不用重新打包。
+#  - 凭据: 内置固定 token (逆向可得, 因此服务端**必须**限流 + 字段白名单;
+#    该 token 只能写日志, 不能读写其它数据)。
+#  - 开关: 默认开启, 但首次运行弹窗告知并可关闭 (客户知情权)。
+#    开关状态存 %LOCALAPPDATA%\NetPulse\log_report.json。
+#  - 内容: 异常类型 + traceback + 系统版本 + NetPulse 版本 + 模块/线程上下文。
+#  - 隐私: traceback 里可能带用户路径 / 机器名 / SSID, 上报前统一脱敏。
+#  - 绝不阻塞主流程: 上报失败只写本地日志, 不影响退出码与用户操作。
+
+# 日志服务端端点 (POST JSON)。换服务器: 设环境变量 NETPULSE_LOG_URL 即可。
+LOG_SERVER_URL = "http://router.silentcrow.top:9800/v1/logs"
+# 内置写入 token。**这是公开写权限** (exe 可逆向) —— 服务端必须限流 + 字段
+# 白名单。它只能写日志, 不能读库/改配置, 故泄露影响可控。
+LOG_SERVER_TOKEN = "app-tk_87a4d0bc31508c1f0b10dd8eb116f165"
+# 端点 / token 覆盖环境变量 (换服务器不必重新打包)
+LOG_URL_ENV = "NETPULSE_LOG_URL"
+LOG_TOKEN_ENV = "NETPULSE_LOG_TOKEN"
+LOG_TIMEOUT_S = 10
+# 协议允许的 type 取值 (缺省 info)
+LOG_LEVELS = ("critical", "error", "warn", "info", "debug")
+LOG_MAX_STACK_CHARS = 12000
+LOG_MAX_MESSAGE_CHARS = 2000
+# 同一处同一异常最多上报几次 (防崩溃循环 / 盯障模式刷屏)
+LOG_MAX_REPORTS_PER_KEY = 3
+# 单轮诊断最多上报几条模块异常 (客户网络全断时 23 个模块会集体失败)
+LOG_RUN_BUDGET = 5
+# 本轮已上报条数计数器 (run_diagnostics 开头重置)
+_LOG_RUN_STATE = {"sent": 0}
+# 本地日志限频计数器 {指纹: 次数}。盯障模式 24h 循环里同一处失败会重复上万次,
+# 不限频就把 netpulse_error.log 撑爆 (进程内有效, 每次启动重新计数)。
+_LOG_LOCAL_SEEN = {}
+
+
+def _log_config_path():
+    """上报配置路径: %LOCALAPPDATA%\\NetPulse\\log_report.json"""
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    return os.path.join(base, "NetPulse", "log_report.json")
+
+
+def _load_log_config():
+    """读上报配置。返回 dict (损坏时返回默认, 不抛异常)。"""
+    try:
+        with open(_log_config_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_log_config(cfg):
+    """写上报配置 (失败静默 —— 上报开关存不住不该影响程序运行)。"""
+    try:
+        path = _log_config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _log_reporting_enabled():
+    """上报是否启用。默认 True (首次运行由菜单弹窗告知并征询)。"""
+    if os.environ.get("NETPULSE_LOG_REPORT") == "0":
+        return False
+    cfg = _load_log_config()
+    return bool(cfg.get("enabled", True))
+
+
+def _set_log_reporting_enabled(enabled):
+    """设置上报开关并落盘。返回是否写入成功。"""
+    cfg = _load_log_config()
+    cfg["enabled"] = bool(enabled)
+    cfg["updated_at"] = datetime.now().isoformat()
+    return _save_log_config(cfg)
+
+
+def _log_reported_counts():
+    """已上报次数表 {异常指纹: 次数} (用于限流)。"""
+    cfg = _load_log_config()
+    counts = cfg.get("reported")
+    return counts if isinstance(counts, dict) else {}
+
+
+def _log_bump_reported(key):
+    """记录某异常指纹已上报 N 次 (超限不再上报, 仍照常落盘)。"""
+    cfg = _load_log_config()
+    counts = cfg.get("reported")
+    if not isinstance(counts, dict):
+        counts = {}
+    counts[key] = int(counts.get(key, 0)) + 1
+    cfg["reported"] = counts
+    _save_log_config(cfg)
+
+
+def _log_os_string():
+    """上报用的终端标识: 系统版本串 (不含 hostname 等任何身份信息)。"""
+    try:
+        system = platform.system() or ""
+    except Exception:
+        system = ""
+    try:
+        version = platform.version() or ""
+    except Exception:
+        version = ""
+    try:
+        machine = (platform.machine() or "").lower()
+    except Exception:
+        machine = ""
+    if machine in ("amd64", "x86_64"):
+        machine = "x64"
+    elif machine in ("i386", "i686", "x86"):
+        machine = "x86"
+    parts = [p for p in (system, version, machine) if p]
+    return " ".join(parts) or "unknown"
+
+
+def _log_now_iso():
+    """客户端时间戳: ISO8601 毫秒 + 本机时区偏移 (服务端存库归一化为 UTC)。
+
+    **必须客户端带 ts** —— 崩溃发生时刻与接收时刻可能相差很久 (机器离线 /
+    限流丢弃 / 重试), 排查时需要真实发生时间, 不能用服务端接收时刻。
+    """
+    try:
+        return datetime.now().astimezone().isoformat(timespec="milliseconds")
+    except Exception:
+        return datetime.now().isoformat()
+
+
+def _log_sanitize_text(text):
+    """对上报文本做隐私脱敏。
+
+    traceback 里最常见的隐私是**用户路径** (C:\\Users\\张三\\...)、**机器名**、
+    **SSID** 与**公网 IP**。用户目录/机器名走精确替换, SSID 走正则 (尽力而为,
+    不保证 100%), 公网 IP 与 MAC 复用调试包既有的值级打码口径。
+    内网 IP **保留** —— 定位现场问题必需。
+    """
+    if not text:
+        return ""
+    text = str(text)
+    # 用户目录 -> <user> (含中文/英文用户名)
+    try:
+        userprofile = os.environ.get("USERPROFILE", "")
+        if userprofile:
+            text = text.replace(userprofile, "<user>")
+        home = os.path.expanduser("~")
+        if home and home not in ("~",):
+            text = text.replace(home, "<user>")
+    except Exception:
+        pass
+    # 机器名 -> <host> (长度 <4 不替换 —— 短机器名会把正文误伤成一片)
+    try:
+        hostname = socket.gethostname()
+        if hostname and len(hostname) >= 4:
+            text = re.sub(re.escape(hostname), "<host>", text,
+                          flags=re.IGNORECASE)
+    except Exception:
+        pass
+    # SSID -> *** (尽力而为: 只覆盖 "SSID: xxx" 这类带标签的写法)
+    try:
+        text = re.sub(r"(SSID\s*[:：=]\s*)\S+", r"\1***", text,
+                      flags=re.IGNORECASE)
+        text = re.sub(r"(无线网络名称\s*[:：=]\s*)\S+", r"\1***", text)
+    except Exception:
+        pass
+    # 公网 IP / IPv6 / MAC -> 复用调试包既有的值级打码
+    try:
+        text = _mask_mac_text(_redact_text_value(text))
+    except Exception:
+        pass
+    return text
+
+
+def _log_fingerprint(scope, exc):
+    """异常指纹: 版本 + 作用域 + 异常类型 + 出错位置 (去掉行号, 跨版本稳定)。
+
+    用于限流去重 —— 同一处同一异常类型只报 N 次, 防崩溃循环/盯障模式刷屏。
+    **带版本号**: 计数跨版本累计会让「修好了的老问题」永远不再上报,
+    每个版本各自重新计 3 次才能看出「这问题还在复发」。
+    """
+    try:
+        tb = traceback.extract_tb(exc.__traceback__)
+        loc = ""
+        if tb:
+            last = tb[-1]
+            loc = "%s:%s" % (os.path.basename(last.filename), last.name)
+        return "v%s|%s@%s@%s" % (APP_VERSION, scope, type(exc).__name__, loc)
+    except Exception:
+        try:
+            return "v%s|%s@%s" % (APP_VERSION, scope, type(exc).__name__)
+        except Exception:
+            return scope or "unknown"
+
+
+def _log_message(scope, exc, detail=None):
+    """组装 message: v<版本> [<作用域>] <异常类型>: <细节>。
+
+    协议没有独立的 metadata 字段, 上下文 (版本/模块/线程) 只能编码进 message。
+    固定前缀便于服务端机器解析。
+    """
+    try:
+        kind = type(exc).__name__
+    except Exception:
+        kind = "Exception"
+    text = ""
+    try:
+        text = str(exc).strip().replace("\r", " ").replace("\n", " ")
+    except Exception:
+        text = ""
+    if len(text) > 300:
+        text = text[:300] + "..."
+    head = "v%s [%s] %s" % (APP_VERSION, scope or "未知", kind)
+    if detail:
+        return "%s: %s" % (head, str(detail))
+    if text:
+        return "%s: %s" % (head, text)
+    return head
+
+
+def _log_payload(level, message, stack=None, ts=None):
+    """构造上报负载 —— 严格用协议约定的字段 (app/type/message/stack/ts/os)。
+
+    服务端实测约束 (2026-11-02): `message` 不能为空 (400), `type` 必须是
+    critical|error|warn|info|debug (400), `ts` 必须是 RFC3339 (400)。
+    这里全部在客户端侧先兜住 —— 一次非法请求不会浪费服务端配额。
+    """
+    if level not in LOG_LEVELS:
+        level = "error"
+    message = _log_sanitize_text(message)[:LOG_MAX_MESSAGE_CHARS].strip()
+    if not message:
+        # message 为空服务端直接 400 —— 兜底成一条占位摘要, 不丢这次事件。
+        message = "v%s [未知] %s" % (APP_VERSION, level)
+    payload = {
+        "app": "netpulse",
+        "type": level,
+        "message": message,
+    }
+    if stack:
+        payload["stack"] = _log_sanitize_text(stack)[:LOG_MAX_STACK_CHARS]
+    payload["ts"] = ts or _log_now_iso()
+    payload["os"] = _log_os_string()
+    return payload
+
+
+def _log_endpoint():
+    """上报端点 URL (环境变量优先, 便于换服务器不改 exe)。"""
+    return (os.environ.get(LOG_URL_ENV) or LOG_SERVER_URL).strip()
+
+
+def _log_token():
+    """上报 token (环境变量优先)。"""
+    return (os.environ.get(LOG_TOKEN_ENV) or LOG_SERVER_TOKEN).strip()
+
+
+def _post_log(payload, timeout=LOG_TIMEOUT_S):
+    """把负载 POST 到日志服务端。返回 (ok, msg)。
+
+    鉴权用内置 token (X-Token 头)。token 是公开写权限, 服务端必须限流 ——
+    这是客户端无法弥补的, 由服务端负责。
+
+    服务端错误约定 (实测): 4xx + `{"ok": false, "error": "..."}`。
+    `error` 是中文可读原因 (如 "第 1 条: message 不能为空"), **必须透传** ——
+    压成 "HTTP Error 400" 等于把排查线索全丢了。
+    """
+    url = _log_endpoint()
+    if not url:
+        return False, "未配置上报端点"
+    token = _log_token()
+    if not token:
+        return False, "未配置 X-Token"
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    try:
+        with _urlopen_with_proxy(
+            url, timeout=timeout, ua="NetPulse/%s" % APP_VERSION,
+            data=body, method="POST",
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "X-Token": token,
+                "X-NetPulse-Version": str(APP_VERSION),
+            },
+        ) as resp:
+            raw = resp.read().decode("utf-8", "ignore")
+            status = getattr(resp, "status", None) or getattr(resp, "code", 0)
+        try:
+            status = int(status)
+        except Exception:
+            status = 0
+        if status >= 400:
+            return False, "服务端拒绝 HTTP %s: %s" % (status, raw[:200])
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+        if isinstance(data, dict) and data.get("ok") is False:
+            return False, "服务端拒绝: %s" % (data.get("error") or "未知原因")
+        return True, str(data.get("id") or data.get("message")
+                         or raw[:120] or "已接收")
+    except Exception as e:
+        # HTTPError: 服务端 4xx/5xx。解析响应体里的 error 字段透传可读原因。
+        detail = ""
+        try:
+            raw = e.read().decode("utf-8", "ignore")
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                detail = str(data.get("error") or "")
+            elif raw:
+                detail = raw[:200]
+        except Exception:
+            pass
+        code = getattr(e, "code", None)
+        if detail:
+            return False, "服务端拒绝%s: %s" % (
+                (" HTTP %s" % code) if code else "", detail)
+        return False, "上报失败: %s: %s" % (type(e).__name__, e)
+
+
+def _emit_runtime_event(level, exc, scope, detail=None, tb_text=None):
+    """统一上报出口: 写本地日志 + (按开关)推送到日志服务器。返回 (ok, msg)。
+
+    **绝不影响主流程**: 内部吞掉一切异常, 返回 (False, 原因)。
+    关闭上报 / 超过限流 -> 只落盘不上报。
+
+    本地日志与远端上报**分别限频**: 盯障模式 24h 循环里同一处失败会重复上万次,
+    两边都不限频就是「本地日志撑爆 + 服务端被刷屏」双输。
+    """
+    try:
+        if tb_text is None:
+            tb_text = "".join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__))
+    except Exception:
+        tb_text = ""
+    try:
+        key = _log_fingerprint(scope, exc)
+    except Exception:
+        key = scope or "unknown"
+    # 本地日志限频 (进程内)
+    seen = _LOG_LOCAL_SEEN.get(key, 0)
+    if seen < LOG_MAX_REPORTS_PER_KEY:
+        try:
+            _write_error_log(level, exc, tb_text)
+        except Exception:
+            pass
+        _LOG_LOCAL_SEEN[key] = seen + 1
+    try:
+        if not _log_reporting_enabled():
+            return False, "上报已关闭"
+        if _log_reported_counts().get(key, 0) >= LOG_MAX_REPORTS_PER_KEY:
+            return False, "同类异常上报次数已达上限, 仅落盘"
+        payload = _log_payload(level, _log_message(scope, exc, detail),
+                               stack=tb_text)
+        ok, msg = _post_log(payload)
+        if ok:
+            _log_bump_reported(key)
+        return ok, msg
+    except Exception as e:
+        return False, "上报异常: %s" % type(e).__name__
+
+
+def _emit_thread_failure(exc, scope, detail=None):
+    """后台线程里的异常 —— 写本地日志 + 异步推送 (不打断线程自身流程)。
+
+    用于「静默死亡」改造: 这些点原本 `except Exception: pass`, 客户机表现为
+    「没报错但也没结果」—— 报告呈现「0 丢包」之类的假象, 用户与厂商都看不出来。
+    """
+    try:
+        tb_text = "".join(traceback.format_exception(
+            type(exc), exc, exc.__traceback__))
+    except Exception:
+        tb_text = ""
+    try:
+        _emit_runtime_event_async("error", exc, scope, detail=detail,
+                                  tb_text=tb_text)
+    except Exception:
+        pass
+
+
+def _emit_runtime_event_async(level, exc, scope, detail=None, tb_text=None,
+                              wait=0.0, announce=False):
+    """异步上报 —— 后台线程发起, 主流程最多等 wait 秒。
+
+    wait=0: 完全不等 (fire-and-forget), 适合诊断过程中的模块异常 ——
+            绝不能让上报拖住用户正在跑的检测。
+    wait>0: 限时等待 (崩溃路径用), 网络不通时不能拖住用户退出。
+    """
+    result = {}
+
+    def _worker():
+        try:
+            result["ok"], result["msg"] = _emit_runtime_event(
+                level, exc, scope, detail=detail, tb_text=tb_text)
+        except Exception as e:
+            result["ok"], result["msg"] = False, "上报异常: %s" % e
+
+    t = threading.Thread(target=_worker, name="log-report", daemon=True)
+    t.start()
+    if wait:
+        t.join(timeout=wait)   # 限时等待; 线程是 daemon, 进程退出即终止
+    if announce:
+        if result.get("ok"):
+            try:
+                print(_c("    ✓ 已自动上报 (%s)" % result.get("msg"), C_GRAY))
+            except Exception:
+                pass
+        else:
+            msg = result.get("msg") or "未完成"
+            try:
+                print(_c("    (自动上报未完成: %s; 本地日志已保留)" % msg,
+                         C_GRAY))
+            except Exception:
+                pass
+    return bool(result.get("ok"))
+
+
+def _emit_probe_failure(key, exc, tb_text=None, detail=None):
+    """模块/探针异常上报 —— 受单轮预算约束。
+
+    客户网络全断时 23 个模块会集体失败, 不设预算就是 23 条齐飞; 超预算的
+    只写本地日志。
+    """
+    try:
+        if _LOG_RUN_STATE.get("sent", 0) >= LOG_RUN_BUDGET:
+            try:
+                _write_error_log("error", exc, tb_text)
+            except Exception:
+                pass
+            return False
+        _LOG_RUN_STATE["sent"] = _LOG_RUN_STATE.get("sent", 0) + 1
+        _emit_runtime_event_async("error", exc, "模块:%s" % key,
+                                   detail=detail, tb_text=tb_text)
+        return True
+    except Exception:
+        return False
+
+
+def _exc_meta(scope, exc):
+    """异常元数据 (留在模块结果里, **不含栈**)。
+
+    栈只在推送那一刻用 —— 不进 LAST_RUN、不进客户交付物 (隐私)。
+    但异常类型必须留下来: 旧路径只留 str(e), 报告层根本分不清是
+    TimeoutError 还是 PermissionError。
+    """
+    try:
+        etype = type(exc).__name__
+    except Exception:
+        etype = "Exception"
+    try:
+        msg = str(exc)
+    except Exception:
+        msg = ""
+    return {
+        "type": etype,
+        "message": _log_sanitize_text(msg)[:300],
+        "scope": scope,
+    }
+
+
+def _install_thread_excepthook():
+    """v1.17.0: 捕获后台线程的未捕获异常并上报。
+
+    动机: 顶层 except 只兜住主线程。NetPulse 有多个 daemon 后台线程
+    (scapy 预加载 / 盯障 / 测速 / 更新检查), 线程里的未捕获异常默认只打到
+    stderr 就消失 —— 客户机上表现为「没报错但也没结果」, 厂商完全看不到。
+    这里装 threading.excepthook, 把这类异常一并纳入上报。
+
+    注意: 只上报, 不改变原异常传播语义 (不吞异常, 不影响线程退出)。
+    """
+    def _hook(args):
+        try:
+            exc = args.exc_value
+            if exc is None:
+                return
+            tb_text = "".join(traceback.format_exception(
+                type(exc), exc, exc.__traceback__))
+            try:
+                _write_error_log("error", exc, tb_text)
+            except Exception:
+                pass
+            try:
+                _emit_runtime_event_async(
+                    "error", exc,
+                    "线程:%s" % (args.thread.name if args.thread else "未知"),
+                    tb_text=tb_text)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    try:
+        threading.excepthook = _hook
+        return True
+    except Exception:
+        return False
 
 
 def _cli_entry():
@@ -21651,6 +22331,11 @@ def _cli_entry():
     不改动的: SystemExit (argparse 的退出码 2/4 等) 原样抛出;
     KeyboardInterrupt 单独处理 (Ctrl+C 不是错误, 退出码 130)。
     """
+    # v1.17.0: 装后台线程异常钩子 (主线程以外的崩溃也要能上报)
+    try:
+        _install_thread_excepthook()
+    except Exception:
+        pass
     try:
         main()
     except KeyboardInterrupt:
@@ -21667,7 +22352,7 @@ def _cli_entry():
             print(_c(f"\n  ✗ 发生未预期错误 ({name}): {exc}", C_RED))
         except Exception:
             pass
-        log_path = _write_crash_log(exc)
+        log_path = _write_error_log("critical", exc)
         if log_path:
             try:
                 print(_c(f"    完整错误信息已写入: {log_path}", C_GRAY))
@@ -21679,6 +22364,13 @@ def _cli_entry():
                 print(_c("    (错误日志写入失败, 请改用 --verbose 重跑一次)", C_GRAY))
             except Exception:
                 pass
+        # v1.17.0: 自动上报到日志服务器 (脱敏后)。
+        # 异步上报 + 短超时 —— 网络慢/不通时不能拖住用户退出。
+        try:
+            _emit_runtime_event_async("critical", exc, "崩溃",
+                                      wait=LOG_TIMEOUT_S + 5, announce=True)
+        except Exception:
+            pass
         sys.exit(3)     # 3 = 工具执行失败 (与 compute_exit_code 口径一致)
 
 

@@ -117,6 +117,79 @@ class TestRelaunchElevated(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("提权重启失败", msg)
 
+    def test_reset_environment_set_during_launch(self):
+        """v1.16.1 回归: 提权重启必须置 PYINSTALLER_RESET_ENVIRONMENT=1。
+
+        背景 (现场反馈: 输入 [A] 后新窗口秒退): PyInstaller 6.9+ 语义下,
+        同 exe 派生的子进程默认被当成「同一实例的 worker 子进程」→ 复用旧实例
+        已解包的 _MEI 目录; 旧实例随后 sys.exit(0) 触发 bootloader 清理该目录
+        → 新实例 bootstrap 阶段读 base_library.zip 报 FileNotFoundError 直接死。
+        PyInstaller 官方要求「重启自身」必须置该变量 (见 PyInstaller 6.10 changelog)。
+        """
+        seen = {}
+
+        def fake_se(*a, **kw):
+            # 在 ShellExecuteW 被调用的瞬间取环境变量 (子进程继承的就是这一刻的值)
+            seen["reset"] = os.environ.get("PYINSTALLER_RESET_ENVIRONMENT")
+            return 33
+
+        saved = os.environ.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+        try:
+            with mock.patch("ctypes.windll.shell32.ShellExecuteW",
+                            side_effect=fake_se), \
+                 mock.patch.object(N, "_find_windows_terminal", return_value=None):
+                ok, msg = N._relaunch_elevated()
+        finally:
+            if saved is None:
+                os.environ.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+            else:
+                os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = saved
+        self.assertTrue(ok)
+        self.assertEqual(seen.get("reset"), "1",
+                         "提权重启必须置 PYINSTALLER_RESET_ENVIRONMENT=1, "
+                         "否则新实例复用旧 _MEI 目录会被旧实例退出时清掉")
+
+    def test_reset_environment_restored_after_call(self):
+        """v1.16.1: 该变量只在发起瞬间置位, 不得污染当前进程后续子进程。"""
+        saved = os.environ.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+        try:
+            with mock.patch("ctypes.windll.shell32.ShellExecuteW",
+                            return_value=33), \
+                 mock.patch.object(N, "_find_windows_terminal", return_value=None):
+                N._relaunch_elevated()
+            self.assertNotIn("PYINSTALLER_RESET_ENVIRONMENT", os.environ,
+                             "调用结束后必须还原, 避免污染后续子进程")
+        finally:
+            if saved is not None:
+                os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = saved
+
+    def test_reset_environment_set_for_wt_path_too(self):
+        """v1.16.1: 经 wt.exe 中转的提权路径同样必须置该变量。
+
+        wt.exe 会把父进程环境变量传给它启动的命令 (已实测), 故置位时机
+        只需覆盖 ShellExecuteW 调用瞬间, 两条路径都覆盖到。
+        """
+        seen = {}
+
+        def fake_se(*a, **kw):
+            seen["reset"] = os.environ.get("PYINSTALLER_RESET_ENVIRONMENT")
+            return 33
+
+        wt = r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\wt.exe"
+        saved = os.environ.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+        try:
+            with mock.patch("ctypes.windll.shell32.ShellExecuteW",
+                            side_effect=fake_se), \
+                 mock.patch.object(N, "_find_windows_terminal", return_value=wt):
+                N._relaunch_elevated()
+        finally:
+            if saved is None:
+                os.environ.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+            else:
+                os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = saved
+        self.assertEqual(seen.get("reset"), "1",
+                         "wt 提权路径同样必须置 PYINSTALLER_RESET_ENVIRONMENT=1")
+
 
 class TestOfferElevationRelaunch(unittest.TestCase):
     """确认交互: 取消 / 成功退出 / 失败降级。"""

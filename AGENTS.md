@@ -257,6 +257,50 @@
 任一不满足 → 重新征求授权。**旧格式（只有一行时间戳）判无效** —— 否则老用户永远
 不会被新白名单约束。读文件失败（权限/只读目录）保持「不拦路」语义。
 
+## 异常上报 (v1.17.0)
+
+程序自身的问题（崩溃 / 模块异常 / 后台线程静默死亡）自动上报到统一日志服务器。
+
+- **端点**：`POST http://router.silentcrow.top:9800/v1/logs`，`X-Token` 鉴权。
+  端点/token 内置在 exe 里，环境变量 `NETPULSE_LOG_URL` / `NETPULSE_LOG_TOKEN` 覆盖。
+- **负载只用协议约定的字段**：`app` / `type` / `message` / `stack` / `ts` / `os`。
+  **不要自造字段** —— 服务端按白名单解析，多余字段会被忽略。
+  `type` 只能是 `critical|error|warn|info|debug`；
+  `message` **不能为空**（服务端 400）；`ts` 必须是 RFC3339（服务端 400）。
+- **`ts` 必须客户端带**（`datetime.now().astimezone().isoformat(timespec="milliseconds")`）：
+  崩溃发生时刻 ≠ 服务端接收时刻（离线/丢弃/重试都会拉长间隔）。
+- **`os` 用系统版本串**，**不含 hostname**（会带出客户机名）。
+- **上下文编码进 `message`**（协议无独立 metadata 字段）：
+  `v{版本} [{作用域}] {异常类型}: {细节}`，作用域如 `模块:dns` / `线程:monitor-probe` / `崩溃`。
+- **单条提交，不要用数组批量**：实测批量是「全有或全无」—— 一条不合法整批 400，
+  **所有条目都不入库**。
+- **上报范围只限软件自身问题**。**绝不**上报客户网络诊断数据（丢包率、延迟、
+  诊断结论、公网 IP、MAC、SSID、客户名）。
+- **限流在客户端**：指纹去重（3 次/指纹/**按版本计**）+ 单轮预算（5 条/轮）
+  + 本地日志限频（进程内）。盯障模式 24h 循环里同一处失败会重复上万次，
+  不限频就把 `netpulse_error.log` 撑爆。
+- **脱敏**（`_log_sanitize_text`）：用户目录 → `<user>`、机器名 → `<host>`、
+  公网 IP / MAC 走既有值级打码、SSID 正则 → `***`（尽力而为）。
+  内网 IP **保留**（定位现场问题必需）。
+- **开关**：默认开 + 首次弹窗告知 + 菜单 `[C]` + `--log-report on|off` +
+  `NETPULSE_LOG_REPORT=0`。配置 `%LOCALAPPDATA%\NetPulse\log_report.json`。
+- **绝不影响主流程**：任何失败都只写本地日志（`reports/netpulse_error.log`），
+  **退出码不变**（崩溃仍是 3）。
+
+### 异常捕捉的硬规则
+
+- **捕获异常必须留住 traceback**。`except Exception as e: ... {"error": str(e)}`
+  这种写法把异常类型与栈全丢了 —— 报告层分不清 `TimeoutError` 还是
+  `PermissionError`，上报更是无从谈起。捕获点立刻 `traceback.format_exc()`。
+- **模块结果里只留元数据不留栈**：`res["_exc"] = {type, message, scope}`。
+  `error` 键的值**逐字不变**（报告文案零变化、健康分口径不变）；
+  栈只在推送那一刻用，不进 `LAST_RUN`、不进客户交付物。
+  `tech.raw_results` 是自由对象（schema 允许），加键不破坏 JSON Schema 校验。
+- **后台线程不许 `except Exception: pass`**。这类「静默死亡」在客户机上表现为
+  「没报错但也没结果」—— 报告呈现「0 丢包」「重传率 0」之类的假象。
+  走 `_emit_thread_failure(exc, scope, detail=...)`。
+- 新增异常处理点时，同步问一句：**这个异常消失后，谁会知道？**
+
 ## 验证
 
 ```bash
@@ -267,7 +311,8 @@ for f in tests/test_*.py; do python "$f"; done
 #   **JSON Schema ↔ 导出一致性 (v1.14.14 新增)**/probes/redaction/场景菜单/
 #   盯障统计/scapy 懒加载 (v1.9.7 PR-2)/自提权重启/管理员修复命令一键执行/
 #   全量口径与 tcpcc 多目标轮转 (v1.10.0)/自动检查更新 (v1.12.0)/
-#   现场检测模式 (v1.13.0)/一页版问题区回退 (v1.13.1)/现场模式自动 PDF (v1.14.0)
+#   现场检测模式 (v1.13.0)/一页版问题区回退 (v1.13.1)/现场模式自动 PDF (v1.14.0)/
+#   **异常上报 (v1.17.0 新增: 协议/脱敏/限流/探针保栈/端到端)**/
 #   v1.14.14 已删 tests/test_parsers.py: 那 29 个用例测的 4 个解析器
 #   (parse_ipconfig / parse_route_print / parse_arp_a / parse_netsh_wlan_interfaces)
 #   **生产代码一次都没调用** —— ARPAnalyzer/RouteAnalyzer/WifiAnalyzer 都是各自

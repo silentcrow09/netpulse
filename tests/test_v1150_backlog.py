@@ -340,8 +340,10 @@ class TestCliEntryCrashGuard(unittest.TestCase):
     def test_unexpected_error_gets_exit_code_3_and_log(self):
         buf = io.StringIO()
         with mock.patch.object(N, "main", side_effect=RuntimeError("炸了")), \
-             mock.patch.object(N, "_write_crash_log",
+             mock.patch.object(N, "_write_error_log",
                                return_value=r"C:\tmp\netpulse_error.log"), \
+             mock.patch.object(N, "_emit_runtime_event_async",
+                               return_value=True), \
              contextlib.redirect_stdout(buf):
             with self.assertRaises(SystemExit) as cm:
                 N._cli_entry()

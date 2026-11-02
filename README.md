@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.16.0
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.17.0
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -62,6 +62,26 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 
 两个开关默认**都不设置**（行为与以前一致）。实际发生第三方查询时，报告「主机信息」区
 会列出被请求的域名（公网 IP 查询），LAN 扫描结果里也会注明补查次数与域名。
+
+### 异常自动上报
+
+程序跑在客户机器上时，**程序自身的问题**默认会**自动上报到开发者的日志服务器**，
+让厂商能直接看到现场异常栈，不必等用户截图回传。
+
+- **上报范围**：只报软件自身的问题 —— 顶层崩溃、**模块/探针异常（含完整 traceback
+  与异常类型）**、后台线程静默死亡、内部降级。
+- **不上报的内容**：任何网络诊断结果（丢包率、延迟、诊断结论）、公网 IP、MAC、
+  SSID、账号、客户名。用户目录名（`C:\Users\xxx`）替换为 `<user>`，机器名替换为
+  `<host>`，公网 IP / MAC 走与调试包同一套脱敏规则。
+- **客户机无需任何配置**：端点与写入 token 内置在 exe 里，不让用户持有凭据。
+  换了服务器地址也不必重打包 —— 设环境变量 `NETPULSE_LOG_URL` 即可
+  （token 可用 `NETPULSE_LOG_TOKEN` 覆盖）。
+- **开关**：默认开启，**首次运行会弹窗告知并征询同意**；之后可用菜单 `[C]` 随时开关，
+  状态存 `%LOCALAPPDATA%\NetPulse\log_report.json`。
+  也可用 `--log-report on|off`（自动化场景）或 `NETPULSE_LOG_REPORT=0`（最高优先级）。
+- **降级**：网络不通、上报失败、超过限流，都只写本地日志
+  （`reports/netpulse_error.log`），**不影响退出码与使用**。同一异常最多上报 3 次
+  （按版本计），单轮诊断最多上报 5 条模块异常，防崩溃循环与批量刷屏。
 
 ## 🚀 快速开始
 
@@ -206,6 +226,7 @@ python netpulse.py --install
 | `--site` | 现场检测模式 (v1.13.0): 全量诊断(排除压测) + 机房 6 项勾选 + 现场备注, 自动生成 一页客户报告(PDF) / 完整版 / JSON 到 reports/ — 检测到 Chrome/Edge 自动转 PDF (v1.14.1), 都没有则打开 HTML 后 Ctrl+P。菜单入口: 场景 `[6]` |
 | `--customer` | 现场检测模式的客户名称预填 (配合 `--site`; 不填则终端询问) |
 | `--export` | 诊断后导出报告，逗号分隔多格式（`report.html,report.json`） |
+| `--log-report` | 异常自动上报开关 (v1.17.0): `on`=开启 / `off`=关闭。默认开启，首次运行弹窗征询；交互菜单按 `[C]` 随时切换。`off` 等价于设 `NETPULSE_LOG_REPORT=0` |
 
 ## 📋 诊断模块（23 项）
 

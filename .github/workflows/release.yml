@@ -26,7 +26,10 @@ jobs:
       - name: 安装构建依赖 (x64)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller scapy
+          # pyinstaller>=6.10: PYINSTALLER_RESET_ENVIRONMENT 变量自 6.10 引入,
+          # 提权重启靠它让新实例自行解包 (版本过低则该变量被忽略, 修复失效)。
+          # 不锁死上限: 上游 6.x 修复频繁, 但下限是硬要求。
+          python -m pip install "pyinstaller>=6.10" scapy
 
       - name: 下载 Ookla Speedtest CLI
         shell: pwsh
@@ -77,7 +80,9 @@ jobs:
       - name: 安装构建依赖 (x86)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller scapy
+          # 同 x64: 需要 >=6.10 (PYINSTALLER_RESET_ENVIRONMENT 提权重启修复);
+          # pip 会自动挑选仍支持 Python 3.8 的版本。
+          python -m pip install "pyinstaller>=6.10" scapy
 
       - name: PyInstaller 打包 (x86)
         env:

@@ -7,6 +7,133 @@
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-11-02
+
+### 新增
+
+**异常自动上报（统一日志服务器）—— 现场问题闭环**
+
+- **动机**：程序主要跑在客户机器上。此前崩溃只写本地 `reports/netpulse_error.log`，
+  厂商拿不到现场栈 → 只能等用户截图回传，复现率极低（v1.16.1 的提权重启崩溃就是
+  这样才暴露出来的）。现在**程序自身的问题**自动上报到统一日志服务器。
+- **上报范围（已确认）**：只报软件自身问题 —— 顶层崩溃、**模块/探针异常（含完整
+  traceback 与异常类型）**、后台线程静默死亡、内部降级。**不含任何客户网络诊断数据**
+  （不碰丢包率、延迟、诊断结论、公网 IP、MAC、SSID、客户名）。
+- **接口**：`POST http://router.silentcrow.top:9800/v1/logs`，`X-Token` 鉴权，
+  负载严格用协议约定的 `app` / `type` / `message` / `stack` / `ts` / `os`。
+  端点与 token 内置在 exe 里（**客户机零配置**），可用环境变量 `NETPULSE_LOG_URL` /
+  `NETPULSE_LOG_TOKEN` 覆盖 —— 换服务器不必重新打包。
+- **`ts` 由客户端带**（ISO8601 毫秒 + 时区偏移）：崩溃发生时刻与接收时刻可能相差很久
+  （机器离线 / 限流丢弃 / 重试），排查需要真实发生时间，不能用服务端接收时刻。
+- **`os` 用系统版本串**（如 `Windows 10.0.26100 x64`），不含 hostname 等身份信息。
+- **上下文编码进 `message`**（协议无独立 metadata 字段），固定前缀便于服务端解析：
+  `v1.17.0 [模块:dns] TimeoutError: socket timeout after 30s`。
+- **知情权**：默认开启，但**首次运行弹窗告知上报内容并征询同意**；之后菜单 `[C]`
+  随时开关，状态存 `%LOCALAPPDATA%\NetPulse\log_report.json`。
+  环境变量 `NETPULSE_LOG_REPORT=0` 是最高优先级的关闭开关；
+  CLI `--log-report on|off` 供自动化场景使用。
+- **健壮性**（关键：上报绝不影响主流程）：
+  - 异步上报 + 限时等待（崩溃路径 15s）—— 网络不通不会拖住用户退出。
+  - 网络失败 / 服务端拒绝 / 上报本身抛异常 → 全部降级为「只落盘」，退出码不变。
+  - 服务端 4xx 的中文原因（如「第 1 条: message 不能为空」）**原样透传**，
+    不压成「HTTP Error 400」。
+  - 同一异常指纹最多上报 3 次（**按版本计** —— 修好的老问题不会永久停止上报）；
+    单轮诊断最多上报 5 条模块异常（客户网络全断时 23 个模块会集体失败）；
+    本地日志同样限频（盯障模式 24h 循环里同一处失败会重复上万次）。
+  - `SystemExit` 与 `KeyboardInterrupt` 不上报（前者是正常退出，后者是 Ctrl+C）。
+
+### 修复
+
+**异常捕捉健全性 —— 模块级异常原本只留一句 `str(e)`**
+
+- **问题**：全仓约 45 处吞异常点把异常在到达任何上报通道之前就吃掉了，原有通道
+  只接得住「逃逸到顶层」的异常，因此**模块级异常 100% 不会进入上报**。
+  更糟的是探针路径把异常降级成 `{"error": str(e)}` —— **异常类型与 traceback
+  全丢**，报告层根本分不清是 `TimeoutError` 还是 `PermissionError`。
+- **修法**：
+  - `_run_module_with_timeout`（V2 probe 路径 + 旧 Tester 路径）与
+    `_run_diagnostics_sequential` / `_run_diagnostics_parallel._run_one`
+    —— 捕获点立刻 `traceback.format_exc()`，上报时带完整栈。
+  - 模块结果里留存 `res["_exc"] = {type, message, scope}`（**不含栈**）：
+    `error` 键的值逐字不变 → 报告文案零变化、健康分口径不变；
+    栈只在推送那一刻用，不进 `LAST_RUN`、不进客户交付物。
+  - 并行模式 `fut.result()` 的兜底分支原为 `except Exception: pass` ——
+    该模块会从结果里整个消失且完全静默；现在写日志 + 上报（不改报告口径）。
+
+**后台线程「静默死亡」**
+
+盯障探测循环、TCP 重传统计、网卡错误计数、MTU 探测、主动负载、ping 读循环、
+更新检查、上行测速 worker —— 共 9 处原为 `except Exception: pass`，客户机表现为
+「没报错但也没结果」：报告呈现「0 丢包」「重传率 0」之类的假象，用户与厂商都看不出来。
+全部改走统一钩子 `_emit_thread_failure()`：写本地日志 + 异步推送。
+
+**脱敏补强**
+
+在既有「用户目录 / 公网 IP / MAC」基础上补 **机器名**（精确替换 `<host>`）与
+**SSID**（正则替换 `***`，尽力而为）。内网 IP 保留 —— 定位现场问题必需。
+
+**`_urlopen_with_proxy()` 支持 POST**
+
+原先只支持 GET，无法向日志服务端推送。扩展出 `data` / `method` / `headers`
+参数，上报走同一套企业代理支持（客户机常在代理环境）。
+
+### 测试
+
+- 新增 `tests/test_log_report.py`（56 例）：协议字段与取值合法、ts 为 RFC3339、
+  os 不含机器名、脱敏（用户名 / 公网 IP / MAC / 机器名 / SSID）、开关语义与持久化、
+  限流与本地日志限频、单轮预算、服务端 4xx 原因透传、401 透传、
+  `_cli_entry` 接入与退出码、线程钩子、首次告知、CLI 开关、
+  **探针异常必须带完整 traceback**、**端到端真发一条 POST 到本地 mock 服务端**。
+- 删除 `tests/test_crash_report.py` / `tests/test_crash_server.py`
+  与 `deploy/crash_server/`（自建服务端从未部署，域名 DNS 都不解析）。
+
+### 验证
+
+- **真实服务端端到端**：用本仓库客户端代码向 `router.silentcrow.top:9800` 实推，
+  服务端返回 `{"ok":true,"data":{"inserted":1}}`；载荷字段恰为协议约定的 6 个。
+- **协议实测**：token 缺失/错误 → `401 无效 token`；`type` 非法 → `400`；
+  `message` 为空 → `400`；`ts` 非 RFC3339 → `400`；缺 `type` 缺省为 `info`。
+  数组批量提交是「全有或全无」（一条不合法整批丢失）→ 客户端采用**单条提交**。
+- **渲染零回归**：模块结果多出 `_exc` 键后，customer / brief / brief_v2 三份
+  HTML 逐行比对**完全一致**（601 / 171 / 248 行）；`_exc` 只出现在 JSON 导出的
+  `tech.raw_results`（技术视图），客户报告不可见。
+- 全量回归 **42 个测试文件全绿**；Python 3.13 与 3.8（打包目标版本）均编译通过。
+
+### 已知限制
+
+- 端点是**明文 HTTP**，栈信息在链路上明文。URL 可配，切 HTTPS 不用重打包 ——
+  建议服务端后续补 HTTPS 入口。
+- 实测服务端**未实现限流**（连发 55 条无 429）。token 内置在 exe 里、逆向可得，
+  服务端侧应补 IP 限流与配额；客户端侧目前靠「指纹去重 + 单轮预算」兜底。
+
+## [1.16.1] - 2026-10-27
+
+### 修复
+
+**P0 提权重启（场景菜单 `[A]`）秒退 — `FileNotFoundError: base_library.zip`**
+
+- **现象**：用户机器上双击运行、输入 `[A]`（管理员模式）后，新窗口闪退，终端刷出
+  `FileNotFoundError: [Errno 2] No such file or directory: '...\Temp\_MEIxxxxxx\base_library.zip'`
+  + `[PYI-xxxxx:ERROR] Failed to execute script 'pyiboot01_bootstrap'`。同一 exe 在开发者
+  机器上正常 → 与打包产物、与目标机器环境相关。
+- **根因**：PyInstaller ≥6.9 改变了 bootloader 对「同 exe 派生进程」的判定 —— 默认认为是
+  **同一实例的 worker 子进程**，因而**复用**父进程已解包的 `_MEI` 临时目录，而不是自行解包。
+  NetPulse 的提权重启正是这个模式（拉起新实例后旧窗口 `sys.exit(0)`）：旧实例退出触发其
+  bootloader 清理 `_MEI` 目录，新实例此刻还在 bootstrap 阶段读该目录下的
+  `base_library.zip` → 文件已被删除 → 进程在跑起 Python 主代码前就死掉。
+  上游为此专门引入 `PYINSTALLER_RESET_ENVIRONMENT`，并在文档「Implementing application
+  restart」中明确要求：重启自身时必须置该变量，否则子进程会「missing files」。
+- **修法**：`_relaunch_elevated()` 在调用 `ShellExecuteW` 的瞬间置
+  `PYINSTALLER_RESET_ENVIRONMENT=1`，让新实例被当作**顶层新实例**自行解包；调用结束后
+  立即还原，不污染当前进程后续的子进程。
+- **验证**（本机 PyInstaller 6.22.2 实测，非推断）：
+  - 同 exe 经 wt.exe 中转拉起 + 父进程立即退出：**未置**该变量 → 子实例死在 bootstrap
+    （与用户现场逐字一致）；**置了** → 子实例存活，且 `_MEI` 目录与父实例不同
+    （`_MEI00002eb42` vs `_MEI000011c02`），确认是自行解包而非复用。
+  - 该变量确实随进程环境继承穿过 wt.exe 传给被拉起的命令。
+  - 真实 `NetPulse.exe` 产物实测：置位后新实例存活并自行解包。
+- **测试**：`tests/test_elevation.py` 新增 3 例（置位 / 调用后还原 / wt 路径同样置位）。
+
 ## [1.16.0] - 2026-10-21
 
 ### 修复
