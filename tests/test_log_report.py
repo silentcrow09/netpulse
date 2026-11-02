@@ -219,46 +219,35 @@ class TestLogEndpointOverride(_TmpCfg, unittest.TestCase):
 
 
 class TestLogTls(_TmpCfg, unittest.TestCase):
-    """TLS —— 服务端用自签证书, 客户端 pin 它当信任锚, **校验不关闭**。"""
+    """TLS —— 服务端用 Let's Encrypt 公用 CA 证书, 客户端走系统信任链。"""
 
-    def test_pinned_cert_is_valid_pem(self):
-        """内置的 pin 证书必须是合法 PEM (写坏了会静默失去认证能力)。"""
-        pem = N.LOG_PINNED_CERT_PEM
-        self.assertIn("-----BEGIN CERTIFICATE-----", pem)
-        self.assertIn("-----END CERTIFICATE-----", pem)
-        base = pem.count("-----BEGIN CERTIFICATE-----")
-        self.assertEqual(base, 1, "只应内置一张证书")
+    def test_no_embedded_certificate(self):
+        """客户端**不得内置任何证书**。
 
-    def test_pinned_cert_parses_and_is_ca(self):
-        """证书必须是自签且 CA=True —— 否则不能当信任锚用。"""
-        try:
-            import base64
-            import re
-            from cryptography import x509
-        except ImportError:
-            self.skipTest("cryptography 未安装, 跳过")
-        body = re.sub(r"-----(BEGIN|END) CERTIFICATE-----", "",
-                      N.LOG_PINNED_CERT_PEM).replace("\n", "")
-        der = base64.b64decode(body)
-        cert = x509.load_der_x509_certificate(der)
-        self.assertEqual(cert.subject, cert.issuer, "pin 证书应是自签的")
-        bc = cert.extensions.get_extension_for_class(
-            x509.BasicConstraints).value
-        self.assertTrue(bc.ca, "pin 证书必须 CA=True 才能当信任锚")
+        Let's Encrypt 证书 90 天轮换 —— 内置进 exe 等于给所有客户端埋
+        90 天后的定时炸弹 (换证后全部客户端证书校验失败, 上报静默失效)。
+        """
+        src = open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "netpulse.py"),
+            encoding="utf-8").read()
+        self.assertNotIn("-----BEGIN CERTIFICATE-----", src,
+                         "客户端不得内置证书 (LE 证书 90 天轮换)")
+        self.assertFalse(hasattr(N, "LOG_PINNED_CERT_PEM"),
+                         "不得存在内置证书常量")
 
     def test_ssl_context_keeps_verification_on(self):
         """**校验永不关闭** —— 关闭等于加密但不认证, 中间人可读全部栈信息。"""
+        import ssl as _ssl
         ctx = N._log_ssl_context()
         self.assertTrue(ctx.check_hostname, "必须校验主机名")
-        self.assertEqual(ctx.verify_mode, 2, "必须 CERT_REQUIRED")
+        self.assertEqual(ctx.verify_mode, _ssl.CERT_REQUIRED, "必须 CERT_REQUIRED")
 
-    def test_ssl_context_includes_pinned_cert(self):
-        """系统 CA 之上**叠加** pin 证书 (服务端换公共证书时无需改客户端)。"""
+    def test_ssl_context_uses_system_ca_only(self):
+        """信任链 = 系统 CA 原样, 没有额外塞进去的证书。"""
         import ssl as _ssl
         base = len(_ssl.create_default_context().get_ca_certs())
-        ctx = N._log_ssl_context()
-        self.assertGreater(len(ctx.get_ca_certs()), base,
-                           "pin 证书必须被加载进信任链")
+        self.assertEqual(len(N._log_ssl_context().get_ca_certs()), base,
+                         "不得往信任链里塞额外证书")
 
     def test_cert_error_is_actionable(self):
         """证书校验失败要给出可行动原因 (服务端可能换了证书)。"""
@@ -273,7 +262,112 @@ class TestLogTls(_TmpCfg, unittest.TestCase):
             ok, msg = N._post_log(N._log_payload("info", "x"))
         self.assertFalse(ok)
         self.assertIn("证书", msg)
-        self.assertIn("pin", msg.lower() + msg)
+
+
+class _FakeSSLSock:
+    """假 TLS socket (自检测试用, 不发真实流量)。"""
+
+    def version(self):
+        return "TLSv1.3"
+
+    def cipher(self):
+        return ("TLS_AES_128_GCM_SHA256", "TLSv1.3", 256)
+
+    def getpeercert(self):
+        return {("subject",): (("commonName", "router.silentcrow.top"),),
+                ("issuer",): (("organizationName", "Let's Encrypt"),),
+                "notAfter": "Jan  2 07:32:27 2027 GMT"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeSock:
+    def wrap_socket(self, sock, server_hostname=None):
+        return _FakeSSLSock()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+TLS_LINES = [
+    "TLS      : TLSv1.3 / TLS_AES_128_GCM_SHA256",
+    "证书     : commonName=router.silentcrow.top",
+    "签发者   : organizationName=Let's Encrypt",
+]
+
+
+class TestLogSelfCheck(_TmpCfg, unittest.TestCase):
+    """上报自检 —— 把「上报是不是悄悄失效了」变成明确结论。"""
+
+    def test_success_path(self):
+        """链路正常 -> ok=True, 且实发一条测试日志。"""
+        with mock.patch.object(N, "_log_tls_probe", return_value=TLS_LINES), \
+             mock.patch.object(N, "_post_log",
+                               return_value=(True, "ok")) as m_post:
+            ok, lines = N._log_report_selfcheck(verbose=False)
+        self.assertTrue(ok)
+        m_post.assert_called_once()
+        blob = "\n".join(lines)
+        self.assertIn("上报链路可用", blob)
+        self.assertIn("Let's Encrypt", blob)
+
+    def test_disabled_skips_real_push(self):
+        """开关关闭时不实发 —— 不违背用户的关闭意图。"""
+        N._set_log_reporting_enabled(False)
+        with mock.patch.object(N, "_log_tls_probe", return_value=TLS_LINES), \
+             mock.patch.object(N, "_post_log") as m_post:
+            ok, lines = N._log_report_selfcheck(verbose=False)
+        self.assertTrue(ok)
+        m_post.assert_not_called()
+        self.assertIn("已跳过", "\n".join(lines))
+
+    def test_unreachable_endpoint_fails(self):
+        """端点不可达 -> ok=False, 明确给出原因。"""
+        with mock.patch.object(N, "_log_tls_probe",
+                               side_effect=ConnectionRefusedError("refused")):
+            ok, lines = N._log_report_selfcheck(verbose=False)
+        self.assertFalse(ok)
+        self.assertIn("连接失败", "\n".join(lines))
+
+    def test_untrusted_cert_fails(self):
+        """证书不受信 -> ok=False, 明确指出是证书问题 (根证书库陈旧)。"""
+        import ssl as _ssl
+        with mock.patch.object(N, "_log_tls_probe",
+                               side_effect=_ssl.SSLCertVerificationError(
+                                   "self-signed certificate")):
+            ok, lines = N._log_report_selfcheck(verbose=False)
+        self.assertFalse(ok)
+        blob = "\n".join(lines)
+        self.assertIn("证书校验失败", blob)
+        self.assertIn("根证书库", blob)
+
+    def test_missing_token_fails(self):
+        """没 token -> 直接判不可用。"""
+        with mock.patch.object(N, "_log_token", return_value=""), \
+             mock.patch.object(N, "_log_tls_probe", return_value=TLS_LINES):
+            ok, lines = N._log_report_selfcheck(verbose=False)
+        self.assertFalse(ok)
+        self.assertIn("未配置 token", "\n".join(lines))
+
+    def test_cli_check_exit_codes(self):
+        """CLI --log-report check: 通过 0 / 未通过 6, 且不跑诊断。"""
+        for ret, expected in ((0, 0), (6, 6)):
+            with mock.patch.object(N, "_log_report_selfcheck_cmd",
+                                   return_value=ret), \
+                 mock.patch.object(N, "run_diagnostics") as m_run:
+                with mock.patch.object(sys, "argv",
+                                       ["netpulse.py", "--log-report", "check"]):
+                    with self.assertRaises(SystemExit) as ctx:
+                        N.main()
+            self.assertEqual(ctx.exception.code, expected)
+            m_run.assert_not_called()
 
 
 class TestLogReportFlow(_TmpCfg, unittest.TestCase):

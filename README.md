@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.17.0
+> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.18.0
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -76,10 +76,16 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 - **客户机无需任何配置**：端点与写入 token 内置在 exe 里，不让用户持有凭据。
   换了服务器地址也不必重打包 —— 设环境变量 `NETPULSE_LOG_URL` 即可
   （token 可用 `NETPULSE_LOG_TOKEN` 覆盖）。
-- **走 HTTPS**：端点为 `https://router.silentcrow.top:9800/v1/logs`（TLS 1.3）。
-  服务端用的是自签证书，客户端把该证书**内置成信任锚**（pin）—— 加密与身份认证
-  都在，**不是**关闭证书校验。服务端以后换成公共 CA 签发的证书，客户端无需更新
-  即可继续工作；服务端**换证书**时需同步更新客户端内置的证书。
+- **走 HTTPS**：端点为 `https://router.silentcrow.top:9800/v1/logs`（TLS 1.3），
+  服务端证书由 **Let's Encrypt 公用 CA** 签发，客户端走**系统信任链**验证，
+  不内置任何证书（Let's Encrypt 证书 90 天轮换，内置等于给所有客户端埋定时炸弹）。
+- **自检**：`--log-report check` 一条命令就能回答「这台机器能不能成功上报」——
+  现场装维不用猜。依次输出端点 / 开关状态 / TLS 版本 / 证书签发者 / 有效期，
+  并实发一条测试日志。**通过退出码 0，未通过退出码 6**。
+  交互菜单 `[C]` 里按 `T` 也可自检。
+  为什么需要：证书校验失败、根证书库陈旧（Win7 等停止更新的机器）、企业代理
+  重签证书 —— 这三种情况都会让上报**静默失效**，厂商收不到任何东西却以为
+  「客户机器没崩」。
 - **开关**：默认开启，**首次运行会弹窗告知并征询同意**；之后可用菜单 `[C]` 随时开关，
   状态存 `%LOCALAPPDATA%\NetPulse\log_report.json`。
   也可用 `--log-report on|off`（自动化场景）或 `NETPULSE_LOG_REPORT=0`（最高优先级）。
@@ -230,7 +236,7 @@ python netpulse.py --install
 | `--site` | 现场检测模式 (v1.13.0): 全量诊断(排除压测) + 机房 6 项勾选 + 现场备注, 自动生成 一页客户报告(PDF) / 完整版 / JSON 到 reports/ — 检测到 Chrome/Edge 自动转 PDF (v1.14.1), 都没有则打开 HTML 后 Ctrl+P。菜单入口: 场景 `[6]` |
 | `--customer` | 现场检测模式的客户名称预填 (配合 `--site`; 不填则终端询问) |
 | `--export` | 诊断后导出报告，逗号分隔多格式（`report.html,report.json`） |
-| `--log-report` | 异常自动上报开关 (v1.17.0): `on`=开启 / `off`=关闭。默认开启，首次运行弹窗征询；交互菜单按 `[C]` 随时切换。`off` 等价于设 `NETPULSE_LOG_REPORT=0` |
+| `--log-report` | 异常自动上报开关 (v1.17.0): `on`=开启 / `off`=关闭。默认开启，首次运行弹窗征询；交互菜单按 `[C]` 随时切换。`off` 等价于设 `NETPULSE_LOG_REPORT=0`。`check`=自检 (v1.18.0)：现场验证本机能否成功上报，不跑诊断，通过退出码 0 / 未通过退出码 6 |
 
 ## 📋 诊断模块（23 项）
 

@@ -20,37 +20,40 @@ curl -X POST https://router.silentcrow.top:9800/v1/logs \
   -d '{"app":"netpulse","type":"error","message":"...","stack":"...","ts":"...","os":"..."}'
 ```
 
-### 2.0 TLS 与证书 pin
+### 2.0 TLS 与证书信任
 
-服务端是**自签证书**：
+服务端最初用自签证书（CN=logserver，CA=True，SAN 含 `router.silentcrow.top`），
+后已换成 **Let's Encrypt 公用 CA 签发**的证书：
 
 | 项 | 值 |
 |---|---|
-| Subject / Issuer | `CN=logserver`（自签） |
-| BasicConstraints | `CA=True`（可作信任锚） |
-| SAN | `router.silentcrow.top` / `localhost` / `127.0.0.1` / `::1` / `192.168.88.7` / `192.168.193.215` / `60.186.131.130` |
-| 有效期 | 2026-11-02 ~ 2036-10-30 |
-| SHA256 | `69289b51cefeda3af35f29cc83f9158ca8f3b687c7bb5eaeebd442e3296e9e3d` |
+| Subject | `CN=router.silentcrow.top` |
+| Issuer | `CN=YE1, O=Let's Encrypt, C=US` |
+| SAN | `router.silentcrow.top` |
+| 有效期 | 2026-10-04 ~ 2027-01-02（90 天） |
+| 链 | ISRG Root X1（根证书库里普遍存在） |
 | 协商结果 | TLSv1.3 / `TLS_AES_128_GCM_SHA256` |
 
-公共 CA 不认它 —— Windows schannel 报 `SEC_E_UNTRUSTED_ROOT`，Python 报
-`self-signed certificate`。
+**客户端做法：只做 `ssl.create_default_context()` —— 纯系统信任链，不内置任何证书。**
 
-**客户端做法：把证书内置成信任锚，不是关闭校验。**
+- **不要 pin Let's Encrypt 证书**：LE 证书 90 天轮换，内置进 exe 等于给所有
+  客户端埋 90 天后的定时炸弹（换证后全部客户端证书校验失败、上报静默失效）。
+  `tests/test_log_report.py` 有断言守着（源码里不得出现 PEM 块）。
+- 需要固定信任某张证书时，pin 的必须是**长期有效的自签 CA**
+  （`BasicConstraints CA=True` + SAN 含访问域名），且服务端换证要同步更新客户端。
+- `check_hostname` 与 `CERT_REQUIRED` 全程开启 → **加密 + 认证**都在。
+  **反面做法**：`CERT_NONE` / `check_hostname=False` —— 那是「加密但不认证」，
+  中间人可读全部栈信息，等于把 HTTPS 降级成明文的等价物。
 
-```python
-ctx = ssl.create_default_context()                    # 系统 CA + 主机名校验
-ctx.load_verify_locations(cadata=LOG_PINNED_CERT_PEM) # 叠加 pin 证书
-```
+### 2.0.1 上报自检（v1.18.0）
 
-- `load_verify_locations(cadata=...)` 是**叠加**到系统 CA 之上，不是替换
-  （`create_default_context(cadata=...)` 才是替换 —— 那样会丢掉公共 CA）。
-- `check_hostname` 与 `CERT_REQUIRED` 全程保持开启 → **加密 + 认证**都在。
-- 服务端换成公共 CA 签发的证书后，系统信任链直接生效，客户端无需更新。
-- 服务端**换证书** = 换信任锚，必须同步更新内置 PEM 并重新发版。
+纯系统信任链带来一个新风险面：**根证书库陈旧的机器（Win7 等停止更新根证书的）
+会验不过 → 上报静默失效**。企业代理 MITM 重签证书同理。
 
-**反面做法**：`CERT_NONE` / `check_hostname=False` —— 那是「加密但不认证」，
-中间人可读全部栈信息，等于把 HTTPS 降级成明文的等价物。
+自检把「不知道」变成「明确结论」：`--log-report check` 或菜单 `[C]` → `T`。
+依次输出端点 / token / 开关 / TLS 版本 / 证书 CN / 签发者 / 有效期，
+实发一条 `info` 测试日志，最后给结论。**通过退出码 0 / 未通过退出码 6。**
+开关关闭时跳过实发（不违背用户意图）但仍输出链路状态。
 
 | 字段 | 说明 |
 |---|---|
@@ -245,11 +248,12 @@ res["_exc"] = {"type": "TimeoutError", "message": "...", "scope": "模块:dns"}
 2. **服务端管理接口按来源 IP 限制**：从开发机访问 `/health`、`/v1/logs` 等
    一律 `403 该来源不允许访问管理接口`（写入接口不受影响）。运维看板需在
    服务端放行来源。
-3. **服务端是自签证书**：客户端靠内置 pin 证书认证。换证书需重新发版；
-   建议服务端后续改用公共 CA 证书，届时客户端无需更新即可继续工作。
+3. **服务端证书已换成 Let's Encrypt 公用 CA**：客户端走系统信任链，不再内置证书。
+   残留风险是**根证书库陈旧的机器**（Win7 等停止更新根证书的）会验不过 →
+   上报静默失效 → 由 v1.18.0 的 `--log-report check` 自检覆盖。
 4. **企业 MITM 代理环境**：若客户机的企业代理解密 HTTPS 并重新签发证书，
-   pin 校验会失败 → 上报静默降级为「只写本地日志」（不影响诊断功能）。
-   这是 pin 的固有取舍。
+   校验会失败 → 上报静默降级为「只写本地日志」（不影响诊断功能）。
+   同样是自检能覆盖的场景。
 5. **SSID 脱敏是尽力而为**：只覆盖 `SSID: xxx` 这类带标签的写法，无法保证
    100%。用户目录、机器名、公网 IP、MAC 是可靠替换。
 

@@ -263,15 +263,23 @@
 
 - **端点**：`POST https://router.silentcrow.top:9800/v1/logs`，`X-Token` 鉴权。
   端点/token 内置在 exe 里，环境变量 `NETPULSE_LOG_URL` / `NETPULSE_LOG_TOKEN` 覆盖。
-- **TLS（改 HTTPS 时必读）**：服务端是**自签证书**（CN=logserver，CA=True，
-  SAN 含 `router.silentcrow.top`），公共 CA 不认。客户端的做法是
-  **`LOG_PINNED_CERT_PEM` 内置证书当信任锚**，在 `create_default_context()`
-  之上 `load_verify_locations(cadata=...)` **叠加**（系统 CA 仍在，服务端换公共
-  证书时客户端无需更新）。
-  **绝不**用 `CERT_NONE` / `check_hostname=False` 顶掉 —— 那是「加密但不认证」，
-  中间人可读全部栈信息。`check_hostname` 与 `CERT_REQUIRED` 必须保持开启。
-  服务端**换证书**要同步更新内置 PEM（换证书 = 换信任锚，需重新发版）。
-  证书校验失败时 `_post_log` 返回可行动原因（提示「服务端证书可能已更换」）。
+- **TLS（v1.18.0 起走系统信任链）**：服务端证书由 **Let's Encrypt 公用 CA** 签发
+  （CN=router.silentcrow.top，Issuer=CN=YE1 O=Let's Encrypt，链到 ISRG Root X1，
+  有效期 90 天）。客户端**只做 `ssl.create_default_context()`**，不内置任何证书。
+  - **绝不 pin Let's Encrypt 证书** —— LE 证书 90 天轮换，内置进 exe 等于给所有
+    客户端埋 90 天后的定时炸弹（换证后全部客户端证书校验失败，上报静默失效）。
+    `tests/test_log_report.py` 有断言守着（源码里不得出现 PEM 块）。
+  - 需要固定信任某张证书时，pin 的必须是**长期有效的自签 CA**
+    （`BasicConstraints CA=True` + SAN 含访问域名），且服务端换证要同步更新客户端。
+  - **校验永不关闭**：`check_hostname` 与 `CERT_REQUIRED` 必须保持开启。
+    `CERT_NONE` = 「加密但不认证」，中间人可读全部栈信息。
+- **自检（v1.18.0）**：`--log-report check` / 菜单 `[C]` → `T`。
+  依次输出端点 / 开关 / TLS 版本 / 证书签发者 / 有效期，并实发一条测试日志。
+  **通过退出码 0 / 未通过退出码 6**（6 是新码，与既有 0~5 不冲突）。
+  **为什么必须有**：证书校验失败、根证书库陈旧（Win7 等停止更新根证书的机器）、
+  企业代理 MITM 重签证书 —— 三种情况都让上报**静默失效**，厂商收不到任何东西
+  却以为「客户机器没崩」。自检把「不知道」变成「明确结论」。
+  开关关闭时**跳过实发**（不违背用户的关闭意图），但仍输出链路状态。
 - **负载只用协议约定的字段**：`app` / `type` / `message` / `stack` / `ts` / `os`。
   **不要自造字段** —— 服务端按白名单解析，多余字段会被忽略。
   `type` 只能是 `critical|error|warn|info|debug`；
@@ -293,6 +301,7 @@
   内网 IP **保留**（定位现场问题必需）。
 - **开关**：默认开 + 首次弹窗告知 + 菜单 `[C]` + `--log-report on|off` +
   `NETPULSE_LOG_REPORT=0`。配置 `%LOCALAPPDATA%\NetPulse\log_report.json`。
+  菜单 `[C]` 面板是三选一：`[Y]` 开启 / `[N]` 关闭 / `[T]` 运行自检。
 - **绝不影响主流程**：任何失败都只写本地日志（`reports/netpulse_error.log`），
   **退出码不变**（崩溃仍是 3）。
 

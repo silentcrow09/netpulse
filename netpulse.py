@@ -3640,7 +3640,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.18.0"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -21081,11 +21081,12 @@ def _offer_log_reporting_notice():
 
 
 def _toggle_log_reporting_menu():
-    """菜单 [C]: 切换异常上报开关。"""
+    """菜单 [C]: 切换异常上报开关 / 运行上报自检。"""
     cur = _log_reporting_enabled()
     print(_c(f"  异常自动上报当前状态: {'已开启' if cur else '已关闭'}", C_GRAY))
     try:
-        ans = input(_c("  切换为 [Y=开启 / N=关闭]: ", C_GREEN)).strip().lower()
+        ans = input(_c("  [Y] 开启  [N] 关闭  [T] 运行自检: ",
+                       C_GREEN)).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         return
@@ -21095,6 +21096,10 @@ def _toggle_log_reporting_menu():
     elif ans in ("n", "no"):
         _set_log_reporting_enabled(False)
         print(_c("  ✓ 异常上报已关闭，仅写本地日志", C_GRAY))
+    elif ans in ("t", "test", "check"):
+        # v1.18.0: 现场自检 —— 证书链/网络不通时, 上报是静默失效的,
+        # 没有自检就永远不知道异常根本没送出去。
+        _log_report_selfcheck(verbose=True)
     else:
         print(_c("  未做修改。", C_GRAY))
 
@@ -21447,10 +21452,13 @@ def main():
     parser.add_argument("--no-update-check", action="store_true",
                         help="跳过启动时的自动检查更新 (v1.12.0; 检查本身"
                              "为后台静默, 失败无感知)")
-    parser.add_argument("--log-report", choices=["on", "off"], default=None,
+    parser.add_argument("--log-report", choices=["on", "off", "check"],
+                        default=None,
                         help="异常自动上报开关 (v1.17.0): on=开启, off=关闭。"
                              "默认开启, 首次运行弹窗征询; 交互菜单按 [C] 随时切换。"
-                             "off 等价于设 NETPULSE_LOG_REPORT=0")
+                             "off 等价于设 NETPULSE_LOG_REPORT=0。"
+                             "check=自检 (v1.18.0): 现场验证本机能否成功上报, "
+                             "不跑诊断")
     parser.add_argument("--diagnose", metavar="PROFILE",
                         choices=sorted(list(DIAGNOSE_PROFILES.keys())),
                         help="按场景 Profile 诊断 (阶段 C · v1.3.0 引入). "
@@ -21624,6 +21632,10 @@ def main():
     # v1.17.0: 异常上报开关 (CLI 显式指定优先于配置文件; 自动化场景用)。
     # 置位后同时跳过首次告知弹窗 —— 用户已用参数表过态, 不再打扰。
     _log_opt = getattr(args, "log_report", None)
+    if _log_opt == "check":
+        # v1.18.0: 自检 —— 不跑诊断, 只回答「这台机器能不能成功上报」。
+        # 退出码 6 = 自检未通过 (与 0~5 的既有含义不冲突)。
+        sys.exit(_log_report_selfcheck_cmd())
     if _log_opt in ("on", "off"):
         _set_log_reporting_enabled(_log_opt == "on")
         _mark_log_notice_shown()
@@ -21863,47 +21875,30 @@ _LOG_RUN_STATE = {"sent": 0}
 # 不限频就把 netpulse_error.log 撑爆 (进程内有效, 每次启动重新计数)。
 _LOG_LOCAL_SEEN = {}
 
-# 服务端证书 pin (自签名)。
-# 服务端用的是**自签证书** (CN=logserver, BasicConstraints CA=True,
-# SAN 含 router.silentcrow.top, 有效期 2026-11-02 ~ 2036-10-30),
-# 公共 CA 不认 —— Windows schannel 与 Python 都会报 CERTIFICATE_VERIFY_FAILED。
+# 服务端证书说明 (v1.18.0)
+# 服务端用的是 **Let's Encrypt 公用 CA 签发**的证书
+# (CN=router.silentcrow.top, Issuer=CN=YE1 O=Let's Encrypt, 链到 ISRG Root X1,
+#  有效期 90 天)。客户端**走系统信任链验证**, 不内置任何证书。
 #
-# **这里把证书内置进 exe 当信任锚, 而不是关闭证书校验**:
-#   - 关闭校验 = 加密但不认证, 中间人可读全部栈信息 -> 不可接受;
-#   - pin 证书 = 加密 (TLS 1.3) + 服务端身份被认证 (只信任这一张), 抗中间人。
-# 信任链里有两张来源: 系统 CA (服务端换成公共 CA 证书时自动生效, 客户端无需更新)
-# + 下面这张自签证书 (当前用)。
+# ⚠ **不要 pin Let's Encrypt 证书**: LE 证书 90 天轮换, 内置进 exe 等于给
+# 所有客户端埋 90 天后的定时炸弹 —— 换证后全部客户端证书校验失败, 上报静默
+# 失效, 且现场毫无察觉。
 #
-# 注意: 服务端**换证书**时必须同步更新这里的 PEM 并重新发版 (换证书 = 换信任锚)。
-LOG_PINNED_CERT_PEM = """-----BEGIN CERTIFICATE-----
-MIIB1zCCAXygAwIBAgIULS/tipSPoLIMwvMMs+x9SpBk7qMwCgYIKoZIzj0EAwIw
-FDESMBAGA1UEAwwJbG9nc2VydmVyMB4XDTI2MTEwMjA0MjI0M1oXDTM2MTAzMDA0
-MjI0M1owFDESMBAGA1UEAwwJbG9nc2VydmVyMFkwEwYHKoZIzj0CAQYIKoZIzj0D
-AQcDQgAEi0MEmxNR6qJazbWvSJPLy63dbRFIPyD0tM6SAB7kRvcnecWtzHFo6/t2
-TOFhsEKJiHEGcd3CwbaYQh6yBoSmLaOBqzCBqDAdBgNVHQ4EFgQUZvebM9akD4Mk
-rp1MoMxD5EC65PgwHwYDVR0jBBgwFoAUZvebM9akD4Mkrp1MoMxD5EC65PgwDwYD
-VR0TAQH/BAUwAwEB/zBVBgNVHREETjBMgglsb2NhbGhvc3SCFXJvdXRlci5zaWxl
-bnRjcm93LnRvcIcEfwAAAYcQAAAAAAAAAAAAAAAAAAAAAYcEwKhYB4cEwKjB14cE
-PLqDgjAKBggqhkjOPQQDAgNJADBGAiEA1+7syWyegnDz7Eua2VyU4euBUJXZhBCV
-YvKQJceW9WwCIQDUJVW+BcSS7uBTas5E7Db7zZRTINFRRZr7tHaJbIpjrg==
------END CERTIFICATE-----
-"""
+# 需要固定信任某张证书时, pin 的必须是**长期有效的自签 CA** (BasicConstraints
+# CA=True + SAN 含访问域名), 且服务端换证时要同步更新客户端。
+# 客户端侧只保留一句代码即可:
+#     ctx.load_verify_locations(cadata=LOG_PINNED_CERT_PEM)
+# 但 v1.18.0 起**不启用** (服务端已是公用 CA) —— tests/test_log_report.py
+# 有断言守着, 防止有人把 LE 证书填进去。
 
 
 def _log_ssl_context():
-    """日志上报用的 SSL 上下文: 系统信任链 + 内置 pin 证书。
+    """日志上报用的 SSL 上下文: **系统信任链**, 校验全程开启。
 
-    **校验永不关闭** —— `check_hostname` 与 `CERT_REQUIRED` 都保持开启。
-    信任链两个来源: 系统 CA (服务端换公共证书时用) + 内置自签证书 (当前用)。
-    `load_verify_locations(cadata=...)` 是**叠加**到默认 CA 之上, 不是替换。
+    `check_hostname` 与 `CERT_REQUIRED` 都保持开启 —— 关闭等于「加密但不认证」,
+    中间人可读全部栈信息。
     """
-    ctx = ssl.create_default_context()
-    if LOG_PINNED_CERT_PEM:
-        try:
-            ctx.load_verify_locations(cadata=LOG_PINNED_CERT_PEM)
-        except Exception:
-            pass   # pin 证书坏了就只靠系统链, 不影响程序运行
-    return ctx
+    return ssl.create_default_context()
 
 
 def _log_config_path():
@@ -22335,6 +22330,145 @@ def _exc_meta(scope, exc):
         "message": _log_sanitize_text(msg)[:300],
         "scope": scope,
     }
+
+
+def _rdn_flat(items):
+    """把 ssl.getpeercert() 的 subject/issuer 结构拍平成一行可读文本。
+
+    结构: `((('commonName', 'x'), ('organizationName', 'y')),)` ——
+    外层每项是一个 RDN 组, 组内是若干 (key, value) 对。
+    """
+    out = []
+    try:
+        for rdn in (items or ()):
+            pairs = (rdn if (isinstance(rdn, (list, tuple)) and rdn
+                             and isinstance(rdn[0], (list, tuple)))
+                     else (rdn,))
+            for pair in pairs:
+                try:
+                    k, v = pair
+                    out.append("%s=%s" % (k, v))
+                except Exception:
+                    out.append(str(pair))
+    except Exception:
+        return ""
+    return " / ".join(out)
+
+
+def _log_tls_probe(hostname, port):
+    """TLS 握手 + 证书链校验 —— **不发任何请求**。
+
+    返回信息行 list; 抛异常表示握手/校验失败 (调用方转成可读原因)。
+    独立成函数是为了可测: 单元测试 mock 它, 不必伪造 socket 内部接口。
+    """
+    lines = []
+    ctx = _log_ssl_context()
+    with socket.create_connection((hostname, port),
+                                  timeout=LOG_TIMEOUT_S) as sock:
+        with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+            lines.append("TLS      : %s / %s" % (ssock.version(),
+                                                 ssock.cipher()[0]))
+            cert = ssock.getpeercert() or {}
+            try:
+                subj = _rdn_flat(cert.get("subject"))
+                issuer = _rdn_flat(cert.get("issuer"))
+                if subj:
+                    lines.append("证书     : %s" % subj)
+                if issuer:
+                    lines.append("签发者   : %s" % issuer)
+                if cert.get("notAfter"):
+                    lines.append("有效期至 : %s" % cert.get("notAfter"))
+            except Exception:
+                pass
+    return lines
+
+
+def _log_report_selfcheck(verbose=True):
+    """异常上报自检 —— 现场一条命令拿到「这台机器能不能成功上报」的结论。
+
+    **为什么需要**: 上报是**后台静默**的。证书校验失败 / 根证书库陈旧
+    (Win7 等停止更新根证书的机器) / 企业代理 MITM 重签证书 —— 这三种情况
+    都会让上报悄悄失效: 厂商收不到任何东西, 却以为「客户机器没崩」。
+    自检把「不知道」变成「明确结论」。
+
+    三步: ① 配置与开关状态 ② TLS 握手 + 证书链校验 ③ 实发一条测试日志。
+
+    返回 (ok, 输出行 list)。ok=False 表示**上报链路不可用**。
+    """
+    lines = []
+    ok_all = True
+
+    # ① 配置与开关
+    url = _log_endpoint()
+    token = _log_token()
+    enabled = _log_reporting_enabled()
+    lines.append("端点     : %s" % url)
+    lines.append("token    : %s" % ("已配置 (%s…)" % token[:12]
+                                  if token else "未配置 —— 无法上报"))
+    lines.append("上报开关 : %s" % ("开启" if enabled
+                                    else "关闭（只写本地日志，不联网）"))
+    if not token:
+        ok_all = False
+        lines.append("  ✗ 未配置 token")
+
+    # ② TLS 握手 + 证书链校验 (不发请求)
+    tls_ok = False
+    host = url.split("//", 1)[-1].split("/", 1)[0]
+    hostname, _, port_s = host.partition(":")
+    try:
+        port = int(port_s) if port_s else (443 if url.startswith("https") else 80)
+    except Exception:
+        port = 443
+    try:
+        lines.extend(_log_tls_probe(hostname, port))
+        tls_ok = True
+    except ssl.SSLCertVerificationError as e:
+        ok_all = False
+        lines.append("  ✗ 证书校验失败: %s" % e)
+        lines.append("    → 本机根证书库可能陈旧, 或服务端证书有问题")
+    except Exception as e:
+        ok_all = False
+        lines.append("  ✗ 连接失败: %s: %s" % (type(e).__name__, e))
+
+    # ③ 实发一条测试日志 (开关关闭时跳过 —— 不违背用户的关闭意图)
+    if tls_ok:
+        if enabled:
+            payload = _log_payload(
+                "info", "v%s [自检] 上报链路连通性测试 (非故障)" % APP_VERSION)
+            ok, msg = _post_log(payload)
+            lines.append("实发测试 : %s" % ("成功 (%s)" % msg.strip()
+                                            if ok else "失败 —— %s" % msg))
+            if not ok:
+                ok_all = False
+        else:
+            lines.append("实发测试 : 已跳过（上报开关关闭）")
+
+    lines.append("")
+    lines.append("结论: %s" % ("上报链路可用" if ok_all
+                               else "**上报链路不可用** —— 异常将只写本地日志"))
+    if verbose:
+        try:
+            for line in lines:
+                print(_c("  " + line, C_GRAY))
+        except Exception:
+            pass
+    return ok_all, lines
+
+
+def _log_report_selfcheck_cmd():
+    """CLI `--log-report check` 的入口。返回进程退出码。"""
+    print(_c("  异常上报自检", C_CYAN))
+    print(_c("  " + "-" * 54, C_GRAY))
+    try:
+        ok, _lines = _log_report_selfcheck(verbose=True)
+    except Exception as e:
+        print(_c("  ✗ 自检异常: %s: %s" % (type(e).__name__, e), C_RED))
+        return 6
+    if ok:
+        print(_c("  ✓ 自检通过", C_GREEN))
+        return 0
+    print(_c("  ✗ 自检未通过 (退出码 6)", C_RED))
+    return 6
 
 
 def _install_thread_excepthook():
