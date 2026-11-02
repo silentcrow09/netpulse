@@ -261,8 +261,17 @@
 
 程序自身的问题（崩溃 / 模块异常 / 后台线程静默死亡）自动上报到统一日志服务器。
 
-- **端点**：`POST http://router.silentcrow.top:9800/v1/logs`，`X-Token` 鉴权。
+- **端点**：`POST https://router.silentcrow.top:9800/v1/logs`，`X-Token` 鉴权。
   端点/token 内置在 exe 里，环境变量 `NETPULSE_LOG_URL` / `NETPULSE_LOG_TOKEN` 覆盖。
+- **TLS（改 HTTPS 时必读）**：服务端是**自签证书**（CN=logserver，CA=True，
+  SAN 含 `router.silentcrow.top`），公共 CA 不认。客户端的做法是
+  **`LOG_PINNED_CERT_PEM` 内置证书当信任锚**，在 `create_default_context()`
+  之上 `load_verify_locations(cadata=...)` **叠加**（系统 CA 仍在，服务端换公共
+  证书时客户端无需更新）。
+  **绝不**用 `CERT_NONE` / `check_hostname=False` 顶掉 —— 那是「加密但不认证」，
+  中间人可读全部栈信息。`check_hostname` 与 `CERT_REQUIRED` 必须保持开启。
+  服务端**换证书**要同步更新内置 PEM（换证书 = 换信任锚，需重新发版）。
+  证书校验失败时 `_post_log` 返回可行动原因（提示「服务端证书可能已更换」）。
 - **负载只用协议约定的字段**：`app` / `type` / `message` / `stack` / `ts` / `os`。
   **不要自造字段** —— 服务端按白名单解析，多余字段会被忽略。
   `type` 只能是 `critical|error|warn|info|debug`；

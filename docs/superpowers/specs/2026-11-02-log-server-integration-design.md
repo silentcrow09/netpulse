@@ -14,11 +14,43 @@
 ## 2. 服务端接口
 
 ```bash
-curl -X POST http://router.silentcrow.top:9800/v1/logs \
+curl -X POST https://router.silentcrow.top:9800/v1/logs \
   -H "Content-Type: application/json" \
   -H "X-Token: app-tk_87a4d0bc31508c1f0b10dd8eb116f165" \
   -d '{"app":"netpulse","type":"error","message":"...","stack":"...","ts":"...","os":"..."}'
 ```
+
+### 2.0 TLS 与证书 pin
+
+服务端是**自签证书**：
+
+| 项 | 值 |
+|---|---|
+| Subject / Issuer | `CN=logserver`（自签） |
+| BasicConstraints | `CA=True`（可作信任锚） |
+| SAN | `router.silentcrow.top` / `localhost` / `127.0.0.1` / `::1` / `192.168.88.7` / `192.168.193.215` / `60.186.131.130` |
+| 有效期 | 2026-11-02 ~ 2036-10-30 |
+| SHA256 | `69289b51cefeda3af35f29cc83f9158ca8f3b687c7bb5eaeebd442e3296e9e3d` |
+| 协商结果 | TLSv1.3 / `TLS_AES_128_GCM_SHA256` |
+
+公共 CA 不认它 —— Windows schannel 报 `SEC_E_UNTRUSTED_ROOT`，Python 报
+`self-signed certificate`。
+
+**客户端做法：把证书内置成信任锚，不是关闭校验。**
+
+```python
+ctx = ssl.create_default_context()                    # 系统 CA + 主机名校验
+ctx.load_verify_locations(cadata=LOG_PINNED_CERT_PEM) # 叠加 pin 证书
+```
+
+- `load_verify_locations(cadata=...)` 是**叠加**到系统 CA 之上，不是替换
+  （`create_default_context(cadata=...)` 才是替换 —— 那样会丢掉公共 CA）。
+- `check_hostname` 与 `CERT_REQUIRED` 全程保持开启 → **加密 + 认证**都在。
+- 服务端换成公共 CA 签发的证书后，系统信任链直接生效，客户端无需更新。
+- 服务端**换证书** = 换信任锚，必须同步更新内置 PEM 并重新发版。
+
+**反面做法**：`CERT_NONE` / `check_hostname=False` —— 那是「加密但不认证」，
+中间人可读全部栈信息，等于把 HTTPS 降级成明文的等价物。
 
 | 字段 | 说明 |
 |---|---|
@@ -207,14 +239,18 @@ res["_exc"] = {"type": "TimeoutError", "message": "...", "scope": "模块:dns"}
 
 ## 10. 已知风险
 
-1. **端点是明文 HTTP**：栈信息在链路上明文。URL 可配（`NETPULSE_LOG_URL`），
-   切 HTTPS 不用重打包 —— 建议服务端后续补 HTTPS 入口。
-2. **服务端未实现限流**：实测连发 55 条无 429。token 内置在 exe 里、逆向可得，
+1. **服务端目前未实现限流**：实测连发 55 条无 429。token 内置在 exe 里、逆向可得，
    限流是必需防线。现在只有客户端侧的「指纹去重（3 次/指纹/版本）+ 单轮预算
    （5 条/轮）+ 本地日志限频」在挡 —— **服务端侧应补 IP 限流与配额**。
-3. **服务端管理接口按来源 IP 限制**：从开发机访问 `/health`、`/v1/logs` 等
+2. **服务端管理接口按来源 IP 限制**：从开发机访问 `/health`、`/v1/logs` 等
    一律 `403 该来源不允许访问管理接口`（写入接口不受影响）。运维看板需在
    服务端放行来源。
-4. **SSID 脱敏是尽力而为**：只覆盖 `SSID: xxx` 这类带标签的写法，无法保证
+3. **服务端是自签证书**：客户端靠内置 pin 证书认证。换证书需重新发版；
+   建议服务端后续改用公共 CA 证书，届时客户端无需更新即可继续工作。
+4. **企业 MITM 代理环境**：若客户机的企业代理解密 HTTPS 并重新签发证书，
+   pin 校验会失败 → 上报静默降级为「只写本地日志」（不影响诊断功能）。
+   这是 pin 的固有取舍。
+5. **SSID 脱敏是尽力而为**：只覆盖 `SSID: xxx` 这类带标签的写法，无法保证
    100%。用户目录、机器名、公网 IP、MAC 是可靠替换。
+
 

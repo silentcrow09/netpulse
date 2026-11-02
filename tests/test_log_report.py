@@ -212,6 +212,69 @@ class TestLogEndpointOverride(_TmpCfg, unittest.TestCase):
         self.assertTrue(N.LOG_SERVER_URL.endswith("/v1/logs"))
         self.assertTrue(N.LOG_SERVER_TOKEN.startswith("app-tk_"))
 
+    def test_default_endpoint_is_https(self):
+        """端点必须走 HTTPS —— 栈信息不能明文躺在链路上。"""
+        self.assertTrue(N.LOG_SERVER_URL.startswith("https://"),
+                        "日志端点必须是 https, 当前: %s" % N.LOG_SERVER_URL)
+
+
+class TestLogTls(_TmpCfg, unittest.TestCase):
+    """TLS —— 服务端用自签证书, 客户端 pin 它当信任锚, **校验不关闭**。"""
+
+    def test_pinned_cert_is_valid_pem(self):
+        """内置的 pin 证书必须是合法 PEM (写坏了会静默失去认证能力)。"""
+        pem = N.LOG_PINNED_CERT_PEM
+        self.assertIn("-----BEGIN CERTIFICATE-----", pem)
+        self.assertIn("-----END CERTIFICATE-----", pem)
+        base = pem.count("-----BEGIN CERTIFICATE-----")
+        self.assertEqual(base, 1, "只应内置一张证书")
+
+    def test_pinned_cert_parses_and_is_ca(self):
+        """证书必须是自签且 CA=True —— 否则不能当信任锚用。"""
+        try:
+            import base64
+            import re
+            from cryptography import x509
+        except ImportError:
+            self.skipTest("cryptography 未安装, 跳过")
+        body = re.sub(r"-----(BEGIN|END) CERTIFICATE-----", "",
+                      N.LOG_PINNED_CERT_PEM).replace("\n", "")
+        der = base64.b64decode(body)
+        cert = x509.load_der_x509_certificate(der)
+        self.assertEqual(cert.subject, cert.issuer, "pin 证书应是自签的")
+        bc = cert.extensions.get_extension_for_class(
+            x509.BasicConstraints).value
+        self.assertTrue(bc.ca, "pin 证书必须 CA=True 才能当信任锚")
+
+    def test_ssl_context_keeps_verification_on(self):
+        """**校验永不关闭** —— 关闭等于加密但不认证, 中间人可读全部栈信息。"""
+        ctx = N._log_ssl_context()
+        self.assertTrue(ctx.check_hostname, "必须校验主机名")
+        self.assertEqual(ctx.verify_mode, 2, "必须 CERT_REQUIRED")
+
+    def test_ssl_context_includes_pinned_cert(self):
+        """系统 CA 之上**叠加** pin 证书 (服务端换公共证书时无需改客户端)。"""
+        import ssl as _ssl
+        base = len(_ssl.create_default_context().get_ca_certs())
+        ctx = N._log_ssl_context()
+        self.assertGreater(len(ctx.get_ca_certs()), base,
+                           "pin 证书必须被加载进信任链")
+
+    def test_cert_error_is_actionable(self):
+        """证书校验失败要给出可行动原因 (服务端可能换了证书)。"""
+        import urllib.error
+
+        def _raise_verify(*a, **kw):
+            raise urllib.error.URLError(
+                "<urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] "
+                "certificate verify failed: self-signed certificate>")
+
+        with mock.patch.object(N, "_urlopen_with_proxy", side_effect=_raise_verify):
+            ok, msg = N._post_log(N._log_payload("info", "x"))
+        self.assertFalse(ok)
+        self.assertIn("证书", msg)
+        self.assertIn("pin", msg.lower() + msg)
+
 
 class TestLogReportFlow(_TmpCfg, unittest.TestCase):
     """上报流程: 降级不抛异常 / 成功后计数 / 超限不再报。"""

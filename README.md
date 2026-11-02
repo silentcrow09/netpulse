@@ -76,6 +76,10 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 - **客户机无需任何配置**：端点与写入 token 内置在 exe 里，不让用户持有凭据。
   换了服务器地址也不必重打包 —— 设环境变量 `NETPULSE_LOG_URL` 即可
   （token 可用 `NETPULSE_LOG_TOKEN` 覆盖）。
+- **走 HTTPS**：端点为 `https://router.silentcrow.top:9800/v1/logs`（TLS 1.3）。
+  服务端用的是自签证书，客户端把该证书**内置成信任锚**（pin）—— 加密与身份认证
+  都在，**不是**关闭证书校验。服务端以后换成公共 CA 签发的证书，客户端无需更新
+  即可继续工作；服务端**换证书**时需同步更新客户端内置的证书。
 - **开关**：默认开启，**首次运行会弹窗告知并征询同意**；之后可用菜单 `[C]` 随时开关，
   状态存 `%LOCALAPPDATA%\NetPulse\log_report.json`。
   也可用 `--log-report on|off`（自动化场景）或 `NETPULSE_LOG_REPORT=0`（最高优先级）。

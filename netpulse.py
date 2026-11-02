@@ -665,14 +665,17 @@ def _npcap_installed():
 
 
 def _urlopen_with_proxy(url, timeout=120, ua="NetPulse/1.0", data=None,
-                       method=None, headers=None):
+                       method=None, headers=None, context=None):
     """带环境变量代理支持的下载 (兼容企业代理网络)。
 
     ua: User-Agent 字符串, 默认 "NetPulse/1.0"。个别站点 (如 mac.bmcx.com)
     对非浏览器 UA 响应异常, 调用方可传入浏览器 UA。
 
-    v1.17.0: 支持 data/method/headers —— 崩溃上报要 POST JSON 到 GitHub API,
+    v1.17.0: 支持 data/method/headers —— 异常上报要 POST JSON 到日志服务器,
     复用本函数才能同样吃到企业代理支持 (客户机常走代理)。
+
+    context: 可选的 ssl.SSLContext。传入后**替换**默认 HTTPSHandler ——
+    日志上报用它加载「系统 CA + 内置 pin 证书」的信任链。
     """
     import urllib.request as ur
     proxies = {}
@@ -682,6 +685,8 @@ def _urlopen_with_proxy(url, timeout=120, ua="NetPulse/1.0", data=None,
             scheme = env_key.lower().split("_")[0]
             proxies[scheme] = val
     handlers = [ur.ProxyHandler(proxies)] if proxies else []
+    if context is not None:
+        handlers.append(ur.HTTPSHandler(context=context))
     opener = ur.build_opener(*handlers)
     hdrs = {"User-Agent": ua}
     if headers:
@@ -21836,7 +21841,7 @@ def _write_error_log(level, exc, tb_text=None):
 #  - 绝不阻塞主流程: 上报失败只写本地日志, 不影响退出码与用户操作。
 
 # 日志服务端端点 (POST JSON)。换服务器: 设环境变量 NETPULSE_LOG_URL 即可。
-LOG_SERVER_URL = "http://router.silentcrow.top:9800/v1/logs"
+LOG_SERVER_URL = "https://router.silentcrow.top:9800/v1/logs"
 # 内置写入 token。**这是公开写权限** (exe 可逆向) —— 服务端必须限流 + 字段
 # 白名单。它只能写日志, 不能读库/改配置, 故泄露影响可控。
 LOG_SERVER_TOKEN = "app-tk_87a4d0bc31508c1f0b10dd8eb116f165"
@@ -21857,6 +21862,48 @@ _LOG_RUN_STATE = {"sent": 0}
 # 本地日志限频计数器 {指纹: 次数}。盯障模式 24h 循环里同一处失败会重复上万次,
 # 不限频就把 netpulse_error.log 撑爆 (进程内有效, 每次启动重新计数)。
 _LOG_LOCAL_SEEN = {}
+
+# 服务端证书 pin (自签名)。
+# 服务端用的是**自签证书** (CN=logserver, BasicConstraints CA=True,
+# SAN 含 router.silentcrow.top, 有效期 2026-11-02 ~ 2036-10-30),
+# 公共 CA 不认 —— Windows schannel 与 Python 都会报 CERTIFICATE_VERIFY_FAILED。
+#
+# **这里把证书内置进 exe 当信任锚, 而不是关闭证书校验**:
+#   - 关闭校验 = 加密但不认证, 中间人可读全部栈信息 -> 不可接受;
+#   - pin 证书 = 加密 (TLS 1.3) + 服务端身份被认证 (只信任这一张), 抗中间人。
+# 信任链里有两张来源: 系统 CA (服务端换成公共 CA 证书时自动生效, 客户端无需更新)
+# + 下面这张自签证书 (当前用)。
+#
+# 注意: 服务端**换证书**时必须同步更新这里的 PEM 并重新发版 (换证书 = 换信任锚)。
+LOG_PINNED_CERT_PEM = """-----BEGIN CERTIFICATE-----
+MIIB1zCCAXygAwIBAgIULS/tipSPoLIMwvMMs+x9SpBk7qMwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9nc2VydmVyMB4XDTI2MTEwMjA0MjI0M1oXDTM2MTAzMDA0
+MjI0M1owFDESMBAGA1UEAwwJbG9nc2VydmVyMFkwEwYHKoZIzj0CAQYIKoZIzj0D
+AQcDQgAEi0MEmxNR6qJazbWvSJPLy63dbRFIPyD0tM6SAB7kRvcnecWtzHFo6/t2
+TOFhsEKJiHEGcd3CwbaYQh6yBoSmLaOBqzCBqDAdBgNVHQ4EFgQUZvebM9akD4Mk
+rp1MoMxD5EC65PgwHwYDVR0jBBgwFoAUZvebM9akD4Mkrp1MoMxD5EC65PgwDwYD
+VR0TAQH/BAUwAwEB/zBVBgNVHREETjBMgglsb2NhbGhvc3SCFXJvdXRlci5zaWxl
+bnRjcm93LnRvcIcEfwAAAYcQAAAAAAAAAAAAAAAAAAAAAYcEwKhYB4cEwKjB14cE
+PLqDgjAKBggqhkjOPQQDAgNJADBGAiEA1+7syWyegnDz7Eua2VyU4euBUJXZhBCV
+YvKQJceW9WwCIQDUJVW+BcSS7uBTas5E7Db7zZRTINFRRZr7tHaJbIpjrg==
+-----END CERTIFICATE-----
+"""
+
+
+def _log_ssl_context():
+    """日志上报用的 SSL 上下文: 系统信任链 + 内置 pin 证书。
+
+    **校验永不关闭** —— `check_hostname` 与 `CERT_REQUIRED` 都保持开启。
+    信任链两个来源: 系统 CA (服务端换公共证书时用) + 内置自签证书 (当前用)。
+    `load_verify_locations(cadata=...)` 是**叠加**到默认 CA 之上, 不是替换。
+    """
+    ctx = ssl.create_default_context()
+    if LOG_PINNED_CERT_PEM:
+        try:
+            ctx.load_verify_locations(cadata=LOG_PINNED_CERT_PEM)
+        except Exception:
+            pass   # pin 证书坏了就只靠系统链, 不影响程序运行
+    return ctx
 
 
 def _log_config_path():
@@ -22106,6 +22153,7 @@ def _post_log(payload, timeout=LOG_TIMEOUT_S):
                 "X-Token": token,
                 "X-NetPulse-Version": str(APP_VERSION),
             },
+            context=_log_ssl_context(),
         ) as resp:
             raw = resp.read().decode("utf-8", "ignore")
             status = getattr(resp, "status", None) or getattr(resp, "code", 0)
@@ -22139,6 +22187,13 @@ def _post_log(payload, timeout=LOG_TIMEOUT_S):
         if detail:
             return False, "服务端拒绝%s: %s" % (
                 (" HTTP %s" % code) if code else "", detail)
+        # 证书校验失败: 服务端可能换了证书 —— 给出可行动的原因, 别只丢栈
+        raw_err = str(e)
+        if ("CERTIFICATE_VERIFY_FAILED" in raw_err
+                or "certificate verify failed" in raw_err.lower()
+                or "self-signed certificate" in raw_err.lower()):
+            return False, ("TLS 证书校验失败（服务端证书可能已更换，"
+                           "需同步更新客户端内置的 pin 证书）: %s" % raw_err)
         return False, "上报失败: %s: %s" % (type(e).__name__, e)
 
 
