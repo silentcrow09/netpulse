@@ -216,6 +216,24 @@ class TestParallelModuleException(unittest.TestCase):
         self.assertEqual(seq_results.get("dns"), "错误")
         self.assertEqual(seq_results.get("gateway"), "完成")
 
+    def test_deliberate_exception_does_not_push_to_log_server(self):
+        """本用例故意抛的异常**不得**被推到线上日志服务器 (v1.18.2 防线)。
+
+        2026-11-03: 这两个故意抛的 RuntimeError 被真推到了线上日志服务器
+        (id 14/15), 厂商通道被自家回归测试污染, 还带着本机目录结构。
+        源码运行 (非打包 exe) 一律不自动上报 —— 本地日志照写。
+        """
+        def _sync(level, exc, scope, detail=None, tb_text=None, **kw):
+            # 把异步上报改成同步, 才能确定性地断言「没有推送」
+            return np._emit_runtime_event(level, exc, scope, detail=detail,
+                                          tb_text=tb_text)
+
+        with mock.patch.object(np, "_emit_runtime_event_async", side_effect=_sync), \
+             mock.patch.object(np, "_post_log") as m_post:
+            results, _full = self._run_parallel(["gateway", "dns"], "dns")
+        self.assertEqual(results.get("dns"), "错误")
+        m_post.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

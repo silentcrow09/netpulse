@@ -7,6 +7,34 @@
 
 ## [Unreleased]
 
+## [1.18.2] - 2026-11-03
+
+### 修复
+
+**源码运行 (开发机 / 回归测试) 不再往线上日志服务器推送**
+
+- **现场现象**：日志服务器收到两条 `[模块:dns] / [模块:speedtest] RuntimeError:
+  模块调度异常`（id 14 / 15），栈里写着
+  `D:\Work\Projects\NetPulse\tests\test_v1100_full_all.py:179 raise RuntimeError(msg)` ——
+  **不是客户机的问题，是自家回归测试故意抛的异常被真推到了线上通道**。
+- **为什么是设计缺陷**：上报通道是给**客户机上的 exe** 用的。开发机/测试机跑出来的
+  栈对现场诊断没有价值，却会污染厂商的错误通道，还把本机目录结构一并送出去。
+- **现在**：非打包运行（`sys.frozen` 不存在）默认**不自动上报**，只写本地日志
+  `reports/netpulse_error.log`；打包后的 exe 行为不变（照常上报）。
+  真要联调设 `NETPULSE_LOG_ALLOW_SOURCE=1` 放行。
+- **边界**：`--log-report check` 自检是用户显式发起的，走另一条路，**不受此限制**
+  （源码下照样能测通上报链路）。
+
+### 测试
+
+- `tests/test_log_report.py` 新增 `TestLogSourceRunGuard`（4 例）：源码运行被拦 /
+  打包 exe 可报 / 可显式放行 / 实际出口不调 `_post_log` 但本地日志照写。
+- `tests/test_v1100_full_all.py` 新增 1 例：那个**故意抛异常**的并行调度路径
+  不得推送（把异步上报改成同步再断言，避开线程竞态）。
+- 端到端对照验证：把上报端点指向本地接收端跑 `test_v1100_full_all.py` ——
+  默认收到 **0** 条；`NETPULSE_LOG_ALLOW_SOURCE=1` 收到 **1** 条，内容与线上
+  那两条一字不差（`RuntimeError: solo-boom`），确证源头就是这条路径。
+
 ## [1.18.1] - 2026-11-03
 
 ### 修复

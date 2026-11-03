@@ -3641,7 +3641,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.18.1"
+APP_VERSION = "1.18.2"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -21976,6 +21976,11 @@ LOG_SERVER_TOKEN = "app-tk_87a4d0bc31508c1f0b10dd8eb116f165"
 # 端点 / token 覆盖环境变量 (换服务器不必重新打包)
 LOG_URL_ENV = "NETPULSE_LOG_URL"
 LOG_TOKEN_ENV = "NETPULSE_LOG_TOKEN"
+# 源码运行放行开关 (v1.18.2): 上报通道是给**客户机上的 exe** 用的 ——
+# 开发机/测试机跑出来的栈只会往厂商通道灌噪音, 还带着本机目录结构。
+# 2026-11-03 就被自家回归测试灌了两条 `RuntimeError: boom` 到线上日志。
+# 非打包运行默认**不自动上报** (本地日志照写); 要联调设本变量=1 放行。
+LOG_ALLOW_SOURCE_ENV = "NETPULSE_LOG_ALLOW_SOURCE"
 LOG_TIMEOUT_S = 10
 # 协议允许的 type 取值 (缺省 info)
 LOG_LEVELS = ("critical", "error", "warn", "info", "debug")
@@ -22051,6 +22056,22 @@ def _log_reporting_enabled():
         return False
     cfg = _load_log_config()
     return bool(cfg.get("enabled", True))
+
+
+def _report_allowed_from_source():
+    """当前进程是否允许自动上报到日志服务器。
+
+    打包后的 exe (客户机) → 允许。
+    源码运行 (开发机 / 回归测试) → 默认**不允许**: 那些栈对现场诊断没有价值,
+    只会污染厂商的错误通道, 还把本机目录结构一并送出去。真要联调可设
+    ``NETPULSE_LOG_ALLOW_SOURCE=1`` 放行。
+
+    注意: 只管**自动**上报 (崩溃 / 模块异常 / 线程异常)。
+    ``--log-report check`` 自检是用户显式发起的, 走另一条路, 不受此限制。
+    """
+    if getattr(sys, "frozen", False):
+        return True
+    return os.environ.get(LOG_ALLOW_SOURCE_ENV) == "1"
 
 
 def _set_log_reporting_enabled(enabled):
@@ -22338,6 +22359,10 @@ def _emit_runtime_event(level, exc, scope, detail=None, tb_text=None):
     try:
         if not _log_reporting_enabled():
             return False, "上报已关闭"
+        # v1.18.2: 源码运行 (开发机 / 回归测试) 不自动上报 —— 上报通道是给
+        # 客户机上的 exe 用的。本地日志照写 (上面已写), 只是不往线上推。
+        if not _report_allowed_from_source():
+            return False, "源码运行不自动上报 (设 %s=1 放行)" % LOG_ALLOW_SOURCE_ENV
         if _log_reported_counts().get(key, 0) >= LOG_MAX_REPORTS_PER_KEY:
             return False, "同类异常上报次数已达上限, 仅落盘"
         payload = _log_payload(level, _log_message(scope, exc, detail),

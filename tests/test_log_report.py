@@ -40,8 +40,14 @@ class _TmpCfg(unittest.TestCase):
         # 限流计数与本地日志计数都是进程内状态, 每个用例从零开始
         N._LOG_LOCAL_SEEN.clear()
         N._LOG_RUN_STATE["sent"] = 0
+        # v1.18.2: 本文件专门验证上报链路, 显式放行源码运行 —— 否则新加的
+        # 「源码不自动上报」防线会把这里的用例全部挡掉 (而这正是要测的)。
+        # 本文件的推送要么 mock 掉 _post_log, 要么指向本地 mock 服务端,
+        # 不会打到线上日志服务器。
+        os.environ[N.LOG_ALLOW_SOURCE_ENV] = "1"
 
     def tearDown(self):
+        os.environ.pop(N.LOG_ALLOW_SOURCE_ENV, None)
         if self._old_env is None:
             os.environ.pop("LOCALAPPDATA", None)
         else:
@@ -801,6 +807,51 @@ class _MockLogServer(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+class TestLogSourceRunGuard(unittest.TestCase):
+    """v1.18.2: 源码运行 (开发机 / 回归测试) 不得往线上日志服务器推送。
+
+    背景: 2026-11-03 跑全量回归时, `tests/test_v1100_full_all.py` 故意抛的
+    RuntimeError("boom") 被真推到了线上日志服务器 (id 14/15) —— 厂商通道
+    被自家测试污染, 还带着本机目录结构。
+    """
+
+    def setUp(self):
+        self._saved = os.environ.pop(N.LOG_ALLOW_SOURCE_ENV, None)
+
+    def tearDown(self):
+        if self._saved is not None:
+            os.environ[N.LOG_ALLOW_SOURCE_ENV] = self._saved
+
+    def test_source_run_is_blocked_by_default(self):
+        """非打包运行 + 未放行 → 不允许自动上报。"""
+        with mock.patch.object(N.sys, "frozen", False, create=True):
+            self.assertFalse(N._report_allowed_from_source())
+
+    def test_frozen_exe_may_report(self):
+        """打包后的 exe (客户机) → 照常上报。"""
+        with mock.patch.object(N.sys, "frozen", True, create=True):
+            self.assertTrue(N._report_allowed_from_source())
+
+    def test_source_run_can_be_opted_in(self):
+        """显式放行 (联调) → 允许上报。"""
+        os.environ[N.LOG_ALLOW_SOURCE_ENV] = "1"
+        with mock.patch.object(N.sys, "frozen", False, create=True):
+            self.assertTrue(N._report_allowed_from_source())
+
+    def test_source_run_does_not_push_payload(self):
+        """实际出口: 源码运行时不调 _post_log, 但本地日志照写。"""
+        with mock.patch.object(N, "_post_log") as m_post, \
+             mock.patch.object(N, "_write_error_log", return_value="x") as m_log:
+            try:
+                raise ValueError("源码运行不该上报")
+            except ValueError as exc:
+                ok, msg = N._emit_runtime_event("error", exc, "模块:srcguard")
+        m_post.assert_not_called()
+        self.assertFalse(ok)
+        self.assertIn("源码运行", msg)
+        m_log.assert_called_once()
 
 
 class TestLogEndToEnd(_TmpCfg, unittest.TestCase):
