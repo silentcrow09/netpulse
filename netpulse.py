@@ -42,6 +42,7 @@ import tempfile
 import ipaddress
 import shutil
 import zipfile
+import select
 from bisect import bisect_left
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter, deque
@@ -3640,7 +3641,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.18.0"
+APP_VERSION = "1.18.1"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -4232,25 +4233,71 @@ def _select_domestic_speedtest_server(callback=None):
     return best, None
 
 
+# ── 上行测速的写超时口径 (v1.18.1) ────────────────────────────────
+# 建链超时: 只管 TCP 握手 (建链失败 = 节点不可达, 属于网络状况)。
+UPLOAD_CONNECT_TIMEOUT = 10.0
+# 写停滞保护: 「多久对端一个字节都没收下」, **不是**「这一块最多发多久」。
+#
+# 旧实现把两者混成一个 timeout=20s, 而 CPython 的 socket 超时覆盖**整个
+# sendall** —— 256KB 一块必须在 20s 内全部塞进内核缓冲, 每连接至少要
+# 12.8KB/s; 4 个连接共享同一条上行, 于是上行低于约 0.5~1Mbps 的客户机
+# 必然 socket 超时。而那恰恰是本该测出来的链路 (v1.18.0 线上日志里的
+# `TimeoutError: timed out` 就是这么来的), 上行测速因此在最该用的链路上
+# 自毁, 还把网络状况当成程序缺陷上报到了日志服务器。
+#
+# 现在改成「非阻塞写 + select 等可写」: 写超时只表示「这么久一个字节都没
+# 发出去」= 对端死了/链路断了, 与链路快慢无关。
+UPLOAD_STALL_TIMEOUT = 20.0
+
+
+def _wait_writable(sock, timeout):
+    """等 socket 可写。返回 True=可写, False=超时(停滞)或 socket 已失效。
+
+    单独抽出来是为了让「对端死了」这条分支可以被测试直接驱动, 不必真的
+    造一个永远不可写的 fd。
+    """
+    try:
+        _, writable, _ = select.select([], [sock], [], timeout)
+        return bool(writable)
+    except (OSError, ValueError):
+        return False
+
+
 def _upload_speed_multi(host_port, threads=4, duration=8.0, chunk_size=256 * 1024,
-                        on_sample=None, series=None):
+                        on_sample=None, series=None, stall_timeout=None):
     """多连接 HTTP POST 上传测速 (speedtest 协议, 参考 speedtest-cli 做法)。
 
     向测速服务器 /upload.php 持续 POST 数据: 声明 100MB Content-Length,
     客户端持续 send, 达到 duration 后断开。多连接并发才能打满高速上行的
     拥塞窗口。每 0.2s 采样一次累计字节 → 瞬时速率 (实时动画 + 时间序列)。
 
+    写路径 (v1.18.1 重写): socket 设为**非阻塞**, 用 `send()` 逐次写入。
+    非阻塞 `send()` 立刻返回「内核实际收下多少字节」, 于是:
+
+      · 字节统计精确 —— `sendall()` 超时会把已写出的那一部分一起丢掉,
+        上行速率因此被系统性低估;
+      · socket 超时不再等价于「这一块最多发多久」—— 见 UPLOAD_STALL_TIMEOUT
+        处的说明, 旧实现因此在慢上行链路上必然失败;
+      · 写满内核缓冲时不算失败, 交给 select 等可写, 只有「这么久一个字节
+        都没发出去」才判定连接中断。
+
     返回 dict (upload_mbps / uploaded_bytes / uploaded_mb / elapsed_s /
-    threads / server) 或 None。
+    threads / server / dropped) 或 None。
     """
     host, _, port = host_port.rpartition(":")
     if not port or not port.isdigit():
         host, port = host_port, "8080"
     port = int(port)
+    if stall_timeout is None:
+        stall_timeout = UPLOAD_STALL_TIMEOUT
 
     total_uploaded = [0]
     bytes_lock = threading.Lock()
     errors = [0]
+    # 中断的连接数 (对端不收了 / 连接被重置)。**不是**程序缺陷, 属于网络
+    # 状况 —— 不走 _emit_thread_failure (那会把客户网络问题刷到厂商的
+    # 错误通道), 而是记进结果, 由报告如实告诉用户「有几条连接没跑完」。
+    dropped = [0]
     # 最后一次成功 send 的时刻 (v1.15.0 审查 P1-20): 有效传输时长的基准。
     # 不能用 join 之后的墙钟 —— worker 线程跑满 duration 后才退出, 而
     # join(timeout=5) 还要再等最多 5 秒, 于是 elapsed = duration + 5,
@@ -4260,23 +4307,72 @@ def _upload_speed_multi(host_port, threads=4, duration=8.0, chunk_size=256 * 102
     def worker():
         conn = None
         try:
-            conn = http.client.HTTPConnection(host, port, timeout=20)
-            conn.putrequest("POST", "/upload.php")
-            conn.putheader("Content-Length", "104857600")   # 声明 100MB
-            conn.putheader("User-Agent", "NetPulse/1.0")
-            conn.endheaders()
-            payload = os.urandom(chunk_size)
-            deadline = time.time() + duration
-            while time.time() < deadline:
-                conn.send(payload)
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=UPLOAD_CONNECT_TIMEOUT)
+                conn.putrequest("POST", "/upload.php")
+                conn.putheader("Content-Length", "104857600")   # 声明 100MB
+                conn.putheader("User-Agent", "NetPulse/1.0")
+                conn.endheaders()
+            except OSError:
+                # 建链失败 = 节点不可达 / DNS 解析不了 (网络状况, 不是程序缺陷)。
+                # 旧实现把它当成 worker 异常上报, 于是「某个测速节点挂了」这种
+                # 客户网络问题也会刷到厂商的错误通道。
                 with bytes_lock:
-                    total_uploaded[0] += len(payload)
-                    last_send[0] = time.time()
+                    dropped[0] += 1
+                return
+            sock = conn.sock
+            sock.setblocking(False)
+            payload = os.urandom(chunk_size)
+            view = memoryview(payload)
+            deadline = time.time() + duration
+            # 最后一次**有字节写出**的时刻 —— 判「对端死了」只看它, 不看
+            # 可写事件: 慢链路上内核缓冲本来就是满的, 不可写是常态。
+            last_progress = time.time()
+            dead = False
+            # 外层: 一块接一块地发, 直到测速窗口结束
+            while not dead and time.time() < deadline:
+                offset = 0
+                # 内层: 把当前这一块写完 (慢链路上一块要写很久)
+                while offset < len(view):
+                    if time.time() >= deadline:
+                        break
+                    try:
+                        n = sock.send(view[offset:])
+                    except (BlockingIOError, InterruptedError):
+                        n = 0          # 内核缓冲满了 → 等可写
+                    except OSError:
+                        n = -1         # 连接被重置/断开
+                    if n < 0:
+                        dead = True
+                        break
+                    if n:
+                        offset += n
+                        with bytes_lock:
+                            total_uploaded[0] += n
+                            last_send[0] = time.time()
+                        last_progress = time.time()
+                        continue
+                    # 一个字节都写不出去 → 等到可写
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    if not _wait_writable(sock, min(stall_timeout, remaining)):
+                        # 等不到可写: 只有「这么久一个字节都没发出去」才判链路
+                        # 死了。窗口先到 (remaining < stall_timeout) 是正常收尾,
+                        # 不能当成连接中断 —— 否则每次测速都会误报中断。
+                        if time.time() - last_progress >= stall_timeout:
+                            dead = True
+                        break
+            if dead:
+                with bytes_lock:
+                    dropped[0] += 1
         except Exception as e:
             with bytes_lock:
                 errors[0] += 1
             # v1.17.0: 原先只计数, 异常类型/消息/栈全丢 —— 上行测速失败时
             # 用户只见「上行测速失败: host」, 厂商无从判断是网络还是代码问题。
+            # v1.18.1: 网络状况 (超时/连接重置) 已在上面单独归类, 不再走到
+            # 这里 —— 能走到这里的都是**程序自身**的异常, 值得上报。
             _emit_thread_failure(e, "线程:upload-speed",
                                  detail="上行测速 worker 异常")
         finally:
@@ -4297,7 +4393,7 @@ def _upload_speed_multi(host_port, threads=4, duration=8.0, chunk_size=256 * 102
     last_bytes, last_t = 0, start
     while time.time() < start + duration:
         time.sleep(0.2)
-        if errors[0] >= threads:
+        if dropped[0] + errors[0] >= threads:
             break
         now = time.time()
         with bytes_lock:
@@ -4318,14 +4414,15 @@ def _upload_speed_multi(host_port, threads=4, duration=8.0, chunk_size=256 * 102
     # 最多 38% —— 客户拿到的上行数字与实测对不上, 会误判宽带不达标。
     with bytes_lock:
         elapsed = (last_send[0] - start) if last_send[0] else 0.0
+        total = total_uploaded[0]
+        n_dropped = dropped[0]
     if elapsed <= 0:
         # 兜底: 一个字节都没成功发出 (或时钟异常) → 用墙钟, 但不除以 0
         elapsed = max(time.time() - start, 1e-6)
-    total = total_uploaded[0]
     if total <= 0:
         return None
     speed_mbps = total * 8 / 1e6 / elapsed
-    return {
+    result = {
         "upload_mbps": round(speed_mbps, 2),
         "uploaded_bytes": total,
         "uploaded_mb": round(total / 1e6, 2),
@@ -4333,6 +4430,10 @@ def _upload_speed_multi(host_port, threads=4, duration=8.0, chunk_size=256 * 102
         "threads": threads,
         "server": host_port,
     }
+    if n_dropped:
+        # 有连接没跑完 → 如实标注, 避免用户把「部分连接跑完」当成全量结果
+        result["dropped"] = n_dropped
+    return result
 
 
 def _download_speed_test(url, target_bytes=5 * 1024 * 1024, chunk_size=64 * 1024,
@@ -7269,6 +7370,7 @@ def _render_speedtest_html(res):
         upload_server = ookla.get("server", "—")
         upload_method = "Ookla 官方"
         server_lat_str = f"{idle_rtt:.0f} ms (Ookla 服务器)" if idle_rtt is not None else "—"
+        up_drop_note = ""   # Ookla 路径不经过 _upload_speed_multi, 无「连接中断」概念
     else:
         download = res.get("download_mbps") or 0
         upload = res.get("upload_mbps")
@@ -7287,6 +7389,10 @@ def _render_speedtest_html(res):
         up_res = res.get("up_result") or {}
         server_lat = up_res.get("server_latency_ms")
         server_lat_str = (f"{server_lat:.0f} ms (TCP 握手)" if server_lat is not None else "—")
+        # v1.18.1: 有连接没跑完 (对端不收了 / 连接被重置) → 如实标注,
+        # 别让用户把「部分连接跑完」当成全量结果。
+        up_dropped = int(up_res.get("dropped") or 0)
+        up_drop_note = (f" · {up_dropped}/{up_threads} 连接中断" if up_dropped else "")
 
     est = res.get("estimated_bandwidth") or {}
     grade = str(res.get("bufferbloat_grade") or "—")
@@ -7478,7 +7584,7 @@ def _render_speedtest_html(res):
     <table>
       <tr><td>主测速方式</td><td>{'Ookla Speedtest 官方 CLI (speedtest.exe)' if use_ookla else '国内 HTTP 多连接 + 国内运营商上行'}</td></tr>
       <tr><td>下行测速</td><td>{f'Ookla 官方测速 ({ookla.get("server", "—")})' if use_ookla else f'国内镜像多连接 HTTP 下载 ({down_threads} 连接 × {src_domain})'}</td></tr>
-      <tr><td>上行测速</td><td>{f'Ookla 官方测速 ({ookla.get("server", "—")})' if use_ookla else f'{upload_method} ({upload_server}) · {up_threads} 连接'}</td></tr>
+      <tr><td>上行测速</td><td>{f'Ookla 官方测速 ({ookla.get("server", "—")})' if use_ookla else f'{upload_method} ({upload_server}) · {up_threads} 连接{up_drop_note}'}</td></tr>
       <tr><td>延迟来源</td><td>{f'Ookla 服务器延迟 {server_lat_str}' if use_ookla else f'网关 {res.get("latency_target", "—")} (空闲/负载延迟均对它测)'}</td></tr>
       <tr><td>测速节点延迟</td><td>{server_lat_str}</td></tr>
       {'<tr><td>抖动</td><td>' + f'{ookla.get("jitter_ms", 0):.2f} ms' + '</td></tr>' if use_ookla else ''}
@@ -15537,6 +15643,15 @@ def _metrics_speedtest(res):
             g_rest = grade[len(g0):].strip(" ()")
             out.append(("缓冲膨胀", g0, lv, g_rest or "负载时延迟增加量"))
         out.append(("测速方式", "国内HTTP+上行", "ok"))
+        # v1.18.1: 部分连接没跑完 (对端不收了 / 连接被重置) → 指标卡上直接标出,
+        # 别让人把「部分连接跑完」的结果当成全量结果。
+        up_res = res.get("up_result") or {}
+        dropped = int(up_res.get("dropped") or 0)
+        if dropped:
+            total_conn = int(up_res.get("threads") or 0)
+            out.append(("连接中断",
+                        f"{dropped}/{total_conn} 条" if total_conn else f"{dropped} 条",
+                        "warn", "部分连接未跑完, 上行速率可能偏低"))
 
     # 预估宽带 (两种方式都显示)
     est = res.get("estimated_bandwidth") or {}
@@ -17405,6 +17520,7 @@ HEADER_MAP = {
     "downloaded_bytes": "下载字节", "downloaded_mb": "下载量(MB)",
     "uploaded_bytes": "上传字节", "uploaded_mb": "上传量(MB)",
     "elapsed_s": "耗时(秒)", "threads": "连接数",
+    "dropped": "中断连接数",
     "method": "测速方式", "sponsor": "测速节点", "server_host": "服务器地址",
     "server_latency_ms": "服务器延迟(ms)",
     "server_country": "服务器国家", "server_cc": "国家码",

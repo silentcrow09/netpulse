@@ -30,7 +30,27 @@ import netpulse as N  # noqa: E402
 
 
 class TestUploadSpeedElapsed(unittest.TestCase):
-    """P1-20: 上行速率的有效传输时长不能被 join 等待拉长。"""
+    """P1-20: 上行速率的有效传输时长不能被 join 等待拉长。
+
+    v1.18.1 起写路径改成「非阻塞 socket + send() 逐次写」, 所以替身要多给
+    一个 .sock (裸 socket)。这正是修复慢上行必然超时的关键: sendall() 的
+    超时覆盖整个调用, 而裸 socket 的 send() 返回实际写入量。
+    """
+
+    class _FakeSock:
+        """最小 socket 替身: 非阻塞写, 每次 send 收下全部字节。"""
+
+        def __init__(self):
+            self.blocking = True
+            self.written = 0
+
+        def setblocking(self, flag):
+            self.blocking = flag
+
+        def send(self, view):
+            time.sleep(0.01)
+            self.written += len(view)
+            return len(view)
 
     class _SlowCloseConn:
         """模拟 HTTPConnection: send 正常, close 故意卡 3 秒。
@@ -44,6 +64,7 @@ class TestUploadSpeedElapsed(unittest.TestCase):
 
         def __init__(self, host, port, timeout=None):
             self.host = host
+            self.sock = TestUploadSpeedElapsed._FakeSock()
 
         def putrequest(self, *a, **k):
             pass
