@@ -40,6 +40,7 @@ import unicodedata
 import argparse
 import tempfile
 import ipaddress
+import math
 import shutil
 import zipfile
 import select
@@ -5364,7 +5365,7 @@ def get_network_adapters():
     adapters = []
     code, out, _ = run_ps(
         "Get-NetAdapter | Select-Object Name, InterfaceDescription, Status, "
-        "LinkSpeed, MediaType, PhysicalMediaType | ConvertTo-Json"
+        "LinkSpeed, MediaType, PhysicalMediaType, Virtual | ConvertTo-Json"
     )
     if out and out.strip():
         try:
@@ -5379,6 +5380,10 @@ def get_network_adapters():
                     "link_speed": item.get("LinkSpeed", ""),
                     "media_type": item.get("MediaType", ""),
                     "physical_media": item.get("PhysicalMediaType", ""),
+                    # v1.18.3: Windows 权威的"这是软件虚拟网卡"标志位
+                    # (VirtualBox / Hyper-V / ZeroTier / WSL 等均为 True)。
+                    # 加进同一条命令的 Select 列表, 不新增命令族。
+                    "virtual": bool(item.get("Virtual", False)),
                 })
         except Exception:
             pass
@@ -6237,6 +6242,9 @@ class LinkSpeedDetector:
                 "is_wifi": "802.11" in adapter.get("description", "") or \
                            "Wi-Fi" in adapter["name"] or "Wireless" in adapter["name"],
                 "link_speed_raw": adapter.get("link_speed", ""),
+                # v1.18.3: 软件虚拟网卡标志 (Windows Virtual 属性) —— 供
+                # 「网口对照」区分物理口与虚拟桥接口 (VirtualBox/Hyper-V 等)
+                "virtual": bool(adapter.get("virtual", False)),
             }
             # 解析速率
             speed_str = str(adapter.get("link_speed", ""))
@@ -6255,23 +6263,24 @@ class LinkSpeedDetector:
             else:
                 detail["speed_mbps"] = 0
 
-            # 评估
+            # 评估 (v1.18.3: 健康档位的四个边界值取 LINKSPEED_* 常量 ——
+            # 档位阈值单一来源; 866/433/10 是描述性子档, 只属本段)
             if adapter["status"] == "Up" or adapter["status"] == "已启用":
                 if detail["is_wifi"]:
                     if detail["speed_mbps"] >= 866:
                         detail["assessment"] = "WiFi 速率优秀 (802.11ac/ax)"
                     elif detail["speed_mbps"] >= 433:
                         detail["assessment"] = "WiFi 速率良好"
-                    elif detail["speed_mbps"] >= 150:
+                    elif detail["speed_mbps"] >= LINKSPEED_WIFI_OK:
                         detail["assessment"] = "WiFi 速率一般"
-                    elif detail["speed_mbps"] >= 54:
+                    elif detail["speed_mbps"] >= LINKSPEED_WIFI_WARN:
                         detail["assessment"] = "WiFi 速率较低 (802.11g)"
                     else:
                         detail["assessment"] = "WiFi 速率过低"
                 else:
-                    if detail["speed_mbps"] >= 1000:
+                    if detail["speed_mbps"] >= LINKSPEED_WIRED_OK:
                         detail["assessment"] = "千兆以太网"
-                    elif detail["speed_mbps"] >= 100:
+                    elif detail["speed_mbps"] >= LINKSPEED_WIRED_WARN:
                         detail["assessment"] = "百兆以太网"
                     elif detail["speed_mbps"] >= 10:
                         detail["assessment"] = "十兆以太网"
@@ -6321,7 +6330,7 @@ class LinkSpeedDetector:
         for d in adapter_details:
             if d["status"] not in ("Up", "已启用"):
                 continue
-            if d.get("is_wifi") and d.get("speed_mbps", 0) < 54:
+            if d.get("is_wifi") and d.get("speed_mbps", 0) < LINKSPEED_WIFI_WARN:
                 issues.append({
                     "type": "wifi_rate_low",
                     "severity": "warning",
@@ -6329,13 +6338,26 @@ class LinkSpeedDetector:
                     "detail": "极低速 WiFi 通常由信号弱/距离远/障碍物/驱动异常导致, 建议靠近路由器或检查天线",
                 })
             elif (not d.get("is_wifi")) and d.get("speed_mbps", 0) > 0 \
-                    and d.get("speed_mbps", 0) < 100:
-                issues.append({
-                    "type": "ethernet_rate_low",
-                    "severity": "warning",
-                    "message": f"有线适配器 {d['name']} 协商速率仅 {d.get('speed_mbps', 0):.1f} Mbps",
-                    "detail": "有线协商到非千兆可能是网线/端口/驱动降速, 建议检查网线类别 (千兆需 Cat5e+) 与端口",
-                })
+                    and d.get("speed_mbps", 0) < LINKSPEED_WIRED_WARN:
+                if d.get("virtual"):
+                    # 软件桥接网卡 (VirtualBox / Hyper-V / WSL 等): 根本没有网线,
+                    # 不能让装维去查一根不存在的网线 (与模块卡的「虚拟」标签同一
+                    # 口径, 见 docs/verify.md 例外 3)。issue 的类型/严重度/数量
+                    # 一律不变 —— 只换面向人的文案。
+                    issues.append({
+                        "type": "ethernet_rate_low",
+                        "severity": "warning",
+                        "virtual": True,
+                        "message": f"虚拟网卡 {d['name']} 协商速率仅 {d.get('speed_mbps', 0):.1f} Mbps",
+                        "detail": "虚拟网卡的协商速率不代表物理链路, 一般无需处理; 若确实影响业务, 先确认这个虚拟网卡是否还需要",
+                    })
+                else:
+                    issues.append({
+                        "type": "ethernet_rate_low",
+                        "severity": "warning",
+                        "message": f"有线适配器 {d['name']} 协商速率仅 {d.get('speed_mbps', 0):.1f} Mbps",
+                        "detail": "有线协商到非千兆可能是网线/端口/驱动降速, 建议检查网线类别 (千兆需 Cat5e+) 与端口",
+                    })
             if (d.get("rx_errors", 0) + d.get("tx_errors", 0)) > 0:
                 issues.append({
                     "type": "nic_errors",
@@ -6346,12 +6368,23 @@ class LinkSpeedDetector:
                               "速率协商正常但错误持续增长同样影响传输",
                 })
 
+        # v1.18.3: 出口接口 (承载默认路由的网卡别名) —— 「网口对照表」定位端口
+        # 的依据。复用 mtu 模块已有的 _default_route_if_mtu() (内部 Get-NetRoute
+        # → Get-NetIPInterface, 按 RouteMetric 取最优默认路由), 取不到就留空串
+        # 降级, 不影响本模块其它结论。
+        egress_interface = ""
+        try:
+            _mtu_egress, egress_interface = _default_route_if_mtu()
+        except Exception:
+            egress_interface = ""
+
         self.results = {
             "adapters": adapter_details,
             "wifi_details": wifi_details,
             "wifi_interfaces": wifi_interfaces,
             "nic_errors": {"total_errors": total_errors,
                            "total_discarded": total_discarded},
+            "egress_interface": egress_interface,
             "issues": issues,
             "timestamp": datetime.now().isoformat(),
             "summary": f"检测到 {len(adapter_details)} 个网络适配器" +
@@ -8152,7 +8185,13 @@ class MultiEgressDetector:
             name = adapter.get("name", "").lower()
             if any(kw in desc or kw in name for kw in
                    ["vpn", "virtual", "tap", "tun", "ppp", "wireguard", "openvpn", "sstp", "l2tp"]):
-                vpn_adapters.append(adapter)
+                # 只挑本模块用到的字段 —— get_network_adapters() 新增的字段不得
+                # 顺带泄漏进别的模块的 raw_results (schema 虽不报错, 但那是
+                # 别的模块的数据形状, 不该被本次改动带着变)
+                vpn_adapters.append({k: adapter.get(k, "") for k in
+                                     ("name", "description", "status",
+                                      "link_speed", "media_type",
+                                      "physical_media")})
 
         if vpn_adapters:
             issues.append({
@@ -15767,6 +15806,236 @@ def _issues_bufferbloat(res):
     return []
 
 
+# ── 链路速率档位判定 (全仓唯一实现) ────────────────────────────────────────
+# v1.18.3: 速率档位阈值与 VPN 虚拟网卡关键字表原先散落三处 (_verdict_linkspeed /
+# _metrics_linkspeed / _tech_appendix_section), 关键字表已出现 forticl 与
+# forticlient 不一致 —— 抽成单一 helper 供三处 + 新的「网口对照表」共用,
+# 避免再多写一份 (AGENTS.md「状态与配色」: 不要在各渲染函数里另立映射)。
+#
+#   有线: ≥1000 正常 / ≥100 警告 / <100 异常
+#   WiFi: ≥150  正常 / ≥54  警告 / <54  异常
+#   虚拟: 恒为正常, 不参与扣分 (隧道速率不代表物理链路)
+LINKSPEED_WIRED_OK = 1000.0
+LINKSPEED_WIRED_WARN = 100.0
+LINKSPEED_WIFI_OK = 150.0
+LINKSPEED_WIFI_WARN = 54.0
+
+# VPN/隧道产品关键字: 取两份历史列表的并集 ("forticl" 能匹配 "forticlient",
+# 反之不能 —— 两边并存最稳, 避免某一处漏判)
+LINKSPEED_VIRTUAL_KEYWORDS = (
+    "zerotier", "tailscale", "wireguard", "tap-windows", "vpn-adapter",
+    "cisco anyconnect", "forticl", "forticlient", "globalprotect",
+    "openvpn", "nordvpn", "expressvpn", "hamachi",
+)
+
+
+def _linkspeed_tier(adapter):
+    """单块网卡的速率档位判定 —— 全仓唯一实现。
+
+    返回 (kind, speed_mbps, level, hint, is_virtual):
+      kind       "有线" / "WiFi" / "虚拟"
+                 虚拟 = VPN/隧道网卡**与**软件桥接网卡 (VirtualBox/Hyper-V/WSL 等,
+                 靠 Windows 的 Virtual 属性判定) —— 全报告统一一个词义: 虚拟口
+                 就是"不是物理插口"。软件桥接网卡**没有网线**, 提示不得再说
+                 "检查网线/水晶头", 否则装维会去查一根不存在的网线。
+      level      "ok" / "warn" / "err" (VPN 隧道恒为 ok, 不参与扣分;
+                 软件桥接网卡仍按有线阈值算 —— 档位口径与既有模块一致, 不改扣分)
+      hint       面向用户的提示文案 (空串 = 无异常)
+      is_virtual 是否非物理插口
+    """
+    # 速率取值: 缺键 → int 0。LinkSpeedDetector 在 LinkSpeed 不可解析时给的
+    # 就是 int 0, 既有渲染要保持 "0 Mbps" 而不是变成 "0.0 Mbps" (文案逐字不变)。
+    raw_speed = adapter.get("speed_mbps", 0)
+    if isinstance(raw_speed, bool):          # bool 是 int 子类, 但不是合法速率
+        raw_speed = 0
+    speed = raw_speed
+    try:
+        num = float(speed or 0)
+    except (TypeError, ValueError):
+        speed = 0
+        num = 0.0
+    if not math.isfinite(num):
+        # NaN / Infinity 兜底 —— 否则 port_map 导出会产出非法 JSON (NaN 字面量),
+        # 严格 JSON 解析器直接报错, 而 port_map 已是公开的 JSON 契约。
+        speed = 0
+        num = 0.0
+    elif speed is not None and not isinstance(speed, (int, float)):
+        # 字符串速率 (探测器不会产出, 合成数据可能有) → 转数值, 别让下游
+        # `speed >= 阈值` 抛 TypeError
+        speed = num
+    # 判档位一律用 num (数值); 返回的 speed 保留原始类型 —— 渲染逐字不变
+    desc = (adapter.get("description") or "").lower()
+    name_lower = (adapter.get("name") or "").lower()
+    is_vpn = any(kw in desc or kw in name_lower
+                 for kw in LINKSPEED_VIRTUAL_KEYWORDS)
+    # 软件桥接网卡 (VirtualBox/Hyper-V/WSL 等) —— Windows 权威的 Virtual 属性。
+    # 档位(level)仍按有线阈值算, 与既有 linkspeed 模块口径一致 (不改扣分);
+    # 但**类型与提示**不得再说「有线」或「检查网线/水晶头」—— 软件网卡根本没有
+    # 网线, 装维照着去查一根不存在的网线。
+    is_sw = bool(adapter.get("virtual"))
+    if adapter.get("is_wifi"):
+        level = ("ok" if num >= LINKSPEED_WIFI_OK
+                 else "warn" if num >= LINKSPEED_WIFI_WARN else "err")
+        hint = ""
+        if level == "warn":
+            hint = (f"档位偏低 ({int(LINKSPEED_WIFI_WARN)}-{int(LINKSPEED_WIFI_OK)} "
+                    "Mbps, 千兆环境期望更高)")
+        elif level == "err":
+            hint = f"档位过低 (<{int(LINKSPEED_WIFI_WARN)} Mbps, 远低于预期)"
+        return "WiFi", speed, level, hint, False
+    if is_vpn:
+        return "虚拟", speed, "ok", "VPN/虚拟网卡速率, 不代表物理链路", True
+    if is_sw:
+        level = ("ok" if num >= LINKSPEED_WIRED_OK
+                 else "warn" if num >= LINKSPEED_WIRED_WARN else "err")
+        # 红/黄档要给出**红黄的理由** (档位偏低/过低), 再补一句"这不代表物理
+        # 链路" —— 否则卡是红的、理由却没了, 客户会一头雾水。
+        if level == "warn":
+            hint = "虚拟网卡档位偏低, 不代表物理链路"
+        elif level == "err":
+            hint = "虚拟网卡档位过低, 不代表物理链路"
+        else:
+            hint = "虚拟网卡速率, 不代表物理链路"
+        return "虚拟", speed, level, hint, True
+    level = ("ok" if num >= LINKSPEED_WIRED_OK
+             else "warn" if num >= LINKSPEED_WIRED_WARN else "err")
+    hint = ""
+    if level == "warn":
+        hint = f"协商到百兆, 千兆环境应达 {int(LINKSPEED_WIRED_OK)} Mbps"
+    elif level == "err":
+        hint = f"协商速率过低 (<{int(LINKSPEED_WIRED_WARN)} Mbps), 检查网线/水晶头"
+    return "有线", speed, level, hint, False
+
+
+def _fmt_port_speed(speed):
+    """协商速率的展示文本 —— 完整版对照表与一页版摘要共用, 两处精度必须一致。
+
+    整数走无小数位 (1000 Mbps), 非整数保留一位小数 (115.6 Mbps);
+    0 / 不可判走「—」(客户版不显示无意义的 0)。
+    """
+    try:
+        val = float(speed or 0)
+    except (TypeError, ValueError):
+        return "—"
+    if isinstance(speed, bool):          # bool 是 int 子类, 但不是合法速率
+        return "—"
+    if not math.isfinite(val) or val <= 0:
+        return "—"
+    if val.is_integer():
+        return f"{int(val)} Mbps"
+    return f"{val:.1f} Mbps"
+
+
+def _is_virtual_adapter(adapter):
+    """这块网卡是不是**软件虚拟网卡** (即不是物理插口)。
+
+    两条信号:
+      1. Windows 权威的 ``Get-NetAdapter.Virtual`` 属性 (VirtualBox / Hyper-V /
+         ZeroTier / WSL / 环回 等软件桥接均为 True)
+      2. VPN/隧道产品关键字 (拿不到 Virtual 属性时的兜底)
+
+    ⚠ 与 `_linkspeed_tier` 的 is_virtual 是**两个轴**: 后者决定"档位要不要
+    扣分" (VirtualBox 这类本地桥接口的速率仍按有线算, 因为它不影响客户
+    宽带); 本函数只回答"这是不是物理口", 供「网口对照」的角色判定用。
+    """
+    if adapter.get("virtual"):
+        return True
+    desc = (adapter.get("description") or "").lower()
+    name_lower = (adapter.get("name") or "").lower()
+    return any(kw in desc or kw in name_lower
+               for kw in LINKSPEED_VIRTUAL_KEYWORDS)
+
+
+def _derive_port_map(linkspeed_res):
+    """由 linkspeed 模块结果派生「网口 → 角色」对照表 (端口定位)。
+
+    角色只给**可推导**的结论, 不臆造交换机侧的上联口/管理口 (客户端拿不到):
+      出口口  承载默认路由的那块网卡 (egress_interface)
+      内网口  已连接的**物理**有线网卡, 且不是出口口
+      WiFi 口 无线网卡, 且不是出口口
+      虚拟口  软件虚拟网卡 (VirtualBox/Hyper-V/ZeroTier/VPN 等), 且不是出口口
+      未插口  状态非 Up
+      未判定  取不到默认路由出口时, 物理有线口无法确定角色
+    """
+    res = linkspeed_res or {}
+    adapters = res.get("adapters") or []
+    egress = (res.get("egress_interface") or "").strip()
+    # 出口别名必须能对上某块网卡, 否则视作未知 —— 不能因为"拿不到出口口"
+    # 就把有线口断言成「内网口」(那是在替客户断言一件我们并不知道的事)。
+    if egress and not any((a.get("name") or "").strip().lower() == egress.lower()
+                           for a in adapters):
+        egress = ""
+    out = []
+    egress_done = False       # 出口口只能有一行 (S2) —— 同名网卡不能都标出口口
+    for a in adapters:
+        kind, speed, level, hint, _is_vpn = _linkspeed_tier(a)
+        name = (a.get("name") or "").strip()
+        up = a.get("status") in ("Up", "已启用")
+        is_virtual = _is_virtual_adapter(a)
+        # JSON 契约: speed_mbps 必须是数字 (schema 声明 "type": "number"),
+        # 拿不到速率的网卡归零, 不能把 null/NaN 写进公开的 JSON 报告
+        if isinstance(speed, bool) or not isinstance(speed, (int, float)):
+            speed = 0
+        if is_virtual:
+            # 虚拟桥接口的速率不代表物理链路 → 档位**不适用** (n/a)。
+            # 不能报 ok (会让一页版摘要说"各口速率正常", 而 linkspeed 模块卡
+            # 同时在说这块虚拟网卡的档位异常 —— 同一份报告自相矛盾);
+            # 也不能报 err (虚拟桥接口的速率不是物理链路质量问题)。
+            kind = "虚拟"
+            level = "n/a"
+            hint = "虚拟网卡速率, 不代表物理链路"
+        if not up:
+            # 未连接: 驱动报的协商速率是上次连接留下的陈旧值, 没有"协商速率"这回事
+            speed = 0.0
+            level = "n/a"
+            if kind in ("WiFi", "虚拟"):
+                hint = "未连接或已禁用"
+            else:
+                hint = "网线未接或网卡未启用"
+        is_egress_name = bool(egress) and name.lower() == egress.lower()
+        if is_egress_name and not egress_done:
+            egress_done = True
+            role = "出口口"
+            if not up:
+                hint = "默认路由指向它, 但当前未连接"
+            elif level in ("warn", "err"):
+                pass                      # 保留档位提示 (更可操作)
+            elif is_virtual:
+                hint = "虚拟网卡承载默认路由 (隧道速率不代表物理链路)"
+            else:
+                hint = "承载默认路由"
+        elif not up:
+            role = "未插口"
+        elif is_virtual:
+            role = "虚拟口"
+        elif is_egress_name:
+            # 同名网卡: 出口口已经判给前一行, 这里不能再标出口口 (S2 要求唯一)
+            role = "未判定"
+            if not hint:
+                hint = "与出口口同名, 角色待判定"
+        elif kind == "WiFi":
+            role = "WiFi 口"
+        elif not egress:
+            # 只在档位无提示时补这句 —— 覆盖掉档位提示会让"协商到百兆"这类
+            # 关键信息从报告里消失 (验收 S4 要求该文案逐字出现)
+            role = "未判定"
+            if not hint:
+                hint = "未能确定默认路由出口, 角色待判定"
+        else:
+            role = "内网口"
+        out.append({
+            "name": name,
+            "description": a.get("description", "") or "",
+            "kind": kind,
+            "status": a.get("status", "") or "",
+            "speed_mbps": speed,
+            "role": role,
+            "hint": hint,
+            "level": level,
+        })
+    return out
+
+
 def _verdict_linkspeed(res):
     """链路速率结论。
     旧版只看 issues 数量, 即便所有网卡都协商到百兆也报"速率正常"。
@@ -15780,27 +16049,14 @@ def _verdict_linkspeed(res):
     if up_adapters:
         # 按 is_wifi 分档: 有线 ≥1000 ok / ≥100 warn / <100 err; WiFi ≥150 ok / ≥54 warn / <54 err
         # VPN/虚拟接口单独识别, 不当作"有线"评估档位 (VPN 隧道速率不代表物理链路)
+        # v1.18.3: 档位判定统一走 _linkspeed_tier (阈值与关键字表单一来源)
         worst = "ok"
         worst_kinds = []  # [(kind, name, speed, level)]
         for a in up_adapters:
-            sp = a.get("speed_mbps", 0) or 0
-            is_wifi = bool(a.get("is_wifi"))
-            desc = (a.get("description") or "").lower()
-            name_lower = (a.get("name") or "").lower()
-            is_virt = any(kw in desc or kw in name_lower
-                          for kw in ("zerotier", "tailscale", "wireguard",
-                                     "tap-windows", "vpn-adapter", "cisco anyconnect",
-                                     "forticl", "globalprotect", "openvpn",
-                                     "nordvpn", "expressvpn", "hamachi"))
-            if is_wifi:
-                lvl = "ok" if sp >= 150 else "warn" if sp >= 54 else "err"
-                kind = "WiFi"
-            elif is_virt:
-                lvl = "ok"  # VPN 虚拟接口档位不扣分
-                kind = "虚拟"
-            else:
-                lvl = "ok" if sp >= 1000 else "warn" if sp >= 100 else "err"
-                kind = "有线"
+            kind, sp, lvl, _hint, _virt = _linkspeed_tier(a)
+            # 与既有实现逐字一致: `a.get("speed_mbps", 0) or 0` —— 0.0 / None
+            # 归一为 int 0, 文案是 "0 Mbps" 而不是 "0.0 Mbps" (零回归)
+            sp = sp or 0
             worst_kinds.append((kind, a.get("name", "?"), sp, lvl))
             # 计算最差等级 (err > warn > ok)
             rank = {"ok": 0, "warn": 1, "err": 2}
@@ -15831,37 +16087,10 @@ def _metrics_linkspeed(res):
     for a in res.get("adapters", []):
         if a.get("status") not in ("Up", "已启用"):
             continue
-        speed = a.get("speed_mbps", 0)
-        # 接口分类: VPN 虚拟接口单独标识 (避免被误以为是物理网线速率)
-        desc = (a.get("description") or "").lower()
-        name_lower = (a.get("name") or "").lower()
-        # 关键字选具体的 VPN/隧道产品名, 避免误伤正常网卡
-        # (不要写 "virtual", 太宽, 会把 VirtualBox Host-Only 这种本地桥接网误判)
-        is_virt = any(kw in desc or kw in name_lower
-                      for kw in ("zerotier", "tailscale", "wireguard",
-                                 "tap-windows", "vpn-adapter", "cisco anyconnect",
-                                 "forticlient", "globalprotect", "openvpn",
-                                 "nordvpn", "expressvpn", "hamachi"))
-        if a.get("is_wifi"):
-            kind = "WiFi"
-            hint = ""
-            level = "ok" if speed >= 150 else "warn" if speed >= 54 else "err"
-            if level == "warn":
-                hint = "档位偏低 (54-150 Mbps, 千兆环境期望更高)"
-            elif level == "err":
-                hint = "档位过低 (<54 Mbps, 远低于预期)"
-        elif is_virt:
-            kind = "虚拟"
-            hint = "VPN/虚拟网卡速率, 不代表物理链路"
-            level = "ok"  # 虚拟网卡档位不扣分
-        else:
-            kind = "有线"
-            hint = ""
-            level = "ok" if speed >= 1000 else "warn" if speed >= 100 else "err"
-            if level == "warn":
-                hint = "协商到百兆, 千兆环境应达 1000 Mbps"
-            elif level == "err":
-                hint = "协商速率过低 (<100 Mbps), 检查网线/水晶头"
+        # v1.18.3: 接口分类与档位判定统一走 _linkspeed_tier (阈值与 VPN 关键字表
+        # 单一来源)。关键字仍只写具体产品名 —— 不要写 "virtual", 太宽, 会把
+        # VirtualBox Host-Only 这种本地桥接网误判。
+        kind, speed, level, hint, _virt = _linkspeed_tier(a)
         # 有 hint 时占位, 避免 _present_module 用通用 "略超阈值" 覆盖
         out.append((f"{kind} · {_short_iface(a.get('name', '?'))}",
                     f"{speed} Mbps", level, hint))
@@ -15882,9 +16111,14 @@ def _issues_linkspeed(res):
     out = []
     for issue in res.get("issues", []):
         if isinstance(issue, dict):
-            action = ("换网线/换端口后重跑对比 (错误清零需重启); 持续增长则网卡"
-                      "或对端端口硬件故障" if issue.get("type") == "nic_errors"
-                      else "检查物理连接或网卡驱动")
+            if issue.get("type") == "nic_errors":
+                action = ("换网线/换端口后重跑对比 (错误清零需重启); 持续增长则网卡"
+                          "或对端端口硬件故障")
+            elif issue.get("virtual"):
+                # 软件桥接网卡: 没有网线可查 (与模块卡的「虚拟」标签同一口径)
+                action = "确认这个虚拟网卡是否还需要, 一般不影响物理链路"
+            else:
+                action = "检查物理连接或网卡驱动"
             out.append({
                 "severity": "警告" if issue.get("severity") == "warning" else "信息",
                 "text": issue.get("message", ""),
@@ -17360,6 +17594,11 @@ def build_report(rule_filter=None, diagnosis=None, site_check=None,
         status = status_map.get(key, "未检测")
         modules.append(_present_module(key, res, status))
 
+    # v1.18.3: 网口对照表 (端口定位) —— 由 linkspeed 模块结果派生。
+    # 完整版报告章节 / 一页版摘要 / JSON 顶层 port_map 共用这一份数据 (单一来源),
+    # 不新增 LAST_RUN 依赖 (数据流 runner → report → renderer)。
+    port_map = _derive_port_map(run["results"].get("linkspeed") or {})
+
     # 健康分: 扣分只用 counts (不含豁免, 可选/环境/运营商问题不压总分);
     # verdict 文案用 all_counts (含豁免, 与一览徽章、统计卡的数字一致 —
     # 豁免模块的异常客户同样看得到, 文案少报会造成"一览 2 个红而这里说 1 个"的矛盾)。
@@ -17396,6 +17635,8 @@ def build_report(rule_filter=None, diagnosis=None, site_check=None,
         # 不再夹带屏幕上有意隐藏的根因 (如 gaming 报告里的 wifi_weak)
         "diagnosis": diagnosis,
         "modules": modules,
+        # v1.18.3: 网口对照 (端口定位) —— 逐网口的角色与提示
+        "port_map": port_map,
         # v1.13.0: 现场检测模式手输数据 (显式传参; site_check 已过白名单)
         "site_check": _normalize_site_check(site_check),
         "site_note": (str(site_note).strip() if site_note else ""),
@@ -17599,7 +17840,18 @@ def _short_iface(name, max_len=32):
             keep = f"{inside[:6]}..{inside[-6:]}"
         else:
             keep = inside
-        return f"{prefix.strip()} [{keep}]"
+        shortened = f"{prefix.strip()} [{keep}]"
+        # v1.18.3: 方括号分支此前**无视 max_len** (e.g. "ZeroTier One [9f77fc..225015]"
+        # 在 max_len=24 时仍返回 29 字符) —— 兜底裁到 max_len, 兑现函数契约。
+        # 裁剪时**保留方括号里的区分段**: 两台同名不同 GUID 的网卡必须能区分,
+        # 整段丢掉只剩 "Some Adapter Name…" 反而更没用。
+        if len(shortened) <= max_len:
+            return shortened
+        suffix = f"[{keep[:4]}..{keep[-4:]}]"
+        room = max_len - len(suffix) - 1
+        if room >= 4:
+            return prefix.strip()[:room] + "…" + suffix
+        return shortened[:max_len - 1] + "…"
     return name[:max_len - 1] + "…"
 
 
@@ -18326,6 +18578,26 @@ details.collapse p.muted{color:#94a3b8;font-size:11.5px;margin-top:6px}
 .host-card .val{font-size:13px;font-weight:600;font-family:Cascadia Mono,Consolas,monospace;color:#0f172a;cursor:pointer;word-break:break-all}.host-card .val:hover{color:#2563eb;background:#f1f5f9}.host-card .val.copied{color:#16a34a !important}
 /* v1.15.2 (审查 P2): 公网 IP / 出口位置的第三方查询披露 */
 .host-note{font-size:11px;color:#94a3b8;margin-top:8px;line-height:1.5}
+/* v1.18.3: 网口对照表 (端口定位) —— 角色徽章走角色语义轴 (蓝/紫/灰),
+   速率档位色走 STATUS_COLORS (状态语义轴), 两轴不混用 */
+.portmap{background:#fff;border:1px solid #e6e9f0;border-radius:16px;padding:6px 22px 14px}
+/* 章节副标题 (默认网关 + 出口口判定口径) —— 与折叠区里的 .subcap 同一套样式 */
+.portmap .subcap{font-size:12px;font-weight:700;color:#475569;margin:8px 0 4px}
+.portmap .tbl{font-size:12.5px;width:100%;border-collapse:collapse}
+.portmap .tbl th{background:#1e293b;color:#f1f5f9;font-weight:600;padding:7px 10px;text-align:left;white-space:nowrap}
+.portmap .tbl td{padding:6px 10px;border-top:1px solid #e2e8f0;vertical-align:middle}
+.portmap .tbl td.st{white-space:nowrap}
+.portmap .tbl td.num{font-family:Cascadia Mono,Consolas,monospace;text-align:right;white-space:nowrap}
+.portmap .tbl td.desc{color:#64748b;font-size:11.5px}
+.portmap .tbl tbody tr:nth-child(odd){background:#f8fafc}
+.portmap .role{display:inline-block;padding:0 7px;border-radius:4px;font-weight:600;font-size:11.5px;white-space:nowrap}
+.portmap .role.egress{background:#dbeafe;color:#1d4ed8}
+.portmap .role.inner{background:#e2e8f0;color:#475569}
+.portmap .role.wireless{background:#ede9fe;color:#6d28d9}
+.portmap .role.virtual{background:#f1f5f9;color:#94a3b8}
+.portmap .role.down{background:#f1f5f9;color:#94a3b8}
+.portmap .role.unknown{background:#f1f5f9;color:#94a3b8}
+.portmap .hint{color:#64748b;font-size:11.5px}
 /* 诊断标准表 */
 .tbl.std{font-size:12px}
 .tbl.std th{background:#1e293b;color:#f1f5f9;font-weight:600;padding:7px 10px}
@@ -18862,6 +19134,76 @@ def _host_info_section(sys_i):
     return host_section
 
 
+# 网口角色 → CSS 类 (角色语义轴, 与状态语义轴分开: 只用蓝/紫/灰, 不碰绿/橙/红,
+# 免得装维把「灰=虚拟口」误读成「灰=异常」。速率档位色仍走 STATUS_COLORS。)
+PORT_ROLE_CLASS = {
+    "出口口": "egress",
+    "内网口": "inner",
+    "WiFi 口": "wireless",
+    "虚拟口": "virtual",
+    "未插口": "down",
+    "未判定": "unknown",
+}
+
+
+def _port_map_section(report):
+    """网口对照 (端口定位) —— 哪个口接的线、哪个口承载默认路由、哪个降速了。
+
+    数据来自 report['port_map'] (由 linkspeed 模块结果派生), 与「主机信息」相邻
+    放置: 装维看完 IP/网关, 紧接着就能对照是哪块物理口。
+    """
+    rows = report.get("port_map") or []
+    if not rows:
+        return ""
+    head = "".join(f"<th>{_html_esc(h)}</th>" for h in
+                   ("网口", "描述 (驱动)", "类型", "状态", "协商速率", "角色", "提示"))
+    body = []
+    for r in rows:
+        name = _html_esc(_short_iface(str(r.get("name") or ""), 36))
+        desc = _html_esc(_short_iface(str(r.get("description") or ""), 34))
+        kind = _html_esc(r.get("kind") or "")
+        raw_status = r.get("status") or ""
+        if raw_status in ("Up", "已启用"):
+            status = "已连接"
+        elif raw_status == "Disabled":
+            status = "已禁用"
+        else:
+            status = "未连接"
+        # 速率文本与一页版摘要共用 _fmt_port_speed —— 两处精度必须一致
+        # (不能对照表写 115.6 Mbps, 摘要写 116 Mbps)
+        speed_txt = _fmt_port_speed(r.get("speed_mbps"))
+        # 虚拟口的档位是 n/a (隧道/桥接速率不代表物理链路), 染色没有判读意义 —— 走中性色
+        color = ("" if r.get("kind") == "虚拟"
+                 else STATUS_COLORS.get(r.get("level") or "", ""))
+        speed_cell = (f"<span style='color:{color}'>{_html_esc(speed_txt)}</span>"
+                      if color else _html_esc(speed_txt))
+        role = r.get("role") or ""
+        cls = PORT_ROLE_CLASS.get(role, "unknown")
+        hint = r.get("hint") or ""
+        body.append(
+            "<tr>"
+            f"<td>{name}</td>"
+            f"<td class='desc'>{desc}</td>"
+            f"<td>{kind}</td>"
+            f"<td class='st'>{_html_esc(status)}</td>"
+            f"<td class='num'>{speed_cell}</td>"
+            f"<td><span class='role {cls}'>{_html_esc(role)}</span></td>"
+            f"<td class='hint'>{_html_esc(hint)}</td>"
+            "</tr>")
+    gateway = (report.get("system") or {}).get("gateway") or ""
+    gw_txt = "出口口按 Windows 最优路由 metric 判定"
+    if gateway:
+        gw_txt = f"默认网关 {gateway} · " + gw_txt
+    return f"""
+<div class="sec" id="portmap"><h2><span class="icon">🔌</span>网口对照
+<span class="cnt">{len(rows)} 个网口 · 装维定位用</span></h2></div>
+<div class="portmap">
+  <div class='subcap'>{_html_esc(gw_txt)}</div>
+  <div class="tbl-wrap"><table class="tbl"><thead><tr>{head}</tr></thead>
+  <tbody>{''.join(body)}</tbody></table></div>
+</div>"""
+
+
 def _tech_appendix_section(report):
     """技术附录: 判定阈值表 + 评分口径说明。
 
@@ -18881,9 +19223,13 @@ def _tech_appendix_section(report):
             lower = cfg.get("lower_better", True)
             direction = "越低越差 (≥ 触发)" if lower else "越低越好 (≤ 触发)"
             standards_rows.append((mod_name, label, str(warn), str(err), unit, direction))
-    # 链路速率阈值在 _metrics_linkspeed 硬编码, THRESHOLDS 里是空, 补进来
-    standards_rows.append(("链路速率", "有线协商速率", "100", "1000", "Mbps", "越低越差 (≥ 触发)"))
-    standards_rows.append(("链路速率", "WiFi 协商速率", "54",  "150",  "Mbps", "越低越差 (≥ 触发)"))
+    # 链路速率阈值在 LINKSPEED_* 常量 (v1.18.3 起单一来源), THRESHOLDS 里是空, 补进来
+    standards_rows.append(("链路速率", "有线协商速率",
+                            str(int(LINKSPEED_WIRED_WARN)), str(int(LINKSPEED_WIRED_OK)),
+                            "Mbps", "越低越差 (≥ 触发)"))
+    standards_rows.append(("链路速率", "WiFi 协商速率",
+                            str(int(LINKSPEED_WIFI_WARN)), str(int(LINKSPEED_WIFI_OK)),
+                            "Mbps", "越低越差 (≥ 触发)"))
 
     std_body = "".join(
         f"<tr><td>{_html_esc(m)}</td><td>{_html_esc(l)}</td>"
@@ -18899,7 +19245,7 @@ def _tech_appendix_section(report):
 <details class="collapse" data-auto-open="0"><summary>查看本次诊断的判定标准与评分口径 <span class='cnt'>{len(standards_rows)} 项指标</span></summary>
 <div class="body">
   <div class='subcap'>本节是工具内部的判定口径，<b>不影响</b>上方已列出的实测数据与结论。阈值只决定状态标签（正常 / 警告 / 异常），所有原始测量值仍完整保留在各模块的「技术细节」中。</div>
-  <div class='subcap' style='margin-top:10px'>判定规则: "越低越差"的指标 (延迟/丢包/重传/抖动), 超过<span class='kw warn'>警告阈值</span>标 ⚠️ 警告, 超过<span class='kw err'>异常阈值</span>标 ❌ 异常; "越高越好"的指标 (速率/TCP 可达数), 低于警告阈值标警告, 低于异常阈值标异常。所有阈值集中维护在 <code>THRESHOLDS</code>, 链路速率另在 <code>_metrics_linkspeed</code> 硬编码。</div>
+  <div class='subcap' style='margin-top:10px'>判定规则: "越低越差"的指标 (延迟/丢包/重传/抖动), 超过<span class='kw warn'>警告阈值</span>标 ⚠️ 警告, 超过<span class='kw err'>异常阈值</span>标 ❌ 异常; "越高越好"的指标 (速率/TCP 可达数), 低于警告阈值标警告, 低于异常阈值标异常。所有阈值集中维护在 <code>THRESHOLDS</code>, 链路速率在 <code>LINKSPEED_*</code> 常量维护。</div>
   <table class='tbl std'>
     <thead><tr><th>模块</th><th>指标</th><th>警告阈值</th><th>异常阈值</th><th>单位</th><th>判定方向</th></tr></thead>
     <tbody>{std_body}</tbody>
@@ -19010,6 +19356,8 @@ def render_report_html_customer(report):
     modules_section = _module_cards_section(modules, report, SKEY)
     # ── 主机信息 ──
     host_section = _host_info_section(sys_i)
+    # ── 网口对照 (端口定位) ──
+    portmap_section = _port_map_section(report)
     # ── 诊断标准表 (THRESHOLDS + _metrics_linkspeed 硬编码阈值, 折叠显示) ──
     standards_section = _tech_appendix_section(report)
     # ── CSS (方案 A: 晨雾浅色仪表盘) ──
@@ -19043,6 +19391,7 @@ def render_report_html_customer(report):
 {overview_section}
 {modules_section}
 {host_section}
+{portmap_section}
 {standards_section}
 </main>
 <footer>由 {_html_esc(report['app'])} v{_html_esc(report['version'])} 自动生成 · {_html_esc(g)}</footer>
@@ -19236,6 +19585,8 @@ def render_report_json(report, indent=2):
         "summary": report["summary"],
         "diagnosis": report["diagnosis"],
         "modules": report["modules"],
+        # v1.18.3: 网口对照 (端口定位) —— 顶层平铺, 技术员/脚本可直接读
+        "port_map": report.get("port_map", []),
         "tech": report["tech"],
         # v1.13.0: 现场检测模式手输数据 (普通模式为空值)
         "site_check": report.get("site_check", {}),
@@ -20102,6 +20453,56 @@ def render_report_html_brief_v2(report):
     def sev_class(s): return _SEV_PILL.get(s, ("提示", "low"))[1]
     def sev_pill(s): return _SEV_PILL.get(s, ("提示", "low"))
 
+    # v1.18.3: 网口摘要 (端口定位) —— 一页版只给一行, 不占版面 (A4 双页有硬锁):
+    # 哪个口承载默认路由 + 几口速率档位偏低 + 几个虚拟网卡。
+    # 完整对照表在完整版报告的「网口对照」章节。
+    portline_html = ""
+    _pm = report.get("port_map") or []
+    if _pm:
+        _eg = next((r for r in _pm if r.get("role") == "出口口"), None)
+        # 只统计**已连接物理口** (有线 + WiFi) 的档位: 未连接口没有速率可判,
+        # 虚拟口档位是 n/a 也不参与。漏掉前者的后果是"物理口一根没插, 摘要
+        # 却说各口速率正常" —— 交到客户手上的假绿。
+        _bad = [r for r in _pm if r.get("level") in ("warn", "err")]
+        _phys_up = [r for r in _pm if r.get("kind") in ("有线", "WiFi")
+                    and r.get("status") in ("Up", "已启用")]
+        # 口数一律按**对照表的列**统计, 摘要里的数字与表里的行数不会打架:
+        # 「N 口未连接」= 表里状态列为「未连接」的行数 (已禁用不算未连接);
+        # 「N 个虚拟网卡」= 表里类型列为「虚拟」的行数。
+        # 用角色列统计会漏掉两处: 未连接但承载默认路由的那块口 (角色是「出口口」),
+        # 以及未连接的虚拟网卡 (角色是「未插口」)。
+        _ndown = sum(1 for r in _pm
+                     if r.get("status") not in ("Up", "已启用", "Disabled"))
+        _nvirt = sum(1 for r in _pm if r.get("kind") == "虚拟")
+        _bits = []
+        if _eg:
+            _egname = _html_esc(_short_iface(str(_eg.get("name") or ""), 24))
+            if _eg.get("kind") == "虚拟":
+                # 隧道/桥接速率不代表物理链路 —— 摘要里不报这个数, 否则装维
+                # 会把「10000 Mbps」当成物理链路带宽 (对照表里有完整说明)
+                _egtxt = _egname
+            elif _eg.get("status") in ("Up", "已启用"):
+                # 速率文本与完整版对照表共用 _fmt_port_speed (两处精度必须一致)
+                _egsp = _fmt_port_speed(_eg.get("speed_mbps"))
+                _egtxt = f"{_egname} · {_egsp}" if _egsp != "—" else _egname
+            else:
+                _egtxt = f"{_egname} (未连接)"
+            _bits.append(f"出口口 {_egtxt}")
+        else:
+            _bits.append("出口口未判定")
+        if _bad:
+            _bits.append(f"{len(_bad)} 口速率档位偏低")
+        elif _phys_up:
+            _bits.append("已连接网口速率正常")
+        else:
+            _bits.append("无在线物理口")
+        if _ndown:
+            _bits.append(f"{_ndown} 口未连接")
+        if _nvirt:
+            _bits.append(f"{_nvirt} 个虚拟网卡")
+        portline_html = (f'<div class="portline"><span class="k">网口</span>'
+                         f'{" · ".join(_bits)}</div>')
+
     findings_html = ""
     for i, f in enumerate(findings, 1):
         sev = sev_class(f["sev"])
@@ -20243,6 +20644,7 @@ def render_report_html_brief_v2(report):
       <div class="value num">{_fmt_pct(retrans_rate) or "—"}<small>%</small></div>
       <div class="delta">{'偏高(&lt;2% 优)' if (retrans_rate and retrans_rate > 2) else '正常'}</div></div>
   </div>
+  {portline_html}
   <div class="sec-h"><div class="n">§</div><div class="t">主要发现</div>
     <div class="r">按优先级 · 完整根因链见随单完整版报告</div></div>
   <div class="findings">{findings_html}</div>
@@ -20432,6 +20834,12 @@ CSS_BRIEF_V2 = """
   .kpi .value small { font-size: 10.5px; font-weight: 500; color: var(--dim);
                      margin-left: 1mm; }
   .kpi .delta { font-size: 10px; color: var(--dim); margin-top: 1mm; }
+  /* v1.18.3: 网口摘要行 (端口定位) —— 一页版只占一行, 强制不换行不撑页 */
+  .portline { padding: 1.3mm 12mm; font-size: 9.5px; color: var(--dim);
+              border-bottom: 1px solid var(--rule); white-space: nowrap;
+              overflow: hidden; text-overflow: ellipsis; }
+  .portline .k { color: var(--navy); font-weight: 700; letter-spacing: 1.5px;
+                 margin-right: 2mm; }
   .sec-h { padding: 3mm 12mm 0; display: flex; align-items: baseline; gap: 2mm; }
   .sec-h .n { font-size: 11px; font-weight: 700; color: var(--navy);
               letter-spacing: 1.5px; }

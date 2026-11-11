@@ -33,7 +33,7 @@ TIMEOUT_ISSUE = {"severity": "异常",
                  "action": "现场排查后重新运行本模块"}
 
 
-def _mk_report(modules, root_causes=None, health=None):
+def _mk_report(modules, root_causes=None, health=None, port_map=None):
     return {
         "app": "NetPulse", "version": "1.15.2", "schema_version": "1.2.0",
         "generated_at": datetime.datetime(2026, 10, 21, 14, 11, 0),
@@ -50,8 +50,26 @@ def _mk_report(modules, root_causes=None, health=None):
         "diagnosis": {"root_causes": root_causes or [], "overall_confidence": 0.0,
                       "rules_evaluated": 8, "rules_fired": 0},
         "modules": modules, "site_check": {}, "site_note": "", "meta_manual": {},
+        "port_map": port_map or [],
         "tech": {},
     }
+
+
+# v1.18.3: 网口对照摘要行 (端口定位) 的实页样本 —— 一页版第 1 页多一行,
+# 必须仍为 A4 2 页。故意放最长的网卡名 + 最长的提示文案, 看会不会撑破。
+PORT_MAP = [
+    {"name": "以太网 2", "kind": "有线", "status": "Up", "speed_mbps": 1000.0,
+     "role": "出口口", "hint": "承载默认路由", "level": "ok"},
+    {"name": "以太网 3", "kind": "有线", "status": "Up", "speed_mbps": 100.0,
+     "role": "内网口", "hint": "协商到百兆, 千兆环境应达 1000 Mbps", "level": "warn"},
+    {"name": "WLAN", "kind": "WiFi", "status": "Up", "speed_mbps": 866.0,
+     "role": "WiFi 口", "hint": "", "level": "ok"},
+    {"name": "ZeroTier One [a1b2c3d4e5f60718]", "kind": "虚拟", "status": "Up",
+     "speed_mbps": 10000.0, "role": "虚拟口",
+     "hint": "VPN/虚拟网卡速率, 不代表物理链路", "level": "n/a"},
+    {"name": "USB 以太网 5", "kind": "有线", "status": "Down", "speed_mbps": 0,
+     "role": "未插口", "hint": "网线未接或网卡未启用", "level": "n/a"},
+]
 
 
 def _rc(i, sev, title, desc):
@@ -81,7 +99,19 @@ def scenarios():
                          _rc(4, "low", "MTU 偏小", "路径 MTU 探测到 1400。")]),
         "healthy": _mk_report(
             [_mk_module("m%d" % i, "模块%d" % i, "完成") for i in range(23)],
-            health={"score": 100, "grade": "A", "label": "优秀", "verdict": "良好"}),
+            health={"score": 100, "grade": "A", "label": "优秀", "verdict": "良好"},
+            port_map=PORT_MAP),
+        # v1.18.3: 网口摘要行 + 满页问题卡 (最坏情况: 第 1 页已有 4 张根因卡
+        # + 机房区, 再加一行摘要, 看会不会从 2 页变 3 页)
+        "rootcauses_with_ports": _mk_report(
+            [_mk_module("m%d" % i, "模块%d" % i, "异常",
+                        [{"severity": "异常", "text": "模块%d 异常" % i,
+                          "impact": "", "action": ""}]) for i in range(4)],
+            root_causes=[_rc(1, "critical", "WAN 中断 (运营商链路故障)", "网关可达但外网不可达。"),
+                         _rc(2, "high", "DNS 解析异常", "多个域名解析超时。"),
+                         _rc(3, "medium", "无线环境干扰较高", "2.4G 信道拥堵。"),
+                         _rc(4, "low", "MTU 偏小", "路径 MTU 探测到 1400。")],
+            port_map=PORT_MAP),
     }
 
 

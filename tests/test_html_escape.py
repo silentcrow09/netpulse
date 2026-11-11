@@ -158,5 +158,67 @@ class TestSpeedtestReportEscape(unittest.TestCase):
         self.assertIn("&quot;", out)
 
 
+class TestPortMapEscape(unittest.TestCase):
+    """v1.18.3: 网口对照表 (端口定位) 的网卡名/描述是**用户可自定义**的
+    不可信输入 (网卡可以改名, 描述来自驱动), 且直接进客户报告表格 ——
+    必须走 _html_esc 通道。"""
+    def setUp(self):
+        self._saved = np.LAST_RUN
+
+    def tearDown(self):
+        np.LAST_RUN = self._saved
+
+    def _hostile_port_map_run(self):
+        return {
+            "app": "NetPulse", "version": "1.18.3",
+            "generated_at": datetime.now(),
+            "status": {"linkspeed": "完成"},
+            "results": {"linkspeed": {
+                "adapters": [
+                    {"name": X_TAG_IMG, "description": X_SCRIPT,
+                     "status": "Up", "media_type": "802.3", "is_wifi": False,
+                     "link_speed_raw": "1 Gbps", "speed_mbps": 1000.0,
+                     "assessment": ""},
+                    {"name": X_ATTR, "description": X_SVG,
+                     "status": "Down", "media_type": "802.3", "is_wifi": False,
+                     "link_speed_raw": "", "speed_mbps": 0, "assessment": ""},
+                ],
+                "wifi_details": {}, "wifi_interfaces": [],
+                "nic_errors": {"total_errors": 0, "total_discarded": 0},
+                "egress_interface": X_TAG_IMG,
+                "issues": [], "timestamp": "", "summary": "x",
+            }},
+            "keys": ["linkspeed"],
+            "duration_ms": 5, "total_modules": 23,
+            "system": {"hostname": "PC-01", "local_ip": "192.168.1.10",
+                       "gateway": "192.168.1.1", "dns": "223.5.5.5",
+                       "public_ip": "1.2.3.4", "geo": "", "asn": ""},
+        }
+
+    def test_port_map_never_emits_raw_injection(self):
+        np.LAST_RUN = self._hostile_port_map_run()
+        html = np.render_report_html_customer(np.build_report())
+        for raw in FORBIDDEN_RAW:
+            self.assertNotIn(raw, html, msg=f"原始注入序列泄漏: {raw!r}")
+
+    def test_port_map_payload_reaches_table_escaped(self):
+        """payload 必须真的进了网口对照表 (转义形态), 防止测试假绿。"""
+        np.LAST_RUN = self._hostile_port_map_run()
+        html = np.render_report_html_customer(np.build_report())
+        self.assertIn('id="portmap"', html)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", html)
+
+    def test_brief_v2_port_summary_never_emits_raw_injection(self):
+        """一页版的网口摘要行同样吃网卡名 —— 它在 <div class="portline"> 里
+        拼了出口口名, 逃逸漏一处就是客户版被注入。"""
+        np.LAST_RUN = self._hostile_port_map_run()
+        html = np.render_report_html_brief_v2(np.build_report())
+        self.assertIn('class="portline"', html)
+        for raw in FORBIDDEN_RAW:
+            self.assertNotIn(raw, html, msg=f"原始注入序列泄漏: {raw!r}")
+        # 摘要行里的网卡名会被 _short_iface 截断到 24 字符, 只断言截断后仍存活的片段
+        self.assertIn("&lt;img src=x", html)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

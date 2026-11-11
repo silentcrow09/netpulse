@@ -323,6 +323,69 @@
         }
       }
     },
+    "port_map": {
+      "type": "array",
+      "description": "网口对照 (端口定位) —— 逐网口的类型/状态/协商速率/角色/提示. 角色只给可推导结论, 不臆造交换机侧的上联口/管理口",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "kind",
+          "role"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "网卡别名 (Get-NetAdapter.Name)"
+          },
+          "description": {
+            "type": "string",
+            "description": "网卡描述 (驱动名, 用于分辨物理口与虚拟网卡)"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "有线",
+              "WiFi",
+              "虚拟"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "description": "网卡原始状态 (Up / Down / Disabled ...)"
+          },
+          "speed_mbps": {
+            "type": "number",
+            "description": "协商速率 (Mbps). 未连接时归零 —— 驱动报的是上次连接留下的陈旧值, 原始值见 tech.raw_results"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "出口口",
+              "内网口",
+              "WiFi 口",
+              "虚拟口",
+              "未插口",
+              "未判定"
+            ]
+          },
+          "hint": {
+            "type": "string",
+            "description": "档位提示文案 (空串 = 无异常)"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "warn",
+              "err",
+              "n/a"
+            ],
+            "description": "速率档位等级 (与报告状态语义轴同源); n/a = 不适用 (未连接无速率可判 / 虚拟网卡速率不代表物理链路)"
+          }
+        }
+      }
+    },
     "tech": {
       "type": "object",
       "description": "技术视图 (raw_results / module_keys / thresholds), 仅 JSON 报告含, HTML 报告不含",
