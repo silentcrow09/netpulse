@@ -1,6 +1,6 @@
 # NetPulse
 
-> 单文件 Windows 网络诊断命令行工具 · 内置 23 项诊断模块 · v1.18.2
+> 单文件 Windows 网络诊断命令行工具 · 内置 24 项诊断模块 · v1.19.0
 
 [![GitHub release](https://img.shields.io/github/v/release/silentcrow09/netpulse)](https://github.com/silentcrow09/netpulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -19,7 +19,7 @@ NetPulse 是一个面向 Windows 平台的便携网络诊断工具。**单个 `n
 ## ✨ 特性
 
 - **零依赖即可运行**：核心诊断只用 Python 标准库，无需安装任何第三方包。
-- **23 个诊断模块**：从局域网设备扫描、TCP 并发压测、网页分层体检到 NAT 类型与代理检测，覆盖端到端排障链路。
+- **24 个诊断模块**：从局域网设备扫描、TCP 并发压测、网页分层体检到 NAT 类型与代理检测，覆盖端到端排障链路。
 - **根因分析引擎**：8 条内置规则（DNS / WAN / WiFi / Bufferbloat / 网关丢包 / NAT / **MTU 黑洞** / **TCP 传输层丢包**）跨模块聚合证据，按严重度排序输出根因 + 置信度 + 建议；HTML 报告每条根因带「为什么这样判断 / 已基本排除」证据链和**一句话报障卡**（可直接复制发给客服）。
 - **场景化诊断 Profile**：无参数启动（双击 exe）进**场景菜单** — `[1] 网络很慢 / [2] 经常断网 / [3] 网页打不开 / [4] 游戏卡顿 / [5] WiFi 信号差 / [7] 持续盯障 / [9] 高级选项`，选完自动跑对应模块组合并给出根因结论，报告存到 `桌面\NetPulse\`（文件名含时分秒，同日复测不覆盖）；CLI 同步支持 `--diagnose slow|disconnect|web|gaming|wifi`，按场景过滤规则评估（gaming 不误报「WiFi 信号弱」），导出报告与屏幕结论同源。
 - **并行执行**：`--parallel` 多模块并发跑（`--max-workers N` 控制并发数），交互菜单多模块默认并发；测速 / Bufferbloat / iperf3 / TCP 并发等**带宽敏感模块不参与并发**（v1.12.2），在并发阶段结束后独占串行跑，测速口径与单独运行一致。
@@ -174,7 +174,7 @@ python netpulse.py proxy
 # iperf3 UDP 模式: 测抖动/丢包 (语音/游戏质量口径, 1 Mbps 发包率)
 python netpulse.py iperf3 --iperf3-server 192.168.1.10 --iperf3-udp
 
-# 盯障模式 (独立运行, 不属于 23 个模块): 长时间监测找偶发掉线
+# 盯障模式 (独立运行, 不属于 24 个模块): 长时间监测找偶发掉线
 python netpulse.py --site                # 现场检测模式: 诊断+机房勾选+客户报告 (含 PDF)
 python netpulse.py --site --customer "某某公司"   # 预填客户名称
 python netpulse.py --monitor              # 默认 600 秒 (10 分钟)
@@ -238,7 +238,7 @@ python netpulse.py --install
 | `--export` | 诊断后导出报告，逗号分隔多格式（`report.html,report.json`） |
 | `--log-report` | 异常自动上报开关 (v1.17.0): `on`=开启 / `off`=关闭。默认开启，首次运行弹窗征询；交互菜单按 `[C]` 随时切换。`off` 等价于设 `NETPULSE_LOG_REPORT=0`。`check`=自检 (v1.18.0)：现场验证本机能否成功上报，不跑诊断，通过退出码 0 / 未通过退出码 6 |
 
-## 📋 诊断模块（23 项）
+## 📋 诊断模块（24 项）
 
 > 按装维工作流分三大类，序号与交互菜单 / `--list` 输出一致；菜单 / CLI 均可用分类字母快捷运行：**a=基础信息、b=宽带测速、c=故障诊断**。
 
@@ -254,19 +254,20 @@ python netpulse.py --install
 | 8 | `bufferbloat` | Bufferbloat | 负载下延迟测试，评级 A–F |
 | 9 | `iperf3` | iperf3 吞吐 | 到指定 iperf3 服务器的点对点上下行吞吐 (链路吞吐非宽带, 需 `--iperf3-server`) |
 | 10 | `tcpcc` | TCP 并发 | 阶梯并发连接压测, 判定最大可持续并发 (NAT 表上限), 本机回环对照区分瓶颈位置 |
-| 11 | `gateway` | 网关检测 | Ping 默认网关，统计延迟、丢包率、抖动 |
-| 12 | `external` | 外网检测 | 多目标 Ping + Traceroute，逐跳延迟、丢包与路径可视化 |
-| 13 | `dns` | DNS 诊断 | 多 DNS 服务器原生 UDP 对比，延迟 / 异常 / **DNS 劫持检测** |
-| 14 | `web` | 网页体检 | DNS/TCP/TLS/TTFB 分段计时, 证书检查, 重定向跟踪, 断层定位, 慢访问判定 (首字节 ≥500ms 警告 / ≥2s 异常) |
-| 15 | `arp` | ARP 分析 | ARP 冲突检测、网关 MAC 验证、ARP 欺骗排查 |
-| 16 | `loop` | 环路检测 | ARP 表 / TTL / 丢包模式分析内网环路 |
-| 17 | `tcp` | TCP 连接 | 按状态 / 进程统计 TCP 连接，检测连接数超限 |
-| 18 | `port` | 端口探测 | TCP / UDP 端口可达性与响应时延 |
-| 19 | `route` | 路由表 | 路由环路检测、异常路由、网关子网验证 |
-| 20 | `tcpstats` | TCP 传输质量 | 解析 `netstat -s` 重传率、错误段、连接失败数 |
-| 21 | `mtu` | MTU 检测 | 二分法发现路径 MTU，识别分片风险 |
-| 22 | `proxy` | 代理检测 | WinINET/WinHTTP/环境变量/VPN 网卡代理清点 + 可用性探测 (疑似断网根因) |
-| 23 | `nattype` | NAT 类型 | STUN 双服务器对比判定锥形/对称型, UDP 出网受阻检测 (游戏/P2P 排障) |
+| 11 | `loopback` | 环回测速 | 终端 → 网关 往返吞吐 (流量不出接入网), 与公网测速并排对照接入速度 / 使用速度 (需 Npcap, 无需管理员) |
+| 12 | `gateway` | 网关检测 | Ping 默认网关，统计延迟、丢包率、抖动 |
+| 13 | `external` | 外网检测 | 多目标 Ping + Traceroute，逐跳延迟、丢包与路径可视化 |
+| 14 | `dns` | DNS 诊断 | 多 DNS 服务器原生 UDP 对比，延迟 / 异常 / **DNS 劫持检测** |
+| 15 | `web` | 网页体检 | DNS/TCP/TLS/TTFB 分段计时, 证书检查, 重定向跟踪, 断层定位, 慢访问判定 (首字节 ≥500ms 警告 / ≥2s 异常) |
+| 16 | `arp` | ARP 分析 | ARP 冲突检测、网关 MAC 验证、ARP 欺骗排查 |
+| 17 | `loop` | 环路检测 | ARP 表 / TTL / 丢包模式分析内网环路 |
+| 18 | `tcp` | TCP 连接 | 按状态 / 进程统计 TCP 连接，检测连接数超限 |
+| 19 | `port` | 端口探测 | TCP / UDP 端口可达性与响应时延 |
+| 20 | `route` | 路由表 | 路由环路检测、异常路由、网关子网验证 |
+| 21 | `tcpstats` | TCP 传输质量 | 解析 `netstat -s` 重传率、错误段、连接失败数 |
+| 22 | `mtu` | MTU 检测 | 二分法发现路径 MTU，识别分片风险 |
+| 23 | `proxy` | 代理检测 | WinINET/WinHTTP/环境变量/VPN 网卡代理清点 + 可用性探测 (疑似断网根因) |
+| 24 | `nattype` | NAT 类型 | STUN 双服务器对比判定锥形/对称型, UDP 出网受阻检测 (游戏/P2P 排障) |
 
 ## 🔌 端口探测 `--port-target` 语法
 

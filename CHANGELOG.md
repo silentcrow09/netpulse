@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [1.19.0] - 2026-11-11
+
 ### 新增
 
 **环回测速（终端→网关）—— 接入速度与使用速度并排对照**
@@ -2046,7 +2048,8 @@ v1.4.0 代码审查修复：v1.2.0–v1.4.0 有多项路线图标 [x] 但未真�
 - HTML / JSON 报告导出，支持浏览器打印/另存为 PDF
 - 国内网络优化：默认使用国内 DNS（AliDNS / DNSPod / 114）与公网 IP 服务
 
-[Unreleased]: https://github.com/silentcrow09/netpulse/compare/v1.15.1...HEAD
+[Unreleased]: https://github.com/silentcrow09/netpulse/compare/v1.19.0...HEAD
+[1.19.0]: https://github.com/silentcrow09/netpulse/compare/v1.18.2...v1.19.0
 [1.15.1]: https://github.com/silentcrow09/netpulse/compare/v1.15.0...v1.15.1
 [1.15.0]: https://github.com/silentcrow09/netpulse/compare/v1.14.14...v1.15.0
 [1.0.0]: https://github.com/henu_09/netpulse/releases/tag/v1.0.0
