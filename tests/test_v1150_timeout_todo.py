@@ -16,7 +16,7 @@
 
 修复后契约:
   1) 超时/错误模块各自产出一条 severity=异常 的 issue; 超时文案与模块无关
-     (各模块超时阈值不同, 写进文案会让 23 条 issue 无法去重合并)
+     (各模块超时阈值不同, 写进文案会让 24 条 issue 无法去重合并)
   2) 待办区标题与会诊计数按「涉及模块数」口径
   3) 有未完成模块时根因摘要区不写「✓ 无故障」
   4) WiFi 的「未连接」友好提示在超时/错误时不出现 (那是"没测出来", 不是"没连")
@@ -56,7 +56,7 @@ def _mk_last_run(status=None, results=None, keys=None):
 
 
 class _AllTimeoutBase(unittest.TestCase):
-    """23 个模块全超时的公共夹具。"""
+    """24 个模块全超时的公共夹具。"""
 
     def _report(self):
         old = N.LAST_RUN
@@ -84,8 +84,8 @@ class TestFailureIssueSynth(unittest.TestCase):
 
     def test_timeout_text_is_module_independent(self):
         """超时文案必须与模块无关 ——
-        各模块超时阈值不同 (120~180 秒), 写进文案会让 23 条 issue 无法去重,
-        待办区直接刷屏 23 张卡。"""
+        各模块超时阈值不同 (120~180 秒), 写进文案会让 24 条 issue 无法去重,
+        待办区直接刷屏 24 张卡。"""
         a = N._present_module("linkspeed", {"error": TIMEOUT_ERR}, "超时")
         b = N._present_module("speedtest", {"error": TIMEOUT_ERR}, "超时")
         self.assertEqual(a["issues"][0]["text"], b["issues"][0]["text"])
@@ -148,19 +148,19 @@ class TestTodoSectionReflectsTimeouts(_AllTimeoutBase):
     def test_todo_heading_shows_involved_module_count(self):
         rep = self._report()
         todo = N._todo_issues_section(rep["modules"])
-        self.assertIn("涉及 23 个模块", todo)
+        self.assertIn("涉及 24 个模块", todo)
 
     def test_todo_card_shows_affected_modules(self):
         rep = self._report()
         todo = N._todo_issues_section(rep["modules"])
         self.assertIn("波及", todo)
-        self.assertIn("23", todo)
+        self.assertIn("24", todo)
 
     def test_consult_card_counts_by_module(self):
-        """会诊卡片按「涉及模块数」计数, 不能把 23 个模块说成 1 项。"""
+        """会诊卡片按「涉及模块数」计数, 不能把 24 个模块说成 1 项。"""
         rep = self._report()
         todo = N._todo_issues_section(rep["modules"])
-        self.assertIn("23 项异常级问题", todo)
+        self.assertIn("24 项异常级问题", todo)
 
     def test_todo_issue_is_timeout_not_gateway_only(self):
         """基线: 待办卡来源写「网关检测」→ 装维以为只有网关有问题。"""
@@ -169,10 +169,10 @@ class TestTodoSectionReflectsTimeouts(_AllTimeoutBase):
         self.assertIn(SYNTH_TEXT, todo)
 
     def test_brief_v1_shows_involved_modules(self):
-        """现网现场交付主文档 (选项 6) 同样不能把 23 个模块说成 1 项。"""
+        """现网现场交付主文档 (选项 6) 同样不能把 24 个模块说成 1 项。"""
         rep = self._report()
         html = N.render_report_html_brief(rep)
-        self.assertIn("涉及 23 个模块", html)
+        self.assertIn("涉及 24 个模块", html)
 
 
 class TestDiagnosisSectionNotClaimNoFault(_AllTimeoutBase):

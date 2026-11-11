@@ -21,10 +21,10 @@ import tempfile
 REPO = r"D:\Work\Projects\NetPulse"
 
 
-def _mk_module(key, name, status, issues=None):
+def _mk_module(key, name, status, issues=None, raw=None):
     return {"key": key, "name": name, "status": status, "verdict": "—",
             "key_metrics": [], "issues": issues or [],
-            "has_tech_details": False, "raw": {}}
+            "has_tech_details": False, "raw": raw or {}}
 
 
 TIMEOUT_ISSUE = {"severity": "异常",
@@ -78,6 +78,20 @@ def _rc(i, sev, title, desc):
             "affected_modules": ["gateway"], "evidence_ids": []}
 
 
+# v1.19.0: 环回测速摘要行的实页样本 —— 一页版第 1 页多一行, 必须仍为 A4 2 页。
+# 故意放最长的口径说明文案, 看会不会撑破。
+LOOPBACK_RAW = {
+    "gateway": "192.168.1.1", "gateway_mac": "aa:bb:cc:dd:ee:ff",
+    "interface": "以太网", "scope": "unknown",
+    "scope_label": "默认网关 (类型未知, 可能是家用路由器)",
+    "mbps": 312.5, "negotiated_mbps": 1000.0, "ratio_pct": 31.3,
+    "at_ceiling": False, "offered_mbps": 900.0, "load_limited": False,
+    "saturated": True, "is_wireless": False, "return_ratio": 0.35,
+    "frames": 89000, "bytes": 124600000, "seconds": 5.0, "duration_s": 5,
+    "issues": [], "summary": "环回 312.5 Mbps",
+}
+
+
 def scenarios():
     return {
         "all_timeout": _mk_report(
@@ -107,6 +121,18 @@ def scenarios():
             [_mk_module("m%d" % i, "模块%d" % i, "异常",
                         [{"severity": "异常", "text": "模块%d 异常" % i,
                           "impact": "", "action": ""}]) for i in range(4)],
+            root_causes=[_rc(1, "critical", "WAN 中断 (运营商链路故障)", "网关可达但外网不可达。"),
+                         _rc(2, "high", "DNS 解析异常", "多个域名解析超时。"),
+                         _rc(3, "medium", "无线环境干扰较高", "2.4G 信道拥堵。"),
+                         _rc(4, "low", "MTU 偏小", "路径 MTU 探测到 1400。")],
+            port_map=PORT_MAP),
+        # v1.19.0: 环回测速摘要行 + 满页问题卡 (最坏情况: 第 1 页已有 4 张根因卡
+        # + 机房区 + 两行摘要, 看会不会从 2 页变 3 页)
+        "rootcauses_with_loopback": _mk_report(
+            [_mk_module("m%d" % i, "模块%d" % i, "异常",
+                        [{"severity": "异常", "text": "模块%d 异常" % i,
+                          "impact": "", "action": ""}]) for i in range(4)]
+            + [_mk_module("loopback", "环回测速", "完成", raw=LOOPBACK_RAW)],
             root_causes=[_rc(1, "critical", "WAN 中断 (运营商链路故障)", "网关可达但外网不可达。"),
                          _rc(2, "high", "DNS 解析异常", "多个域名解析超时。"),
                          _rc(3, "medium", "无线环境干扰较高", "2.4G 信道拥堵。"),

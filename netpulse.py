@@ -4,9 +4,10 @@
 NetPulse - Windows 网络诊断工具
 单文件便携版 v1.0.0
 
-功能模块 (23 项, 序号与 --list 一致):
+功能模块 (24 项, 序号与 --list 一致):
   基础信息:  链路速率 / DHCP / LAN 扫描 / WiFi / IPv6 / 多出口
-  宽带测速:  测速 / Bufferbloat / iperf3 吞吐 / TCP 并发 (NAT 表上限压测)
+  宽带测速:  测速 / Bufferbloat / iperf3 吞吐 / TCP 并发 (NAT 表上限压测) /
+             环回测速 (终端→网关, 反映接入侧能力)
   故障诊断:  网关 / 外网 / DNS / 网页体检 (L7 分段) / ARP / 环路 / TCP 连接 /
              端口探测 / 路由表 / TCP 传输质量 / MTU / 代理检测 / NAT 类型 (STUN)
 """
@@ -234,6 +235,12 @@ CONFIG = {
     #   预检通过的候选**全部入池轮转压测** (连接 round-robin 分散到多 IP,
     #   避免单 IP 高频建连被对方限流/拉黑; custom 指定时保持单目标)
     "tcpcc": {"max": 4000, "target": None},
+    # 环回测速模块的运行参数 (由 CLI --loopback-scope / --loopback-duration 写入)
+    # - scope: 对端类型 — "access" = 确认在运营商接入侧 (可与签约带宽对照判达标),
+    #   "unknown" = 默认网关类型未知 (家用路由器等) → 只报数, 不判达标。
+    #   默认 "unknown": 自动判定 (PPPoE 拨号会话) 失败时不猜, 宁可少判不错判。
+    # - duration: 采样秒数 (3-30)
+    "loopback": {"scope": "unknown", "duration": 5},
 }
 
 # 兼容性 alias (B12): 旧名字指向 CONFIG 子项, 旧代码不改即可继续工作
@@ -243,6 +250,7 @@ SPEEDTEST_CONFIG = CONFIG["speedtest"]
 NATTYPE_CONFIG = CONFIG["nattype"]
 WEB_CONFIG = CONFIG["web"]
 TCPCC_CONFIG = CONFIG["tcpcc"]
+LOOPBACK_CONFIG = CONFIG["loopback"]
 
 
 def _is_admin():
@@ -7133,6 +7141,897 @@ def _parse_iperf3_server(spec, default_port=5201):
     if not _valid_iperf3_host(host) or not _valid_iperf3_port(port):
         return None
     return (host, port)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 环回测速 (loopback): 终端 → 网关 → 终端 的二层吞吐测量
+#
+# 原理 (实机验证过):
+#   构造 UDP 报文 —— 目的 IP = 本机 IP, Ethernet 目的 MAC = 网关 MAC ——
+#   从网卡发出去。网关按普通 IP 路由查得「目的地址就是这台客户端」,
+#   于是原路送回; 本机内核按本地地址认领该报文。整条路径物理经过网关,
+#   流量不出接入网, 因此不受互联网拥塞 / 对端服务器负载 / ISP 限速策略
+#   影响 —— 这正是运营商保障的「接入速度」与 speedtest 测的「使用速度」
+#   的区别。
+#
+#   **不是网关的特殊功能**: 任何路由器都具备这个行为 (目的地址在网关的
+#   直连网段上, 回程路由查回来就是「回到我」)。所以不要求网关装任何
+#   东西、不要求开 UPnP、不要求管理员权限。
+#
+# 为什么必须走二层 (两条死路都实测排除):
+#   ① 普通 socket 连自己的 IP → Windows strong host model 就地消费,
+#      0 包上线, 发不出去;
+#   ② raw socket (IP_HDRINCL) → 需要管理员权限。
+#   Npcap 的二层注入不需要管理员, 是唯一可行路径。
+#
+# 计数口径 (最容易搞错的一处):
+#   Npcap 注入的帧会被本机协议栈额外收一份, 所以 socket 收包数 =
+#   线上回送帧数的 2 倍 (实测: 发 500 个, socket 收 1000)。直接拿
+#   socket 计数会把速率算高一倍。本实现只数「线上真正回送」的帧:
+#   BPF 过滤条件里限定以太网**源 MAC = 网关 MAC**, 本机注入的副本
+#   源 MAC 是自己, 天然被排除。
+# ══════════════════════════════════════════════════════════════════════
+
+LOOPBACK_PAYLOAD_BYTES = 1400        # UDP 载荷字节 (帧长 = 14+20+8+1400)
+LOOPBACK_SRC_PORT = 45311            # 固定端口, 与其它工具不冲突
+LOOPBACK_SEND_THREADS = 8             # 二层注入并发线程 (实测 8 线程 ≈ 820 Mbps)
+LOOPBACK_DEFAULT_DURATION = 5         # 默认采样秒数
+LOOPBACK_MIN_DURATION = 3
+LOOPBACK_MAX_DURATION = 30
+LOOPBACK_MIN_RATIO_PCT = 80.0         # 实测/协商 低于此值 = 终端到网关有瓶颈
+LOOPBACK_CEILING_MBPS = 800.0         # 测得值 ≥ 此值 → 已达本工具测量上限
+# 回程完整度阈值: 送出去的大半没回来 = 路径被打满, 测得值≈路径能力;
+# 几乎全回来了 = 路径没被压满, 测得值只是下限 (受工具施加负载限制)。
+LOOPBACK_SATURATED_RATIO = 0.7
+# 施加负载下限: 施加不足这个量说明**工具本身**没能把链路压满 (例如无线网卡的
+# 二层注入很慢), 此时测得的低速率反映的是工具能力, 不是链路有瓶颈 —— 不许
+# 据此报「终端到网关有瓶颈」。实测: 有线可施加 ~900 Mbps, 无线只有 ~28 Mbps。
+LOOPBACK_OFFER_MIN_MBPS = 400.0
+LOOPBACK_SCOPES = ("access", "unknown")
+LOOPBACK_NOT_RUN_MARK = "环回测速未执行"
+
+# 环回测速的实时进度 (模块级): 采样线程低频更新帧数/已发数。
+# 用途: 模块执行超时时, probe 线程还挂在后台, runner 拿不到返回值 ——
+# 但**已采到的数据不该丢** (spec: 已采数据不丢弃), 从这里读回来。
+_LOOPBACK_PROGRESS = {"frames": 0, "sent": 0, "started": 0.0}
+
+# Npcap 的 pcap 兼容层 (wpcap.dll) — 与既有抓包功能同一份依赖
+_NPCAP_DLL_PATHS = (
+    r"C:\Windows\System32\Npcap\wpcap.dll",
+    r"C:\Program Files\Npcap\wpcap.dll",
+)
+
+
+class _PcapIfDev(ctypes.Structure):
+    pass
+
+
+_PcapIfDev._fields_ = [
+    ("next", ctypes.POINTER(_PcapIfDev)),
+    ("name", ctypes.c_char_p),
+    ("description", ctypes.c_char_p),
+    ("addresses", ctypes.c_void_p),
+    ("flags", ctypes.c_uint32),
+]
+
+
+class _BpfProgram(ctypes.Structure):
+    _fields_ = [("bf_len", ctypes.c_uint32), ("bf_insns", ctypes.c_void_p)]
+
+
+class _PcapPktHdr(ctypes.Structure):
+    _fields_ = [("ts_sec", ctypes.c_long), ("ts_usec", ctypes.c_long),
+                ("caplen", ctypes.c_uint32), ("len", ctypes.c_uint32)]
+
+
+_NPCAP_STATE = {"loaded": False, "dll": None, "err": ""}
+
+
+def _npcap_dll():
+    """加载 Npcap 的 wpcap.dll。返回 dll; 不可用返回 None。
+
+    Npcap 缺失是「环回测速跑不了」的**第一降级原因**, 所以这里把失败原因
+    记下来, 由调用方原样转成「未检测」而不是笼统的「错误」。
+    """
+    if _NPCAP_STATE["loaded"]:
+        return _NPCAP_STATE["dll"]
+    _NPCAP_STATE["loaded"] = True
+    dll = None
+    err = "未检测到 Npcap (环回测速需要 Npcap 才能做二层注入, 与抓包功能同款依赖)"
+    win_dll = getattr(ctypes, "WinDLL", None)
+    if win_dll is None:                      # 非 Windows 平台: 静默不可用
+        _NPCAP_STATE["dll"] = None
+        _NPCAP_STATE["err"] = "当前系统不支持 Npcap 二层注入"
+        return None
+    for path in _NPCAP_DLL_PATHS:
+        if not os.path.exists(path):
+            continue
+        try:
+            dll = win_dll(path)
+            err = ""
+            break
+        except OSError as e:
+            err = "Npcap 加载失败: %s" % e
+    if dll is None:
+        _NPCAP_STATE["dll"] = None
+        _NPCAP_STATE["err"] = err
+        return None
+    try:
+        dll.pcap_findalldevs.restype = ctypes.c_int
+        dll.pcap_findalldevs.argtypes = [
+            ctypes.POINTER(ctypes.POINTER(_PcapIfDev)), ctypes.c_char_p]
+        if hasattr(dll, "pcap_freealldevs"):
+            dll.pcap_freealldevs.argtypes = [ctypes.POINTER(_PcapIfDev)]
+        dll.pcap_open_live.restype = ctypes.c_void_p
+        dll.pcap_open_live.argtypes = [ctypes.c_char_p, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
+        dll.pcap_close.argtypes = [ctypes.c_void_p]
+        dll.pcap_sendpacket.restype = ctypes.c_int
+        dll.pcap_sendpacket.argtypes = [ctypes.c_void_p,
+                                        ctypes.POINTER(ctypes.c_ubyte),
+                                        ctypes.c_int]
+        dll.pcap_compile.restype = ctypes.c_int
+        dll.pcap_compile.argtypes = [ctypes.c_void_p,
+                                     ctypes.POINTER(_BpfProgram), ctypes.c_char_p,
+                                     ctypes.c_int, ctypes.c_uint32]
+        dll.pcap_setfilter.restype = ctypes.c_int
+        dll.pcap_setfilter.argtypes = [ctypes.c_void_p,
+                                       ctypes.POINTER(_BpfProgram)]
+        dll.pcap_next_ex.restype = ctypes.c_int
+        dll.pcap_next_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                     ctypes.c_void_p]
+    except AttributeError as e:
+        dll = None
+        err = "Npcap 接口不完整: %s" % e
+    _NPCAP_STATE["dll"] = dll
+    _NPCAP_STATE["err"] = err
+    return dll
+
+
+def _npcap_devices():
+    """列出 Npcap 可用的网卡: [(npf 设备名, 描述), ...]。"""
+    dll = _npcap_dll()
+    if dll is None:
+        return []
+    head = ctypes.POINTER(_PcapIfDev)()
+    errbuf = ctypes.create_string_buffer(256)
+    try:
+        if dll.pcap_findalldevs(ctypes.byref(head), errbuf) != 0:
+            return []
+    except Exception:
+        return []
+    out = []
+    try:
+        cur = head
+        while cur:
+            d = cur.contents
+            out.append((d.name.decode("utf-8", "ignore") if d.name else "",
+                        d.description.decode("utf-8", "ignore")
+                        if d.description else ""))
+            cur = d.next
+    finally:
+        try:
+            dll.pcap_freealldevs(head)
+        except Exception:
+            pass
+    return out
+
+
+def _ip_checksum(data):
+    """标准 Internet 校验和 (RFC 1071)。"""
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) + data[i + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def _mac_bytes(mac):
+    """'AA-BB-CC-DD-EE-FF' / 'aa:bb:...' → 6 字节。"""
+    hexs = [h for h in str(mac).replace("-", ":").split(":") if h]
+    if len(hexs) != 6:
+        raise ValueError("MAC 格式不对: %r" % (mac,))
+    return bytes.fromhex("".join(hexs))
+
+
+def _mac_text(mac_bytes):
+    """6 字节 → 'aa:bb:cc:dd:ee:ff'。"""
+    return ":".join("%02x" % b for b in mac_bytes)
+
+
+def _parse_link_speed_mbps(speed_str):
+    """把 Get-NetAdapter 的 LinkSpeed 字符串解析成 Mbps 数值。
+
+    单一来源: linkspeed 模块与环回测速模块都用它, 不各写一份单位换算。
+    解析不出来返回 0.0。
+    """
+    m = re.search(r"([\d.]+)\s*(Gbps|Mbps|Kbps|bps)", str(speed_str or ""),
+                  re.IGNORECASE)
+    if not m:
+        return 0.0
+    val = float(m.group(1))
+    unit = m.group(2).lower()
+    if "gbps" in unit:
+        return val * 1000
+    if "mbps" in unit:
+        return val
+    if "kbps" in unit:
+        return val / 1000
+    return val / 1e6
+
+
+def _loopback_frame(src_ip, dst_ip, src_mac, dst_mac, sport, dport, payload):
+    """构造 Ethernet/IPv4/UDP 帧。
+
+    目的 IP = 本机 IP, Ethernet 目的 MAC = 网关 MAC —— 网关查路由后原路送回。
+    IP 头校验和必须正确 (实测: 校验和置 0 的帧会被网关直接丢弃);
+    UDP 校验和置 0 = 不校验, IPv4 允许。
+    """
+    udp_len = 8 + len(payload)
+    udp = struct.pack("!HHHH", sport, dport, udp_len, 0) + payload
+    total_len = 20 + udp_len
+    ip = struct.pack("!BBHHHBBH4s4s",
+                     0x45, 0, total_len, 0x1234, 0, 64, 17, 0,
+                     socket.inet_aton(src_ip), socket.inet_aton(dst_ip))
+    cks = _ip_checksum(ip)
+    ip = ip[:10] + struct.pack("!H", cks) + ip[12:]
+    eth = _mac_bytes(dst_mac) + _mac_bytes(src_mac) + b"\x08\x00"
+    frame = eth + ip + udp
+    if len(frame) < 60:                    # 以太网最小帧长 60 字节
+        frame += b"\x00" * (60 - len(frame))
+    return frame
+
+
+def _arp_request_frame(src_ip, src_mac, target_ip):
+    """构造 ARP 请求帧 (Ethernet + ARP, op=1)。"""
+    sha = _mac_bytes(src_mac)
+    tha = b"\x00" * 6
+    arp = struct.pack("!HHBBH6s4s6s4s",
+                      1, 0x0800, 6, 4, 1,
+                      sha, socket.inet_aton(src_ip),
+                      tha, socket.inet_aton(target_ip))
+    eth = b"\xff" * 6 + sha + b"\x08\x06"
+    frame = eth + arp
+    if len(frame) < 60:
+        frame += b"\x00" * (60 - len(frame))
+    return frame
+
+
+def _parse_arp_reply(frame_bytes, target_ip):
+    """从 ARP 帧里取发送方 MAC; 不是给 target_ip 的应答则返回 None。"""
+    if len(frame_bytes) < 14 + 28:
+        return None
+    if frame_bytes[12:14] != b"\x08\x06":
+        return None
+    arp = frame_bytes[14:]
+    try:
+        op = struct.unpack("!H", arp[6:8])[0]
+        spa = socket.inet_ntoa(arp[14:18])
+    except Exception:
+        return None
+    if op != 2 or spa != target_ip:
+        return None
+    return _mac_text(arp[8:14])
+
+
+def _pcap_open(dev_name, promisc=1, to_ms=100):
+    """打开一个 pcap 句柄。返回 (handle, err)。"""
+    dll = _npcap_dll()
+    if dll is None:
+        return None, (_NPCAP_STATE["err"] or "Npcap 不可用")
+    errbuf = ctypes.create_string_buffer(256)
+    handle = dll.pcap_open_live(dev_name.encode("utf-8"), 65535,
+                                 1 if promisc else 0, to_ms, errbuf)
+    if not handle:
+        msg = errbuf.value.decode("utf-8", "ignore") or "无法打开网卡"
+        return None, "打开网卡失败: %s" % msg
+    return handle, ""
+
+
+def _pcap_set_filter(handle, expr):
+    """给句柄装 BPF 过滤条件。失败返回 False。"""
+    dll = _npcap_dll()
+    if dll is None:
+        return False
+    prog = _BpfProgram()
+    try:
+        if dll.pcap_compile(handle, ctypes.byref(prog), expr.encode("utf-8"),
+                            1, 0xFFFFFFFF) != 0:
+            return False
+        return dll.pcap_setfilter(handle, ctypes.byref(prog)) == 0
+    except Exception:
+        return False
+
+
+def _pcap_send(handle, frame):
+    """二层发一帧。返回 True/False。"""
+    dll = _npcap_dll()
+    if dll is None:
+        return False
+    buf = (ctypes.c_ubyte * len(frame)).from_buffer_copy(frame)
+    try:
+        return dll.pcap_sendpacket(handle, buf, len(frame)) == 0
+    except Exception:
+        return False
+
+
+def _pcap_count_only(handle):
+    """读一帧但**不取数据** (热路径)。
+
+    每帧都 string_at 拷一遍整帧 (1.4KB) 会把捕获侧拖到只跟得上 1/8 的
+    速率 (实测: 65k pps 只收到 13%)。计数场景根本不需要报文内容 ——
+    BPF 过滤已经在内核里筛过了, 这里只数个数。
+    """
+    dll = _npcap_dll()
+    if dll is None:
+        return False
+    hdr_pp = ctypes.c_void_p()
+    data_pp = ctypes.c_void_p()
+    h_ref = ctypes.byref(hdr_pp)
+    d_ref = ctypes.byref(data_pp)
+    try:
+        rc = dll.pcap_next_ex(handle, h_ref, d_ref)
+    except Exception:
+        return False
+    return rc == 1
+
+
+def _pcap_read(handle, timeout_ms=300):
+    """读一帧。返回 bytes 或 None (超时/结束)。"""
+    dll = _npcap_dll()
+    if dll is None:
+        return None
+    hdr_pp = ctypes.c_void_p()
+    data_pp = ctypes.c_void_p()
+    try:
+        rc = dll.pcap_next_ex(handle, ctypes.byref(hdr_pp),
+                              ctypes.byref(data_pp))
+    except Exception:
+        return None
+    if rc != 1:
+        return None
+    try:
+        hdr = ctypes.cast(hdr_pp, ctypes.POINTER(_PcapPktHdr)).contents
+        if not hdr.caplen:
+            return None
+        data = ctypes.cast(data_pp, ctypes.POINTER(ctypes.c_ubyte))
+        return ctypes.string_at(data, hdr.caplen)
+    except Exception:
+        return None
+
+
+def _loopback_route_info():
+    """取默认路由出口信息。
+
+    返回 {"gateway", "if_index", "alias", "desc", "mac", "local_ip"}; 失败返回 None。
+    出口口判定沿用既有口径 (Get-NetRoute 按 RouteMetric 取最优), 与
+    `_default_route_if_mtu()` 一致, 不另立一套。
+    """
+    code, out, _ = run_ps(
+        "$r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | "
+        "Sort-Object RouteMetric | Select-Object -First 1; "
+        "if (-not $r) { exit 1 }; "
+        "$a = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -ErrorAction SilentlyContinue; "
+        "$ip = (Get-NetIPAddress -InterfaceIndex $r.InterfaceIndex -AddressFamily IPv4 "
+        "-ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '169.254.*' } | "
+        "Select-Object -First 1).IPAddress; "
+        "[PSCustomObject]@{ gateway=$r.NextHop; if_index=$r.InterfaceIndex; "
+        "alias=$r.InterfaceAlias; desc=$a.InterfaceDescription; mac=$a.MacAddress; "
+        "local_ip=$ip } | ConvertTo-Json -Compress")
+    if not out or not out.strip():
+        return None
+    try:
+        data = json.loads(out)
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        if not isinstance(data, dict):
+            return None
+    except Exception:
+        return None
+    gw = str(data.get("gateway") or "").strip()
+    mac = str(data.get("mac") or "").strip()
+    local_ip = str(data.get("local_ip") or "").strip()
+    if not gw or not mac or not local_ip:
+        return None
+    return {
+        "gateway": gw,
+        "if_index": data.get("if_index"),
+        "alias": str(data.get("alias") or ""),
+        "desc": str(data.get("desc") or ""),
+        "mac": mac,
+        "local_ip": local_ip,
+    }
+
+
+def _loopback_find_device(desc):
+    """按网卡描述找 Npcap 设备名。找不到返回 ""。"""
+    want = (desc or "").strip().lower()
+    if not want:
+        return ""
+    devices = _npcap_devices()
+    for name, d in devices:
+        if d.strip().lower() == want:
+            return name
+    for name, d in devices:
+        if want in d.strip().lower():
+            return name
+    return ""
+
+
+def _loopback_resolve_gw_mac(dev_name, our_ip, our_mac, gw_ip, timeout=3.0):
+    """拿网关 MAC: 先查系统 ARP 缓存, 查不到就用二层发一个 ARP 请求。
+
+    返回 MAC 字符串; 失败返回 ""。
+    """
+    # 快路径: 系统 ARP 缓存 (默认路由在跑时通常已有)
+    code, out, _ = run_ps(
+        "Get-NetNeighbor -IPAddress '%s' -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.LinkLayerAddress -and $_.LinkLayerAddress -ne '' } | "
+        "Select-Object -First 1 -ExpandProperty LinkLayerAddress" % gw_ip)
+    if out and out.strip():
+        mac = out.strip().splitlines()[0].strip()
+        try:
+            _mac_bytes(mac)
+            return mac
+        except Exception:
+            pass
+    # 慢路径: 自己发 ARP 请求 (网关不回 ICMP 也能用)
+    handle, err = _pcap_open(dev_name, promisc=1, to_ms=200)
+    if not handle:
+        return ""
+    dll = _npcap_dll()
+    try:
+        if not _pcap_set_filter(handle, "arp and ether dst %s"
+                                % _mac_text(_mac_bytes(our_mac))):
+            _pcap_set_filter(handle, "arp")
+        frame = _arp_request_frame(our_ip, our_mac, gw_ip)
+        _pcap_send(handle, frame)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            raw = _pcap_read(handle, timeout_ms=200)
+            if not raw:
+                continue
+            mac = _parse_arp_reply(raw, gw_ip)
+            if mac:
+                return mac
+    finally:
+        try:
+            dll.pcap_close(handle)
+        except Exception:
+            pass
+    return ""
+
+
+def _loopback_measure(our_ip, gw_ip, our_mac, gw_mac, dev_name,
+                      duration_s=LOOPBACK_DEFAULT_DURATION,
+                      payload_len=LOOPBACK_PAYLOAD_BYTES,
+                      threads=LOOPBACK_SEND_THREADS,
+                      callback=None):
+    """跑一次环回测量。
+
+    返回 {"ok", "error", "mbps", "frames", "bytes", "seconds", "sent"}。
+    失败时 ok=False 且 error 给出**具体**原因 (不测成 ≠ 测出问题)。
+    """
+    dll = _npcap_dll()
+    if dll is None:
+        return {"ok": False, "error": _NPCAP_STATE["err"] or "Npcap 不可用"}
+
+    duration_s = max(LOOPBACK_MIN_DURATION,
+                     min(LOOPBACK_MAX_DURATION, int(duration_s or 0)))
+    threads = max(1, min(16, int(threads or 1)))
+    dport = LOOPBACK_SRC_PORT
+    frame = _loopback_frame(our_ip, our_ip, our_mac, gw_mac,
+                             dport, dport, b"N" * payload_len)
+
+    # 抓包句柄: 只收「网关 MAC 发出、发给本机、UDP 目的端口匹配」的帧 ——
+    # 这条过滤同时排除了 Npcap 注入到本机协议栈的那份副本 (源 MAC 是自己)。
+    cap, err = _pcap_open(dev_name, promisc=1, to_ms=100)
+    if not cap:
+        return {"ok": False, "error": err}
+    filter_expr = ("ether src %s and ether dst %s and dst host %s "
+                   "and udp dst port %d"
+                   % (_mac_text(_mac_bytes(gw_mac)).lower(),
+                      _mac_text(_mac_bytes(our_mac)).lower(),
+                      our_ip, dport))
+    if not _pcap_set_filter(cap, filter_expr):
+        dll.pcap_close(cap)
+        return {"ok": False, "error": "抓包过滤器设置失败 (BPF 编译错误)"}
+
+    # 发送句柄: 每线程一个 (pcap 句柄不跨线程共用)
+    send_handles = []
+    for _ in range(threads):
+        h, e = _pcap_open(dev_name, promisc=0, to_ms=10)
+        if not h:
+            for sh in send_handles:
+                try:
+                    dll.pcap_close(sh)
+                except Exception:
+                    pass
+            dll.pcap_close(cap)
+            return {"ok": False, "error": e}
+        send_handles.append(h)
+
+    counter = [0]
+    stop_flag = {"stop": False}
+    # 本次采样的进度写进模块级 dict: 模块超时被掐断时, runner 能把已采到的
+    # 帧数/时长交回去 (已采数据不丢弃)。每次测量前先归零, 避免读到上一次的。
+    _LOOPBACK_PROGRESS.update({"frames": 0, "sent": 0,
+                                "started": time.time()})
+
+    def _capture_loop():
+        # 热路径: 只数帧, 不拷贝报文数据 (见 _pcap_count_only 的说明)
+        dll2 = _npcap_dll()
+        hdr_pp = ctypes.c_void_p()
+        data_pp = ctypes.c_void_p()
+        h_ref = ctypes.byref(hdr_pp)
+        d_ref = ctypes.byref(data_pp)
+        n = 0
+        while not stop_flag["stop"]:
+            try:
+                rc = dll2.pcap_next_ex(cap, h_ref, d_ref)
+            except Exception:
+                break
+            if rc == 1:
+                n += 1
+                counter[0] = n
+                if n % 64 == 0:            # 低频写进度, 别把热路径拖慢
+                    _LOOPBACK_PROGRESS["frames"] = n
+            elif rc == -2:
+                break
+        counter[0] = n
+        _LOOPBACK_PROGRESS["frames"] = n
+
+    cap_thread = threading.Thread(target=_capture_loop, daemon=True)
+    cap_thread.start()
+    time.sleep(0.2)                       # 等抓包线程进入循环再开始发
+
+    sent = [0] * threads
+    deadline = [time.time() + duration_s]
+
+    def _send_loop(idx):
+        # 发送缓冲**只建一次**: 每帧新建 1.4KB 的 ctypes 数组会把发送
+        # 侧拖慢一个数量级 (实测 65k pps → 修后 200k+ pps)
+        h = send_handles[idx]
+        dll2 = _npcap_dll()
+        buf = (ctypes.c_ubyte * len(frame)).from_buffer_copy(frame)
+        n = 0
+        end = deadline[0]
+        while time.time() < end:
+            for _ in range(64):
+                try:
+                    if dll2.pcap_sendpacket(h, buf, len(frame)) != 0:
+                        break
+                except Exception:
+                    break
+                n += 1
+            sent[idx] = n
+            _LOOPBACK_PROGRESS["sent"] = sum(sent) + n
+
+    if callback:
+        callback("环回测速中 (采样 %d 秒)..." % duration_s)
+    send_threads = [threading.Thread(target=_send_loop, args=(i,), daemon=True)
+                    for i in range(threads)]
+    t0 = time.time()
+    base_frames = counter[0]
+    interrupted = ""
+    try:
+        for t in send_threads:
+            t.start()
+        for t in send_threads:
+            t.join(duration_s + 5)
+    except KeyboardInterrupt:
+        # 采样被打断 (Ctrl+C): 已采到的数据不丢弃, 但这一轮不作为测得值使用
+        interrupted = "采样被中断 (Ctrl+C)"
+    elapsed = time.time() - t0
+    time.sleep(0.15)                      # 等最后一批回送帧落地
+    end_frames = counter[0]
+    stop_flag["stop"] = True
+    cap_thread.join(timeout=2.0)
+
+    for h in send_handles:
+        try:
+            dll.pcap_close(h)
+        except Exception:
+            pass
+    try:
+        dll.pcap_close(cap)
+    except Exception:
+        pass
+
+    frames = max(0, end_frames - base_frames)
+    total_sent = sum(sent)
+    if interrupted:
+        # 采样未完成: 报「未检测」, 但把已采到的帧数/时长交回去 (spec: 已采数据
+        # 不丢弃) —— 现场要知道「打了一半」还是「一个包都没回来」。
+        return {"ok": False, "interrupted": True, "sent": total_sent,
+                "frames": frames, "seconds": round(elapsed, 2),
+                "partial_mbps": round(frames * payload_len * 8 / 1e6 / elapsed, 1)
+                if elapsed > 0 else 0.0,
+                "error": "采样未完成: %s (已采 %d 帧 / %.1f 秒, 不作为测得值)"
+                         % (interrupted, frames, elapsed)}
+    if frames <= 0:
+        return {"ok": False, "sent": total_sent,
+                "error": "网关未回送源目同址报文, 无法环回 (该网关/链路不支持这种回程)"}
+    if elapsed <= 0:
+        elapsed = 0.001
+    payload_bytes = frames * payload_len
+    mbps = payload_bytes * 8 / 1e6 / elapsed
+    # 施加负载 (offered): 驱动排队成功即算, 是上界不是实发量。
+    # 与实测值对比可判断「是路径到顶了, 还是工具没压满」。
+    offered_mbps = (total_sent * payload_len * 8 / 1e6 / elapsed) if total_sent else 0.0
+    return {
+        "ok": True,
+        "mbps": round(mbps, 1),
+        "frames": frames,
+        "bytes": payload_bytes,
+        "seconds": round(elapsed, 2),
+        "sent": total_sent,
+        "offered_mbps": round(offered_mbps, 1),
+        "return_ratio": round(frames / total_sent, 3) if total_sent else 0.0,
+        "payload_len": payload_len,
+    }
+
+
+def _loopback_progress_snapshot():
+    """读回环回测速的实时进度 (供模块超时时保留已采数据)。
+
+    返回 {"frames", "sent", "seconds", "mbps"}; 本轮没开始采样时返回空 dict。
+    """
+    try:
+        frames = int(_LOOPBACK_PROGRESS.get("frames") or 0)
+        sent = int(_LOOPBACK_PROGRESS.get("sent") or 0)
+        started = float(_LOOPBACK_PROGRESS.get("started") or 0.0)
+    except (TypeError, ValueError):
+        return {}
+    if frames <= 0 and sent <= 0:
+        return {}
+    seconds = max(0.0, time.time() - started) if started else 0.0
+    return {
+        "frames": frames,
+        "sent": sent,
+        "seconds": round(seconds, 2),
+        "mbps": round(frames * LOOPBACK_PAYLOAD_BYTES * 8 / 1e6 / seconds, 1)
+        if seconds > 0 else 0.0,
+    }
+
+
+def _loopback_negotiated_mbps(desc, alias):
+    """出口口的协商速率 (Mbps)。取不到返回 0。
+
+    与 linkspeed 模块同源 (Get-NetAdapter.LinkSpeed), 单位换算复用
+    `_parse_link_speed_mbps` —— 单一来源, 不另写一份。
+    """
+    try:
+        adapters = get_network_adapters()
+    except Exception:
+        return 0.0
+    for ad in adapters or []:
+        if alias and ad.get("name") == alias:
+            return _parse_link_speed_mbps(ad.get("link_speed", ""))
+    for ad in adapters or []:
+        if desc and ad.get("description") == desc:
+            return _parse_link_speed_mbps(ad.get("link_speed", ""))
+    return 0.0
+
+
+def _loopback_scope_auto():
+    """自动判定对端类型: access (在运营商接入侧) / unknown。
+
+    判据: 本机处于 PPPoE/宽带拨号会话, 且默认路由走该适配器 —— 此时
+    默认网关即 BRAS/BNG。家用路由器 / 专线静态路由无法自动区分, 一律
+    unknown (只报数, 不拿局域网段速率去比签约带宽)。
+    """
+    code, out, _ = run_ps(
+        "$pp = Get-NetAdapter -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.InterfaceDescription -match 'PPPoE|Broadband|宽带' -or "
+        "$_.Name -match 'PPPoE|Broadband|宽带' }; "
+        "$r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | "
+        "Sort-Object RouteMetric | Select-Object -First 1; "
+        "if ($pp -and $r) { "
+        "$hit = $pp | Where-Object { $_.ifIndex -eq $r.InterfaceIndex }; "
+        "if ($hit) { 'access' } else { 'unknown' } } else { 'unknown' }")
+    val = (out or "").strip().lower()
+    return "access" if val == "access" else "unknown"
+
+
+@_register_probe("loopback")
+def probe_loopback_v2(duration_s=None, scope=None, callback=None):
+    """环回测速 Probe —— 测「终端 → 网关 → 终端」这一段的吞吐。
+
+    与 speedtest (走公网的使用速度) 完全分开: 本探针的流量不出接入网,
+    反映的是接入侧能力。产出原生 DiagnosticResult, 不走旧包装。
+
+    duration_s / scope 缺省时从 LOOPBACK_CONFIG 取 (CLI --loopback-duration /
+    --loopback-scope 写入); 走配置而非新增依赖注入, 是因为 V2 probe 路径
+    只回调 callback, 不传 detect kwargs。
+    """
+    if duration_s is None:
+        duration_s = LOOPBACK_CONFIG.get("duration", LOOPBACK_DEFAULT_DURATION)
+    if scope is None:
+        scope = LOOPBACK_CONFIG.get("scope", "unknown")
+    started_mono = time.monotonic()
+    started_at = datetime.now().isoformat()
+    # 本轮进度归零: 上一次的残留不能让本次超时的报告带上旧数据
+    _LOOPBACK_PROGRESS.update({"frames": 0, "sent": 0, "started": 0.0})
+
+    def _fail(reason, extra=None):
+        metrics = {"reason": reason, "scope": scope}
+        if extra:
+            metrics.update(extra)
+        return DiagnosticResult(
+            module_id="loopback", status=Status.ERROR,
+            started_at=started_at,
+            duration_ms=int((time.monotonic() - started_mono) * 1000),
+            metrics=metrics,
+            error=DiagnosticError(
+                code="LOOPBACK_NOT_RUN", category="network",
+                message="%s: %s" % (LOOPBACK_NOT_RUN_MARK, reason),
+                retryable=True, severity=Severity.LOW),
+        )
+
+    if callback:
+        callback("正在准备环回测速...")
+
+    # Npcap 是第一降级原因: 先查它再查网卡 —— 否则「没装 Npcap」会被报成
+    # 「适配器不在 Npcap 设备列表里」, 装维照着这条找不到原因。
+    if _npcap_dll() is None:
+        return _fail(_NPCAP_STATE["err"]
+                     or "未检测到 Npcap (环回测速需要 Npcap 才能做二层注入)")
+
+    route = _loopback_route_info()
+    if not route:
+        return _fail("取不到默认路由出口 (本机是否有可用的默认网关?)")
+
+    our_ip = route["local_ip"]
+    gw_ip = route["gateway"]
+    our_mac = route["mac"]
+    desc = route["desc"]
+
+    dev_name = _loopback_find_device(desc)
+    if not dev_name:
+        return _fail("未找到可注入的二层网卡 (适配器「%s」不在 Npcap 设备列表里)"
+                     % (route["alias"] or desc or "?"))
+
+    gw_mac = _loopback_resolve_gw_mac(dev_name, our_ip, our_mac, gw_ip)
+    if not gw_mac:
+        return _fail("解析不到网关 MAC (网关 %s 无 ARP 应答)" % gw_ip)
+
+    scope = scope if scope in LOOPBACK_SCOPES else "unknown"
+    if scope == "unknown":
+        scope = _loopback_scope_auto()
+
+    out = _loopback_measure(our_ip, gw_ip, our_mac, gw_mac, dev_name,
+                             duration_s=duration_s, callback=callback)
+    if not out.get("ok"):
+        if out.get("interrupted"):
+            # 采样被打断: 报「未检测」(带 LOOPBACK_NOT_RUN_MARK → 状态归一为
+            # 未检测), 已采到的帧数/时长/速率照样交回去, 不丢弃。
+            return _fail(out.get("error") or "采样未完成", extra={
+                "partial": True,
+                "partial_frames": out.get("frames"),
+                "partial_seconds": out.get("seconds"),
+                "partial_mbps": out.get("partial_mbps"),
+            })
+        return _fail(out.get("error") or "环回测量失败")
+
+    mbps = float(out.get("mbps") or 0)
+    negotiated = _loopback_negotiated_mbps(desc, route["alias"])
+    at_ceiling = mbps >= LOOPBACK_CEILING_MBPS
+    offered = float(out.get("offered_mbps") or 0)
+    return_ratio = float(out.get("return_ratio") or 0)
+    # 路径被打满 = 送出去的大半没回来 → 测得值≈路径能力, 可以拿来判链路
+    # 未打满 = 路径还有余量 → 测得值只是下限, 不能据此说链路有瓶颈
+    saturated = return_ratio < LOOPBACK_SATURATED_RATIO
+    # 无线接入的注入能力不稳 (实测只能施加 ~28 Mbps), 环回数字不可用于判定
+    is_wireless = bool(re.search(r"wireless|wi-?fi|802\.11", desc or "",
+                                 re.IGNORECASE))
+    # 施加负载不足 → 工具没能把链路压满, 测得值是下限而非路径能力
+    load_limited = (not saturated) or offered < LOOPBACK_OFFER_MIN_MBPS
+    ratio = round(mbps / negotiated * 100, 1) if negotiated else 0.0
+
+    issues = []
+    # 出发现项的四个条件必须同时成立 (spec 2.1):
+    #   ① 实测/协商 < 80%  ② 路径被打满  ③ 有线接入  ④ 施加负载够 (≥400 Mbps)
+    # 另外撞到工具上限 (at_ceiling) 也不报: 那时的实测值是**下限**, 真实能力
+    # 可能远高于 800 Mbps, 拿它比 2.5G 协商速率必然得出「只有 32%」的假瓶颈。
+    # 漏掉 ④/⑤ 就会自相矛盾: 施加负载不足或撞上限时测得值不可判读, 章节结论
+    # 已写「无法判定瓶颈在哪一侧」, 而「主要发现」却指着接入段说瓶颈 ——
+    # 装维照着去换网线。
+    if (negotiated and ratio and ratio < LOOPBACK_MIN_RATIO_PCT
+            and saturated and not is_wireless and not load_limited
+            and not at_ceiling):
+        issues.append(Issue(
+            id="loopback.link_bottleneck",
+            severity=Severity.MEDIUM,
+            title="终端到网关这一段有瓶颈 (实测 %.1f Mbps / 协商 %.0f Mbps, 仅 %.0f%%)"
+                  % (mbps, negotiated, ratio),
+            description="环回速率明显低于网卡协商速率, 说明问题在「终端 ↔ 网关」"
+                        "这一段 (网线/水晶头/网口协商掉档/网关转发能力), "
+                        "不是运营商接入段的问题。",
+            confidence=0.85,
+            recommendations=["检查网线与水晶头, 换一个插口试",
+                             "确认路由器 LAN 口是千兆而不是百兆",
+                             "网关/路由器本身的包转发能力不足也会压低环回速率"],
+        ))
+
+    evidence = [
+        Evidence(id="loopback.rate.mbps", source="loopback.rate",
+                 metric="loopback_mbps", value=mbps, unit="Mbps",
+                 confidence=0.9, timestamp=started_at,
+                 metadata={"frames": out.get("frames"),
+                           "seconds": out.get("seconds")}),
+    ]
+    if negotiated:
+        evidence.append(Evidence(
+            id="loopback.rate.negotiated_mbps", source="loopback.rate",
+            metric="negotiated_mbps", value=negotiated, unit="Mbps",
+            confidence=0.85, timestamp=started_at))
+
+    scope_label = ("运营商接入侧" if scope == "access"
+                   else "默认网关 (类型未知, 可能是家用路由器)")
+    metrics = {
+        "gateway": gw_ip,
+        "gateway_mac": gw_mac,
+        "interface": route["alias"] or desc,
+        "scope": scope,
+        "scope_label": scope_label,
+        "mbps": mbps,
+        "negotiated_mbps": negotiated,
+        "ratio_pct": ratio,
+        "at_ceiling": at_ceiling,
+        "offered_mbps": offered,
+        "load_limited": load_limited,
+        "saturated": saturated,
+        "is_wireless": is_wireless,
+        "return_ratio": out.get("return_ratio"),
+        "frames": out.get("frames"),
+        "bytes": out.get("bytes"),
+        "seconds": out.get("seconds"),
+        "duration_s": duration_s,
+        "issues": [
+            {
+                "type": i.id,
+                "severity": ("严重" if i.severity == Severity.CRITICAL
+                             else "警告" if i.severity in (Severity.HIGH,
+                                                         Severity.MEDIUM)
+                             else "信息"),
+                "message": i.title,
+                "detail": i.description,
+                "action": "\n".join(i.recommendations) if i.recommendations else "",
+            }
+            for i in issues
+        ],
+        "timestamp": started_at,
+        "summary": "环回 %.1f Mbps (终端→网关, 对端 %s)" % (mbps, scope_label),
+    }
+
+    return DiagnosticResult(
+        module_id="loopback", status=Status.OK,
+        started_at=started_at,
+        duration_ms=int((time.monotonic() - started_mono) * 1000),
+        metrics=metrics, evidence=evidence, issues=issues)
+
+
+class LoopbackTester:
+    """环回测速 —— 走 V2 原生 Probe (见 probe_loopback_v2)。
+
+    保留这个类只为满足 MODULE_REGISTRY 的三元组结构 (key, 显示名, 类);
+    实际执行路径是 _V2_PROBES["loopback"], 不经过本类的 detect()。
+    """
+
+    def __init__(self):
+        self.name = "环回测速"
+        self.results = {}
+
+    def detect(self, callback=None):
+        res = probe_loopback_v2(callback=callback)
+        self.results = dict(res.metrics or {})
+        if res.error is not None:
+            self.results["error"] = res.error.message
+        return self.results
 
 
 class Iperf3Tester:
@@ -14285,6 +15184,8 @@ MODULE_REGISTRY = [
     ("iperf3",     "iperf3 吞吐",   Iperf3Tester),
     # tcpcc: 并发连接容量压测 (NAT 表上限), 与吞吐/延迟同属"容量性能"家族
     ("tcpcc",      "TCP 并发",      TCPConcurrencyTester),
+    # loopback: 终端→网关 的环回测速 (流量不出接入网, 反映接入侧能力)
+    ("loopback",   "环回测速",      LoopbackTester),
     # ── 故障诊断: 定位故障根源 ──
     ("gateway",    "网关检测",      GatewayTester),
     ("external",   "外网检测",      ExternalNetworkTester),
@@ -14316,7 +15217,8 @@ STRESS_MODULE_KEYS = ("tcpcc",)
 # 压低 (网页体检下载、LAN 扫描、外网探测并行抢带宽 → 全量报告测速偏低,
 # 与单独测速报告不一致), tcpcc 的高频建连也会反过来干扰并发的延迟/吞吐
 # 测量。并行跑多模块时: 普通模块先并发跑完, 这批模块再逐个串行独占跑。
-EXCLUSIVE_NET_MODULE_KEYS = ("speedtest", "bufferbloat", "iperf3", "tcpcc")
+EXCLUSIVE_NET_MODULE_KEYS = ("speedtest", "bufferbloat", "iperf3", "tcpcc",
+                             "loopback")
 
 
 def all_module_keys():
@@ -14336,7 +15238,7 @@ def full_module_keys():
 MODULE_CATEGORIES = [
     ("基础信息", ["linkspeed", "dhcp", "lan", "wifi", "ipv6", "egress"],
      "环境快照 · 看清网络状态"),
-    ("宽带测速", ["speedtest", "bufferbloat", "iperf3", "tcpcc"],
+    ("宽带测速", ["speedtest", "bufferbloat", "iperf3", "tcpcc", "loopback"],
      "带宽达标验证 · 装维核心高频"),
     ("故障诊断", ["gateway", "external", "dns", "web", "arp", "loop", "tcp",
                   "port", "route", "tcpstats", "mtu", "proxy", "nattype"],
@@ -14979,6 +15881,7 @@ MODULE_TIMEOUTS = {
     "proxy":       30.0,   # 注册表/netsh 即时 + 探测 ≤3+8+8s
     "web":         150.0,  # _module_timeout 有动态公式, 这里只兜底
     "tcpcc":       120.0,  # 同上, 动态公式优先生效
+    "loopback":    90.0,   # 同上, 动态公式优先生效
 }
 
 
@@ -15024,6 +15927,12 @@ def _module_timeout(key):
         mx = max(50, min(8000, int(TCPCC_CONFIG.get("max", 4000) or 4000)))
         n_levels = len({l for l in TCPConcurrencyTester.LADDER_BASE if l <= mx} | {mx})
         return 30 + 12 * n_levels + 10
+    if key == "loopback":
+        # 采样时长随 --loopback-duration 伸缩: 采样 d 秒 + ARP 解析/网卡定位余量
+        d = max(LOOPBACK_MIN_DURATION,
+                min(LOOPBACK_MAX_DURATION,
+                    int(LOOPBACK_CONFIG.get("duration", LOOPBACK_DEFAULT_DURATION) or 0)))
+        return 30 + d * 3
     return MODULE_TIMEOUTS.get(key, DEFAULT_MODULE_TIMEOUT)
 
 
@@ -15060,7 +15969,25 @@ def _run_module_with_timeout(key, callback):
         t.start()
         t.join(timeout)
         if t.is_alive():
-            return "超时", {"error": f"模块执行超时（超过 {timeout:.0f} 秒）"}
+            err = f"模块执行超时（超过 {timeout:.0f} 秒）"
+            if key == "loopback":
+                # 环回测速超时 = 采样窗口被打断, 不是「测出问题」。带上
+                # LOOPBACK_NOT_RUN_MARK 才会被 _normalize_module_statuses 改写成
+                # 「未检测」; 否则会以「超时/异常」进待办清单, 让客户以为网络坏了。
+                err = ("%s: 采样未完成 (模块执行超时, 超过 %.0f 秒)"
+                       % (LOOPBACK_NOT_RUN_MARK, timeout))
+                # 已采到的数据不丢弃 (spec 降级链): probe 线程还挂在后台, 但采样
+                # 进度记在 _LOOPBACK_PROGRESS 里, 这里读回来。
+                prog = _loopback_progress_snapshot()
+                if prog:
+                    err += " (已采 %d 帧 / %.1f 秒, 不作为测得值)" % (
+                        prog.get("frames") or 0, prog.get("seconds") or 0.0)
+                    return "超时", {"error": err, "partial": True,
+                                    "partial_frames": prog.get("frames"),
+                                    "partial_seconds": prog.get("seconds"),
+                                    "partial_mbps": prog.get("mbps"),
+                                    "partial_sent": prog.get("sent")}
+            return "超时", {"error": err}
         if "err" in box:
             exc = box["err"]
             tb_text = box.get("tb") or ""
@@ -15696,6 +16623,90 @@ def _metrics_speedtest(res):
     est = res.get("estimated_bandwidth") or {}
     if est.get("text"):
         out.append(("预估宽带", est["text"], "ok"))
+    return out
+
+
+def _verdict_loopback(res):
+    """环回测速的一句话结论。
+
+    没测成 (未检测) 与测出问题必须分得清: 未检测只说原因, 不给结论。
+    """
+    if not res:
+        return "未检测"
+    if "error" in res:
+        reason = str(res.get("reason") or "").strip()
+        if not reason:
+            err = str(res.get("error", ""))
+            reason = err.split(":", 1)[-1].strip() if ":" in err else err
+        return "本次未测试 — %s" % (reason or "环回测速未执行")
+    mbps = res.get("mbps")
+    if not mbps:
+        return "环回测速无有效结果"
+    scope = res.get("scope") or "unknown"
+    if res.get("is_wireless"):
+        tail = " (无线接入, 环回注入能力受限, 结果仅供参考)"
+    elif res.get("at_ceiling") or res.get("load_limited"):
+        tail = " (已达本工具测量上限, 实际能力可能更高)"
+    else:
+        tail = ""
+    if scope == "access":
+        return "环回 %.1f Mbps (终端→网关, 对端在运营商接入侧)%s" % (mbps, tail)
+    return "环回 %.1f Mbps (终端→默认网关, 反映终端到网关这一段)%s" % (mbps, tail)
+
+
+def _metrics_loopback(res):
+    """环回测速关键指标。
+
+    口径必须写清: 环回速率是「终端→网关→终端」往返, 受较慢一侧限制,
+    **不是下行带宽**; 达标与否只在确认对端在接入侧时才给。
+    """
+    out = []
+    if not res or "error" in res:
+        return out
+    mbps = res.get("mbps")
+    if mbps is not None:
+        out.append(("环回速率", "%.1f Mbps" % mbps, "ok"))
+    neg = res.get("negotiated_mbps") or 0
+    if neg:
+        out.append(("网卡协商速率", "%.0f Mbps" % neg, "ok"))
+    ratio = res.get("ratio_pct") or 0
+    # 实测/协商 只在「路径确实被打满 + 有线接入 + 施加负载够 + 没撞工具上限」
+    # 时才有判断意义 (与出发现项的条件完全一致): 否则 tooltip 说「说明这一段
+    # 有瓶颈」, 而同页章节结论说「无法判定瓶颈在哪一侧」—— 一页两套说法。
+    if (neg and ratio and res.get("saturated") and not res.get("is_wireless")
+            and not res.get("load_limited") and not res.get("at_ceiling")):
+        out.append(("实测/协商", "%.0f%%" % ratio,
+                    "ok" if ratio >= LOOPBACK_MIN_RATIO_PCT else "warn",
+                    "低于 %.0f%% 说明终端到网关这一段有瓶颈"
+                    % int(LOOPBACK_MIN_RATIO_PCT)))
+    out.append(("测速区间", "终端 → 网关 (流量不出接入网)", "ok"))
+    out.append(("对端", res.get("scope_label") or "默认网关 (类型未知)", "ok"))
+    if res.get("is_wireless"):
+        out.append(("接入方式", "无线 (环回注入能力受限, 结果仅供参考)", "warn"))
+    if res.get("at_ceiling"):
+        out.append(("测量上限", "已达本工具测量上限", "warn",
+                    "实际能力可能更高, 该数字不代表链路上限"))
+    elif res.get("load_limited"):
+        out.append(("测量上限", "已达本工具测量上限", "warn",
+                    "本次施加 %.0f Mbps 负载未跑满, 测得值是下限"
+                    % (res.get("offered_mbps") or 0)))
+    return out
+
+
+def _issues_loopback(res):
+    """环回测速的发现项 (由 probe 产出的 issues 转成报告格式)。"""
+    out = []
+    if not res or "error" in res:
+        return out
+    for it in (res.get("issues") or []):
+        if not isinstance(it, dict):
+            continue
+        out.append({
+            "severity": it.get("severity") or "警告",
+            "text": it.get("message") or "",
+            "impact": it.get("detail") or "",
+            "action": it.get("action") or "",
+        })
     return out
 
 
@@ -17092,6 +18103,8 @@ MODULE_PRESENTATION = {
                    "issues_fn": _issues_tcpcc,
                    "tech_keys": ["levels", "target_candidates", "local_baseline",
                                  "established_before", "established_after"]},
+    "loopback":   {"verdict_fn": _verdict_loopback,   "metrics_fn": _metrics_loopback,
+                   "issues_fn": _issues_loopback},
 }
 
 
@@ -17108,6 +18121,7 @@ MODULE_EXPLAINS = {
     "speedtest": "实测下载/上传速率并推算宽带档位。实测明显低于办理档位 = 线路或设备有问题, 是装维核心验收项。",
     "bufferbloat": "测『一边满速下载、一边游戏/通话』时延会不会暴涨。评级差说明路由器缓存策略差, 表现为下载时全家卡。",
     "iperf3": "到指定服务器点对点测吞吐 (内网/专线验收用), 测的是链路吞吐, 与互联网宽带测速是两回事。UDP 模式 (--iperf3-udp) 改测抖动/丢包 — 语音/游戏质量的关键指标。",
+    "loopback": "测「终端 → 网关 → 终端」这一段的真实吞吐: 流量不出接入网, 不受互联网拥塞与对端服务器负载影响, 反映的是接入侧能力。与「测速」(走公网的使用速度) 并排看, 就能分清是接入段慢还是互联网侧慢。",
     "tcpcc": "压测整条通路同时能保持多少条 TCP 连接 (光猫/路由器的 NAT 会话表容量)。数值低 = 设备一连多就掉线、网页资源加载不全。",
     "gateway": "Ping 网关 (光猫/路由器), 反映『本机 ↔ 网关』这一段的质量。这里丢包/高延迟说明问题在内网 (网线/WiFi/路由器), 无需找运营商。",
     "external": "Ping 多个外网目标并逐跳追踪路径, 定位问题出在哪一段: 内网侧、运营商侧还是目标网站侧。",
@@ -17463,11 +18477,12 @@ SITE_CHECK_BY_KEY = {it["key"]: it for it in SITE_CHECK_ITEMS}
 # 评分豁免模块 (原 build_report 内局部集合, v1.13.1 提为常量供渲染层引用):
 # iperf3 未配置不是故障 / ipv6 可选 / proxy·VPN 环境特性 / nattype 运营商侧。
 # 豁免 = 不扣分, 但状态徽章照常展示 (全口径), 报告需说明这层差异。
-SCORE_EXEMPT_MODULES = ("iperf3", "ipv6", "proxy", "nattype")
+SCORE_EXEMPT_MODULES = ("iperf3", "ipv6", "proxy", "nattype", "loopback")
 
 # 「未配置」类模块: 模块返回 error, 但那是「没测」而不是「测出问题」。
 # 状态改写为「未检测」, 客户看红色错误会误以为网络坏了 (v1.15.0 审查 P1-13)。
-_STATUS_NOT_CONFIGURED = {"iperf3": "未指定 iperf3"}
+_STATUS_NOT_CONFIGURED = {"iperf3": "未指定 iperf3",
+                          "loopback": LOOPBACK_NOT_RUN_MARK}
 
 
 def _exempt_names(report):
@@ -18598,6 +19613,18 @@ details.collapse p.muted{color:#94a3b8;font-size:11.5px;margin-top:6px}
 .portmap .role.down{background:#f1f5f9;color:#94a3b8}
 .portmap .role.unknown{background:#f1f5f9;color:#94a3b8}
 .portmap .hint{color:#64748b;font-size:11.5px}
+/* v1.19.0: 环回测速 —— 接入侧 (终端→网关) 与使用侧 (走公网) 并排对照。
+   速率走数据轴配色 (下行蓝 / 上行橙), 不进状态语义轴 —— 这两个数字都不是
+   「好/坏」判定, 只是两组客观速率 (AGENTS.md 状态与配色节) */
+.lb-compare{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
+.lb-col{background:#fff;border:1px solid #e6e9f0;border-radius:12px;padding:14px 16px}
+.lb-col .lab{font-size:11px;color:#94a3b8;font-weight:600}
+.lb-col .val{font-size:26px;font-weight:700;font-family:Cascadia Mono,Consolas,monospace;color:#0f172a;margin:4px 0 3px}
+.lb-col .note{font-size:11.5px;color:#64748b;line-height:1.55}
+.lb-col.access .val{color:#0a84ff}
+.lb-col.usage .val{color:#ff9500}
+.lb-verdict{margin-top:12px;padding:10px 14px;border-radius:10px;background:#f1f5f9;border:1px solid #e2e8f0;font-size:12.5px;line-height:1.6;color:#334155}
+.lb-verdict b{color:#0f172a}
 /* 诊断标准表 */
 .tbl.std{font-size:12px}
 .tbl.std th{background:#1e293b;color:#f1f5f9;font-weight:600;padding:7px 10px}
@@ -19204,6 +20231,136 @@ def _port_map_section(report):
 </div>"""
 
 
+def _loopback_section(report, by_key):
+    """环回测速 —— 接入侧 (终端→网关) 与使用侧 (走公网) 并排对照。
+
+    这两个数字回答的是不同的问题:
+      接入侧 = 环回测速 (流量不出接入网) → 接入段/终端侧的能力
+      使用侧 = speedtest (走公网)        → 用户实际感受到的速度
+    并排放, 装维一眼就能分清「是接入段慢, 还是互联网侧慢」。
+
+    口径铁律 (少一条就会误导现场):
+      ① 环回速率是**往返** (终端→网关→终端), 受较慢一侧限制, 不是下行带宽;
+      ② scope=unknown (默认网关类型未知) 时**不得**出现「达标/不达标」——
+         拿局域网段速率比签约带宽, 会把「网线插错口」误判成「宽带不达标」。
+    """
+    lb = (by_key.get("loopback") or {}).get("raw") or {}
+    if not lb:
+        return ""
+    spd = (by_key.get("speedtest") or {}).get("raw") or {}
+    spd_dl = None
+    try:
+        # 走既有 speed chart 解析: Ookla 嵌套结果也在里面, 与图表口径一致
+        _spd_src, _spd_lbl = _resolve_speed_chart_src(spd)
+        if _spd_src.get("download_mbps") is not None:
+            spd_dl = float(_spd_src.get("download_mbps"))
+    except (TypeError, ValueError):
+        spd_dl = None
+
+    failed = "error" in lb
+    reason = str(lb.get("reason") or lb.get("error") or "").strip()
+    mbps = lb.get("mbps")
+    neg = lb.get("negotiated_mbps") or 0
+    scope = lb.get("scope") or "unknown"
+
+    if failed:
+        access_val = "未检测"
+        access_note = reason or "环回测速未执行"
+    else:
+        try:
+            access_val = "%.1f Mbps" % float(mbps or 0)
+        except (TypeError, ValueError):
+            access_val = "—"
+        notes = []
+        try:
+            if float(neg or 0):
+                notes.append("对照网卡协商速率 %.0f Mbps" % float(neg))
+        except (TypeError, ValueError):
+            pass
+        if lb.get("is_wireless"):
+            notes.append("无线接入, 二层注入能力受限, 数字仅供参考")
+        elif lb.get("load_limited") or lb.get("at_ceiling"):
+            notes.append("已达本工具测量上限, 实际能力可能更高")
+        notes.append("往返路径 (终端→网关→终端), 速率受较慢一侧限制, 不代表链路的单向能力")
+        access_note = " · ".join(notes)
+
+    # 接入侧数字**能不能拿来比**: 无线 / 没跑满 / 撞到工具上限时, 测得值只是
+    # 参考或下限, 拿它和使用侧比大小会得出反向的错误结论 (无线 0.8 Mbps 与
+    # speedtest 0.5 Mbps 比 → 得出「接入侧更高」, 实际两个数都不能判读)。
+    lb_judgeable = bool(lb.get("saturated")) and not lb.get("is_wireless") \
+        and not lb.get("load_limited") and not lb.get("at_ceiling")
+    if lb.get("is_wireless"):
+        lb_unjudgeable_why = "无线接入, 数字仅供参考"
+    elif lb.get("at_ceiling"):
+        lb_unjudgeable_why = "已达本工具测量上限, 实际能力可能更高"
+    elif lb.get("load_limited"):
+        lb_unjudgeable_why = "已达本工具测量上限 (本次未跑满路径, 测得值是下限)"
+    else:
+        lb_unjudgeable_why = ""
+
+    if spd_dl is not None:
+        usage_val = "%.1f Mbps" % spd_dl
+        usage_note = "走公网到测速服务器, 受互联网拥塞与对端负载影响"
+    else:
+        usage_val = "—"
+        usage_note = "本次未测公网测速 (未运行 speedtest 模块), 无法做两侧对照"
+
+    if failed:
+        # 失败原因来自运行环境 (Npcap 缺失 / 网关无 ARP 应答 / 网卡名), 是**外部
+        # 文本** —— 必须转义后再拼进 HTML (verdict 里其它分支的 <b> 是自有标记,
+        # 不能整段 escape, 只能对插入值逐个转义)。
+        verdict = "环回测速未执行: %s" % _html_esc(reason or "原因未记录")
+    elif not lb_judgeable and lb_unjudgeable_why:
+        # 数字不可判读 → 不下「瓶颈在哪一侧」的结论 (否则注释写「仅供参考」、
+        # 结论却说接入段有瓶颈, 同一页自相矛盾)
+        verdict = ("接入侧 %s %s → 不与使用侧对照, 无法判定瓶颈在接入段还是互联网侧"
+                   % (_html_esc(access_val), lb_unjudgeable_why))
+    elif spd_dl and mbps:
+        try:
+            lbv = float(mbps)
+        except (TypeError, ValueError):
+            lbv = 0.0
+        if lbv >= spd_dl * 1.5:
+            verdict = ("接入侧 <b>%.1f Mbps</b> 明显高于使用侧 <b>%.1f Mbps</b> → "
+                       "瓶颈在互联网侧/上游, 接入段本身正常"
+                       % (lbv, spd_dl))
+        else:
+            # 关系词要说准: 接入侧明显低于使用侧时, 说「接近」是错的 (那是
+            # 「接入侧更慢」, 结论仍是接入段有瓶颈, 但理由不能写成「接近」)
+            rel = "低于" if lbv < spd_dl else "与"
+            verdict = ("接入侧 <b>%.1f Mbps</b> %s使用侧 <b>%.1f Mbps</b> → "
+                       "瓶颈在接入段或终端侧, 优先查网线/网口/网关"
+                       % (lbv, rel, spd_dl))
+    else:
+        verdict = "本次未测公网测速, 无法做接入侧/使用侧对照"
+
+    # scope 说明: 只有确认对端在运营商接入侧时才谈签约带宽, 否则只说链路段。
+    # unknown 口径下**不得出现**「达标 / 不达标 / 签约带宽」字样 (见 verify S4) ——
+    # 拿局域侧速率比运营商承诺带宽, 会把「网线插错口」误判成「宽带不达标」。
+    if scope == "access":
+        scope_note = "对端已确认在运营商接入侧 (本机处于宽带拨号会话)"
+    else:
+        scope_note = ("测的是「终端 → 默认网关」这一段 (默认网关类型未知, "
+                      "可能是家用路由器) —— 局域侧与运营商承诺的带宽不在同一段")
+
+    return f"""
+<div class="sec" id="loopback"><h2><span class="icon">🔁</span>环回测速
+<span class="cnt">接入侧 vs 使用侧 · 流量不出接入网</span></h2></div>
+<div class="lb-compare">
+  <div class="lb-col access">
+    <div class="lab">接入侧 · 环回测速 (终端 → 网关)</div>
+    <div class="val">{_html_esc(access_val)}</div>
+    <div class="note">{_html_esc(access_note)}</div>
+  </div>
+  <div class="lb-col usage">
+    <div class="lab">使用侧 · 公网测速 (走互联网)</div>
+    <div class="val">{_html_esc(usage_val)}</div>
+    <div class="note">{_html_esc(usage_note)}</div>
+  </div>
+</div>
+<div class="lb-verdict">{verdict}<br><span style="color:#64748b">{_html_esc(scope_note)}</span></div>"""
+
+
 def _tech_appendix_section(report):
     """技术附录: 判定阈值表 + 评分口径说明。
 
@@ -19358,6 +20515,8 @@ def render_report_html_customer(report):
     host_section = _host_info_section(sys_i)
     # ── 网口对照 (端口定位) ──
     portmap_section = _port_map_section(report)
+    # ── 环回测速 (接入侧 vs 使用侧 对照) ──
+    loopback_section = _loopback_section(report, by_key)
     # ── 诊断标准表 (THRESHOLDS + _metrics_linkspeed 硬编码阈值, 折叠显示) ──
     standards_section = _tech_appendix_section(report)
     # ── CSS (方案 A: 晨雾浅色仪表盘) ──
@@ -19392,6 +20551,7 @@ def render_report_html_customer(report):
 {modules_section}
 {host_section}
 {portmap_section}
+{loopback_section}
 {standards_section}
 </main>
 <footer>由 {_html_esc(report['app'])} v{_html_esc(report['version'])} 自动生成 · {_html_esc(g)}</footer>
@@ -20503,6 +21663,49 @@ def render_report_html_brief_v2(report):
         portline_html = (f'<div class="portline"><span class="k">网口</span>'
                          f'{" · ".join(_bits)}</div>')
 
+    # v1.19.0: 环回测速摘要行 —— 接入侧 (终端→网关) 与使用侧 (走公网) 一句话对照。
+    # 与完整版「环回测速」章节同口径同精度 (都走 %.1f Mbps), 只占一行不占版面。
+    loopline_html = ""
+    _lb = _raw("loopback")
+    if _lb:
+        if "error" in _lb:
+            loopline_html = ('<div class="loopline"><span class="k">环回</span>'
+                             '未检测 · 本次未能测出终端→网关这一段的速率</div>')
+        else:
+            try:
+                _lbm = float(_lb.get("mbps") or 0)
+            except (TypeError, ValueError):
+                _lbm = 0.0
+            _lbbits = [f"终端→网关 {_lbm:.1f} Mbps"]
+            _spd_dl = None
+            try:
+                _spd_src, _ = _resolve_speed_chart_src(_raw("speedtest"))
+                if _spd_src.get("download_mbps") is not None:
+                    _spd_dl = float(_spd_src.get("download_mbps"))
+            except (TypeError, ValueError):
+                _spd_dl = None
+            if _spd_dl:
+                # 接入侧数字不可判读时不做大小对照 (无线 / 没跑满 / 撞工具上限的
+                # 数字是参考值或下限, 拿来比大小会得出反向结论)
+                _lb_judgeable = (bool(_lb.get("saturated"))
+                                 and not _lb.get("is_wireless")
+                                 and not _lb.get("load_limited")
+                                 and not _lb.get("at_ceiling"))
+                if _lb_judgeable and _lbm >= _spd_dl * 1.5:
+                    _lbbits.append(f"接入侧高于使用侧 {_spd_dl:.1f} Mbps")
+                else:
+                    _lbbits.append(f"使用侧 {_spd_dl:.1f} Mbps")
+            if _lb.get("scope") != "access":
+                _lbbits.append("测的是终端→默认网关这一段")
+            # 数字不可判读时必须在一页版就说明: 否则客户只看到「环回 0.8 Mbps」,
+            # 会以为线路坏了 (完整版里才有注解就晚了)。与完整版章节同口径。
+            if _lb.get("is_wireless"):
+                _lbbits.append("无线接入仅供参考")
+            elif _lb.get("load_limited") or _lb.get("at_ceiling"):
+                _lbbits.append("已达本工具测量上限")
+            loopline_html = ('<div class="loopline"><span class="k">环回</span>'
+                             f'{" · ".join(_lbbits)}</div>')
+
     findings_html = ""
     for i, f in enumerate(findings, 1):
         sev = sev_class(f["sev"])
@@ -20645,6 +21848,7 @@ def render_report_html_brief_v2(report):
       <div class="delta">{'偏高(&lt;2% 优)' if (retrans_rate and retrans_rate > 2) else '正常'}</div></div>
   </div>
   {portline_html}
+  {loopline_html}
   <div class="sec-h"><div class="n">§</div><div class="t">主要发现</div>
     <div class="r">按优先级 · 完整根因链见随单完整版报告</div></div>
   <div class="findings">{findings_html}</div>
@@ -20839,6 +22043,12 @@ CSS_BRIEF_V2 = """
               border-bottom: 1px solid var(--rule); white-space: nowrap;
               overflow: hidden; text-overflow: ellipsis; }
   .portline .k { color: var(--navy); font-weight: 700; letter-spacing: 1.5px;
+                 margin-right: 2mm; }
+  /* v1.19.0: 环回测速摘要行 (接入侧 vs 使用侧) —— 与网口摘要行同样只占一行 */
+  .loopline { padding: 1.3mm 12mm; font-size: 9.5px; color: var(--dim);
+              border-bottom: 1px solid var(--rule); white-space: nowrap;
+              overflow: hidden; text-overflow: ellipsis; }
+  .loopline .k { color: var(--navy); font-weight: 700; letter-spacing: 1.5px;
                  margin-right: 2mm; }
   .sec-h { padding: 3mm 12mm 0; display: flex; align-items: baseline; gap: 2mm; }
   .sec-h .n { font-size: 11px; font-weight: 700; color: var(--navy);
@@ -21134,7 +22344,8 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
     """现场检测模式 (v1.13.0): 上门全量诊断 + 机房 6 项勾选 → 一页客户报告。
 
     流程: 手输(客户名/检测时间/签约带宽) → 全量诊断(all_module_keys(),
-    排除 tcpcc 压测 — 不在客户网络里制造压测负载) → 机房勾选 →
+    排除 tcpcc NAT 压测; 含 loopback 环回测速 —— 现场本就是带宽验收场景,
+    该模块独占串行跑不影响其它模块) → 机房勾选 →
     同一份 report 出 一页客户报告/完整版/.json (+PDF, Chrome/Edge 任一即可)。
     customer: CLI --customer 预填, 空则终端询问 (必填)。
     """
@@ -21178,8 +22389,8 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
     # ── 步骤 2: 网络全量诊断 (排除压力级 tcpcc; port/iperf3 无配置自动跳过) ──
     print()
     print(_c("─" * 60, C_BLUE))
-    print(_c("  [1/3] 网络全量诊断 (排除 tcpcc 压测, 不在客户网络里制造压测负载)",
-             C_BOLD))
+    print(_c("  [1/3] 网络全量诊断 (排除 tcpcc NAT 压测; 含 5 秒环回测速, "
+             "独占串行不影响其它模块)", C_BOLD))
     keys = [k for k in all_module_keys() if k not in ("port", "iperf3")]
     run_diagnostics(keys, banner=False, parallel=True, install=install,
                     pip_mirror=pip_mirror)
@@ -21293,8 +22504,8 @@ def parse_choice(choice):
     if choice == "":
         return None
     if choice.lower() in ("0", "all", "*"):
-        print(_c("  全量口径: 全部 23 模块, 含压力级 tcpcc 压测"
-                 " (多目标轮转, 约多花 2 分钟)", C_GRAY))
+        print(_c("  全量口径: 全部 %d 模块, 含压力级 tcpcc 压测"
+                 " (多目标轮转, 约多花 2 分钟)" % len(MODULE_REGISTRY), C_GRAY))
         return full_module_keys()
     return _parse_keys(choice.split(), strict=True)
 
@@ -22068,6 +23279,14 @@ def main():
     parser.add_argument("--tcpcc-max", type=int, default=4000, metavar="N",
                         help="TCP 并发阶梯上限 (默认 4000, 硬上限 8000)。高上限会短时"
                              "建立大量连接, 勿短时间重复运行; 并行模式下建议单跑本模块")
+    parser.add_argument("--loopback-scope", choices=["access", "unknown"],
+                        default="unknown",
+                        help="环回测速的对端类型声明: access = 确认默认网关在运营商"
+                             "接入侧 (可与签约带宽对照判达标), unknown = 类型未知"
+                             "(家用路由器等, 只报数不判达标)。默认 unknown —— "
+                             "自动判定 (PPPoE 拨号会话) 失败时不猜。")
+    parser.add_argument("--loopback-duration", type=int, default=5, metavar="SEC",
+                        help="环回测速采样时长 (秒, 默认 5, 范围 3-30)")
     parser.add_argument("--monitor", metavar="SEC", type=int, nargs="?", const=600,
                         help="盯障模式: 持续监测 SEC 秒找偶发掉线, 结束生成 CSV/HTML/JSON "
                              "报告 (不带值 = 600 秒; 范围 30-86400; Ctrl+C 提前结束同样"
@@ -22207,6 +23426,14 @@ def main():
     # TCP 并发参数 -> 全局配置 (runner -> TCPConcurrencyTester.detect 读取)
     TCPCC_CONFIG["max"] = max(50, min(8000, int(getattr(args, "tcpcc_max", 4000) or 4000)))
     TCPCC_CONFIG["target"] = (getattr(args, "tcpcc_target", None) or "").strip() or None
+
+    # 环回测速参数 -> 全局配置 (runner -> probe_loopback_v2 读取)
+    _lb_scope = (getattr(args, "loopback_scope", None) or "unknown").strip().lower()
+    LOOPBACK_CONFIG["scope"] = _lb_scope if _lb_scope in LOOPBACK_SCOPES else "unknown"
+    LOOPBACK_CONFIG["duration"] = max(
+        LOOPBACK_MIN_DURATION,
+        min(LOOPBACK_MAX_DURATION,
+            int(getattr(args, "loopback_duration", LOOPBACK_DEFAULT_DURATION) or 0)))
 
     if args.list:
         _print_module_list()

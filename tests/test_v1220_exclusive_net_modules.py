@@ -3,7 +3,8 @@
 背景: 菜单 0 / CLI --parallel 并发跑多模块时, 测速的下载/上传窗口里
 网页体检下载、LAN 扫描等同时抢带宽 → 全量报告测速普遍偏低, 与单独
 测速报告不一致。修复: 并行阶段只跑普通模块, speedtest/bufferbloat/
-iperf3/tcpcc (EXCLUSIVE_NET_MODULE_KEYS) 在并发阶段结束后逐个独占跑。
+iperf3/tcpcc/loopback (EXCLUSIVE_NET_MODULE_KEYS) 在并发阶段结束后
+逐个独占跑。
 
 测试全部 mock _run_module_with_timeout (无真实网络), 用时间戳区间
 断言独占语义, 用 Barrier 断言普通模块确实并发。
@@ -52,9 +53,10 @@ class TestExclusiveNetModules(unittest.TestCase):
         return results, full, calls
 
     def test_membership(self):
-        # 独占集合 = 容量性能家族四模块 (写死, 防误改扩大/缩小范围)
+        # 独占集合 = 容量性能家族五模块 (写死, 防误改扩大/缩小范围)
         self.assertEqual(EXCLUSIVE,
-                         ("speedtest", "bufferbloat", "iperf3", "tcpcc"))
+                         ("speedtest", "bufferbloat", "iperf3", "tcpcc",
+                          "loopback"))
 
     def test_solo_after_all_normal_finished(self):
         # 全量口径: 最后一个普通模块结束时间 <= 最早独占模块开始时间
@@ -62,8 +64,8 @@ class TestExclusiveNetModules(unittest.TestCase):
         _, _, calls = self._run(keys)
         normal = [c for c in calls if c[0] not in EXCLUSIVE]
         solo = [c for c in calls if c[0] in EXCLUSIVE]
-        self.assertEqual(len(normal), len(keys) - 4)
-        self.assertEqual(len(solo), 4)
+        self.assertEqual(len(normal), len(keys) - 5)
+        self.assertEqual(len(solo), 5)
         self.assertGreaterEqual(min(c[1] for c in solo),
                                 max(c[2] for c in normal))
 
@@ -71,7 +73,7 @@ class TestExclusiveNetModules(unittest.TestCase):
         # 独占模块彼此不重叠 (逐个跑)
         _, _, calls = self._run(list(EXCLUSIVE))
         ordered = sorted(calls, key=lambda c: c[1])
-        self.assertEqual(len(ordered), 4)
+        self.assertEqual(len(ordered), 5)
         for (_, _, prev_end), (_, nxt_start, _) in zip(ordered, ordered[1:]):
             self.assertGreaterEqual(nxt_start, prev_end)
 

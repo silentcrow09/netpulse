@@ -198,11 +198,11 @@ class TestWebTargetsPrompt(unittest.TestCase):
         self.assertNotIn("foo", urls)
 
     def test_module_menu_wiring(self):
-        # 工程师菜单单选 web (序号 14) → 询问追加 → 写入 WEB_CONFIG
+        # 工程师菜单单选 web (序号 15) → 询问追加 → 写入 WEB_CONFIG
         old = np.WEB_CONFIG["targets"]
         try:
             with mock.patch("builtins.input",
-                            side_effect=["14", "https://crm.example.com", "",
+                            side_effect=["15", "https://crm.example.com", "",
                                          "q"]), \
                  mock.patch("sys.stdout.isatty", return_value=True), \
                  mock.patch.object(np, "_menu_clear"), \

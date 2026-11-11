@@ -220,5 +220,80 @@ class TestPortMapEscape(unittest.TestCase):
         self.assertIn("&lt;img src=x", html)
 
 
+class TestLoopbackEscape(unittest.TestCase):
+    """v1.19.0: 环回测速 (终端→网关) 的不可信输入。
+
+    环回测速会往客户报告里写三类外部文本: 网关/适配器描述 (网卡可以改名,
+    描述来自驱动)、失败原因 (Npcap 缺失 / 网关无 ARP 应答等)、发现项文案。
+    它们分别流进「环回测速」章节的 note、模块卡的指标值与发现项 —— 任何一处
+    漏转义, 客户拿到的就是一份能被注入的报告。
+    """
+
+    def setUp(self):
+        self._saved = np.LAST_RUN
+
+    def tearDown(self):
+        np.LAST_RUN = self._saved
+
+    def _hostile_loopback_run(self, failed=False):
+        if failed:
+            lb = {"error": "环回测速未执行: " + X_TAG_IMG, "reason": X_TAG_IMG}
+            status = "错误"
+        else:
+            lb = {
+                "gateway": "192.168.1.1", "gateway_mac": "4c-09-b4-fc-ac-f0",
+                "interface": X_ATTR, "scope": "unknown",
+                "scope_label": X_TAG_IMG,
+                "mbps": 312.5, "negotiated_mbps": 1000.0, "ratio_pct": 31.3,
+                "at_ceiling": False, "offered_mbps": 900.0,
+                "load_limited": False, "saturated": True, "is_wireless": False,
+                "return_ratio": 0.35, "frames": 89000, "bytes": 124600000,
+                "seconds": 5.0, "duration_s": 5,
+                "issues": [{"severity": "警告", "message": X_TAG_IMG,
+                            "detail": X_SCRIPT, "action": X_SVG}],
+                "timestamp": "", "summary": "x",
+            }
+            status = "完成"
+        return {
+            "app": "NetPulse", "version": "1.19.0",
+            "generated_at": datetime.now(),
+            "status": {"loopback": status},
+            "results": {"loopback": lb},
+            "keys": ["loopback"],
+            "duration_ms": 5, "total_modules": 24,
+            "system": {"hostname": "PC-01", "local_ip": "192.168.1.10",
+                       "gateway": "192.168.1.1", "dns": "223.5.5.5",
+                       "public_ip": "1.2.3.4", "geo": "", "asn": ""},
+        }
+
+    def test_loopback_module_never_emits_raw_injection(self):
+        np.LAST_RUN = self._hostile_loopback_run()
+        html = np.render_report_html_customer(np.build_report())
+        for raw in FORBIDDEN_RAW:
+            self.assertNotIn(raw, html, msg=f"原始注入序列泄漏: {raw!r}")
+
+    def test_loopback_section_escapes_hostile_text(self):
+        """payload 必须真的流到「环回测速」章节并以转义形态出现 (防测试假绿)。"""
+        np.LAST_RUN = self._hostile_loopback_run()
+        html = np.render_report_html_customer(np.build_report())
+        self.assertIn('id="loopback"', html)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", html)
+        self.assertNotIn("<img src=x", html)
+
+    def test_loopback_failure_reason_never_emits_raw_injection(self):
+        """未测成的原因 (Npcap 缺失 / 网关无应答) 同样进报告, 也要转义。"""
+        np.LAST_RUN = self._hostile_loopback_run(failed=True)
+        html = np.render_report_html_customer(np.build_report())
+        for raw in FORBIDDEN_RAW:
+            self.assertNotIn(raw, html, msg=f"原始注入序列泄漏: {raw!r}")
+
+    def test_brief_v2_loopback_line_never_emits_raw_injection(self):
+        """一页版的环回摘要行同样吃这些文本。"""
+        np.LAST_RUN = self._hostile_loopback_run()
+        html = np.render_report_html_brief_v2(np.build_report())
+        for raw in FORBIDDEN_RAW:
+            self.assertNotIn(raw, html, msg=f"原始注入序列泄漏: {raw!r}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

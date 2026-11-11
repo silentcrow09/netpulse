@@ -353,12 +353,12 @@ class TestProbesB8B11Registered(unittest.TestCase):
         self.assertIs(N._V2_PROBES["wifi"], N.probe_wifi_v2)
 
     def test_total_5_probes(self):
-        """v1.8.4 (P0-03): 11 个 probe (B7-B11 + external/tcpstats/mtu/web/
-        bufferbloat/nattype)."""
+        """v1.8.4 (P0-03): 12 个 probe (B7-B11 + external/tcpstats/mtu/web/
+        bufferbloat/nattype + loopback)."""
         self.assertEqual(set(N._V2_PROBES),
                          {"gateway", "dns", "route", "arp", "wifi",
                           "external", "tcpstats", "mtu", "web",
-                          "bufferbloat", "nattype"})
+                          "bufferbloat", "nattype", "loopback"})
 
     def test_dns_old_tester_still_exists(self):
         """DNSTester 保留 (双轨), 等 B13 删除."""

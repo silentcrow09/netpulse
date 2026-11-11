@@ -11,7 +11,7 @@
 修复后契约:
   1. CLI 指标解包兼容 2/3/4 元组 (与报告层同口径)
   2. metrics_fn 自身抛异常时不得连带崩掉整个模块打印
-  3. 全部 23 个模块的关键指标都必须在命令行显示出来
+  3. 全部 24 个模块的关键指标都必须在命令行显示出来
 
 跑用: cd 到项目根目录, `py -3.13 tests/test_v1150_cli_metrics.py`
 """
@@ -59,6 +59,18 @@ _FIX = {
     "nattype": {"nat_behavior": "锥形"},
     "web": {"sites": []},
     "tcpcc": {"max_sustained": 1000},
+    # loopback: 原生 DiagnosticResult 的 metrics (键名对齐 probe_loopback_v2 产出)
+    "loopback": {"gateway": "192.168.1.1", "gateway_mac": "aa:bb:cc:dd:ee:ff",
+                 "interface": "以太网", "scope": "unknown",
+                 "scope_label": "默认网关 (类型未知, 可能是家用路由器)",
+                 "mbps": 312.5, "negotiated_mbps": 1000.0, "ratio_pct": 31.3,
+                 "at_ceiling": False, "offered_mbps": 900.0,
+                 "load_limited": False, "saturated": True, "is_wireless": False,
+                 "return_ratio": 0.1, "frames": 89000, "bytes": 124600000,
+                 "seconds": 5.0, "duration_s": 5, "issues": [],
+                 "timestamp": "2026-11-11T09:30:00",
+                 "summary": "环回 312.5 Mbps (终端→网关, 对端 默认网关 "
+                           "(类型未知, 可能是家用路由器))"},
 }
 
 _MODULE_KEYS = sorted(N.MODULE_PRESENTATION.keys())
@@ -81,7 +93,7 @@ class TestMetricsShapeContract(_NoColorMixin, unittest.TestCase):
     """元数契约: 所有模块的指标元组只能是 2/3/4 元 (与报告层同口径)。"""
 
     def test_module_count(self):
-        self.assertEqual(len(_MODULE_KEYS), 23, "模块数变了, 契约测试要跟着更新")
+        self.assertEqual(len(_MODULE_KEYS), 24, "模块数变了, 契约测试要跟着更新")
 
     def test_every_module_metrics_shape_valid(self):
         bad = []
