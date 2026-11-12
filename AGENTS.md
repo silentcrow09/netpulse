@@ -222,6 +222,11 @@
   tag 推到内网 Gitea（`origin`）不会触发。
 - **本地重打 exe 只用于自测**（`build_exe.ps1` / `build_exe.bat` → `dist/NetPulse.exe`），
   或 Actions 构建失败时人工兜底。打包完清掉 `build/` 工作区。
+- ⚠️ **build_exe.ps1 必须带 `--specpath build`**（2026-11-12 起已加）：脚本入口构建
+  会让 PyInstaller 按 `--name` 重写 spec，Windows 大小写不敏感 → `netpulse.spec`
+  直接覆盖仓库 `NetPulse.spec`，**x86 发版分支被静默回退**（实测踩过）。若 `git status`
+  见 `NetPulse.spec` 出现 M 且丢失 `IS_X86`/`NETPULSE_ARCH` 逻辑，即被本地构建覆盖，
+  `git checkout -- NetPulse.spec` 还原即可。
 - ⚠️ **本地 exe 与线上 exe 字节数不同，不要互相核对**。构建环境不同（Python 小版本、
   PyInstaller 版本、是否内嵌 Ookla exe）→ 同一份代码两次构建可差几十万字节。
   实测 v1.15.1：本地 19,229,389 B vs Actions 19,487,819 B。

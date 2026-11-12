@@ -196,6 +196,11 @@ $piArgs = @(
     '--exclude-module', 'cryptography',
     '--exclude-module', 'tkinter',
     '--log-level', 'WARN',
+    # 2026-11-12: 用脚本入口构建时 PyInstaller 会按 --name 重写 spec
+    # (Windows 大小写不敏感, netpulse.spec 直接覆盖仓库 NetPulse.spec,
+    #  x86 发版分支被静默回退)。--specpath 把 spec 写进 build/ 工作区,
+    # 不再污染仓库; build/ 本就是 pyinstaller 工作目录且已 gitignore。
+    '--specpath', 'build',
     'netpulse.py'
 )
 # Ookla speedtest.exe 官方只有 x64 版 — x86 构建不随包:
