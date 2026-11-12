@@ -39,6 +39,31 @@ function Step-Fail($msg) {
     if ($msg) { Write-Host "  $msg" -ForegroundColor Yellow }
 }
 
+function Step-DumpLog {
+    # 失败时回显 PyInstaller 日志 (2026-11-12 从内联代码提成函数:
+    # 退出码与产物两种失败路径都要走)
+    Write-Host ""
+    Write-Host "  PyInstaller 日志 (前 50 行, 来自 $logFile):" -ForegroundColor Yellow
+    if ((Test-Path $logFile) -and (Get-Item $logFile).Length -gt 0) {
+        Get-Content $logFile -TotalCount 50 -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "    $_" -ForegroundColor Gray
+        }
+    } else {
+        Write-Host "    (--log-file 写出来 0 字节, 可能是 pyinstaller 启动前就崩了)" -ForegroundColor DarkGray
+        Write-Host "    补充检查 stderr:" -ForegroundColor DarkGray
+        if ((Test-Path $stderrLog) -and (Get-Item $stderrLog).Length -gt 0) {
+            Get-Content $stderrLog -TotalCount 30 -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Host "      $_" -ForegroundColor DarkGray
+            }
+        } else {
+            Write-Host "      (stderr 也为空)" -ForegroundColor DarkGray
+        }
+    }
+    Write-Host ""
+    Write-Host "  手动复现命令 (用于排查):" -ForegroundColor Yellow
+    Write-Host "    pyinstaller $piArgs" -ForegroundColor Gray
+}
+
 # 探测 Python 解释器 (用 try/catch 包装, 任何错误都不闪退)
 # 优先用 'py' 启动器 (Windows 官方推荐, 稳定指向已注册 Python, 不依赖 PATH)
 function Find-Python {
@@ -168,12 +193,15 @@ if ($missing.Count -gt 0) {
 # ---- 3/6: 清理旧构建 ----
 Step-Start 3 6 "清理旧构建"
 try {
-    if (Test-Path build) { Remove-Item -Recurse -Force build }
-    if (Test-Path dist)  { Remove-Item -Recurse -Force dist }
+    # -ErrorAction Stop: dist\NetPulse.exe 被占用 (上次打包的 exe 还开着) 时
+    # 必须显式失败并给出指引, 不能静默带病继续 (2026-11-12 加固)
+    if (Test-Path build) { Remove-Item -Recurse -Force build -ErrorAction Stop }
+    if (Test-Path dist)  { Remove-Item -Recurse -Force dist -ErrorAction Stop }
     if (Test-Path $logFile) { Remove-Item $logFile -Force }
     Step-Ok
 } catch {
     Step-Fail "清理失败: $_"
+    Write-Host "  若提示 dist\NetPulse.exe 被占用: 先退出正在运行的 NetPulse 再重试。" -ForegroundColor Yellow
     Read-Host "`n  按 Enter 退出"; exit 1
 }
 
@@ -273,31 +301,28 @@ if ((Test-Path $stdoutLog) -or (Test-Path $stderrLog)) {
     Get-Content $stdoutLog, $stderrLog -ErrorAction SilentlyContinue | Out-File $logFile -Encoding UTF8
 }
 
-if ($piExit -ne 0) {
-    Step-Fail
+# 2026-11-12 构建加固: 成败判据改为 dist 产物存在性, 不再只信退出码。
+# 实测踩坑: pyinstaller 被外力终止 (杀软实时扫描瞬时拦截) 时 ExitCode 读到
+# $null, 旧版把 null 当 0 → 打 "OK" 但 dist 无产物, 第 5 步只报
+# "EXE 未生成" 没有任何日志可查。
+if (-not (Test-Path (Join-Path $PSScriptRoot "dist\$exeName.exe"))) {
+    Step-Fail "dist\$exeName.exe 未生成"
     Write-Host ""
-    Write-Host "  PyInstaller 日志 (前 50 行, 来自 $logFile):" -ForegroundColor Yellow
-    if ((Test-Path $logFile) -and (Get-Item $logFile).Length -gt 0) {
-        Get-Content $logFile -TotalCount 50 -ErrorAction SilentlyContinue | ForEach-Object {
-            Write-Host "    $_" -ForegroundColor Gray
-        }
+    if ($null -eq $piExit) {
+        Write-Host "  进程退出码未知 —— 常见于被杀软实时扫描终止; 稍候重试, " -ForegroundColor Yellow
+        Write-Host "  若反复出现把本项目目录加入杀软白名单后再构建。" -ForegroundColor Yellow
     } else {
-        Write-Host "    (--log-file 写出来 0 字节, 可能是 pyinstaller 启动前就崩了)" -ForegroundColor DarkGray
-        Write-Host "    补充检查 stderr:" -ForegroundColor DarkGray
-        if ((Test-Path $stderrLog) -and (Get-Item $stderrLog).Length -gt 0) {
-            Get-Content $stderrLog -TotalCount 30 -ErrorAction SilentlyContinue | ForEach-Object {
-                Write-Host "      $_" -ForegroundColor DarkGray
-            }
-        } else {
-            Write-Host "      (stderr 也为空)" -ForegroundColor DarkGray
-        }
+        Write-Host "  PyInstaller 退出码: $([int]$piExit)" -ForegroundColor Yellow
     }
-    Write-Host ""
-    Write-Host "  手动复现命令 (用于排查):" -ForegroundColor Yellow
-    Write-Host "    pyinstaller $piArgs" -ForegroundColor Gray
+    Step-DumpLog
     Read-Host "`n  按 Enter 退出"; exit 1
 }
-Step-Ok
+if ($piExit -ne 0 -and $null -ne $piExit) {
+    # 罕见: 退出码非零但产物在 —— 以产物为准, 提示一句不拦流程
+    Step-Ok "(退出码 $([int]$piExit) 非零, 但产物已生成)"
+} else {
+    Step-Ok
+}
 
 # ---- 5/6: 验证 EXE ----
 Step-Start 5 6 "验证 EXE"
