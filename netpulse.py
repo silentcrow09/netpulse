@@ -24779,6 +24779,557 @@ class _GuiSession:
         return None, "未知导出类型: %s" % kind
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# GUI 单页资产 (v1.21.0 Task 3): 纯静态壳。动态数据全部经 API + JS textContent
+# 渲染, 本区段零插值、零外链 (无 http(s):// / <link / <script src / <img),
+# 由 tests/test_gui_page.py 闸住。
+# 视觉规范: design_ref/gui/gui_design_v1.html 方案A「亮色仪表盘」(第 1 节主页 /
+# 第 3 节进度 / 第 4 节报告 / 第 5 节现场检测), :root 变量逐字一致, 图标为
+# 设计稿内联 SVG; 设计稿 1160px 画布概念对应满窗口布局 (GUI 是真实窗口)。
+# 状态色唯一来源服务端: 亮灯点颜色由 JS 从 /api/scenarios 的 status_colors
+# 注入 style, CSS 只定义形状/边框; 「进行中」蓝脉冲是 UI 态 (品牌蓝), 不是
+# 状态色轴上的值, 因此允许出现在 CSS。
+# ────────────────────────────────────────────────────────────────────────────
+
+_GUI_CSS = """
+:root{
+  --navy:#0a3b6e; --navy-2:#2a5485; --red:#b3261e; --amber:#ad6e10; --green:#1e6e44;
+  --text:#1a2230; --dim:#5b6472; --mute:#98a2ad; --rule:#d8dde5; --soft:#f6f7f9;
+}
+*{ box-sizing:border-box; margin:0; padding:0; }
+html,body{ height:100%; }
+body{ font-family:"Inter","Microsoft YaHei","PingFang SC",sans-serif; color:var(--text);
+      font-size:14px; line-height:1.65; background:#fff; -webkit-font-smoothing:antialiased; }
+.num{ font-variant-numeric:tabular-nums; font-feature-settings:"tnum"; }
+button{ font-family:inherit; cursor:pointer; }
+input,select{ font-family:inherit; }
+
+/* ── 顶栏 (设计稿 .app-top) ── */
+.g-top{ height:58px; display:flex; align-items:center; gap:12px; padding:0 24px;
+        border-bottom:1px solid var(--rule); }
+.g-mark{ width:34px; height:34px; border-radius:9px; background:var(--navy); color:#fff;
+         font-size:14px; font-weight:800; letter-spacing:.5px;
+         display:flex; align-items:center; justify-content:center; }
+.g-brand{ font-size:17px; font-weight:800; color:var(--navy); letter-spacing:.3px; }
+.g-ver{ font-size:11px; font-weight:600; letter-spacing:.5px; color:var(--mute);
+        border:1px solid var(--rule); border-radius:999px; padding:2px 11px; }
+.g-spring{ margin-left:auto; }
+.g-host{ display:flex; align-items:center; gap:8px; background:var(--soft);
+         border:1px solid var(--rule); border-radius:999px; padding:5px 15px;
+         font-size:12.5px; font-weight:600; color:var(--dim); }
+.g-host svg{ width:13px; height:13px; color:var(--mute); flex:none; }
+.g-dot-ok{ width:11px; height:11px; flex:none; border-radius:50%; background:var(--green);
+           box-shadow:0 0 0 3px #1e6e4422; }
+
+/* ── 各视图容器 padding (对齐设计稿各节) ── */
+.g-view-home{ padding:32px 36px 30px; }
+.g-view-prog{ padding:30px 36px 26px; }
+.g-rep{ padding:26px 32px 30px; }
+.g-view-site{ padding:26px 36px 30px; }
+
+/* ── 主页 (设计稿第 1 节 方案A) ── */
+.g-h1{ font-size:26px; font-weight:800; letter-spacing:.3px; }
+.g-sub{ font-size:13px; color:var(--dim); margin-top:5px; }
+.g-cards{ display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-top:24px; }
+.g-card{ background:var(--soft); border:1px solid var(--rule); border-radius:12px;
+         padding:20px 20px 18px; min-height:158px; display:flex; flex-direction:column;
+         text-align:left; color:var(--text); }
+.g-card:hover{ border-color:var(--navy-2); }
+.g-card-ic{ width:46px; height:46px; border-radius:11px; background:#fff;
+            border:1px solid var(--rule); display:flex; align-items:center;
+            justify-content:center; color:var(--navy); margin-bottom:14px; }
+.g-card-ic svg{ width:24px; height:24px; }
+.g-card-t{ font-size:16.5px; font-weight:700; letter-spacing:.2px; }
+.g-card-d{ font-size:12.5px; color:var(--dim); margin-top:6px; line-height:1.6; }
+.g-card-go{ margin-top:auto; padding-top:12px; font-size:11.5px; font-weight:700;
+            letter-spacing:1px; color:var(--mute); }
+.g-card.site{ background:var(--navy); border-color:var(--navy); }
+.g-card.site:hover{ border-color:var(--navy-2); }
+.g-card.site .g-card-ic{ background:rgba(255,255,255,.13); border-color:rgba(255,255,255,.28); color:#fff; }
+.g-card.site .g-card-t{ color:#fff; }
+.g-card.site .g-card-d{ color:#c7d7e8; }
+.g-card.site .g-card-go{ color:#8fb3d6; }
+.g-fullrow{ display:flex; align-items:center; gap:16px; margin-top:22px; padding-top:20px;
+            border-top:1px solid var(--rule); }
+
+/* ── 按钮族 (设计稿 .btn / .btn-primary / .btn-line-navy) ── */
+.g-btn{ display:inline-flex; align-items:center; gap:8px; border-radius:7px; font-size:13px;
+        font-weight:600; padding:9px 18px; letter-spacing:.3px;
+        background:var(--navy); border:1px solid var(--navy); color:#fff; }
+.g-btn svg{ width:15px; height:15px; }
+.g-btn:hover{ background:var(--navy-2); border-color:var(--navy-2); }
+.g-btn.line{ background:#fff; border-color:var(--rule); color:var(--text); }
+.g-btn.line:hover{ background:var(--soft); border-color:var(--rule); }
+.g-btn2{ display:inline-flex; align-items:center; gap:8px; border-radius:7px; font-size:13px;
+         font-weight:600; padding:9px 18px; letter-spacing:.3px;
+         background:#fff; border:1px solid var(--navy-2); color:var(--navy); }
+.g-btn2 svg{ width:15px; height:15px; }
+.g-btn2:hover{ background:#eef3f9; }
+.g-link{ background:none; border:none; color:var(--mute); font-size:12.5px; font-weight:600; padding:0; }
+.g-link:hover{ color:var(--navy); }
+.g-dim{ font-size:12.5px; color:var(--mute); }
+.g-err{ color:var(--red); font-size:12.5px; margin-top:12px; min-height:1.2em; }
+
+/* ── 进度页 (设计稿第 3 节) ── */
+.g-prog{ display:flex; align-items:flex-end; gap:26px; padding-bottom:20px;
+         border-bottom:1px solid var(--rule); }
+.g-big{ font-size:46px; font-weight:800; letter-spacing:-1px; line-height:1; color:var(--navy); }
+.g-time{ margin-left:auto; text-align:right; padding-bottom:2px; }
+.g-time .lab{ font-size:11px; letter-spacing:2px; color:var(--mute); font-weight:700; }
+.g-time .g-dim{ font-size:21px; font-weight:700; color:var(--text); }
+.g-bar{ height:10px; background:var(--soft); border:1px solid var(--rule); border-radius:999px;
+        margin-top:16px; position:relative; overflow:hidden; }
+.g-bar>i{ position:absolute; top:0; bottom:0; left:0; width:0; background:var(--navy-2);
+          border-radius:999px; transition:width .3s; }
+.g-cur{ margin-top:20px; background:var(--soft); border:1px solid var(--rule);
+        border-left:3px solid var(--navy-2); border-radius:10px; padding:16px 22px;
+        display:flex; align-items:center; gap:18px; }
+.g-spin{ width:22px; height:22px; flex:none; border-radius:50%; border:2.5px solid #d9e2ee;
+         border-top-color:var(--navy-2); animation:gspin 1s linear infinite; }
+@keyframes gspin{ to{ transform:rotate(360deg); } }
+.g-cur .lab{ font-size:11px; letter-spacing:2.5px; color:var(--navy-2); font-weight:700; }
+.g-cur b{ display:block; font-size:17px; font-weight:700; margin-top:2px; }
+.g-lights{ margin-top:24px; display:grid; grid-template-columns:1fr 1fr; column-gap:44px; }
+.g-light{ display:flex; align-items:center; gap:12px; padding:7.5px 2px;
+          border-bottom:1px solid var(--soft); font-size:13.5px; color:var(--text); }
+.g-light i{ width:10px; height:10px; flex:none; border-radius:50%; }
+/* 进行中蓝脉冲 (设计稿 .mdot.run): UI 态用品牌蓝, 不属于状态色轴 ——
+   状态色 (完成/警告/异常/错误/超时/未检测) 一律由 JS 从 status_colors 注入 */
+.g-light.cur i{ background:var(--navy-2); animation:gpulse 1.6s ease-out infinite; }
+@keyframes gpulse{ 0%{ box-shadow:0 0 0 0 rgba(42,84,133,.40);}
+                   70%{ box-shadow:0 0 0 7px rgba(42,84,133,0);}
+                   100%{ box-shadow:0 0 0 0 rgba(42,84,133,0);} }
+#btn-back{ margin-top:18px; }
+.g-hint{ margin-top:22px; padding-top:14px; border-top:1px solid var(--rule); text-align:center;
+         font-size:12.5px; color:var(--mute); }
+
+/* ── 报告页 (设计稿第 4 节): 结论条 + 导出条 + 内嵌报告 ── */
+.g-verdict{ display:flex; align-items:center; gap:24px; background:var(--soft);
+            border:1px solid var(--rule); border-radius:12px; padding:14px 26px; }
+.g-verdict .g-ver-line{ font-size:15.5px; font-weight:700; }
+.g-verdict .g-ver-sub{ font-size:12px; color:var(--mute); margin-top:3px; letter-spacing:.3px; }
+.g-exports{ display:flex; align-items:center; gap:10px; margin-top:16px; flex-wrap:wrap; }
+.g-exports .g-link{ margin-left:auto; }
+#rep-files{ list-style:none; margin-top:14px; border:1px solid var(--rule); border-radius:12px;
+            padding:4px 20px; background:#fff; }
+#rep-files li{ padding:8px 0; border-bottom:1px solid var(--soft); font-size:12.5px;
+               font-family:Consolas,"Courier New",monospace; color:var(--dim); }
+#rep-files li:last-child{ border-bottom:none; }
+#rep-files:empty{ display:none; }
+#exp-msg{ margin-top:8px; }
+iframe#g-frame{ width:100%; height:calc(100vh - 120px); border:0; margin-top:16px; }
+
+/* ── 现场检测 (设计稿第 5 节) ── */
+.g-steps{ display:flex; align-items:center; margin:2px 0 24px; }
+.g-steps>i{ display:flex; align-items:center; gap:10px; font-style:normal; font-size:13px;
+            font-weight:600; color:var(--mute); white-space:nowrap; }
+.g-steps>i b{ width:30px; height:30px; border-radius:50%; border:1.5px solid var(--rule);
+              background:#fff; color:var(--mute); font-size:13px; font-weight:700;
+              display:flex; align-items:center; justify-content:center; }
+.g-steps>i.on b{ background:var(--navy); border-color:var(--navy); color:#fff; }
+.g-steps>i.on{ color:var(--text); font-weight:700; }
+.g-steps .ln{ flex:1; height:1.5px; background:var(--rule); margin:0 14px; min-width:30px; }
+.g-form{ border:1px solid var(--rule); border-radius:12px; padding:20px 24px 22px;
+         background:#fff; max-width:720px; }
+.g-field{ margin-bottom:16px; }
+.g-flabel{ font-size:13px; font-weight:600; margin-bottom:6px; }
+.g-flabel .req{ color:var(--red); margin-left:3px; font-weight:700; }
+.g-input{ width:100%; height:38px; border:1px solid var(--rule); border-radius:7px; padding:0 13px;
+          font-size:13.5px; color:var(--text); background:#fff; }
+.g-input::placeholder{ color:#a8b2bd; }
+.g-fhint{ font-size:11.5px; color:var(--mute); margin-top:5px; }
+.g-form-foot{ display:flex; align-items:center; gap:14px; margin-top:4px; }
+.g-form-foot .g-link{ margin-left:auto; }
+#site-check{ max-width:720px; }
+.g-h2{ font-size:16px; font-weight:800; margin-bottom:12px; }
+#site-items{ border:1px solid var(--rule); border-radius:12px; padding:4px 20px; background:#fff; }
+.g-siteit{ display:flex; align-items:center; justify-content:space-between; gap:12px;
+           padding:8.5px 0; border-bottom:1px solid var(--soft); }
+.g-siteit:last-child{ border-bottom:none; }
+.g-siteit b{ font-size:13.5px; font-weight:600; }
+#site-items select{ height:32px; border:1px solid var(--rule); border-radius:7px; padding:0 10px;
+                    font-size:12.5px; color:var(--text); background:#fff; }
+"""
+
+_GUI_JS = r"""(function () {
+  "use strict";
+  var T = new URLSearchParams(location.search).get("t") || "";
+  var Q = function (p) { return p + (p.indexOf("?") >= 0 ? "&" : "?") + "t=" + T; };
+  var API = {
+    scenarios: Q("/api/scenarios"),
+    progress: Q("/api/progress"),
+    report: Q("/api/report"),
+    run: Q("/api/run"),
+    export: Q("/api/export"),
+    siteStart: Q("/api/site/start"),
+    siteFinish: Q("/api/site/finish"),
+    shutdown: Q("/api/shutdown")
+  };
+  // 场景卡图标 (内联 SVG 常量, 复制自 design_ref/gui/gui_design_v1.html 第 1 节;
+  // 键 = DIAGNOSE_PROFILES profile id + site / full)。纯常量模板、不含变量插值,
+  // 属于 textContent 规则允许的例外; 动态数据 (label/desc) 一律 textContent。
+  var ICONS = {
+    slow: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 16a8 8 0 1 1 14 0"/><path d="M12 16 8.6 11.4"/><circle cx="12" cy="16" r="1.5"/></svg>',
+    disconnect: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12.5h4l2.5-5.5 3.5 10 2.5-4.5h6.5"/></svg>',
+    web: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/><path d="M10 12.5l4 4M14 12.5l-4 4"/></svg>',
+    gaming: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="7.5" width="19" height="9.5" rx="4.75"/><path d="M8 10.2v4M6 12.2h4"/><circle cx="15.6" cy="11" r="1" fill="currentColor" stroke="none"/><circle cx="18" cy="13.4" r="1" fill="currentColor" stroke="none"/></svg>',
+    wifi: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 10.2a11.5 11.5 0 0 1 15 0" opacity=".22"/><path d="M7.3 13.2a7.5 7.5 0 0 1 9.4 0" opacity=".45"/><path d="M10 16.1a3.6 3.6 0 0 1 4 0"/><circle cx="12" cy="18.7" r="1.2" fill="currentColor" stroke="none"/></svg>',
+    site: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-13a2 2 0 0 0-2-2h-2"/><rect x="9" y="2.5" width="6" height="4" rx="1"/><path d="M8.8 13.5l2.3 2.3 4.3-4.6"/></svg>',
+    full: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/><path d="M7 13h6M7 16h4"/></svg>'
+  };
+  var COLORS = {};          // {状态中文: 颜色} — 来自 /api/scenarios, 唯一来源服务端
+  var state = { view: "home", pollTimer: null, data: null, meta: null, leftProgress: false };
+
+  function $(s) { return document.querySelector(s); }
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;   // 动态数据一律 textContent
+    return n;
+  }
+  function post(url, body) {
+    return fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(body || {}) })
+      .then(function (r) { return r.json(); });
+  }
+  function get(url) { return fetch(url).then(function (r) { return r.json(); }); }
+
+  // ── 视图切换: 四个 section, display 控制 ──
+  function show(view) {
+    state.view = view;
+    ["home", "progress", "report", "site"].forEach(function (v) {
+      var n = $("#view-" + v);
+      if (n) n.style.display = (v === view) ? "" : "none";
+    });
+  }
+
+  // ── 主页: 场景卡渲染 (来自 /api/scenarios) ──
+  function renderHome(meta) {
+    var box = $("#cards");
+    box.textContent = "";
+    meta.scenarios.forEach(function (s) {
+      var c = el("button", "g-card" + (s.id === "site" ? " site" : ""));
+      c.type = "button";
+      c.dataset.p = s.id;
+      var ic = el("span", "g-card-ic");
+      ic.insertAdjacentHTML("afterbegin", ICONS[s.id] || ICONS.full);   // 常量模板, 无插值
+      c.appendChild(ic);
+      c.appendChild(el("span", "g-card-t", s.label));
+      c.appendChild(el("span", "g-card-d", s.desc));
+      c.appendChild(el("span", "g-card-go", "点击开始 →"));
+      if (s.id === "site") {
+        c.addEventListener("click", function () { show("site"); });
+      } else {
+        c.addEventListener("click", function () { startRun(s.id); });
+      }
+      box.appendChild(c);
+    });
+    $("#hostname").textContent = meta.hostname || "";
+    $("#ver").textContent = meta.version || "";
+    $("#full-count").textContent = "全部 " + meta.full_count + " 项, 含压测, 客户网络慎用";
+  }
+
+  function startRun(profile) {
+    post(API.run, { profile: profile }).then(function (r) {
+      if (r && r.ok) { show("progress"); pollOnce(); }
+      else if (r && r.reason === "running") { show("progress"); pollOnce(); }
+    });
+  }
+
+  // ── 进度页轮询 (1s) ──
+  function renderProgress(d) {
+    state.data = d;
+    // 刷新/重开页面时已有进行中的诊断 → 直接回进度页 (brief 注释既定意图);
+    // 用户主动返回主页后不再拉回 (state.leftProgress), 否则「返回主页」会失效
+    if (d.phase === "running" && state.view === "home" && !state.leftProgress) show("progress");
+    $("#p-done").textContent = d.done + "/" + d.total;
+    $("#p-bar").style.width = (d.total ? Math.round(d.done * 100 / d.total) : 0) + "%";
+    $("#p-elapsed").textContent = fmtMs(d.elapsed_ms);
+    var cur = d.running[0];
+    var info = (state.meta && state.meta.module_desc) || {};
+    $("#p-cur-t").textContent = cur ? (info[cur] || cur) : "";
+    var grid = $("#p-lights"); grid.textContent = "";
+    Object.keys(d.module_status).forEach(function (k) {
+      var st = d.module_status[k];
+      var row = el("div", "g-light");
+      row.dataset.k = k;                    // 类名契约: .g-light[data-k]
+      var dot = el("i");
+      if (cur === k) {
+        row.className += " cur";            // 进行中蓝点走 CSS (UI 态), 状态色不参与
+      } else {
+        // 亮灯点颜色唯一来源服务端 status_colors, CSS 不写死状态色
+        dot.style.background = st ? (COLORS[st] || COLORS["未检测"]) : "transparent";
+        dot.style.border = st ? "none" : "1.5px solid " + (COLORS["未检测"] || "#94a3b8");
+      }
+      row.appendChild(dot);
+      row.appendChild(el("span", null, info[k] || k));
+      grid.appendChild(row);
+    });
+    if (d.phase === "site_ready") { show("site"); renderSiteCheck(); stopPoll(); return; }
+    if (d.phase === "done") { stopPoll(); openReport(); return; }
+    if (d.phase === "error") { stopPoll(); $("#p-err").textContent = d.error || "诊断失败"; }
+    else { $("#p-err").textContent = ""; }
+  }
+  function fmtMs(ms) {
+    var s = Math.round((ms || 0) / 1000);
+    var m = Math.floor(s / 60); s = s % 60;
+    return (m ? m + " 分 " : "") + (s < 10 ? "0" + s : s) + " 秒";
+  }
+  function pollOnce() {
+    get(API.progress).then(function (d) {
+      renderProgress(d);
+      if (d.phase === "running" && !state.pollTimer) {
+        state.pollTimer = setInterval(pollOnce, 1000);
+      }
+    });
+  }
+  function stopPoll() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } }
+
+  // ── 报告页: iframe 整页内嵌客户版报告 ──
+  function openReport() {
+    $("#g-frame").src = API.report;
+    get(API.progress).then(function (d) {
+      $("#rep-files").textContent = "";
+      (d.files || []).forEach(function (f) { $("#rep-files").appendChild(el("li", null, f)); });
+      // 结论条只用快照既有字段; 分数/等级留在内嵌报告里, GUI 不自算 (口径统一)
+      $("#ver-line").textContent = "诊断完成" + (d.label ? " · " + d.label : "");
+      $("#ver-sub").textContent = "实检 " + d.done + "/" + d.total + " 项 · 用时 " + fmtMs(d.elapsed_ms);
+    });
+    show("report");
+  }
+
+  // ── 现场检测向导 ──
+  function renderSiteCheck() {
+    var box = $("#site-items"); box.textContent = "";
+    (state.meta.site_items || []).forEach(function (it) {
+      var wrap = el("div", "g-siteit");
+      wrap.appendChild(el("b", null, it.label));
+      var sel = document.createElement("select");
+      var opt0 = document.createElement("option");
+      opt0.value = ""; opt0.textContent = "未检查";
+      sel.appendChild(opt0);
+      (it.options || []).forEach(function (o) {
+        var o1 = document.createElement("option");
+        o1.value = o; o1.textContent = o;
+        sel.appendChild(o1);
+      });
+      sel.dataset.k = it.key;
+      wrap.appendChild(sel);
+      box.appendChild(wrap);
+    });
+  }
+  function collectChecks() {
+    var checks = {};
+    document.querySelectorAll("#site-items select").forEach(function (s) {
+      if (s.value) checks[s.dataset.k] = s.value;
+    });
+    return checks;
+  }
+  function submitSite() {
+    var cust = $("#site-cust").value.trim();
+    if (!cust) { $("#site-err").textContent = "客户名称必填"; return; }
+    $("#site-err").textContent = "";
+    post(API.siteStart, { customer: cust,
+                          tested_at: $("#site-time").value,
+                          plan: $("#site-plan").value }).then(function (r) {
+      if (!r || !r.ok) { $("#site-err").textContent = (r && r.err) || "启动失败"; return; }
+      // 诊断进行中 → 进度页; 完成后 site_ready 回到本页勾选
+      var wait = setInterval(function () {
+        get(API.progress).then(function (d) {
+          state.data = d;
+          if (d.phase === "running") { show("progress"); renderProgress(d); }
+          if (d.phase === "site_ready") {
+            clearInterval(wait);
+            renderSiteCheck();
+            show("site");
+            $("#site-wizard").style.display = "none";
+            $("#site-check").style.display = "";
+            return;
+          }
+          if (d.phase === "error") {
+            clearInterval(wait);
+            show("site");
+            $("#site-wizard").style.display = "";
+            $("#site-check").style.display = "none";
+            $("#site-err").textContent = d.error || "诊断失败";
+          }
+        });
+      }, 1000);
+    });
+  }
+  function finishSite() {
+    post(API.siteFinish, { checks: collectChecks(), note: $("#site-note").value }).then(function (r) {
+      if (r && r.ok) { openReport(); }
+      else { $("#site-err2").textContent = (r && r.err) || "生成失败"; }
+    });
+  }
+
+  // ── 导出按钮 ──
+  function doExport(kind) {
+    post(API.export, { kind: kind }).then(function (r) {
+      var box = $("#exp-msg");
+      if (r && r.path) { box.textContent = "已保存: " + r.path; }
+      else { box.textContent = (r && r.err) || "导出失败"; }
+    });
+  }
+
+  // ── 关窗生命周期: 空闲直接退出; 诊断中先确认 ──
+  window.addEventListener("beforeunload", function (ev) {
+    var busy = state.data && state.data.phase === "running";
+    if (busy) {
+      ev.preventDefault();
+      ev.returnValue = "诊断仍在进行, 关闭窗口将终止本次诊断";
+      return ev.returnValue;
+    }
+  });
+  window.addEventListener("unload", function () {
+    var busy = state.data && state.data.phase === "running";
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon(API.shutdown, JSON.stringify({ force: !!busy }));
+    }
+  });
+
+  // ── 启动 ──
+  document.addEventListener("DOMContentLoaded", function () {
+    $("#btn-full").addEventListener("click", function () { startRun("full"); });
+    $("#btn-open-dir").addEventListener("click", function () {
+      post(Q("/api/open-folder"), {});
+    });
+    $("#btn-back").addEventListener("click", function () {
+      state.leftProgress = true;
+      show("home"); pollOnce();
+    });
+    $("#btn-home2").addEventListener("click", function () { show("home"); });
+    ["html", "pdf", "json"].forEach(function (k) {
+      var b = $("#exp-" + k);
+      if (b) b.addEventListener("click", function () { doExport(k); });
+    });
+    $("#btn-site-start").addEventListener("click", submitSite);
+    $("#btn-site-finish").addEventListener("click", finishSite);
+    $("#btn-site-back").addEventListener("click", function () { show("home"); });
+    get(API.scenarios).then(function (meta) {
+      state.meta = meta;
+      COLORS = meta.status_colors || {};
+      renderHome(meta);
+      pollOnce();     // 若已有进行中的诊断 (刷新场景), 直接回进度页
+    });
+  });
+})();
+"""
+
+def _gui_page():
+    """GUI 单页 (纯静态壳): 动态数据全部经 API + textContent, 本函数零插值。
+
+    结构对齐 design_ref/gui/gui_design_v1.html 方案A (第 1 节主页 / 第 3 节
+    进度 / 第 4 节报告 / 第 5 节现场检测); 类名契约见 Task 3 brief Interfaces。
+    """
+    return ("<!DOCTYPE html>\n"
+            '<html lang="zh-CN">\n<head>\n<meta charset="utf-8">\n'
+            "<title>NetPulse 网络诊断</title>\n"
+            "<style>" + _GUI_CSS + "</style>\n</head>\n<body>\n"
+            '<header class="g-top"><span class="g-mark">NP</span>'
+            '<span class="g-brand">NetPulse</span>'
+            '<span id="ver" class="g-ver num"></span>'
+            '<span class="g-spring"></span>'
+            '<span class="g-host">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round" stroke-linejoin="round">'
+            '<rect x="3" y="5" width="18" height="13" rx="2"/><path d="M8 21h8M12 18v3"/></svg>'
+            '<i class="g-dot-ok" title="网络正常"></i><span id="hostname"></span></span>'
+            "</header>\n"
+            # ── 主页 (设计稿第 1 节) ──
+            '<main id="view-home" class="g-view-home">'
+            '<h1 class="g-h1">今天网络哪里不舒服？</h1>'
+            '<div class="g-sub">点一张卡片就开始测，测完直接出报告。</div>'
+            '<div id="cards" class="g-cards"></div>'
+            '<div class="g-fullrow">'
+            '<button id="btn-full" class="g-btn2" type="button">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round" stroke-linejoin="round">'
+            '<rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/>'
+            '<path d="M7 13h6M7 16h4"/></svg>完整诊断</button>'
+            '<span id="full-count" class="g-dim"></span></div>'
+            "</main>\n"
+            # ── 进度页 (设计稿第 3 节) ──
+            '<main id="view-progress" class="g-view-prog" style="display:none">'
+            '<div class="g-prog"><span id="p-done" class="g-big num"></span>'
+            '<div class="g-time"><div class="lab">已耗时</div>'
+            '<div id="p-elapsed" class="g-dim num"></div></div></div>'
+            '<div class="g-bar"><i id="p-bar"></i></div>'
+            '<div class="g-cur"><span class="g-spin"></span>'
+            '<span><span class="lab">正在测试</span><b id="p-cur-t"></b></span></div>'
+            '<div id="p-lights" class="g-lights"></div>'
+            '<div id="p-err" class="g-err"></div>'
+            '<button id="btn-back" class="g-link" type="button">返回主页</button>'
+            '<p class="g-hint">诊断期间请勿断开网络或合上笔记本</p></main>\n'
+            # ── 报告页 (设计稿第 4 节): 结论条 + 导出条 + 内嵌客户版报告 ──
+            '<main id="view-report" class="g-rep" style="display:none">'
+            '<div class="g-verdict"><div>'
+            '<div class="g-ver-line" id="ver-line">诊断完成</div>'
+            '<div class="g-ver-sub" id="ver-sub"></div></div></div>'
+            '<div class="g-exports">'
+            '<button id="exp-html" class="g-btn" type="button" data-kind="html">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round" stroke-linejoin="round">'
+            '<path d="M13.5 3.5H7.5A1.5 1.5 0 0 0 6 5v14a1.5 1.5 0 0 0 1.5 1.5h9A1.5 1.5 0 0 0 18 19V8l-4.5-4.5Z"/>'
+            '<path d="M13.5 3.5V8H18"/><path d="M12 11.5v5M9.8 14.2l2.2 2.3 2.2-2.3"/></svg>'
+            '存 HTML 报告</button>'
+            '<button id="exp-pdf" class="g-btn line" type="button" data-kind="pdf">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round" stroke-linejoin="round">'
+            '<path d="M13.5 3.5H7.5A1.5 1.5 0 0 0 6 5v14a1.5 1.5 0 0 0 1.5 1.5h9A1.5 1.5 0 0 0 18 19V8l-4.5-4.5Z"/>'
+            '<path d="M13.5 3.5V8H18"/><path d="M9 14h6M9 17h4"/></svg>'
+            '导出 PDF</button>'
+            '<button id="exp-json" class="g-btn line" type="button" data-kind="json">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round" stroke-linejoin="round">'
+            '<ellipse cx="12" cy="6" rx="7" ry="2.6"/>'
+            '<path d="M5 6v12c0 1.4 3.1 2.6 7 2.6s7-1.2 7-2.6V6"/>'
+            '<path d="M5 12c0 1.4 3.1 2.6 7 2.6s7-1.2 7-2.6"/></svg>'
+            '存原始数据</button>'
+            '<button id="btn-open-dir" class="g-btn line" type="button">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round" stroke-linejoin="round">'
+            '<path d="M3.5 7A1.5 1.5 0 0 1 5 5.5h4l2 2h8A1.5 1.5 0 0 1 20.5 9v8a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 17Z"/></svg>'
+            '打开报告文件夹</button>'
+            '<button id="btn-home2" class="g-link" type="button">返回主页</button></div>'
+            '<ul id="rep-files"></ul><div id="exp-msg" class="g-dim"></div>'
+            '<iframe id="g-frame" title="报告"></iframe></main>\n'
+            # ── 现场检测 (设计稿第 5 节, 对应终端菜单 [6]) ──
+            '<main id="view-site" class="g-view-site" style="display:none">'
+            '<div id="site-wizard" class="g-form">'
+            '<div class="g-steps"><i class="on"><b>1</b>填写信息</i><span class="ln"></span>'
+            '<i><b>2</b>自动诊断</i><span class="ln"></span>'
+            '<i><b>3</b>机房核对</i><span class="ln"></span>'
+            '<i><b>4</b>产出报告</i></div>'
+            '<div class="g-field"><div class="g-flabel">客户名称<span class="req">*</span></div>'
+            '<input id="site-cust" class="g-input" type="text" placeholder="如：张伟 · 幸福小区 3-502"></div>'
+            '<div class="g-field"><div class="g-flabel">检测时间</div>'
+            '<input id="site-time" class="g-input num" type="datetime-local">'
+            '<div class="g-fhint">留空则按当前时间计。</div></div>'
+            '<div class="g-field"><div class="g-flabel">签约带宽</div>'
+            '<input id="site-plan" class="g-input" type="text" placeholder="如 300M，填写后报告自动判达标">'
+            '<div class="g-fhint">可空：留空时报告只报实测值，不做达标判定。</div></div>'
+            '<div class="g-form-foot">'
+            '<button id="btn-site-start" class="g-btn" type="button">开始检测</button>'
+            '<span class="g-dim">大约 5–10 分钟，测完进入机房核对。</span>'
+            '<button id="btn-site-back" class="g-link" type="button">返回</button></div>'
+            '<div id="site-err" class="g-err"></div></div>'
+            '<div id="site-check" style="display:none">'
+            '<h2 class="g-h2">机房环境核对 · 6 项</h2>'
+            '<div id="site-items"></div>'
+            '<div class="g-field" style="margin-top:16px"><div class="g-flabel">现场备注</div>'
+            '<input id="site-note" class="g-input" type="text" placeholder="可空"></div>'
+            '<div class="g-form-foot">'
+            '<button id="btn-site-finish" class="g-btn" type="button">生成报告</button></div>'
+            '<div id="site-err2" class="g-err"></div></div></main>\n'
+            "<script>" + _GUI_JS + "</script>\n</body>\n</html>\n")
+
+
+# 预渲染常量: HTTP handler (Task 4) 直接引用, 避免每请求重建; 内容与 _gui_page() 一致。
+_GUI_PAGE_HTML = _gui_page()
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="netpulse.py",
