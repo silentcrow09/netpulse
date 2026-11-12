@@ -24759,6 +24759,87 @@ class _GuiSession:
                 self._phase = "error"
                 self._error = "%s: %s" % (type(e).__name__, e)
 
+    # -- 现场检测 (与终端 run_site_visit :23538 同口径) --
+    def start_site(self, customer, tested_at=None, plan="",
+                   install=True, pip_mirror=None):
+        cust = str(customer or "").strip()
+        if not cust:
+            return False, "客户名称必填"
+        keys = [k for k in all_module_keys() if k not in ("port", "iperf3")]
+        ok, err = self._begin("site", keys)
+        if not ok:
+            return False, err
+        with self._lock:
+            ta = str(tested_at or "").strip()
+            if not ta:
+                # 决议: 页面 datetime-local 可能为空, 空值默认当前时间
+                # (终端口径: 回车 = 默认当前)
+                ta = datetime.now().strftime("%Y-%m-%d %H:%M")
+            self._site = {"customer": cust,
+                          "tested_at": ta,
+                          "plan": str(plan or "").strip()}
+        self._thread = threading.Thread(target=self._run_diag_site,
+                                        args=(keys, install, pip_mirror),
+                                        daemon=True, name="np-gui-site")
+        self._thread.start()
+        return True, None
+
+    def _run_diag_site(self, keys, install, pip_mirror):
+        try:
+            run = run_diagnostics(keys, banner=False, parallel=True,
+                                  max_workers=4, install=install,
+                                  pip_mirror=pip_mirror, print_modules=False,
+                                  progress_cb=self.on_progress)
+            if not (run.get("results") or {}):
+                raise RuntimeError("诊断未产生数据")
+            with self._lock:
+                self._run = run
+                self._phase = "site_ready"     # 等机房勾选 (页面切核对步)
+        except Exception as e:
+            with self._lock:
+                self._phase = "error"
+                self._error = "%s: %s" % (type(e).__name__, e)
+
+    def finalize_site(self, checks, note=""):
+        """机房勾选提交 → build_report(显式传参, 守收口规则) → 四件套。"""
+        with self._lock:
+            run, site = self._run, self._site
+            ready = (self._phase == "site_ready")
+        if not ready or not run:
+            return False, "诊断未完成, 无法生成报告"
+        report = build_report(
+            site_check=dict(checks or {}),      # 白名单在 build_report 内
+                                                # (_normalize_site_check)
+            meta_manual={"customer": site["customer"],
+                         "tested_at": site.get("tested_at") or "",
+                         "plan": site.get("plan") or ""},
+            site_note=str(note or "").strip())
+        if not report:
+            return False, "报告构建失败"
+        base = _site_report_base(site["customer"])
+        outs = [(base + ".html", "brief_v2"),
+                (base + "_完整版.html", "full"),
+                (base + ".json", None)]
+        files, err_first = [], None
+        for path, layout in outs:
+            err = export_report(path, report=report, layout=layout)
+            if err:
+                err_first = err_first or err
+            else:
+                files.append(path)
+        chrome = _find_pdf_browser()
+        if chrome:
+            err = _html_to_pdf(chrome, base + ".html", base + ".pdf")
+            if err:
+                err_first = err_first or ("PDF: " + err)
+            else:
+                files.insert(0, base + ".pdf")
+        with self._lock:
+            self._report = report
+            self._files = files
+            self._phase = "done"
+        return True, err_first
+
     # -- 导出 (与终端 _export_scene_report 同目录同名规则) --
     def export(self, kind):
         with self._lock:
@@ -25506,7 +25587,17 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
                     self.shutdown_evt.set()
                     return self._send(200, {"ok": True})
                 return self._send(409, {"ok": False, "reason": "running"})
-            # site 端点在 Task 5 追加
+            if p == "/api/site/start":
+                d = data or {}
+                ok, err = self.session.start_site(
+                    d.get("customer"), tested_at=d.get("tested_at"),
+                    plan=d.get("plan"))
+                return self._send(200 if ok else 400, {"ok": ok, "err": err})
+            if p == "/api/site/finish":
+                d = data or {}
+                ok, err = self.session.finalize_site(
+                    d.get("checks") or {}, note=d.get("note") or "")
+                return self._send(200 if ok else 400, {"ok": ok, "err": err})
             return self._send(404, {"error": "not found"})
         except Exception as e:
             try:
