@@ -23204,29 +23204,35 @@ _SCENE_TOOL_ITEMS = (
 )
 
 
-def _card_row(key, name, desc, name_w, show_desc=True):
-    """菜单卡片行 (批次 2): 亮黑底整行铺底 (ANSI 100), 键号青/名称亮/副行灰。"""
-    row = (_c(f" {key} ", "100;96") + _c(" ", "100")
-           + _c(_pad_disp(name, name_w), "100;97"))
+def _menu_item_row(key, name, desc, name_w, show_desc=True):
+    """场景菜单行 (批次 2 修订): 无底色 —— 键号青/名称亮白/副行灰。
+
+    实机反馈 (2026-11-12): 原方案的 ANSI 100 亮黑底在经典 conhost 配色下
+    是一条明显灰带 (设计稿的"暗色卡片"只在 WT 深色主题成立), 与高级菜单的
+    素色风格打架 → 去底色, 只保留结构与对齐。行为与键位语义不变。
+    """
+    row = _c(f" {key} ", C_CYAN) + " " + _c(_pad_disp(name, name_w), C_WHITE)
     if show_desc and desc:
-        row += _c("  ", "100") + _c(desc, "100;90") + _c(" ", "100")
+        row += "  " + _c(desc, C_GRAY)
     return row
 
 
-def _menu_card_lines(show_desc=True):
-    """场景菜单卡片行 (批次 2): 「按问题选场景」+「工具与报告」双分区。
+def _menu_item_lines(show_desc=True):
+    """场景菜单行 (批次 2): 「按问题选场景」+「工具与报告」双分区。
 
     show_desc=False (窄终端) 时收起副行, 只留键号+名称。返回已着色行列表。
+    无底色 (实机反馈移除 ANSI 100 铺底, 见 _menu_item_row docstring)。
     """
     scene_rows = [(key, SCENE_LABELS[p], SCENE_MENU_DESC.get(p, ""))
                   for key, p in SCENE_MENU_KEYS.items()]
     all_rows = scene_rows + list(_SCENE_TOOL_ITEMS)
     name_w = max(_disp_width(n) for _, n, _ in all_rows)
     out = [_c("按问题选场景", C_WHITE)]
-    out += [_card_row(k, n, d, name_w, show_desc) for k, n, d in scene_rows]
+    out += [_menu_item_row(k, n, d, name_w, show_desc) for k, n, d in scene_rows]
     out.append("")
     out.append(_c("工具与报告", C_WHITE))
-    out += [_card_row(k, n, d, name_w, show_desc) for k, n, d in _SCENE_TOOL_ITEMS]
+    out += [_menu_item_row(k, n, d, name_w, show_desc)
+            for k, n, d in _SCENE_TOOL_ITEMS]
     return ["  " + ln for ln in out]
 
 
@@ -23236,7 +23242,7 @@ def _scene_menu(install=False, pip_mirror=None):
     返回 False = 退出程序 ([0] 退出 / [9] 高级页里退出 / Ctrl+C)。
     v1.9.7 PR-3: [A] 一键以管理员身份重启。
     控制台现代化批次 2: 闭环框横幅 (权限/本机网络进框, 公网联网后补行)
-    + 双分区卡片菜单 (副行按 DIAGNOSE_PROFILES 校准, 窄终端自动收起)。
+    + 双分区菜单 (副行按 DIAGNOSE_PROFILES 校准, 窄终端自动收起)。
     """
     while True:
         _menu_clear()
@@ -23244,7 +23250,7 @@ def _scene_menu(install=False, pip_mirror=None):
         for ln in _menu_banner_lines(notice=notice):
             print(ln)
         print()
-        for ln in _menu_card_lines(show_desc=_term_width() >= 64):
+        for ln in _menu_item_lines(show_desc=_term_width() >= 64):
             print(ln)
         print()
         # v1.17.0: 异常上报开关。退出项只出现一次 —— 之前这行自带一个

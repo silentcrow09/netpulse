@@ -171,19 +171,19 @@ class TestProgressPrimitives(unittest.TestCase):
             self.assertIn(st, N.CLI_STATUS_MARKS)
 
 
-class TestMenuCards(unittest.TestCase):
-    """S5: 双分区卡片菜单 / 全部键位 / 副行可收起。"""
+class TestMenuItems(unittest.TestCase):
+    """S5: 双分区菜单行 / 全部键位 / 副行可收起 / 无底色 (实机反馈修订)。"""
 
     def test_two_sections_all_items(self):
-        text = N._ANSI_RE.sub("", "\n".join(N._menu_card_lines(show_desc=True)))
+        text = N._ANSI_RE.sub("", "\n".join(N._menu_item_lines(show_desc=True)))
         self.assertIn("按问题选场景", text)
         self.assertIn("工具与报告", text)
         for key in "12345679A":
             self.assertIn(f" {key} ", text, f"菜单缺键位 {key}")
 
     def test_desc_toggle(self):
-        wide = "\n".join(_plain(N._menu_card_lines(show_desc=True)))
-        narrow = "\n".join(_plain(N._menu_card_lines(show_desc=False)))
+        wide = "\n".join(_plain(N._menu_item_lines(show_desc=True)))
+        narrow = "\n".join(_plain(N._menu_item_lines(show_desc=False)))
         desc = N.SCENE_MENU_DESC["slow"]
         self.assertIn(desc, wide)
         self.assertNotIn(desc, narrow, "窄终端应收起副行")
@@ -196,6 +196,11 @@ class TestMenuCards(unittest.TestCase):
                  "web": "DNS", "disconnect": "外网"}
         for p, kw in pairs.items():
             self.assertIn(kw, N.SCENE_MENU_DESC[p])
+
+    def test_no_background_fill(self):
+        """菜单行不得铺底色 (实机反馈: ANSI 100 在经典 conhost 是明显灰带)。"""
+        for ln in N._menu_item_lines(show_desc=True):
+            self.assertNotIn("[100", ln, f"菜单行带底色: {ln!r}")
 
 
 class TestMenuBanner(unittest.TestCase):
