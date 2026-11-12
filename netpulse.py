@@ -16472,7 +16472,7 @@ def _restore_stdout_on_exit(fn):
 @_restore_stdout_on_exit
 def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
                    banner=True, install=False, parallel=False, max_workers=4,
-                   pip_mirror=None, print_modules=True):
+                   pip_mirror=None, print_modules=True, progress_cb=None):
     """执行指定模块并打印结果与汇总。返回本次运行的完整数据 dict。
 
     v1.15.2 (审查 P1-16 · 收口规则): 返回值由 `{key: status}` 改为**完整 run
@@ -16490,6 +16490,10 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
     print_modules: 终端是否逐模块打印 `▶ 名称 [状态]` + 结论块 (2026-11-12
               精简)。菜单/场景多模块跑法传 False —— 详细数据在 HTML/JSON
               报告里, 终端只给底部一段汇总框; CLI 与单模块默认 True 不变。
+    progress_cb: 可选进度回调 (v1.21.0 GUI 专用)。每模块开始/结束各发一条
+              dict 事件 {"event": "start", "key": K} / {"event": "done",
+              "key": K, "status": 状态}。None 时行为与旧版逐字节一致;
+              回调异常被吞掉 (进度通知绝不打断诊断)。
               as_json 的载荷收集不受影响 (循环照跑, 只是不打印人读块)。
     """
     global _C_NOCOLOR, LAST_RUN
@@ -16616,10 +16620,11 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
     use_parallel = parallel and len(keys) > 1
     if use_parallel:
         results, full = _run_diagnostics_parallel(
-            keys, max_workers=max_workers, total=len(keys))
+            keys, max_workers=max_workers, total=len(keys),
+            progress_cb=progress_cb)
     else:
         results, full = _run_diagnostics_sequential(
-            keys, is_tty=IS_TTY)
+            keys, is_tty=IS_TTY, progress_cb=progress_cb)
 
     # v1.15.0 (审查 P1-13): 状态归一前置 —— 「未配置」不是故障。
     # 在这里改写后, 模块标题行 / CLI 汇总 / LAST_RUN["status"] / 报告计数 /
@@ -16867,13 +16872,18 @@ def _extract_evidence_map(full):
     return results, evidence
 
 
-def _run_diagnostics_sequential(keys, is_tty):
+def _run_diagnostics_sequential(keys, is_tty, progress_cb=None):
     """顺序模式: 保留 TTY 实时进度行 (\\r\\033[K 刷新), 详细 result 留给主循环统一打。
     每个模块有独立超时 (_run_module_with_timeout), 单个模块卡死不会拖住整个流程。"""
     results = {}
     full = {}
     for key in keys:
         name, cls = MODULE_MAP[key]
+        if progress_cb:
+            try:
+                progress_cb({"event": "start", "key": key})
+            except Exception:
+                pass
         if is_tty:
             sys.stdout.write(_c(f"  正在 {name} …", C_GRAY))
             sys.stdout.flush()
@@ -16902,6 +16912,11 @@ def _run_diagnostics_sequential(keys, is_tty):
         # 结果循环的结论行已用 error 原文 (见 _cli_print_result), 信息不丢。
         results[key] = status
         full[key] = res
+        if progress_cb:
+            try:
+                progress_cb({"event": "done", "key": key, "status": status})
+            except Exception:
+                pass
     return results, full
 
 
@@ -16923,7 +16938,7 @@ def _print_cols(rows):
             _safe_print(colored)
 
 
-def _run_diagnostics_parallel(keys, max_workers, total):
+def _run_diagnostics_parallel(keys, max_workers, total, progress_cb=None):
     """并行模式: 4 worker 并发跑, 启动和完成行都按 keys 顺序打印。
 
     设计要点:
@@ -16986,6 +17001,11 @@ def _run_diagnostics_parallel(keys, max_workers, total):
         # (fut.result() 重新抛出) → 整轮诊断中断, 现场模式等于白跑一趟。
         # 单模块异常降级为 ("错误", {...}), 其余模块照跑, 报告照出。
         name = MODULE_MAP.get(key, (key, key))[0]
+        if progress_cb:
+            try:
+                progress_cb({"event": "start", "key": key})
+            except Exception:
+                pass
         try:
             status, res = _run_module_with_timeout(key, lambda msg: None)
         except Exception as e:
@@ -16997,6 +17017,11 @@ def _run_diagnostics_parallel(keys, max_workers, total):
         # 存结果, 不立即打 (主线程按 keys 顺序统一处理)
         with completed_lock:
             completed[key] = (name, status, res)
+        if progress_cb:
+            try:
+                progress_cb({"event": "done", "key": key, "status": status})
+            except Exception:
+                pass
         return key
 
     # 启动: live 模式画初始进度块 (全部 "… 灰"); 否则原静态两列 "正在 …"
