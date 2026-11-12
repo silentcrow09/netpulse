@@ -234,7 +234,12 @@ $piArgs = @(
 # Ookla speedtest.exe 官方只有 x64 版 — x86 构建不随包:
 # 内置国内 HTTP 多连接测速不受影响, Ookla 对照测速 (--speedtest-net) 缺失时降级跳过
 if ($Arch -ne 'x86') {
-    $piArgs += @('--add-data', 'speedtest/speedtest.exe;speedtest')
+    # 2026-11-12: --specpath build 后, --add-data 的相对路径以 spec 目录
+    # (build\) 解析而非 CWD, "speedtest/speedtest.exe" 会找不到
+    # (实测报 "Unable to find build\speedtest\speedtest.exe")。
+    # 用 = 单 token 形式 + 绝对路径, 值里的分号不会被参数引用机制拆坏
+    # (完整参数实测构建 39.8s 通过, dist\NetPulse.exe 18.4MB)。
+    $piArgs += @('--add-data=' + (Join-Path $PSScriptRoot 'speedtest\speedtest.exe') + ';speedtest')
 }
 
 # 后台跑 pyinstaller, 同时显示旋转动画
