@@ -3723,7 +3723,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.20.0"
+APP_VERSION = "1.21.0"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -26165,8 +26165,12 @@ def main():
             _warn_ignored_mode("diagnose", "monitor")
         profile = args.diagnose
         keys = DIAGNOSE_PROFILES[profile]
+        # v1.21.0: --json 时本分支的人读输出 (banner/分隔线/根因) 改道 stderr,
+        # stdout 只留 run_diagnostics 的纯 JSON —— 与其 as_json 机制同一契约。
+        # 非法/异常路径不受影响; 非 --json 输出逐字节不变。
+        _json_err = sys.stderr if args.json else sys.stdout
         print(_c(f"  按场景诊断: {profile} "
-                 f"(模块: {', '.join(keys)})", C_BOLD))
+                 f"(模块: {', '.join(keys)})", C_BOLD), file=_json_err)
         # v1.19.x: 跑诊断时占用备用屏幕 (固定宽高), 退出后结论写回正常屏幕
         _run_diagnostics_on_screen(
             keys, verbose=args.verbose, as_json=args.json,
@@ -26177,8 +26181,14 @@ def main():
         # v1.6.0 (PR-B): 按场景规则集评估, 避免 gaming 报 wifi 弱等无关根因
         if LAST_RUN and LAST_RUN.get("results"):
             diagnosis = diagnose(LAST_RUN["results"], rule_filter=profile)
-            print(_c("─" * 60, C_BLUE))
-            _print_diagnosis(diagnosis)
+            _saved_out = sys.stdout
+            if args.json:
+                sys.stdout = sys.stderr
+            try:
+                print(_c("─" * 60, C_BLUE))
+                _print_diagnosis(diagnosis)
+            finally:
+                sys.stdout = _saved_out
         # 与 modules 路径同权: --export / --json-schema 等后续动作不再被吞
         # v1.6.1: 导出与屏幕同一规则集, 报告不再夹带过滤掉的根因
         if args.export:

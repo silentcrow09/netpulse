@@ -95,5 +95,47 @@ class TestMainWiring(unittest.TestCase):
         self.assertTrue(called.get("exit"))
 
 
+class TestJsonStdoutPurity(unittest.TestCase):
+    """v1.21.0: --json 时分支人读输出 (banner/分隔线/根因) 改道 stderr,
+    stdout 只留 run_diagnostics 的纯 JSON。非 --json 输出不变。"""
+
+    def _run_diagnose(self, argv, last_run):
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        _old_out, _old_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = out, err
+        try:
+            with mock.patch.object(sys, "argv", ["netpulse.py"] + argv), \
+                 mock.patch.object(np, "_run_diagnostics_on_screen"), \
+                 mock.patch.object(np, "_exit_with_status"), \
+                 mock.patch.object(np, "diagnose",
+                                   side_effect=lambda *a, **k: None), \
+                 mock.patch.object(np, "_print_diagnosis",
+                                   side_effect=lambda d:
+                                   print("DIAGBLOCK")), \
+                 mock.patch.object(np, "_start_scapy_preload"), \
+                 mock.patch.object(np, "_start_update_check"), \
+                 mock.patch.object(np, "LAST_RUN", last_run):
+                np.main()
+        finally:
+            sys.stdout, sys.stderr = _old_out, _old_err
+        return out.getvalue(), err.getvalue()
+
+    def test_json_human_output_goes_to_stderr(self):
+        out, err = self._run_diagnose(
+            ["--json", "--diagnose", "wifi"], {"results": {"gateway": {}}})
+        self.assertEqual(out, "", "--json 时 stdout 必须为空 (纯 JSON 由"
+                          " run_diagnostics 产出, 本分支不得掺人读文本)")
+        self.assertIn("按场景诊断", err)
+        self.assertIn("DIAGBLOCK", err)
+
+    def test_no_json_output_unchanged(self):
+        out, err = self._run_diagnose(
+            ["--diagnose", "wifi"], {"results": {"gateway": {}}})
+        self.assertIn("按场景诊断", out)
+        self.assertIn("DIAGBLOCK", out)
+        self.assertEqual(err, "")
+
+
 if __name__ == "__main__":
     unittest.main()
