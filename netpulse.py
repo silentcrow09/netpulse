@@ -39,6 +39,9 @@ import re
 import sys
 import unicodedata
 import argparse
+import atexit
+import contextlib
+import io
 import tempfile
 import ipaddress
 import math
@@ -15349,30 +15352,140 @@ def _columnize(cells, columns=2, gap=3):
 # (┌┐└┘│─ ✓ ✗ ⚠ ○ … █ ░ ■ ● · »); 一切对齐/补边走 _disp_width (CJK=2, ANSI 不计)。
 
 
+# ── 控制台全屏层 · 备用屏幕缓冲区 + 固定画布 (v1.19.x) ──
+# 起因 (2026-11-12 实机反馈): 旧版没有固定终端窗口尺寸, 终端一窄, 框内长行
+# (旧版诊断汇总是"需关注"模块名单) 就超出终端宽度被终端折行, 右边框被挤到
+# 下一行 → "边框线条错位"。这一层给两层保障:
+#   1) 备用屏幕缓冲区 (ANSI 1049): 程序独占整屏, 退出时恢复用户原屏幕,
+#      进度噪声不再刷进回滚缓冲;
+#   2) 固定画布: 排版宽度冻结为 CONSOLE_FIXED_COLS, 且**不超过**真实终端
+#      宽度 (真实更窄时按真实算) → 任何一行都不折行, 边框恒对齐。
+# 老 conhost (Win7) 不认 1049 → _cli_enable_vt() 失败 → 整层自动跳过,
+# 只保留固定画布的排版收益 (限宽 + 框内折行照旧生效)。
+
+CONSOLE_FIXED_COLS = 100   # 固定画布宽 (列)
+CONSOLE_FIXED_ROWS = 40    # 固定画布高 (行)
+
+_CONSOLE_LAYOUT = {"cols": None, "rows": None}   # 冻结后的画布尺寸
+_FULLSCREEN_DEPTH = 0                             # 嵌套计数 (菜单内跑诊断不重复切屏)
+
+
+def _console_layout_size():
+    """冻结画布尺寸 (列, 行): 取「固定常量」与「真实终端尺寸」的较小者。
+
+    真实终端更窄时按真实宽度排版 —— 保证任何一行都不超出终端宽度, 从根上
+    杜绝折行导致的边框错位; 真实更宽时按固定常量排版, 用户拉宽/拉窄窗口
+    都不再重排 (布局稳定)。
+    """
+    global _CONSOLE_LAYOUT
+    if _CONSOLE_LAYOUT["cols"] is None:
+        cols, rows = CONSOLE_FIXED_COLS, CONSOLE_FIXED_ROWS
+        try:
+            size = shutil.get_terminal_size((CONSOLE_FIXED_COLS,
+                                             CONSOLE_FIXED_ROWS))
+            cols, rows = int(size.columns), int(size.lines)
+        except Exception:
+            pass
+        _CONSOLE_LAYOUT["cols"] = max(40, min(CONSOLE_FIXED_COLS, cols))
+        _CONSOLE_LAYOUT["rows"] = max(10, min(CONSOLE_FIXED_ROWS, rows))
+    return _CONSOLE_LAYOUT["cols"], _CONSOLE_LAYOUT["rows"]
+
+
 def _term_width():
-    """终端可用宽度 (列数); 取不到按 80, 下限 40。自适应排版统一走这里。"""
-    try:
-        cols = int(shutil.get_terminal_size((80, 24)).columns)
-    except Exception:
-        return 80
-    return max(40, min(200, cols))
+    """终端排版宽度 (列数) = 冻结画布宽。自适应排版统一走这里。"""
+    return _console_layout_size()[0]
+
+
+def _term_height():
+    """终端排版高度 (行数) = 冻结画布高。"""
+    return _console_layout_size()[1]
+
+
+_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _truncate_display(s, width):
+    """按显示宽度截断字符串 (超长时尾部加 "…"); ANSI 转义不计宽且原样保留。"""
+    if width <= 0:
+        return ""
+    if _disp_width(s) <= width:
+        return s
+    out, w, i, n = [], 0, 0, len(s)
+    while i < n:
+        m = _SGR_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        ch = s[i]
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if w + cw > width - 1:      # 留 1 列给 "…"
+            break
+        out.append(ch)
+        w += cw
+        i += 1
+    out.append("…")
+    return "".join(out)
+
+
+def _wrap_display(s, width):
+    """按显示宽度折行 (ANSI 不计宽; 续行重发当前 SGR 样式, 行尾复位)。
+
+    框内长文本用它折行: 内容超出框宽时**在框内**换行, 而不是溢出到终端
+    宽度之外被终端折行 —— 后者会把框的右边框挤到下一行 ("边框线条错位")。
+    """
+    if width <= 0 or _disp_width(s) <= width:
+        return [s]
+    lines, cur, cur_w = [], "", 0
+    styles = []          # 当前生效的 SGR 片段 (续行需重发)
+    i, n = 0, len(s)
+    while i < n:
+        m = _SGR_RE.match(s, i)
+        if m:
+            code = m.group(0)
+            cur += code
+            if code in ("\x1b[0m", "\x1b[m"):
+                styles = []
+            else:
+                styles.append(code)
+            i = m.end()
+            continue
+        ch = s[i]
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if cur_w > 0 and cur_w + cw > width:
+            lines.append(cur + ("\x1b[0m" if styles else ""))
+            cur, cur_w = "".join(styles), 0
+        cur += ch
+        cur_w += cw
+        i += 1
+    lines.append(cur + ("\x1b[0m" if styles else ""))
+    return lines
 
 
 def _draw_box(lines, title=None, border_color=None, text_color=None,
-              indent="  "):
-    """闭环提示框 (批次 2): 标题嵌上边框, 宽度按内容自适应。
+              indent="  ", max_width=None):
+    """闭环提示框: 标题嵌上边框, 宽度按内容自适应 (上限 = 画布宽度)。
 
     lines: 框内文字行 (可含 ANSI, 宽度按 _disp_width 计); 空串 = 空行。
     返回字符串行列表 (含缩进与 ANSI), 调用方自行 print —— 纯函数, 便于
     测试断言 (与 v1.19.x 告知框修复同一套宽度口径, 消灭手工排框)。
+
+    v1.19.x: 框宽**不再无限撑**: 上限取画布宽度, 超宽内容在框内按显示宽度
+    折行 —— 旧版按内容撑框, 内容一长就超出终端宽度被终端折行, 右边框落到
+    下一行 ("边框线条错位", 2026-11-12 实机反馈)。
     """
     border_color = border_color if border_color is not None else C_GRAY
     text_color = text_color if text_color is not None else C_WHITE
-    content = list(lines)
+    limit = max_width if max_width is not None else _term_width()
+    # 框内可用宽: 画布宽 - 缩进 - 左右竖线与两侧空格
+    budget = max(20, limit - _disp_width(indent) - 4)
+    content = []
+    for l in lines:
+        content.extend(_wrap_display(str(l), budget))
     inner = max((_disp_width(l) for l in content), default=0) + 2  # 两侧各留一空格
     head = None
     if title:
-        head = "─ " + str(title) + " "
+        head = _truncate_display("─ " + str(title) + " ", budget)
         inner = max(inner, _disp_width(head) + 1)
     out = [_c(indent + ("┌" + head + "─" * (inner - _disp_width(head))
               if head else "┌" + "─" * inner) + "┐", border_color)]
@@ -15381,6 +15494,119 @@ def _draw_box(lines, title=None, border_color=None, text_color=None,
         out.append(_c(indent + "│ " + l + pad + "│", text_color))
     out.append(_c(indent + "└" + "─" * inner + "┘", border_color))
     return out
+
+
+# ── 备用屏幕缓冲区 (ANSI 1049) 会话 ──
+
+
+def _console_fullscreen_supported():
+    """备用屏幕缓冲区是否可用: 交互终端 + VT 可用 (Win7 老 conhost 不支持 1049)。"""
+    try:
+        if not sys.stdout.isatty():
+            return False
+    except Exception:
+        return False
+    return bool(_cli_enable_vt())
+
+
+def _console_fix_window_size(cols, rows):
+    """尽力把控制台窗口调到固定画布尺寸 (仅经典 conhost 有效)。
+
+    窗口尺寸属于**屏幕缓冲区**, 备用屏幕退出会还原用户原来的窗口大小,
+    所以改窗口不破坏用户环境。Windows Terminal / ConPTY 下
+    SetConsoleWindowInfo 失败 → 返回 False, 此时靠"画布宽 ≤ 真实终端宽"
+    保证不折行 (排版收益仍在)。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        k = ctypes.windll.kernel32
+
+        class _Coord(ctypes.Structure):
+            _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+        class _SmallRect(ctypes.Structure):
+            _fields_ = [("Left", ctypes.c_short), ("Top", ctypes.c_short),
+                        ("Right", ctypes.c_short), ("Bottom", ctypes.c_short)]
+
+        class _WindowInfo(ctypes.Structure):
+            _fields_ = [("dwSize", _Coord), ("dwLeft", ctypes.c_short),
+                        ("dwTop", ctypes.c_short), ("dwBufferSize", _Coord),
+                        ("dwWindow", _SmallRect), ("wFlags", ctypes.c_ushort)]
+
+        h = k.GetStdHandle(-11)
+        info = _WindowInfo()
+        if not k.GetConsoleWindowInfo(h, ctypes.byref(info)):
+            return False
+        # 窗口必须完整落在屏幕缓冲区内 (conhost 要求 window ⊆ buffer)
+        if info.dwBufferSize.X < cols or info.dwBufferSize.Y < rows:
+            return False
+        info.dwWindow.Right = info.dwWindow.Left + cols - 1
+        info.dwWindow.Bottom = info.dwWindow.Top + rows - 1
+        return bool(k.SetConsoleWindowInfo(h, ctypes.byref(info)))
+    except Exception:
+        return False
+
+
+def _console_fullscreen_enter():
+    """进入备用屏幕缓冲区 + 固定画布。返回是否真的进入 (False = 保持普通屏幕)。"""
+    global _FULLSCREEN_DEPTH
+    if _FULLSCREEN_DEPTH > 0:
+        _FULLSCREEN_DEPTH += 1     # 已在备用屏幕里 (菜单内跑诊断) → 只计数
+        return False
+    if not _console_fullscreen_supported():
+        return False
+    _FULLSCREEN_DEPTH = 1
+    try:
+        sys.stdout.write("\x1b[?1049h")    # smcup: 切到备用屏幕缓冲区
+        sys.stdout.flush()
+        cols, rows = _console_layout_size()
+        _console_fix_window_size(cols, rows)   # 尽力固定窗口宽高 (conhost 有效)
+        sys.stdout.write("\x1b[2J\x1b[H")   # 清屏 + 光标归位
+        sys.stdout.flush()
+    except Exception:
+        _FULLSCREEN_DEPTH = 0
+        return False
+    return True
+
+
+def _console_fullscreen_exit():
+    """退出备用屏幕缓冲区, 恢复用户原屏幕 (幂等; 未进入时无副作用)。"""
+    global _FULLSCREEN_DEPTH
+    if _FULLSCREEN_DEPTH <= 0:
+        return False
+    _FULLSCREEN_DEPTH -= 1
+    if _FULLSCREEN_DEPTH > 0:
+        return False
+    try:
+        sys.stdout.write("\x1b[?1049l")    # rmcup: 回到原屏幕缓冲区
+        sys.stdout.flush()
+    except Exception:
+        pass
+    return True
+
+
+@contextlib.contextmanager
+def _console_fullscreen():
+    """备用屏幕缓冲区会话 (上下文管理器)。
+
+    yield 的值 = 是否真的进入了备用屏幕 (False = 保持普通屏幕, 输出全部留在
+    回滚缓冲)。退出时 (含异常路径) 一定还原用户原屏幕。
+    """
+    entered = _console_fullscreen_enter()
+    try:
+        yield entered
+    finally:
+        _console_fullscreen_exit()
+
+
+def _console_fullscreen_atexit():
+    """进程退出兜底: 异常路径漏了退出时, 别把用户终端留在备用屏幕里。"""
+    while _FULLSCREEN_DEPTH > 0:
+        _console_fullscreen_exit()
+
+
+atexit.register(_console_fullscreen_atexit)
 
 
 # 进度列表的状态符号 (色 + 形双编码, 色弱/黑白打印不丢语义)。
@@ -15414,33 +15640,127 @@ def _module_progress_row(idx, total, name, status=None):
     return _c(prefix + "… " + name, C_GRAY)
 
 
-def _diagnosis_summary_lines(results):
-    """诊断汇总内容行 (2026-11-12 精简): 状态计数 + 需关注名单。纯函数。
+def _grade_color(grade):
+    """等级 → 终端配色 (A/B 绿, C/D 黄, F 红)。与完成屏健康分区同口径。"""
+    return {"A": C_GREEN, "B": C_GREEN, "C": C_YELLOW,
+            "D": C_YELLOW, "F": C_RED}.get(
+                str(grade or "").strip()[:1].upper(), C_WHITE)
 
-    results: {key: status} (状态归一后)。多模块跑法终端不再逐模块铺开
-    (详细指标在 HTML/JSON 报告与 --verbose), 这里只给一段总结:
-      ✓ 完成 19   ⚠ 警告 2   ✗ 异常 1
-      需关注: 路由追踪 (警告) · NAT 类型 (异常)
-    全部完成且无关注项时补一行绿色结论。
+
+def _diagnosis_summary_lines(status_map):
+    """诊断汇总内容行 (v1.19.x): 健康分 + 异常模块数量, **不列出**异常模块清单。
+
+    2026-11-12 实机反馈: 旧版把全部"需关注"模块名串成一行, 模块一多就超出
+    终端宽度 → 框的右边框被终端折行挤歪 ("边框线条错位")。现在只给两行:
+        健康分 87 / 100 · B 级 良好 (实检 23/23 项 · 18 项参与计分)
+        异常模块 3 个 (异常 1 · 警告 2)
+    模块清单在 HTML/JSON 报告与 --verbose 里。
+
+    口径与报告层严格一致 (数字同源 _score_scope_counts): 健康分用扣分口径
+    (评分豁免模块不扣分), 异常模块数用全口径 (豁免模块照常计数) —— 所以
+    分数行必须带"实检 / 参与计分"两个数, 否则会出现"满分却有异常模块"的
+    口径困惑 (AGENTS.md: 两种计数口径并存, 并排展示必须说明差异)。
     """
-    cnt_by = {}
-    for st in results.values():
-        cnt_by[st] = cnt_by.get(st, 0) + 1
-    segs = []
-    for st in STATUS_BAR_ORDER:
-        if cnt_by.get(st):
-            mark, color = CLI_STATUS_MARKS.get(st, ("○", C_GRAY))
-            segs.append(_c(f"{mark} {st} {cnt_by[st]}", color))
-    attention = [(MODULE_MAP.get(k, (k, k))[0], st)
-                 for k, st in results.items()
-                 if st not in ("完成", "正常", "未检测")]
-    inner = ["  ".join(segs) if segs else _c("无结果", C_GRAY)]
-    if attention:
-        inner.append(_c("需关注: " + " · ".join(
-            f"{n} ({st})" for n, st in attention), C_YELLOW))
-    elif cnt_by.get("完成") or cnt_by.get("正常"):
-        inner.append(_c("✓ 全部完成，未发现问题", C_GREEN))
+    if not status_map:
+        return [_c("无结果", C_GRAY)]
+    counts, all_counts, _exempt = _score_scope_counts(status_map)
+    health = compute_health_score(counts, text_counts=all_counts)
+    score = int(health.get("score") or 0)
+    grade = str(health.get("grade") or "")
+    label = str(health.get("label") or "")
+    head = (_c(f"健康分 {score} / 100", C_BOLD) + _c(" · ", C_GRAY)
+            + _c(f"{grade} 级", _grade_color(grade))
+            + (_c(f" {label}", C_GRAY) if label else ""))
+    scope = (f"实检 {len(status_map)}/{len(MODULE_MAP)} 项 · "
+             f"{sum(counts.values())} 项参与计分")
+    inner = [head + _c(f" ({scope})", C_GRAY)]
+    # 异常模块数 (全口径): 异常/错误/警告/超时都算有问题, 未检测不算
+    bad_parts = []
+    bad_total = 0
+    for st in ("异常", "错误", "警告", "超时"):
+        n = all_counts.get(st) or 0
+        if n:
+            bad_parts.append(f"{st} {n}")
+            bad_total += n
+    if bad_total:
+        inner.append(_c(f"异常模块 {bad_total} 个", C_YELLOW)
+                     + _c(f" ({' · '.join(bad_parts)})", C_GRAY))
+    else:
+        inner.append(_c("✓ 未发现异常模块", C_GREEN))
     return inner
+
+
+def _print_diagnosis_summary(status_map):
+    """打印诊断汇总框 (健康分 + 异常模块数量)。"""
+    for ln in _draw_box(_diagnosis_summary_lines(status_map), title="诊断汇总",
+                        border_color=C_BLUE, text_color=C_GRAY):
+        print(ln)
+
+
+class _TeeWriter:
+    """同时写到真实终端与内存缓冲 (备用屏幕模式用)。
+
+    备用屏幕里跑诊断时: 屏幕上看得见实时进度 (整屏、干净), 同时把这一轮
+    人读输出抄一份 —— 退出备用屏幕后原样回写正常屏幕, 细节与结论仍留在
+    回滚缓冲里 (不像纯备用屏幕那样随屏幕一起消失)。
+    """
+
+    def __init__(self, real, buf):
+        self._real = real
+        self._buf = buf
+
+    def write(self, s):
+        try:
+            self._buf.write(s)
+        except Exception:
+            pass
+        try:
+            self._real.write(s)
+        except Exception:
+            pass
+        return len(s)
+
+    def flush(self):
+        try:
+            self._real.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        return True
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _run_diagnostics_on_screen(keys, as_json=False, **kwargs):
+    """跑诊断, 交互终端下占用**备用屏幕缓冲区**。返回 (run, used_fullscreen)。
+
+    v1.19.x:
+      - as_json=True → **不进**备用屏幕 (stdout 必须是纯 JSON, 终端模式会
+        把输出吞进备用屏幕, 脚本就解析不到了);
+      - 其余 → 跑在备用屏幕里 (固定宽高, 进度不刷回滚缓冲), 退出后把这一轮
+        的人读输出**原样回写**正常屏幕 —— 结论与模块细节仍在回滚缓冲里可翻。
+    """
+    if as_json:
+        return run_diagnostics(keys, as_json=True, **kwargs), False
+    buf = io.StringIO()
+    with _console_fullscreen() as fs:
+        real = sys.stdout
+        if fs:
+            sys.stdout = _TeeWriter(real, buf)
+        try:
+            run = run_diagnostics(keys, **kwargs)
+        finally:
+            if fs:
+                sys.stdout = real
+    if fs:
+        try:
+            sys.stdout.write(buf.getvalue())
+            sys.stdout.flush()
+        except Exception:
+            pass
+    return run, fs
 
 
 # 终端侧状态语义轴的唯一来源 (与报告层 STATUS_COLORS 同语义, 对齐 AGENTS.md
@@ -15965,11 +16285,9 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
             print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge(status))
             _cli_print_result(res, verbose=verbose, key=key)
 
-    # 诊断汇总 (2026-11-12 精简): 一段总结框替代 "=" 条 + 两列全模块清单 ——
-    # 状态计数 + 需关注名单; 详细指标在 HTML/JSON 报告与 --verbose
-    for ln in _draw_box(_diagnosis_summary_lines(results), title="诊断汇总",
-                        border_color=C_BLUE, text_color=C_GRAY):
-        print(ln)
+    # 诊断汇总 (v1.19.x): 只给健康分 + 异常模块数量, **不列异常模块清单**;
+    # 详细指标在 HTML/JSON 报告与 --verbose
+    _print_diagnosis_summary(results)
 
     # 记录本次运行的完整数据, 供报告生成使用
     # v1.9.0: Evidence 升为一等结构 — v2 分支夹带在 res 里的过渡键 _evidence
@@ -18564,6 +18882,29 @@ HEALTH_GRADE_TABLE = [
     (0,  "F", "严重"),
 ]
 
+def _score_scope_counts(status_map):
+    """按状态映射拆出 (扣分口径 counts, 全口径 all_counts, 豁免模块数)。
+
+    **报告层与终端诊断汇总共用这一份口径** (单一来源, 别再各拆一遍):
+      - 扣分口径 counts: 排除评分豁免模块 (iperf3/ipv6/proxy/nattype/loopback)
+        —— 健康分只用它;
+      - 全口径 all_counts: 全部模块 (与"检测结果一览"徽章一致) —— verdict
+        文案与"异常模块数"用它。
+    两个口径并存时**界面上必须说明差异** (否则看起来像算错), 见
+    _diagnosis_summary_lines 的"实检 / 参与计分"。
+    """
+    exempt = set(SCORE_EXEMPT_MODULES)
+    counts, all_counts = {}, {}
+    exempt_count = 0
+    for key, st in (status_map or {}).items():
+        all_counts[st] = all_counts.get(st, 0) + 1
+        if key in exempt:
+            exempt_count += 1
+            continue  # 豁免模块不计入扣分
+        counts[st] = counts.get(st, 0) + 1
+    return counts, all_counts, exempt_count
+
+
 def compute_health_score(counts, text_counts=None):
     """根据模块状态计数算健康分和等级。
 
@@ -18771,16 +19112,8 @@ def build_report(rule_filter=None, diagnosis=None, site_check=None,
 
     # 状态计数 (按模块状态)
     # 豁免模块不参与扣分: iperf3(未配置不是故障), ipv6(可选), proxy/VPN(环境特性), nattype(运营商侧)
-    EXEMPT_MODULES = set(SCORE_EXEMPT_MODULES)
-    counts = {}          # 扣分口径: 不含豁免模块
-    all_counts = {}      # 文案口径: 全部模块 (与"检测结果一览"的徽章一致)
-    exempt_count = 0
-    for key, st in status_map.items():
-        all_counts[st] = all_counts.get(st, 0) + 1
-        if key in EXEMPT_MODULES:
-            exempt_count += 1
-            continue  # 豁免模块不计入扣分
-        counts[st] = counts.get(st, 0) + 1
+    # 口径与终端诊断汇总同源 (_score_scope_counts), 别在这里另拆一遍
+    counts, all_counts, exempt_count = _score_scope_counts(status_map)
 
     # 客户视图模块列表
     modules = []
@@ -22835,8 +23168,7 @@ def _health_box_lines(report):
     label = str(health.get("label") or "").strip()
     cells = 26
     filled = (cells * score_i) // 100
-    g_color = {"A": C_GREEN, "B": C_GREEN, "C": C_YELLOW,
-               "D": C_YELLOW, "F": C_RED}.get(grade, C_WHITE)
+    g_color = _grade_color(grade)
     head = _c(f"{score_i}", C_BOLD) + _c(" / 100", C_GRAY)
     if grade:
         head += "  " + _c(f"{grade} 级", g_color) + (
@@ -23264,7 +23596,9 @@ def _scene_menu(install=False, pip_mirror=None):
         for ln in _menu_banner_lines(notice=notice):
             print(ln)
         print()
-        for ln in _menu_item_lines(show_desc=_term_width() >= 64):
+        # v1.19.x: 副行在**窄或矮**终端收起 (画布宽高都是冻结的固定值)
+        for ln in _menu_item_lines(show_desc=(_term_width() >= 64
+                                              and _term_height() >= 26)):
             print(ln)
         print()
         # v1.17.0: 异常上报开关。退出项只出现一次 —— 之前这行自带一个
@@ -23341,13 +23675,17 @@ def interactive_menu(install=False, pip_mirror=None):
     SPEEDTEST_CONFIG["use_speedtest_net"] = True
     if not SPEEDTEST_CONFIG.get("ookla_server_id"):
         SPEEDTEST_CONFIG["ookla_server_id"] = OOKLA_DEFAULT_SERVER_ID
-    # v1.17.0: 首次运行告知异常自动上报 (征询同意; 非 TTY 静默跳过)
-    try:
-        _offer_log_reporting_notice()
-    except Exception:
-        pass
-    if not _scene_menu(install=install, pip_mirror=pip_mirror):
-        return
+    # v1.19.x: 交互会话走**备用屏幕缓冲区** (程序独占整屏, 退出时恢复用户
+    # 原屏幕)。菜单本来每屏都要 cls 清屏, 换备用屏幕后不再污染回滚缓冲,
+    # 且整屏尺寸固定 → 长内容不会把边框挤歪。
+    with _console_fullscreen():
+        # v1.17.0: 首次运行告知异常自动上报 (征询同意; 非 TTY 静默跳过)
+        try:
+            _offer_log_reporting_notice()
+        except Exception:
+            pass
+        if not _scene_menu(install=install, pip_mirror=pip_mirror):
+            return
 
 
 def _module_menu_lines():
@@ -23879,10 +24217,12 @@ def main():
         keys = DIAGNOSE_PROFILES[profile]
         print(_c(f"  按场景诊断: {profile} "
                  f"(模块: {', '.join(keys)})", C_BOLD))
-        run_diagnostics(keys, verbose=args.verbose, as_json=args.json,
-                        no_color=args.no_color, install=args.install,
-                        parallel=args.parallel, max_workers=args.max_workers,
-                        pip_mirror=args.pip_mirror)
+        # v1.19.x: 跑诊断时占用备用屏幕 (固定宽高), 退出后结论写回正常屏幕
+        _run_diagnostics_on_screen(
+            keys, verbose=args.verbose, as_json=args.json,
+            no_color=args.no_color, install=args.install,
+            parallel=args.parallel, max_workers=args.max_workers,
+            pip_mirror=args.pip_mirror)
         # 根因分析 (基于 run_diagnostics 写入的 LAST_RUN["results"])
         # v1.6.0 (PR-B): 按场景规则集评估, 避免 gaming 报 wifi 弱等无关根因
         if LAST_RUN and LAST_RUN.get("results"):
@@ -23955,10 +24295,12 @@ def main():
                 print(_c("  例:   netpulse.py port --port-target 192.168.1.1:443,8.8.8.8:53", C_GRAY))
                 print(_c("       或: netpulse.py all --port-target 8.8.8.8:53", C_GRAY))
                 sys.exit(4)  # D2: 参数错 (缺少 --port-target)
-        run_diagnostics(keys, verbose=args.verbose, as_json=args.json,
-                        no_color=args.no_color, install=args.install,
-                        parallel=args.parallel, max_workers=args.max_workers,
-                        pip_mirror=args.pip_mirror)
+        # v1.19.x: 跑诊断时占用备用屏幕 (固定宽高), 退出后结论写回正常屏幕
+        _run_diagnostics_on_screen(
+            keys, verbose=args.verbose, as_json=args.json,
+            no_color=args.no_color, install=args.install,
+            parallel=args.parallel, max_workers=args.max_workers,
+            pip_mirror=args.pip_mirror)
         if args.export:
             _export_reports(args.export)
         _exit_with_status()

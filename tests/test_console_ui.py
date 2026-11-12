@@ -360,27 +360,55 @@ class TestModuleMenuCompact(unittest.TestCase):
 
 
 class TestDiagnosisSummary(unittest.TestCase):
-    """2026-11-12 反馈: 多模块诊断终端只给一段总结, 不逐模块铺开。"""
+    """2026-11-12 反馈: 多模块诊断终端只给一段总结, 不逐模块铺开。
 
-    def test_summary_counts_and_attention(self):
+    v1.19.1 (用户拍板): 汇总只给**得分 + 异常模块数量**, 不再列出异常模块
+    清单 —— 旧版把模块名串成一行, 一多就超出终端宽度把框的右边框挤歪。
+    """
+
+    def test_summary_score_and_abnormal_count(self):
         results = {"gateway": "完成", "dns": "完成", "wifi": "警告",
                    "tcpstats": "异常", "web": "超时", "arp": "未检测"}
         rows = _plain(N._diagnosis_summary_lines(results))
-        self.assertIn("✓ 完成 2", rows[0])
-        self.assertIn("⚠ 警告 1", rows[0])
-        self.assertIn("✗ 异常 1", rows[0])
-        self.assertIn("○ 超时 1", rows[0])
-        self.assertIn("○ 未检测 1", rows[0])
-        self.assertIn("需关注", rows[1])
-        # 需关注名单必须带模块中文名与状态 (未检测不算关注项)
-        self.assertIn(f"{N.MODULE_MAP['wifi'][0]} (警告)", rows[1])
-        self.assertIn(f"{N.MODULE_MAP['tcpstats'][0]} (异常)", rows[1])
-        self.assertNotIn(N.MODULE_MAP["arp"][0], rows[1])
+        self.assertRegex(rows[0], r"健康分 \d+ / 100")
+        self.assertIn("级", rows[0])
+        # 扣分口径: 完成 2 / 警告 1 (-2) / 异常 1 (-20) / 超时 1 (-10) → 68 分
+        self.assertIn("68 / 100", rows[0])
+        self.assertIn("C 级", rows[0])
+        # 口径必须写明 (实检项数 vs 参与计分项数), 否则看起来像算错
+        self.assertIn("6 项参与计分", rows[0])
+        # 异常模块数 = 警告 + 异常 + 超时 (未检测不算有问题)
+        self.assertIn("异常模块 3 个", rows[1])
+        self.assertIn("警告 1", rows[1])
+        self.assertIn("异常 1", rows[1])
+        self.assertIn("超时 1", rows[1])
+
+    def test_summary_does_not_list_module_names(self):
+        """不得再列异常模块清单 (只给数量)。"""
+        results = {"gateway": "完成", "wifi": "警告", "tcpstats": "异常"}
+        text = "\n".join(_plain(N._diagnosis_summary_lines(results)))
+        for k in results:
+            self.assertNotIn(N.MODULE_MAP[k][0], text,
+                             f"汇总仍列出了模块名: {k}")
 
     def test_summary_all_ok(self):
         rows = _plain(N._diagnosis_summary_lines(
             {"gateway": "完成", "dns": "完成"}))
-        self.assertIn("✓ 全部完成，未发现问题", rows[1])
+        self.assertIn("100 / 100", rows[0])
+        self.assertIn("✓ 未发现异常模块", rows[1])
+
+    def test_summary_empty(self):
+        rows = _plain(N._diagnosis_summary_lines({}))
+        self.assertIn("无结果", rows[0])
+
+    def test_summary_score_matches_report_layer(self):
+        """汇总里的健康分必须与报告层同口径 (同源 _score_scope_counts)。"""
+        results = {"gateway": "完成", "dns": "完成", "wifi": "警告",
+                   "tcpstats": "异常", "web": "超时", "arp": "未检测"}
+        counts, all_counts, _ex = N._score_scope_counts(results)
+        health = N.compute_health_score(counts, text_counts=all_counts)
+        rows = _plain(N._diagnosis_summary_lines(results))
+        self.assertIn(f"健康分 {health['score']} / 100", rows[0])
 
     def test_print_modules_false_skips_flood(self):
         """print_modules=False: 无 ▶ 逐模块块, 保留诊断汇总框。"""
