@@ -378,7 +378,8 @@ def _offer_elevation_relaunch(args_tail=None, reason="", input_fn=None):
     print()
     print(_c(f"  ⚠ {reason}", C_YELLOW))
     try:
-        ans = input_fn(_c("  以管理员身份重启 NetPulse 继续? [y/N] ", C_GREEN)).strip().lower()
+        ans = input_fn(_c("  以管理员身份重启 NetPulse 继续? [y/N] » ",
+                          C_GREEN)).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         return
@@ -3582,16 +3583,21 @@ def ensure_scapy(auto_yes=False, mirror=None):
         return False
 
     print()
-    print(_c("  ┌──────────────────────────────────────────────────────────┐", C_YELLOW))
-    print(_c("  │ scapy 未安装：DHCP 完整检测(发现多服务器干扰)需要它。    │", C_YELLOW))
-    print(_c("  │ 完整检测还需 Npcap 抓包驱动 (Windows)。                  │", C_YELLOW))
-    print(_c("  └──────────────────────────────────────────────────────────┘", C_YELLOW))
+    # 控制台现代化批次 2: 手工排框 → _draw_box 统一闭环框 (宽度自适应)
+    for ln in _draw_box(["scapy 未安装：DHCP 完整检测(发现多服务器干扰)需要它。",
+                         "完整检测还需 Npcap 抓包驱动 (Windows)。"],
+                        title="需要安装组件", border_color=C_YELLOW,
+                        text_color=C_YELLOW):
+        print(ln)
 
     if auto_yes:
         ans = "y"
     else:
         try:
-            ans = input(_c("  是否现在自动安装 scapy (+Npcap)? [y/N] ", C_GREEN)).strip().lower()
+            ans = input(_c("  是否现在自动安装 scapy (+Npcap)? ",
+                           C_GREEN) + _c("[y=安装", C_GREEN) + _c(" / ",
+                           C_GRAY) + _c("Enter=跳过", C_RED)
+                        + _c("] » ", C_GREEN)).strip().lower()
         except (EOFError, KeyboardInterrupt):
             ans = "n"
     if ans not in ("y", "yes"):
@@ -8072,7 +8078,9 @@ class Iperf3Tester:
         if not auto_download:
             return None
         try:
-            ans = input(_c("  未找到 iperf3.exe, 是否自动下载到程序目录? [Y/n] ",
+            ans = input(_c("  未找到 iperf3.exe, 是否自动下载到程序目录? ",
+                           C_GREEN) + _c("[Y=下载", C_GREEN) + _c(" / ",
+                           C_GRAY) + _c("n=跳过", C_RED) + _c("] » ",
                            C_GREEN)).strip().lower()
         except (EOFError, RuntimeError):
             return None
@@ -10228,7 +10236,7 @@ def _prompt_for_port_targets():
     print(_c("  可选后缀: /udp 改 UDP, /N 改采样次数, 例: 8.8.8.8:53/udp/8", C_GRAY))
     print(_c("  默认: TCP 协议, 采样 4 次", C_GRAY))
     try:
-        spec = input(_c("  目标 > ", C_GREEN)).strip()
+        spec = input(_c("  目标 » ", C_GREEN)).strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return None
@@ -10279,7 +10287,7 @@ def _prompt_for_iperf3():
     print(_c("  iperf3 链路吞吐测试 (需自备服务器, 通常在出口/IDC)", C_YELLOW))
     print(_c("  直接回车=跳过 (该模块将提示缺少服务器)", C_GRAY))
     try:
-        spec = input(_c("  iperf3 server (HOST 或 HOST:PORT, 缺省 :5201) > ",
+        spec = input(_c("  iperf3 server (HOST 或 HOST:PORT, 缺省 :5201) » ",
                         C_GREEN)).strip()
     except (EOFError, KeyboardInterrupt):
         print()
@@ -10309,7 +10317,7 @@ def _prompt_for_web_targets(input_fn=None):
     print(_c("  网页体检: 默认检测 3 个国内大站 (QQ/百度/阿里云)。", C_YELLOW))
     print(_c("  客户指定的站点 (如 OA/CRM) 可在此追加。", C_GRAY))
     try:
-        spec = input_fn(_c("  追加体检站点 [Enter=不追加 / 完整URL, 逗号分隔最多5个] > ",
+        spec = input_fn(_c("  追加体检站点 [Enter=不追加 / 完整URL, 逗号分隔最多5个] » ",
                            C_GREEN)).strip()
     except (EOFError, KeyboardInterrupt):
         print()
@@ -10344,7 +10352,7 @@ def _prompt_for_speedtest_node(input_fn=None):
     print(_c(f"  当前 Ookla 测速节点 ID: {cur} (默认 3633=上海电信)。", C_YELLOW))
     try:
         spec = input_fn(_c("  换测速节点? [Enter=不换 / 服务器ID 或 host:port, "
-                           "如 5396=北京联通] > ", C_GREEN)).strip()
+                           "如 5396=北京联通] » ", C_GREEN)).strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return None
@@ -10359,7 +10367,7 @@ def _prompt_for_iperf3_mode(input_fn=None):
     """
     input_fn = input_fn or input
     try:
-        ans = input_fn(_c("  测速口径? [Enter=TCP吞吐 / u=UDP抖动丢包(语音游戏口径)] > ",
+        ans = input_fn(_c("  测速口径? [Enter=TCP吞吐 / u=UDP抖动丢包(语音游戏口径)] » ",
                           C_GREEN)).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
@@ -14061,7 +14069,13 @@ def _prompt_for_capture(input_fn=None, resume_tail=None):
     if not sys.stdin.isatty():
         return None, CAPTURE_DEFAULT_MB
     input_fn = input_fn or input
-    print(_c("  ── 抓包取证（可选）──────────────────────────", C_GRAY))
+    # 控制台现代化批次 2: 抓包说明改统一闭环框 (说明在 precheck 前给出,
+    # 条件不满足时用户同样知道这功能是什么, 只差条件)
+    for ln in _draw_box(["掉线/抖动发生时自动保存前后 30 秒原始报文 (.pcap)",
+                         "Wireshark 可直接打开; 仅保留包头与域名, 不存账号密码"],
+                        title="抓包取证（可选）", border_color=C_GRAY,
+                        text_color=C_GRAY):
+        print(ln)
     cap = _PcapCaptureSession("slice", CAPTURE_DEFAULT_MB)
     if not cap.precheck():
         print(_c(f"  ✘ 抓包暂不可用: {cap.unavailable_reason}", C_YELLOW))
@@ -14079,11 +14093,9 @@ def _prompt_for_capture(input_fn=None, resume_tail=None):
             pass
         return None, CAPTURE_DEFAULT_MB
     print(_c("  ✔ 抓包条件满足: Npcap · 管理员权限 · 抓包接口已就绪", C_GREEN))
-    print(_c("     掉线/抖动发生时自动保存前后 30 秒原始报文 (.pcap),", C_GRAY))
-    print(_c("     Wireshark 可直接打开; 仅保留包头与域名, 不存账号密码。", C_GRAY))
     try:
         ans = input_fn(_c("  开启抓包取证? [Enter=不开启 / y=事件切片 / "
-                          "f=全程 / s=切片+改上限]: ", C_GREEN)).strip().lower()
+                          "f=全程 / s=切片+改上限] » ", C_GREEN)).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         return None, CAPTURE_DEFAULT_MB
@@ -14093,7 +14105,7 @@ def _prompt_for_capture(input_fn=None, resume_tail=None):
         return "full", CAPTURE_DEFAULT_MB
     if ans.startswith("s"):
         try:
-            mb_s = input_fn(_c("  抓包缓冲上限 MB (默认 64, 最小 8): ",
+            mb_s = input_fn(_c("  抓包缓冲上限 MB (默认 64, 最小 8) » ",
                                C_GREEN)).strip()
             mb = int(mb_s) if mb_s else CAPTURE_DEFAULT_MB
         except (EOFError, KeyboardInterrupt, ValueError):
@@ -15332,6 +15344,76 @@ def _columnize(cells, columns=2, gap=3):
     return out
 
 
+# ── 控制台现代化批次 2 · 渲染基础设施 ──
+# 约束 (docs/spec.md §9): 16 色基线; 只用点阵字体安全字符
+# (┌┐└┘│─ ✓ ✗ ⚠ ○ … █ ░ ■ ● · »); 一切对齐/补边走 _disp_width (CJK=2, ANSI 不计)。
+
+
+def _term_width():
+    """终端可用宽度 (列数); 取不到按 80, 下限 40。自适应排版统一走这里。"""
+    try:
+        cols = int(shutil.get_terminal_size((80, 24)).columns)
+    except Exception:
+        return 80
+    return max(40, min(200, cols))
+
+
+def _draw_box(lines, title=None, border_color=None, text_color=None,
+              indent="  "):
+    """闭环提示框 (批次 2): 标题嵌上边框, 宽度按内容自适应。
+
+    lines: 框内文字行 (可含 ANSI, 宽度按 _disp_width 计); 空串 = 空行。
+    返回字符串行列表 (含缩进与 ANSI), 调用方自行 print —— 纯函数, 便于
+    测试断言 (与 v1.19.x 告知框修复同一套宽度口径, 消灭手工排框)。
+    """
+    border_color = border_color if border_color is not None else C_GRAY
+    text_color = text_color if text_color is not None else C_WHITE
+    content = list(lines)
+    inner = max((_disp_width(l) for l in content), default=0) + 2  # 两侧各留一空格
+    head = None
+    if title:
+        head = "─ " + str(title) + " "
+        inner = max(inner, _disp_width(head) + 1)
+    out = [_c(indent + ("┌" + head + "─" * (inner - _disp_width(head))
+              if head else "┌" + "─" * inner) + "┐", border_color)]
+    for l in content:
+        pad = " " * max(0, inner - 1 - _disp_width(l))
+        out.append(_c(indent + "│ " + l + pad + "│", text_color))
+    out.append(_c(indent + "└" + "─" * inner + "┘", border_color))
+    return out
+
+
+# 进度列表的状态符号 (色 + 形双编码, 色弱/黑白打印不丢语义)。
+# 「超时/未检测」用空心圆 ○ (没跑完 ≠ 故障), 与 STATUS_STYLE 的中性灰对齐。
+CLI_STATUS_MARKS = {
+    "完成": ("✓", C_GREEN), "正常": ("✓", C_GREEN),
+    "警告": ("⚠", C_YELLOW),
+    "异常": ("✗", C_RED), "错误": ("✗", C_RED),
+    "超时": ("○", C_GRAY),
+    "未检测": ("○", C_GRAY),
+}
+
+
+def _progress_bar(done, total, current=None, width=36):
+    """整体进度条行 (批次 2): `██████░░░░  12/23 · 正在 网页体验 …`。纯函数。"""
+    done = max(0, min(int(done), int(total)))
+    cells = max(10, int(width))
+    filled = (cells * done) // max(1, int(total))
+    line = "█" * filled + "░" * (cells - filled) + f"  {done}/{total}"
+    if current:
+        line += f" · 正在 {current} …"
+    return line
+
+
+def _module_progress_row(idx, total, name, status=None):
+    """进度列表单行 (批次 2): 未完成 → `… 名称` 灰; 完成 → 状态符号+色。纯函数。"""
+    prefix = f"[{idx}/{total}] "
+    if status:
+        mark, color = CLI_STATUS_MARKS.get(status, ("○", C_GRAY))
+        return _c(prefix + mark + " " + name, color)
+    return _c(prefix + "… " + name, C_GRAY)
+
+
 # 终端侧状态语义轴的唯一来源 (与报告层 STATUS_COLORS 同语义, 对齐 AGENTS.md
 # 「不要另立映射」的口径)。「超时」在报告层是中性深灰 #334155 ("没跑完, 不是坏"),
 # 终端原先画红与「异常/错误」同级刺眼属语义错配, 现对齐为灰 (16 色基线取 C_GRAY)。
@@ -15727,13 +15809,38 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
         sys.stdout = sys.stderr
 
     if banner:
-        bar = "=" * 60
-        print(_c(bar, C_BLUE))
-        print(_c(f"  {APP_NAME} v{APP_VERSION}", C_BOLD) +
-              _c("   Windows 网络诊断 · 命令行模式", C_GRAY))
+        # 控制台现代化批次 2: "="×60 → 闭环框; 本机/网关/DNS (毫秒级本地
+        # 查询) 进框。公网 IP/归属地是慢查询, 仍由下方 sys_info 块负责
+        # (那里同时负责装进 LAST_RUN, 语义是"诊断数据"而非横幅装饰)。
+        _seg = []
+        try:
+            _lip = get_local_ip() or None
+        except Exception:
+            _lip = None
+        try:
+            _gw = get_default_gateway() or None
+        except Exception:
+            _gw = None
+        try:
+            _dl = get_dns_servers()
+            _dns = (_dl[0] if isinstance(_dl, list) and _dl else None)
+        except Exception:
+            _dns = None
+        for _lab, _v in (("本机", _lip), ("网关", _gw), ("DNS", _dns)):
+            if _v:
+                _seg.append(f"{_lab} {_v}")
+        _blines = []
         if parallel and len(keys) > 1:
-            print(_c(f"  并行模式 (max_workers={max_workers})", C_GRAY))
-        print(_c(bar, C_BLUE))
+            _blines.append(f"并行模式 (max_workers={max_workers})")
+        if _seg:
+            _blines.append("  ".join(_seg))
+        if not _blines:
+            _blines = [" "]
+        for _ln in _draw_box(
+                _blines,
+                title=f"{APP_NAME} v{APP_VERSION} · 网络诊断 · 命令行模式",
+                border_color=C_BLUE, text_color=C_GRAY):
+            print(_ln)
 
     # 系统信息
     sys_info = {}
@@ -15776,8 +15883,8 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
             "geo": geo_str,
             "ipv6_public_ip": pub_v6 or "",
         }
-        # v1.14.7: 分组排版 — 原来 7 项挤一行, 窄终端折行错乱难读
-        print(_c(f"  本机IP: {lip}    网关: {gw}    DNS: {dns}", C_WHITE))
+        # v1.14.7 分组排版已被批次 2 横幅框取代: 本机/网关/DNS 进了顶部闭环框,
+        # 这里只补慢查询的公网侧信息 (公网 IP / 归属地 / ASN / IPv6)。
         _l2 = f"  公网IP: {pub}"
         if geo_str:
             _l2 += f"    📍 {geo_str}"
@@ -16150,6 +16257,42 @@ def _run_diagnostics_parallel(keys, max_workers, total):
     completed = {}       # key -> (name, status, res)
     completed_lock = threading.Lock()
 
+    # 控制台现代化批次 2: VT 可用 → 顶部整体进度条 + 两列状态列表, 每完成
+    # 一项整块重绘 (光标上移 + \x1b[K 逐行清写); VT 不可用/重定向 → 原
+    # 静态两列 (_print_cols), 功能零回退。行数恒定是整块重绘的定位前提
+    # (keys 固定 → 网格行数固定)。
+    live = sys.stdout.isatty() and _cli_enable_vt()
+    names = {k: MODULE_MAP.get(k, (k, k))[0] for k in keys}
+
+    def _progress_block():
+        cur = next((names[k] for k in keys if k not in completed), None)
+        rows = []
+        for i, k in enumerate(keys, 1):
+            st = completed.get(k)
+            rows.append(_module_progress_row(i, total, names[k],
+                                             st[1] if st else None))
+        grid = _columnize(rows, columns=2, gap=4)
+        bar = _c("  " + _progress_bar(len(completed), total, cur), C_CYAN)
+        return [bar, ""] + ["  " + g for g in grid]
+
+    _blk_len = 0
+
+    def _refresh():
+        """整块重绘进度块 (仅 live 模式)。主线程专属 —— worker 只存不打。"""
+        nonlocal _blk_len
+        if not live:
+            return
+        lines = _progress_block()
+        if _blk_len == 0:
+            for ln in lines:
+                sys.stdout.write(ln + "\n")
+            _blk_len = len(lines)
+        else:
+            sys.stdout.write(f"\x1b[{_blk_len}A")
+            for ln in lines:
+                sys.stdout.write("\x1b[K" + ln + "\n")
+        sys.stdout.flush()
+
     def _run_one(key):
         # v1.15.0 (审查 P1-14): 与顺序模式 (_run_diagnostics_sequential) 同构的
         # try/except —— 旧版这里没有, 一次异常会从 worker 冒到主线程
@@ -16164,16 +16307,19 @@ def _run_diagnostics_parallel(keys, max_workers, total):
             _emit_probe_failure(key, e, tb_text, detail="模块调度异常")
             status, res = "错误", {"error": str(e),
                                    "_exc": _exc_meta("模块:%s" % key, e)}
-        # 存结果, 不立即打 (主线程按 keys 顺序统一打)
+        # 存结果, 不立即打 (主线程按 keys 顺序统一处理)
         with completed_lock:
             completed[key] = (name, status, res)
         return key
 
-    # 启动行: 主线程按 keys 顺序打。v1.14.7: 两列排版 (23 行 → 12 行)
-    _print_cols([
-        (f"  [{i}/{total}] 正在 {MODULE_MAP[k][0]} …",
-         _c(f"  [{i}/{total}] 正在 {MODULE_MAP[k][0]} …", C_GRAY))
-        for i, k in enumerate(keys, 1)])
+    # 启动: live 模式画初始进度块 (全部 "… 灰"); 否则原静态两列 "正在 …"
+    if live:
+        _refresh()
+    else:
+        _print_cols([
+            (f"  [{i}/{total}] 正在 {names[k]} …",
+             _c(f"  [{i}/{total}] 正在 {names[k]} …", C_GRAY))
+            for i, k in enumerate(keys, 1)])
 
     # v1.12.2: 带宽/负载敏感模块不参与并发 — 普通模块先并发跑完,
     # 独占模块再逐个串行跑 (测量期间网络空闲, 口径与单独运行一致)
@@ -16194,29 +16340,37 @@ def _run_diagnostics_parallel(keys, max_workers, total):
                 # 这里不改变报告口径 (仍不补模块), 但**不再静默**: 写日志 + 推送。
                 try:
                     _emit_runtime_event_async(
-                        "error", e, "并行调度:%s" % key,
+                        "error", e, "并行调度",
                         detail="worker 抛异常, 该模块未进入结果")
                 except Exception:
                     pass
+            _refresh()
 
     # 独占阶段: 测速/Bufferbloat/iperf3/TCP 并发逐个跑
     for key in solo_keys:
         _run_one(key)
+        _refresh()
 
-    # 完成行: 主线程按 keys 顺序打。v1.14.7: 两列排版 (状态徽章计入对齐宽)
-    _rows = []
+    # 完成: live 模式最后一次 _refresh 已呈现全部状态符号, 不再重复打
+    # 结果行; 字典填充两种模式都必须做 (报告/健康分的数据源)。
     for i, key in enumerate(keys, 1):
         if key not in completed:
             # 理论上不会到这里 (except 块也存了), 但兜底
             continue
         name, status, res = completed[key]
-        _rows.append((
-            f"  [{i}/{total}] ✓ {name} [{status}]",
-            _c(f"  [{i}/{total}] ✓ {name}", C_BOLD) + "  "
-            + _cli_status_badge(status)))
         results[key] = status
         full[key] = res
-    _print_cols(_rows)
+    if not live:
+        _rows = []
+        for i, key in enumerate(keys, 1):
+            if key not in completed:
+                continue
+            name, status, res = completed[key]
+            _rows.append((
+                f"  [{i}/{total}] ✓ {name} [{status}]",
+                _c(f"  [{i}/{total}] ✓ {name}", C_BOLD) + "  "
+                + _cli_status_badge(status)))
+        _print_cols(_rows)
     return results, full
 
 
@@ -22195,7 +22349,7 @@ def prompt_export_report():
     if not LAST_RUN:
         return
     try:
-        ans = input(_c("  生成诊断报告? [Enter=HTML / t=TXT / N=不导出] ",
+        ans = input(_c("  生成诊断报告? [Enter=HTML / t=TXT / N=不导出] » ",
                        C_GREEN)).strip().lower()
     except (EOFError, KeyboardInterrupt):
         return
@@ -22383,7 +22537,7 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
     cust = (customer or "").strip()
     while not cust:
         try:
-            cust = input(_c("  客户名称 (必填) > ", C_GREEN)).strip()
+            cust = input(_c("  客户名称 (必填) » ", C_GREEN)).strip()
         except (EOFError, KeyboardInterrupt):
             print(_c("\n  已取消。", C_YELLOW))
             return
@@ -22391,9 +22545,9 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
             print(_c("  客户名称不能为空。", C_YELLOW))
     try:
         raw_t = input(_c(f"  检测时间 (回车 = "
-                         f"{datetime.now().strftime('%Y-%m-%d %H:%M')}) > ",
+                         f"{datetime.now().strftime('%Y-%m-%d %H:%M')}) » ",
                          C_GREEN)).strip()
-        plan = input(_c("  签约带宽 (建议填写, 用于达标判定, 如 500M) > ",
+        plan = input(_c("  签约带宽 (建议填写, 用于达标判定, 如 500M) » ",
                         C_GREEN)).strip()
     except (EOFError, KeyboardInterrupt):
         print(_c("\n  已取消。", C_YELLOW))
@@ -22422,7 +22576,7 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
         while True:
             try:
                 ans = input(_c(f"  [{i}/{len(SITE_CHECK_ITEMS)}] {it['label']}"
-                               f"  {opts} > ", C_GREEN)).strip()
+                               f"  {opts} » ", C_GREEN)).strip()
             except (EOFError, KeyboardInterrupt):
                 print(_c("\n  机房勾选提前结束, 已选项目保留。", C_YELLOW))
                 ans = ""
@@ -22434,7 +22588,7 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
                 break
             print(_c("  无效输入, 请输入选项数字或直接回车跳过。", C_YELLOW))
     try:
-        site_note = input(_c("  现场备注 (可空) > ", C_GREEN)).strip()
+        site_note = input(_c("  现场备注 (可空) » ", C_GREEN)).strip()
     except (EOFError, KeyboardInterrupt):
         site_note = ""
 
@@ -22626,32 +22780,110 @@ def _export_scene_report(profile, title, report=None):
     return path, None
 
 
+def _pause_menu_or_open(path=None):
+    """完成屏暂停 (控制台现代化批次 2): Enter=返回菜单, [H]=打开报告。
+
+    EOF/Ctrl+C 静默返回 (与 _pause_enter 同语义)。打开动作仅在用户显式
+    按 [H] 时执行; 失败提示一行, 不中断回菜单。
+    """
+    msg = "  [Enter] 返回菜单" + (" / [H] 打开报告" if path else "") + " » "
+    try:
+        ans = input(_c(msg, C_GREEN)).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if path and ans in ("h", "open"):
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)
+            else:
+                webbrowser.open("file://" + path)
+        except Exception:
+            try:
+                print(_c(f"  ✗ 无法打开报告: {path}", C_YELLOW))
+            except Exception:
+                pass
+
+
+def _health_box_lines(report):
+    """完成屏健康分区行 (批次 2): 分数/等级 + 分数条 + 状态分布 + 豁免说明。
+
+    数据与 HTML 报告**严格同源**: score/grade/label 取 report["health"];
+    状态分布对 report["summary"] (全口径) 计数 —— 与 HTML 状态分布条同一
+    口径, 避免"框内有红但分布条没红"的口径困惑; 豁免名单走 _exempt_names。
+    返回纯函数行列表 (可含 ANSI); health 缺失返回 []。
+    """
+    health = (report or {}).get("health") or {}
+    score = health.get("score")
+    if score is None:
+        return []
+    score_i = max(0, min(100, int(score)))
+    grade = str(health.get("grade") or "").strip()
+    label = str(health.get("label") or "").strip()
+    cells = 26
+    filled = (cells * score_i) // 100
+    g_color = {"A": C_GREEN, "B": C_GREEN, "C": C_YELLOW,
+               "D": C_YELLOW, "F": C_RED}.get(grade, C_WHITE)
+    head = _c(f"{score_i}", C_BOLD) + _c(" / 100", C_GRAY)
+    if grade:
+        head += "  " + _c(f"{grade} 级", g_color) + (
+            _c(f" · {label}", C_GRAY) if label else "")
+    meta = []
+    sel = (report or {}).get("selected_modules")
+    tot = (report or {}).get("total_modules")
+    if isinstance(sel, int) and isinstance(tot, int) and tot:
+        meta.append(f"实检 {sel}/{tot} 项")
+    dur = _fmt_duration((report or {}).get("duration_ms"))
+    if dur:
+        meta.append(dur)
+    if meta:
+        head += "   " + _c(" · ".join(meta), C_GRAY)
+    lines = [head,
+             _c("█" * filled + "░" * (cells - filled), g_color)
+             + _c(f"  {score_i}", C_GRAY)]
+    summary = (report or {}).get("summary") or {}
+    dist = Counter(summary.values())
+    segs = []
+    for st in STATUS_BAR_ORDER:
+        n = dist.get(st) or 0
+        if n:
+            mark, color = CLI_STATUS_MARKS[st]
+            segs.append(_c(f"{mark} {st} {n}", color))
+    if segs:
+        lines.append("   ".join(segs))
+    _exm = _exempt_names(report)
+    if _exm:
+        lines.append(_c("评分豁免: " + "、".join(_exm) + " (不计入扣分)",
+                        C_GRAY))
+    return lines
+
+
 def _scene_summary(profile, title, diagnosis, report=None):
-    """场景完成屏: 健康分 + 一句话根因结论 (复用 _print_diagnosis, PR-A/PR-C)。
+    """场景完成屏 (批次 2): 健康分区框 + 根因结论 (复用 _print_diagnosis)。
 
     report: 预构建报告 dict (v1.6.1 审查 #8), 缺省时兜底自建。
+    健康分/等级/分布与 HTML 报告同源 (_health_box_lines); 健康分不可用时
+    框内如实说明, 不伪装。
     """
     print()
-    print(_c("=" * 60, C_BLUE))
-    print(_c(f"  {APP_NAME} > {title} > 检测完成", C_BOLD))
-    print(_c("-" * 60, C_GRAY))
+    print(_c(f"  {APP_NAME} › {title} › 检测完成", C_BOLD))
     try:
         if report is None:
             report = build_report(rule_filter=profile)
-        health = (report or {}).get("health") or {}
-        score = health.get("score")
-        grade = health.get("grade")
-        if score is not None:
-            print(_c(f"  网络健康: {score} / 100" +
-                     (f" （{grade}）" if grade else ""), C_BOLD))
-            print()
     except Exception:
-        pass
+        report = report if isinstance(report, dict) else None
+    inner = _health_box_lines(report)
+    if not inner:
+        inner = [_c("本次未能计算健康分 (数据不足或报告构建失败)", C_GRAY)]
+    for ln in _draw_box(inner, title="网络健康", border_color=C_BLUE,
+                        text_color=C_GRAY):
+        print(ln)
+    print()
     if diagnosis is not None:
         _print_diagnosis(diagnosis)
     else:
         print(_c("  ⚠ 本次未能完成根因分析。", C_YELLOW))
-    print(_c("-" * 60, C_GRAY))
+    print(_c("─" * min(_term_width() - 2, 76), C_GRAY))
 
 
 def _pause_enter(msg="  按 Enter 返回主菜单..."):
@@ -22666,7 +22898,7 @@ def _run_scene_monitor(install=False, pip_mirror=None):
     """[7] 持续盯障: 输入分钟数 (1-1440, 默认 10) → run_monitor_mode。"""
     print(_c("  持续盯障: 持续监测外网连通性, 找偶发掉线/抖动。", C_WHITE))
     try:
-        ans = input(_c("  盯障时长（分钟, 1-1440, 默认 10）: ", C_GREEN)).strip()
+        ans = input(_c("  盯障时长（分钟, 1-1440, 默认 10）» ", C_GREEN)).strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return
@@ -22746,8 +22978,9 @@ def _run_scene(profile, install=False, pip_mirror=None):
         print(_c(f"  ✗ 报告保存失败: {err}", C_RED))
     else:
         print(_c(f"  📄 报告已保存: {path}", C_GREEN))
-    # v1.6.1: 停一拍再回菜单 — 否则完成屏 (健康分/根因/报告路径) 瞬间被清掉
-    _pause_enter()
+    # v1.6.1: 停一拍再回菜单 — 否则完成屏 (健康分/根因/报告路径) 瞬间被清掉。
+    # 批次 2: 换成 [Enter] 回菜单 / [H] 打开报告 的双选项暂停。
+    _pause_menu_or_open(None if err else path)
 
 
 def _menu_clear():
@@ -22769,11 +23002,6 @@ def _menu_clear():
             subprocess.run(["clear"], timeout=2)
         except Exception:
             pass
-
-
-def _perm_badge():
-    """菜单标题权限徽标 (v1.9.7 PR-3): 让用户开屏就知道当前权限状态。"""
-    return _c("    [管理员模式]" if _is_admin() else "    [普通权限]", C_GRAY)
 
 
 def _log_notice_shown():
@@ -22814,19 +23042,16 @@ def _offer_log_reporting_notice():
         return _log_reporting_enabled()
     try:
         lines = _log_notice_text()
-        # 回归修复: 旧版上下横线画到约 47 列就断, 而文字行按显示宽度 (中文=2 列)
-        # 最宽 67 列 —— 右侧既无竖线也无右角, 看起来像"边框没包住文字、右边缺一截"。
-        # 现按 _disp_width (CJK=2, ANSI 不计) 动态算内宽, 补齐右侧 │/┐/┘,
-        # 与 scapy 提示框同款闭环样式; 总宽 ≈72 列, 80 列最小控制台也放得下。
-        inner_w = max(_disp_width(s) for s in lines) + 2   # +2: 两侧各留一空格
-        head = "─ 异常自动上报 "
-        print(_c("\n  ┌" + head + "─" * (inner_w - _disp_width(head)) + "┐",
-                 C_CYAN))
-        for line in lines:
-            print(_c("  │ " + line + " " * (inner_w - 1 - _disp_width(line))
-                     + "│", C_GRAY))
-        print(_c("  └" + "─" * inner_w + "┘", C_CYAN))
-        ans = input(_c("  是否保持开启上报? [Y=开启 / N=关闭]: ", C_GREEN)).strip().lower()
+        # 批次 2: 统一走 _draw_box 闭环框 (宽度自适应)。回归背景: 早期版本
+        # 手工排框横线只画到 47 列, 文字行最宽 67 列, 右侧缺口被当成"边框没
+        # 包住内容" (tests/test_log_report.py::test_notice_box_encloses_text 锁)。
+        print()
+        for ln in _draw_box(lines, title="异常自动上报",
+                            border_color=C_CYAN, text_color=C_GRAY):
+            print(ln)
+        ans = input(_c("  是否保持开启上报? ", C_GREEN)
+                    + _c("[Y=开启", C_GREEN) + _c(" / ", C_GRAY)
+                    + _c("N=关闭", C_RED) + _c("] » ", C_GREEN)).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         return _log_reporting_enabled()
@@ -22843,8 +23068,10 @@ def _toggle_log_reporting_menu():
     cur = _log_reporting_enabled()
     print(_c(f"  异常自动上报当前状态: {'已开启' if cur else '已关闭'}", C_GRAY))
     try:
-        ans = input(_c("  [Y] 开启  [N] 关闭  [T] 运行自检: ",
-                       C_GREEN)).strip().lower()
+        ans = input(_c("  ", C_GREEN) + _c("[Y] 开启", C_GREEN)
+                    + _c("  ", C_GRAY) + _c("[N] 关闭", C_RED)
+                    + _c("  ", C_GRAY) + _c("[T] 运行自检", C_CYAN)
+                    + _c(" » ", C_GREEN)).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         return
@@ -22862,40 +23089,173 @@ def _toggle_log_reporting_menu():
         print(_c("  未做修改。", C_GRAY))
 
 
+# ── 控制台现代化批次 2 · 首页横幅与卡片菜单 ──
+
+_NET_INFO_CACHE = {"ts": 0.0, "data": None, "pub": None, "pub_started": False}
+_NET_INFO_LOCK = threading.Lock()
+
+
+def _menu_net_info():
+    """首页横幅的本机网络信息 (批次 2)。
+
+    本机/网关/DNS 是毫秒级本地查询, 同步取 (30 秒缓存); 公网 IP/归属地是
+    秒级联网查询, 丢后台 daemon 线程 —— **不拖菜单首帧**, 结果下次重绘时
+    自然出现 ("联网后补齐")。任何一步失败静默, 横幅不因查询失败缺行。
+    """
+    now = time.time()
+    with _NET_INFO_LOCK:
+        stale = (now - _NET_INFO_CACHE["ts"] > 30) or _NET_INFO_CACHE["data"] is None
+    if stale:
+        data = {"ip": None, "gw": None, "dns": None}
+        try:
+            data["ip"] = get_local_ip() or None
+        except Exception:
+            pass
+        try:
+            data["gw"] = get_default_gateway() or None
+        except Exception:
+            pass
+        try:
+            _dl = get_dns_servers()
+            data["dns"] = (_dl[0] if isinstance(_dl, list) and _dl
+                           else str(_dl or "") or None)
+        except Exception:
+            pass
+        with _NET_INFO_LOCK:
+            _NET_INFO_CACHE["data"] = data
+            _NET_INFO_CACHE["ts"] = now
+
+        def _fetch_pub():
+            pub, geo_str, isp = None, "", ""
+            try:
+                pub = get_public_ip() or None
+            except Exception:
+                pass
+            if pub:
+                try:
+                    geo = get_ip_geo(pub)
+                    if geo:
+                        geo_str = " / ".join(
+                            b for b in (geo.get("country"), geo.get("region"),
+                                        geo.get("city")) if b)
+                        isp = geo.get("isp", "") or geo.get("asn", "") or ""
+                except Exception:
+                    pass
+            with _NET_INFO_LOCK:
+                _NET_INFO_CACHE["pub"] = (pub, geo_str, isp)
+
+        with _NET_INFO_LOCK:
+            first = not _NET_INFO_CACHE["pub_started"]
+            _NET_INFO_CACHE["pub_started"] = True
+        if first:
+            threading.Thread(target=_fetch_pub, daemon=True,
+                             name="np-menu-pubip").start()
+    with _NET_INFO_LOCK:
+        return (_NET_INFO_CACHE["data"] or {"ip": None, "gw": None, "dns": None},
+                _NET_INFO_CACHE["pub"])
+
+
+def _menu_banner_lines(notice=None, subtitle="网络诊断（场景模式）"):
+    """首页横幅 (批次 2): 闭环框 (标题嵌框 + 权限/本机网络行) + 公网补行。
+
+    返回已着色的行列表, 调用方自行 print。纯排版函数, 网络数据走 _menu_net_info。
+    """
+    data, pub = _menu_net_info()
+    segs = [_c("权限: " + ("管理员" if _is_admin() else "普通"),
+               C_YELLOW if _is_admin() else C_GRAY)]
+    for label, keyk in (("本机", "ip"), ("网关", "gw"), ("DNS", "dns")):
+        v = data.get(keyk)
+        if v:
+            segs.append(_c(f"{label} {v}", C_GRAY))
+    # 窄终端放不下时从右往左丢网络段 (权限段保底), 不折行破坏框
+    room = max(24, _term_width() - len("  ") - 4)
+    while len(segs) > 1 and sum(_disp_width(_ANSI_RE.sub("", s)) + 2
+                                for s in segs) > room:
+        segs.pop()
+    lines = ["  ".join(segs)]
+    out = _draw_box(lines, title=f"{APP_NAME} v{APP_VERSION} · {subtitle}",
+                    border_color=C_CYAN, text_color=C_GRAY)
+    if notice:
+        out.append(_c("  " + notice, C_YELLOW))
+    pub_ip, geo_str, isp = pub or (None, "", "")
+    if pub_ip and pub_ip not in ("未知", "Unknown"):
+        tail = " · ".join(x for x in (geo_str, isp) if x)
+        out.append(_c(f"  公网 {pub_ip}" + (f" · {tail}" if tail else ""),
+                      C_GRAY))
+    return out
+
+
+# 场景菜单卡片副行 (批次 2): 一句话讲清场景测什么。
+# 文案严格对齐 DIAGNOSE_PROFILES 各场景实际包含的模块, 不新增能力承诺。
+SCENE_MENU_DESC = {
+    "slow": "测速 + 缓冲膨胀 + TCP 质量 + WiFi + DNS",
+    "disconnect": "外网连通 + 网关丢包 + DNS + 环路",
+    "web": "DNS + HTTP 体验 + MTU/路由 + TCP 质量",
+    "gaming": "延迟抖动 + NAT 类型 + 缓冲膨胀 + MTU",
+    "wifi": "WiFi 信号 + 信道干扰 + 网关 + 局域网",
+}
+
+# 工具区菜单项 (键, 名称, 副行)
+_SCENE_TOOL_ITEMS = (
+    ("6", "现场检测", "客户信息 + 机房 6 项 → 一页报告/PDF"),
+    ("7", "持续盯障", "定时监测外网, 抓偶发掉线/抖动"),
+    ("9", "高级选项", "模块级单测 / 工程师功能"),
+    ("A", "管理员模式", "抓包取证、Npcap 安装需要"),
+)
+
+
+def _card_row(key, name, desc, name_w, show_desc=True):
+    """菜单卡片行 (批次 2): 亮黑底整行铺底 (ANSI 100), 键号青/名称亮/副行灰。"""
+    row = (_c(f" {key} ", "100;96") + _c(" ", "100")
+           + _c(_pad_disp(name, name_w), "100;97"))
+    if show_desc and desc:
+        row += _c("  ", "100") + _c(desc, "100;90") + _c(" ", "100")
+    return row
+
+
+def _menu_card_lines(show_desc=True):
+    """场景菜单卡片行 (批次 2): 「按问题选场景」+「工具与报告」双分区。
+
+    show_desc=False (窄终端) 时收起副行, 只留键号+名称。返回已着色行列表。
+    """
+    scene_rows = [(key, SCENE_LABELS[p], SCENE_MENU_DESC.get(p, ""))
+                  for key, p in SCENE_MENU_KEYS.items()]
+    all_rows = scene_rows + list(_SCENE_TOOL_ITEMS)
+    name_w = max(_disp_width(n) for _, n, _ in all_rows)
+    out = [_c("按问题选场景", C_WHITE)]
+    out += [_card_row(k, n, d, name_w, show_desc) for k, n, d in scene_rows]
+    out.append("")
+    out.append(_c("工具与报告", C_WHITE))
+    out += [_card_row(k, n, d, name_w, show_desc) for k, n, d in _SCENE_TOOL_ITEMS]
+    return ["  " + ln for ln in out]
+
+
 def _scene_menu(install=False, pip_mirror=None):
     """场景层首页 (PR-A · v1.6.0): 中文场景标签 + 数字回车。
 
     返回 False = 退出程序 ([0] 退出 / [9] 高级页里退出 / Ctrl+C)。
-    v1.9.7 PR-3: 标题权限徽标 + [A] 一键以管理员身份重启。
+    v1.9.7 PR-3: [A] 一键以管理员身份重启。
+    控制台现代化批次 2: 闭环框横幅 (权限/本机网络进框, 公网联网后补行)
+    + 双分区卡片菜单 (副行按 DIAGNOSE_PROFILES 校准, 窄终端自动收起)。
     """
     while True:
         _menu_clear()
-        bar = "=" * 60
-        print(_c(bar, C_BLUE))
-        print(_c(f"  {APP_NAME} v{APP_VERSION}    网络诊断（场景模式）", C_BOLD)
-              + _perm_badge())
         notice = _update_notice_line()
-        if notice:
-            print(_c(f"  {notice}", C_YELLOW))
-        print(_c(bar, C_BLUE))
-        print(_c("  请选择场景（输入数字回车）：", C_WHITE))
+        for ln in _menu_banner_lines(notice=notice):
+            print(ln)
         print()
-        print(f"    {_c('[1]', C_CYAN)} 网络很慢        {_c('[2]', C_CYAN)} 经常断网      {_c('[3]', C_CYAN)} 网页打不开")
-        print(f"    {_c('[4]', C_CYAN)} 游戏卡顿        {_c('[5]', C_CYAN)} WiFi 信号差")
+        for ln in _menu_card_lines(show_desc=_term_width() >= 64):
+            print(ln)
         print()
-        print(f"    {_c('[6]', C_CYAN)} 现场检测（客户报告）")
-        print(f"    {_c('[7]', C_CYAN)} 持续盯障（输入分钟数）")
-        print(f"    {_c('[9]', C_CYAN)} 高级选项（工程师用）   "
-              f"{_c('[A]', C_CYAN)} 管理员模式")
-        print(_c("     (管理员模式 = 以管理员身份重启, 抓包取证/Npcap 安装需要)", C_GRAY))
         # v1.17.0: 异常上报开关。退出项只出现一次 —— 之前这行自带一个
         # "[0] 退出", 与上一行的退出项重复, 菜单看着像有两个退出口。
-        print(_c(f"    {_c('[C]', C_CYAN)} 异常上报: "
-              f"{'已开启' if _log_reporting_enabled() else '已关闭'}"
-              f"    {_c('[0]', C_CYAN)} 退出", C_GRAY))
-        print(_c("-" * 60, C_GRAY))
+        print(_c("    ", C_GRAY) + _c("[C]", C_CYAN)
+              + _c(" 异常上报: ", C_GRAY)
+              + _c("已开启" if _log_reporting_enabled() else "已关闭", C_GRAY)
+              + _c("    ", C_GRAY) + _c("[0]", C_CYAN) + _c(" 退出", C_GRAY))
+        print(_c("─" * min(_term_width() - 2, 76), C_GRAY))
         try:
-            choice = input(_c("  选择 [0-9AC]: ", C_GREEN)).strip().lower()
+            choice = input(_c("  选择 [0-9AC] » ", C_GREEN)).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return False
@@ -22982,15 +23342,11 @@ def _module_menu(install=False, pip_mirror=None):
     last_run = None
     while True:
         _menu_clear()
-        bar = "=" * 60
-        print(_c(bar, C_BLUE))
-        print(_c(f"  {APP_NAME} v{APP_VERSION}    命令行网络诊断", C_BOLD)
-              + _perm_badge())
         notice = _update_notice_line()
-        if notice:
-            print(_c(f"  {notice}", C_YELLOW))
-        print(_c(bar, C_BLUE))
-        print(_c("  工程师模式 (模块级诊断)。运行完成后可返回场景模式主菜单。", C_WHITE))
+        for ln in _menu_banner_lines(notice=notice, subtitle="命令行网络诊断"):
+            print(ln)
+        print(_c("  工程师模式 (模块级诊断)。运行完成后可返回场景模式主菜单。",
+                 C_WHITE))
         idx = 0
         # 全局模块名最大显示宽, 跨分类统一 (保证所有 cell 内的模块名
         # 右端对齐到同一显示列, 行内/行间都齐)
@@ -23037,7 +23393,7 @@ def _module_menu(install=False, pip_mirror=None):
         print(_c("  快捷: 0=全部 a/b/c=按分类 m=盯障 e=导出 d=调试包 r=返回场景 q=退出", C_GRAY))
         print(_c("-" * 60, C_GRAY))
         try:
-            choice = input(_c("  输入 > ", C_GREEN)).strip()
+            choice = input(_c("  输入 » ", C_GREEN)).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
