@@ -25167,12 +25167,14 @@ _GUI_JS = r"""(function () {
                           tested_at: $("#site-time").value,
                           plan: $("#site-plan").value }).then(function (r) {
       if (!r || !r.ok) { $("#site-err").textContent = (r && r.err) || "启动失败"; return; }
-      // 诊断轮询收敛为主轮询一路 (审查 F1): running 回进度页受 leftProgress
-      // 约束 (现场诊断中「返回主页」不再 ≤1s 被拉回), site_ready / error 的
-      // 视图与面板翻折由 renderProgress 统一处理; 不再另起 wait 循环形成
-      // 双路轮询
+      // 诊断轮询收敛为主轮询一路 (审查 F1/F4): 启动成功立即 show("progress")
+      // —— brief 契约「诊断进行中 → 进度页」, 此刻 view 是 "site", 若只靠
+      // renderProgress 的自动跳转 (条件含 view === "home") 会整个诊断期间
+      // 停在静态向导卡; running 中途「返回主页」仍受 leftProgress 约束不被
+      // 拉回, site_ready / error 的视图与面板翻折由 renderProgress 统一处理
       state.siteFlow = true;
       state.leftProgress = false;
+      show("progress");
       pollOnce();
     });
   }
