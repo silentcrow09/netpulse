@@ -226,7 +226,9 @@
   会让 PyInstaller 按 `--name` 重写 spec，Windows 大小写不敏感 → `netpulse.spec`
   直接覆盖仓库 `NetPulse.spec`，**x86 发版分支被静默回退**（实测踩过）。若 `git status`
   见 `NetPulse.spec` 出现 M 且丢失 `IS_X86`/`NETPULSE_ARCH` 逻辑，即被本地构建覆盖，
-  `git checkout -- NetPulse.spec` 还原即可。
+  `git checkout -- NetPulse.spec` 还原即可。注意 `--specpath` 还会改变 `--add-data`
+  相对路径的解析基准（以 spec 目录为准）——脚本里的 speedtest 已改绝对路径 +
+  `--add-data=` 单 token 形式，改回相对路径会复现 "Unable to find build\speedtest\..."。
 - ⚠️ **本地 exe 与线上 exe 字节数不同，不要互相核对**。构建环境不同（Python 小版本、
   PyInstaller 版本、是否内嵌 Ookla exe）→ 同一份代码两次构建可差几十万字节。
   实测 v1.15.1：本地 19,229,389 B vs Actions 19,487,819 B。
