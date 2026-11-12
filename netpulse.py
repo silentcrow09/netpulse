@@ -24606,10 +24606,19 @@ def _module_menu(install=False, pip_mirror=None):
 _GUI_BROWSER_PROC = []   # 浏览器子进程句柄, 防 GC 回收进程对象
 _GUI_SHUTDOWN = threading.Event()   # GUI 停机信号 (Task 3 的 HTTP 服务线程消费)
 
+# 区段级集中 import (Task 2 惯例)。http.server 必须在模块导入期可用:
+# _GuiHandler 的类基址在 class 语句执行时求值, 不能等到 _start_gui_server 才 import。
+import http.server
+import hmac
+import urllib.parse as urllib_parse
+
 
 def _GUI_RESET_FOR_TEST():
     """测试隔离: 清 GUI 区段模块级状态。Task 4/6 在此追加 handler 清理项。"""
     _GUI_SHUTDOWN.clear()
+    _GuiHandler.session = None
+    _GuiHandler.token = None
+    _GuiHandler.shutdown_evt = None
 
 
 def _GUI_LABELS(profile):
@@ -25349,6 +25358,170 @@ def _gui_page():
 
 # 预渲染常量: HTTP handler (Task 4) 直接引用, 避免每请求重建; 内容与 _gui_page() 一致。
 _GUI_PAGE_HTML = _gui_page()
+
+
+def _gui_meta():
+    """/api/scenarios 载荷 (状态色唯一来源 STATUS_COLORS; 文案同源终端菜单)。"""
+    import socket as _s
+    module_desc = {}
+    try:
+        for key, (name, _cls) in MODULE_MAP.items():
+            module_desc[key] = name
+    except Exception:
+        pass
+    return {
+        "version": APP_VERSION,
+        "hostname": _s.gethostname(),
+        "full_count": len(full_module_keys()),
+        "scenarios": (
+            # id = profile id (页面 JS startRun(s.id) 直接 POST /api/run {profile});
+            # SCENE_MENU_KEYS 的数字键只是终端菜单键位, 不下发 (brief 笔误修正)
+            [{"id": p, "label": SCENE_LABELS[p],
+              "desc": SCENE_MENU_DESC.get(p, ""),
+              "modules": len(DIAGNOSE_PROFILES[p])}
+             for k, p in SCENE_MENU_KEYS.items()]
+            + [{"id": "site", "label": "现场检测",
+                "desc": "客户信息 + 机房 6 项 → 一页报告/PDF", "modules": 0}]
+        ),
+        "module_desc": module_desc,
+        "status_colors": {st: STATUS_COLORS[sk]
+                          for st, sk in STATUS_KEY.items()},
+        "site_items": [{"key": it["key"], "cat": it["cat"],
+                        "label": it["label"], "options": list(it["options"])}
+                       for it in SITE_CHECK_ITEMS],
+    }
+
+
+class _GuiHandler(http.server.BaseHTTPRequestHandler):
+    """GUI 请求处理器。session/token/shutdown_evt 由 _start_gui_server 注入。"""
+
+    server_version = "NetPulseGUI/" + APP_VERSION
+    session = None
+    token = None
+    shutdown_evt = None
+
+    def log_message(self, fmt, *args):     # GUI 模式终端不刷 HTTP 日志
+        pass
+
+    # -- 鉴权与应答工具 --
+    def _authorized(self):
+        q = urllib_parse.urlparse(self.path)
+        tok = (urllib_parse.parse_qs(q.query).get("t") or [None])[0]
+        if not tok:
+            tok = self.headers.get("X-NetPulse-Token")
+        return (isinstance(tok, str) and isinstance(self.token, str)
+                and hmac.compare_digest(tok, self.token))
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else \
+            json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except Exception:
+            pass
+
+    def _reject(self):
+        self._send(403, {"error": "forbidden"})
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None
+
+    def _path(self):
+        return urllib_parse.urlparse(self.path).path
+
+    # -- 路由 --
+    def do_GET(self):
+        try:
+            if not self._authorized():
+                return self._reject()
+            p = self._path()
+            if p in ("/", "/index.html"):
+                # 用预渲染常量 (Task 3 注: 避免每请求重建), 内容与 _gui_page() 一致
+                return self._send(200, _GUI_PAGE_HTML.encode("utf-8"),
+                                  "text/html; charset=utf-8")
+            if p == "/api/scenarios":
+                return self._send(200, _gui_meta())
+            if p == "/api/progress":
+                return self._send(200, self.session.snapshot())
+            if p == "/api/report":
+                html = self.session.report_html()
+                if not html:
+                    return self._send(404, {"error": "尚无报告"})
+                return self._send(200, html.encode("utf-8"),
+                                  "text/html; charset=utf-8")
+            return self._send(404, {"error": "not found"})
+        except Exception as e:
+            try:
+                return self._send(500, {"error": str(e)})
+            except Exception:
+                pass
+
+    def do_POST(self):
+        try:
+            if not self._authorized():
+                return self._reject()
+            p, data = self._path(), self._body()
+            if data is None:
+                return self._send(400, {"error": "bad json"})
+            if p == "/api/run":
+                profile = str((data or {}).get("profile") or "")
+                if self.session.is_running():
+                    return self._send(409, {"ok": False, "reason": "running"})
+                ok, err = self.session.start(profile)
+                return self._send(200 if ok else 400,
+                                  {"ok": ok, "err": err})
+            if p == "/api/export":
+                kind = str((data or {}).get("kind") or "")
+                path, err = self.session.export(kind)
+                return self._send(200 if path else 400,
+                                  {"path": path, "err": err})
+            if p == "/api/open-folder":
+                try:
+                    os.startfile(_desktop_netpulse_dir() or _report_dir())
+                    return self._send(200, {"ok": True})
+                except Exception as e:
+                    return self._send(400, {"ok": False, "err": str(e)})
+            if p == "/api/shutdown":
+                force = bool((data or {}).get("force"))
+                if not self.session.is_running() or force:
+                    self.shutdown_evt.set()
+                    return self._send(200, {"ok": True})
+                return self._send(409, {"ok": False, "reason": "running"})
+            # site 端点在 Task 5 追加
+            return self._send(404, {"error": "not found"})
+        except Exception as e:
+            try:
+                return self._send(500, {"error": str(e)})
+            except Exception:
+                pass
+
+
+def _start_gui_server(session=None, shutdown_evt=None):
+    """起本地 GUI 服务: 仅绑 127.0.0.1 随机端口, 返回 (server, port, token)。"""
+    import secrets
+    session = session if session is not None else _GuiSession()
+    shutdown_evt = shutdown_evt if shutdown_evt is not None else threading.Event()
+    token = secrets.token_urlsafe(24)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _GuiHandler)
+    srv.daemon_threads = True
+    _GuiHandler.session = session
+    _GuiHandler.token = token
+    _GuiHandler.shutdown_evt = shutdown_evt
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.2},
+                     daemon=True, name="np-gui-http").start()
+    return srv, srv.server_address[1], token
 
 
 def main():
