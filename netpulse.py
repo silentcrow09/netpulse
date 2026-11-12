@@ -24619,6 +24619,7 @@ def _GUI_RESET_FOR_TEST():
     _GuiHandler.session = None
     _GuiHandler.token = None
     _GuiHandler.shutdown_evt = None
+    del _GUI_BROWSER_PROC[:]   # Task 6: 浏览器子进程句柄 (防测试间泄漏)
 
 
 def _GUI_LABELS(profile):
@@ -25630,6 +25631,94 @@ def _start_gui_server(session=None, shutdown_evt=None):
     threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.2},
                      daemon=True, name="np-gui-http").start()
     return srv, srv.server_address[1], token
+
+
+def _gui_console_process_count():
+    """当前控制台挂着的进程数 (双击 exe = 1; 从终端启动 = ≥2)。非 Windows 返回 0。"""
+    if sys.platform != "win32":
+        return 0
+    try:
+        import ctypes
+        arr = (ctypes.c_ulong * 1)()
+        n = ctypes.windll.kernel32.GetConsoleProcessList(arr, 1)
+        return int(n or 0)
+    except Exception:
+        return 0
+
+
+def _console_is_exclusive():
+    """控制台是否被本进程独占 (只有独占才允许隐藏宿主窗口, 不藏用户终端)。"""
+    return _gui_console_process_count() == 1
+
+
+def _console_hide():
+    if not _console_is_exclusive():
+        return
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)   # SW_HIDE
+    except Exception:
+        pass
+
+
+def _gui_launch_browser(url):
+    """三级降级拉起界面: Chromium --app → 默认浏览器 → "none" (终端打印 URL)。"""
+    browser = None
+    try:
+        browser = _find_pdf_browser()
+    except Exception:
+        browser = None
+    if browser:
+        try:
+            proc = subprocess.Popen([browser, "--app=" + url,
+                                     "--window-size=1280,860"])
+            _GUI_BROWSER_PROC.append(proc)      # 保留句柄防 GC
+            return "app"
+        except OSError:
+            pass
+    try:
+        if webbrowser.open(url):
+            return "tab"
+    except Exception:
+        pass
+    return "none"
+
+
+def _run_gui(install=True, pip_mirror=None, shutdown_evt=None):
+    """GUI 主入口 (v1.21.0): 起服务 → 拉起窗口 → 等退出事件。
+
+    install 默认 True: GUI 无人值守, 依赖预检 (scapy/Npcap) 不能弹 input()
+    问询 —— 会话卡死在隐藏控制台里没人能答。
+    """
+    session = _GuiSession()
+    shutdown_evt = shutdown_evt if shutdown_evt is not None else threading.Event()
+    try:
+        srv, port, token = _start_gui_server(session, shutdown_evt)
+    except OSError as e:
+        print(_c("  ✗ 图形界面服务启动失败 (%s)。" % e, C_RED))
+        return
+    url = "http://127.0.0.1:%d/?t=%s" % (port, token)
+    how = _gui_launch_browser(url)
+    if how == "none":
+        print(_c("  未检测到可用浏览器。请在任意浏览器打开以下地址使用图形界面:",
+                 C_YELLOW))
+        print(_c("  " + url, C_WHITE))
+        print(_c("  (完成诊断后可关闭本窗口; Ctrl+C 退出)", C_GRAY))
+    else:
+        _console_hide()      # app/tab 成功 → 双击场景隐藏宿主黑框
+    try:
+        while not shutdown_evt.is_set():
+            shutdown_evt.wait(1.0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            srv.shutdown()
+            srv.server_close()
+        except Exception:
+            pass
 
 
 def main():
