@@ -33,6 +33,8 @@
 
 状态语义键与配色的**唯一来源**是 `STATUS_KEY` / `STATUS_COLORS` / `STATUS_BAR_ORDER`，
 不要在各渲染函数里另立映射（曾因三份映射并存出现过两种「警告橙」）。
+**终端侧**状态色的唯一来源是 `STATUS_STYLE`（16 色 ANSI 基线，语义与 `STATUS_COLORS`
+对齐：「超时」为中性灰，不是红）；VT 确认失败时 `_cli_enable_vt()` 自动置 `_C_NOCOLOR`。
 `PROBLEM_STATUSES` 决定哪些状态会被标红 + 默认展开。
 
 **v1.15.2 补充（色值审查结论，勿回退）**：

@@ -15332,10 +15332,14 @@ def _columnize(cells, columns=2, gap=3):
     return out
 
 
+# 终端侧状态语义轴的唯一来源 (与报告层 STATUS_COLORS 同语义, 对齐 AGENTS.md
+# 「不要另立映射」的口径)。「超时」在报告层是中性深灰 #334155 ("没跑完, 不是坏"),
+# 终端原先画红与「异常/错误」同级刺眼属语义错配, 现对齐为灰 (16 色基线取 C_GRAY)。
 STATUS_STYLE = {
     "完成": C_GREEN, "正常": C_GREEN,
     "警告": C_YELLOW,
-    "异常": C_RED, "错误": C_RED, "超时": C_RED,
+    "异常": C_RED, "错误": C_RED,
+    "超时": C_GRAY,
     "未检测": C_GRAY,
 }
 
@@ -15396,7 +15400,12 @@ def _cli_enable_vt():
     输出重定向/无控制台/旧终端 = False), 让 _menu_clear 能据此决定
     是否退化 cls/clear 子进程 — 原先忽略返回值时旧 conhost 菜单会
     打出字面转义乱码且清屏回退不可达 (审查 #7)。
+    控制台现代化批次 1: VT 确认**失败**时同步置 ``_C_NOCOLOR=True`` —
+    Win7 老 conhost 不认 ENABLE_VIRTUAL_TERMINAL_PROCESSING, ANSI 颜色码
+    会按字面打成 ``←[90m`` 乱码; 原先只有 --no-color 手动关色, 老机器
+    默认就是花的。VT 可用时不动全局 (颜色行为与原先一致)。
     """
+    global _C_NOCOLOR
     if sys.platform != "win32":
         return True  # POSIX 终端原生支持 ANSI 转义
     try:
@@ -15404,9 +15413,14 @@ def _cli_enable_vt():
         h = k.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
         m = ctypes.c_ulong()
         if not k.GetConsoleMode(h, ctypes.byref(m)):
-            return False  # 输出重定向/无控制台: 转义写了也没意义
-        return bool(k.SetConsoleMode(h, m.value | 0x0004))  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            _C_NOCOLOR = True  # 重定向/无控制台: 转义写了也没意义
+            return False
+        ok = bool(k.SetConsoleMode(h, m.value | 0x0004))  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        if not ok:
+            _C_NOCOLOR = True  # 旧 conhost: 打出乱码不如无色
+        return ok
     except Exception:
+        _C_NOCOLOR = True
         return False
 
 

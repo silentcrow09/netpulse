@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>NetPulse 控制台界面现代化 — 方案稿（A / B / C 三案）</title>
+<style>
+  /* 全部系统字体, 离线打开 */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f1115; color: #d7dce3; font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+         font-size: 14px; line-height: 1.65; padding: 40px 48px 80px; }
+  h1 { font-size: 24px; font-weight: 800; color: #fff; letter-spacing: .5px; }
+  h2 { font-size: 19px; font-weight: 700; color: #fff; margin: 0 0 6px; }
+  h3 { font-size: 15px; font-weight: 700; color: #e8ecf2; margin: 22px 0 8px; }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  .meta { color: #8b93a1; font-size: 12.5px; margin-top: 4px; }
+  .lead { color: #aab2bf; margin: 10px 0 0; max-width: 860px; }
+  .divider { height: 1px; background: #262b35; margin: 34px 0; }
+
+  /* ── 方案区块 ── */
+  .plan { background: #151920; border: 1px solid #262c38; border-radius: 14px; padding: 26px 28px; margin-top: 26px; }
+  .plan.reco { border-color: #2d5a8a; box-shadow: 0 0 0 1px #2d5a8a33, 0 12px 40px -18px #2d5a8a66; }
+  .plan-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .pill { font-size: 11.5px; font-weight: 700; padding: 2px 12px; border-radius: 999px; letter-spacing: .5px; }
+  .pill.reco { background: #12365c; color: #7cb8f7; border: 1px solid #2d5a8a; }
+  .pill.bold  { background: #3a2f10; color: #e5b84b; border: 1px solid #6b5518; }
+  .pill.safe  { background: #16311c; color: #6fce8d; border: 1px solid #2a5c39; }
+  .plan-desc { color: #aab2bf; margin: 10px 0 4px; max-width: 900px; }
+
+  /* ── 工作量/风险/兼容 小卡 ── */
+  .facts { display: flex; gap: 12px; flex-wrap: wrap; margin: 14px 0 20px; }
+  .fact { background: #10141b; border: 1px solid #262c38; border-radius: 10px; padding: 8px 14px; font-size: 12.5px; color: #9aa3b0; }
+  .fact b { color: #d7dce3; font-weight: 600; }
+
+  /* ── CMD 窗口模拟 ── */
+  .win { border-radius: 8px; overflow: hidden; border: 1px solid #333a46; margin: 18px 0 8px;
+         box-shadow: 0 10px 30px -14px #000c; }
+  .win-title { background: #1e222b; color: #9aa3b0; font-size: 12px; padding: 7px 14px;
+               display: flex; align-items: center; gap: 8px; }
+  .win-title .dots { display: inline-flex; gap: 6px; }
+  .win-title .dots i { width: 10px; height: 10px; border-radius: 50%; background: #3a4150; }
+  .scr { background: #0c0c0c; padding: 14px 18px; overflow-x: auto; }
+  pre.term { font-family: Consolas, "Courier New", "NSimSun", monospace;
+             font-size: 13.5px; line-height: 1.5; color: #cccccc; white-space: pre; }
+  /* ANSI 16 色 → conhost/WT Campbell 映射 */
+  .k-gray { color: #767676; } .k-w  { color: #f2f2f2; } .k-bold { color: #f2f2f2; font-weight: 700; }
+  .k-g { color: #16c60c; } .k-y { color: #f9f1a5; } .k-r { color: #e74856; }
+  .k-c { color: #61d6d6; } .k-b { color: #3b78ff; }
+  .bg-card { background: #171a21; }           /* 亮黑底做卡片条 (ANSI 100) */
+  /* 变更/新增 就地标注 */
+  .chg { background: #facc1522; box-shadow: 0 0 0 1px #facc1533; border-radius: 2px; }
+  .new { background: #34d3991f; box-shadow: 0 0 0 1px #34d39944; border-radius: 2px; }
+  .fix { background: #f8717122; box-shadow: 0 0 0 1px #f8717133; border-radius: 2px; }
+  .tag { font-family: "Microsoft YaHei", sans-serif; font-size: 10.5px; font-weight: 700;
+         padding: 0 6px; border-radius: 999px; margin-left: 10px; vertical-align: 1px; }
+  .tag.chg { background: #facc1526; color: #fde68a; }
+  .tag.new { background: #34d39926; color: #6ee7b7; }
+  .tag.fix { background: #f8717126; color: #fca5a5; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 6px 2px 26px; font-size: 12px; color: #8b93a1; }
+  .legend .chg, .legend .new, .legend .fix { padding: 1px 10px; }
+
+  /* ── 注释列表 ── */
+  .notes { font-size: 13px; color: #9aa3b0; margin: 4px 0 8px; }
+  .notes li { margin-left: 20px; margin-top: 4px; }
+  .notes b { color: #d7dce3; }
+
+  /* ── 清单表 / 对比表 ── */
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin: 12px 0; }
+  th { text-align: left; color: #8b93a1; font-weight: 600; border-bottom: 1px solid #2c333f; padding: 8px 12px; white-space: nowrap; }
+  td { border-bottom: 1px solid #20242e; padding: 8px 12px; color: #c3cad4; vertical-align: top; }
+  td.c { text-align: center; }
+  .ok { color: #6ee7b7; } .warn { color: #fde68a; } .bad { color: #fca5a5; } .dim { color: #767e8c; }
+  code { font-family: Consolas, monospace; background: #1c212b; padding: 1px 6px; border-radius: 4px; font-size: 12px; color: #9fc7ef; }
+
+  .unchanged { background: #10141b; border: 1px solid #262c38; border-radius: 10px; padding: 14px 18px;
+               font-size: 13px; color: #9aa3b0; margin-top: 10px; }
+  .unchanged b { color: #c3cad4; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>NetPulse 控制台界面现代化 — 方案稿</h1>
+<div class="meta">v1 · 2026-11-12 · 覆盖场景：双击 exe / cmd 运行的全部人读画面 · 交付物：本稿（选型后另出 spec.md + verify.md 再实施）</div>
+<p class="lead">目标：让 CMD 窗口看上去更现代、更人性化。三个方案按改动幅度递增，可独立实施，也可 A+B 组合。
+所有画面均为真实文案、真实字号（等宽 13.5px ≈ conhost/WT 默认观感）、真实 16 色映射（Campbell 色板）。
+<strong>看稿方式：直接滚动浏览，黄色底=变更点，绿色底=新增内容，红色底=顺带修的问题。</strong></p>
+
+<div class="legend">
+  <span class="chg">黄 = 变更</span>
+  <span class="new">绿 = 新增</span>
+  <span class="fix">红 = 修复</span>
+  <span class="dim">无标注 = 保持不变</span>
+</div>
+
+<!-- ══════════════ 现状基线 ══════════════ -->
+<h2>0 · 现状基线（为什么觉得不好看）</h2>
+<p class="plan-desc">当前首页与完成屏的真实样子。问题不在于「乱」，而在于视觉语言不统一、没有层次、缺少反馈。</p>
+
+<div class="win">
+  <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>NetPulse.exe — 当前场景菜单</div>
+  <div class="scr"><pre class="term">============================================================
+  NetPulse v1.19.1    网络诊断（场景模式）    [普通权限]
+============================================================
+  请选择场景（输入数字回车）：
+
+    [1] 网络很慢        [2] 经常断网      [3] 网页打不开
+    [4] 游戏卡顿        [5] WiFi 信号差
+
+    [6] 现场检测（客户报告）
+    [7] 持续盯障（输入分钟数）
+    [9] 高级选项（工程师用）   [A] 管理员模式
+     (管理员模式 = 以管理员身份重启, 抓包取证/Npcap 安装需要)
+    [C] 异常上报: 已开启    [0] 退出
+------------------------------------------------------------
+  选择 [0-9AC]: █</pre></div>
+</div>
+<ul class="notes">
+  <li><b>分隔线三种人格</b>：<code>=</code>×60 当横幅、<code>-</code>×60 当页脚、另有闭环框/开式框两种提示框，没有一个统一的「框」语言。</li>
+  <li><b>菜单列不对齐</b>：三列菜单项起止位置随文字长度漂移；说明行缩进比其它行多一格。</li>
+  <li><b>无信息层次</b>：标题、说明、可选项、快捷键全是一种字号一种白。</li>
+  <li><b>进度与结果平淡</b>：23 行灰字「正在 xxx …」，完成后健康分只有一行「网络健康: 87/100 （B）」，跟下面密密麻麻的根因文字混在一起，没有「先看结论」的视觉重心。</li>
+  <li><b>潜在乱码（顺带修复项）</b>：Win7 老 conhost 不支持 VT 时，ANSI 颜色码会按字面打出 <code>←[90m</code>。现在只有 <code>--no-color</code> 手动关色，应改成检测失败自动降级。</li>
+</ul>
+
+<div class="divider"></div>
+
+<!-- ══════════════ 方案 A ══════════════ -->
+<div class="plan">
+  <div class="plan-head">
+    <h2>方案 A · 统一修饰</h2>
+    <span class="pill safe">最稳</span>
+  </div>
+  <p class="plan-desc">不动布局结构，只把「视觉语言」收敛成一套：统一边框与分隔线、统一语义色板、对齐菜单网格、修复 Win7 乱码。改动全在打印层，零交互变化，全部终端兼容。</p>
+  <div class="facts">
+    <div class="fact">工作量 <b>小（约半天）</b></div>
+    <div class="fact">风险 <b>低</b></div>
+    <div class="fact">兼容 <b>Win7 conhost / Win10 conhost / WT / 管道 全兼容</b></div>
+    <div class="fact">效果幅度 <b>约 40%</b></div>
+  </div>
+
+  <h3>A-1 · 场景菜单（统一边框 + 对齐 + 语义色）</h3>
+  <div class="win">
+    <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>NetPulse.exe</div>
+    <div class="scr"><pre class="term"><span class="k-c">┌────────────────────────────────────────────────────────────┐</span>
+<span class="k-c">│</span>  <span class="k-bold">NetPulse v1.19.1</span>  网络诊断（场景模式）   <span class="chg"><span class="k-gray">· 普通权限</span></span>       <span class="k-c">│</span>
+<span class="k-c">└────────────────────────────────────────────────────────────┘</span>
+<span class="chg">  <span class="k-w">请选择场景</span> <span class="k-gray">（输入数字回车）</span></span>
+
+    <span class="k-c">[1]</span> 网络很慢           <span class="k-c">[2]</span> 经常断网           <span class="k-c">[3]</span> 网页打不开
+    <span class="k-c">[4]</span> 游戏卡顿           <span class="k-c">[5]</span> WiFi 信号差
+    <span class="k-c">[6]</span> 现场检测（客户报告）
+    <span class="k-c">[7]</span> 持续盯障（输入分钟数）
+    <span class="k-c">[9]</span> 高级选项（工程师用）   <span class="k-c">[A]</span> 管理员模式
+<span class="chg">        <span class="k-gray">管理员模式 = 以管理员身份重启, 抓包取证需要</span></span>
+<span class="chg">    <span class="k-c">[C]</span> <span class="k-gray">异常上报: 已开启</span>       <span class="k-c">[0]</span> <span class="k-gray">退出</span></span>
+<span class="chg"><span class="k-gray">────────────────────────────────────────────────────────────</span></span>
+  <span class="chg">选择 <span class="k-c">[0-9AC]</span> » </span>█</pre></div>
+  </div>
+  <ul class="notes">
+    <li><b>横幅改闭环细框</b>（与已修复的告知框、scapy 提示框同一语言），去掉 <code>=</code>×60；页脚分隔线从 <code>-</code>×60 改为 <code>─</code>×60，与框线同族。</li>
+    <li><b>权限徽标弱化</b>：从方括号白字改成灰字「· 普通权限」，管理员时才亮色提醒。</li>
+    <li><b>菜单网格对齐</b>：按显示宽度（中文 2 列）计算列宽，三列起点严格对齐；说明行缩进与主项对齐。</li>
+    <li><b>输入提示统一</b>：绿色「选择 …」后加 <code>»</code> 全站统一提示符。</li>
+  </ul>
+
+  <h3>A-2 · 完成屏（健康分先行 + 根因缩进理顺）</h3>
+  <div class="win">
+    <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>NetPulse.exe</div>
+    <div class="scr"><pre class="term"><span class="k-c">┌────────────────────────────────────────────────────────────┐</span>
+<span class="k-c">│</span>  <span class="k-bold">NetPulse</span> <span class="chg"><span class="k-gray">› 网络很慢 › 检测完成</span></span>                             <span class="k-c">│</span>
+<span class="chg"><span class="k-c">│</span>  <span class="k-w">网络健康</span>  <span class="k-g">87 / 100 · B 级 良好</span>   <span class="k-gray">23 项实检 · 1 分 42 秒</span>      <span class="k-c">│</span></span>
+<span class="k-c">└────────────────────────────────────────────────────────────┘</span>
+
+  <span class="k-g">✓</span> 根因分析: 未发现故障 (评估 8 条规则)
+<span class="chg"><span class="k-gray">────────────────────────────────────────────────────────────</span></span>
+  <span class="chg"><span class="k-g">📄 报告已保存</span> <span class="k-gray">→</span> reports\完整版_20261112_112030.html</span></pre></div>
+  </div>
+  <ul class="notes">
+    <li><b>完成屏只保留一个重点</b>：健康分与等级放框内第一行，附带覆盖数与耗时（数据与 HTML 报告 hero 同源）。</li>
+    <li>根因区、报告路径照旧，但分隔线统一为 <code>─</code>。</li>
+  </ul>
+
+  <h3>A-3 · 顺带修复（所有方案共享）</h3>
+  <div class="win">
+    <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>Win7 老 conhost（修复前后对比）</div>
+    <div class="scr"><pre class="term"><span class="fix">修复前:  ←[96m┌─ 异常自动上报 ──────────────←[0m   <span class="k-gray">(ANSI 码按字面打出来)</span></span>
+<span class="fix">修复后:  ┌─ 异常自动上报 ──────────────          <span class="k-gray">(VT 失败 → 自动 _C_NOCOLOR)</span></span></pre></div>
+  </div>
+  <ul class="notes">
+    <li><b>VT 检测自动降色</b>：<code>_cli_enable_vt()</code> 返回 False 时自动置 <code>_C_NOCOLOR=True</code>，Win7 老 conhost / 重定向管道不再出乱码；<code>--no-color</code> 仍可强制。</li>
+    <li><b>语义色板收口</b>：新增 <code>CLI_STATUS_COLORS</code>（完成=绿 / 警告=黄 / 异常错误=红 / 超时=黄 / 未检测=灰），与 HTML 报告的 <code>STATUS_COLORS</code> 同语义，替换终端侧散落的 <code>_severity_color</code> 等局部映射（呼应 AGENTS.md「不要另立映射」）。</li>
+  </ul>
+</div>
+
+<!-- ══════════════ 方案 B ══════════════ -->
+<div class="plan reco">
+  <div class="plan-head">
+    <h2>方案 B · 现代重排</h2>
+    <span class="pill reco">推荐</span>
+    <span class="meta">= 方案 A 的全部内容 + 布局与反馈升级</span>
+  </div>
+  <p class="plan-desc">在 A 的统一色板/边框基础上，重排关键画面：菜单卡片化、进度条实时化、完成屏结论前置。全部用 16 色 ANSI + <code>\r</code> 回车刷新实现，不依赖 Windows Terminal；老 conhost 自动降级为 A 的静态形态。</p>
+  <div class="facts">
+    <div class="fact">工作量 <b>中（约 2 天）</b></div>
+    <div class="fact">风险 <b>中低（进度条有 VT 检测降级路径）</b></div>
+    <div class="fact">兼容 <b>全兼容：VT 可用→动态；否则→静态</b></div>
+    <div class="fact">效果幅度 <b>约 75%</b></div>
+  </div>
+
+  <h3>B-1 · 启动横幅（信息归位：网络身世一行看清）</h3>
+  <div class="win">
+    <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>NetPulse.exe</div>
+    <div class="scr"><pre class="term"><span class="k-c">┌────────────────────────────────────────────────────────────┐</span>
+<span class="k-c">│</span>  <span class="k-bold">NetPulse v1.19.1</span>  <span class="k-gray">网络诊断 · 场景模式</span>      <span class="k-gray">· 普通权限</span>      <span class="k-c">│</span>
+<span class="chg"><span class="new"><span class="k-c">│</span>  <span class="k-gray">本机</span> 192.168.1.23  <span class="k-gray">网关</span> 192.168.1.1  <span class="k-gray">DNS</span> 223.5.5.5       <span class="k-c">│</span></span></span>
+<span class="k-c">└────────────────────────────────────────────────────────────┘</span>
+<span class="chg"><span class="new">  <span class="k-gray">公网 117.32.x.x · 中国 浙江 杭州 · 电信          (联网后补齐)</span></span></span>
+  <span class="k-w">请选择场景</span> <span class="k-gray">（输入数字回车）</span></pre></div>
+  </div>
+  <ul class="notes">
+    <li><b>系统信息进横幅</b>：本机/网关/DNS 收进框内第二行；公网 IP/归属地查到后在框外补一行灰字，查不到不占位——现在是固定两行硬挤，窄窗口必折行。</li>
+  </ul>
+
+  <h3>B-2 · 场景菜单（卡片条 + 说明副行 + 分区）</h3>
+  <div class="win">
+    <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>NetPulse.exe</div>
+    <div class="scr"><pre class="term">  <span class="k-w">按问题选场景</span>
+<span class="chg">   <span class="bg-card"> <span class="k-c">1</span>  网络很慢      <span class="k-gray">网页开得慢、下载慢、视频卡</span> </span>
+   <span class="bg-card"> <span class="k-c">2</span>  经常断网      <span class="k-gray">时好时坏、WiFi 掉线、游戏掉线</span> </span>
+   <span class="bg-card"> <span class="k-c">3</span>  网页打不开    <span class="k-gray">打不开特定网站、DNS 报错</span> </span>
+   <span class="bg-card"> <span class="k-c">4</span>  游戏卡顿      <span class="k-gray">延迟高、跳 ping、外服卡</span> </span>
+   <span class="bg-card"> <span class="k-c">5</span>  WiFi 信号差   <span class="k-gray">信号弱、隔墙掉速、频段拥堵</span> </span></span>
+
+  <span class="k-w">工具与报告</span>
+<span class="chg">   <span class="bg-card"> <span class="k-c">6</span>  现场检测      <span class="k-gray">客户名称+机房 6 项 → 一页报告/PDF</span> </span>
+   <span class="bg-card"> <span class="k-c">7</span>  持续盯障      <span class="k-gray">定时监测外网, 抓偶发掉线/抖动</span> </span>
+   <span class="bg-card"> <span class="k-c">9</span>  高级选项      <span class="k-gray">23 项模块单测 / 工程师功能</span> </span>
+   <span class="bg-card"> <span class="k-c">A</span>  管理员模式    <span class="k-gray">抓包取证、Npcap 安装需要</span> </span></span>
+
+<span class="chg">  <span class="k-gray">C 异常上报: 已开启        0 退出</span></span>
+<span class="k-gray">────────────────────────────────────────────────────────────</span>
+  <span class="chg">请选择 <span class="k-c">[1-9 / A / C / 0]</span> » </span>█</pre></div>
+  </div>
+  <ul class="notes">
+    <li><b>场景项加说明副行</b>：现在「网络很慢」四个字让客户猜里面测什么；副行一句话讲清，文案由场景对应的模块清单生成，不新增承诺。</li>
+    <li><b>分区标题</b>：「按问题选场景」（客户视角）与「工具与报告」（装维视角）分开，9/A/C/0 归入工具区。</li>
+    <li><b>卡片条</b>：亮黑底（ANSI 100）整行铺底，键号亮青、说明灰，主次分明。宽窗口居中限宽 64 列，窄窗口自动收起说明列（<code>_disp_width</code> 按终端宽度自适应）。</li>
+  </ul>
+
+  <h3>B-3 · 诊断进行中（实时进度条 + 完成即变绿）</h3>
+  <div class="win">
+    <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>NetPulse.exe — 诊断运行画面</div>
+    <div class="scr"><pre class="term"><span class="chg"><span class="new">  <span class="k-c">███████████████████░░░░░░░░░░░░░░░░░░░</span>  <span class="k-w">19/23</span>  <span class="k-gray">正在 网页体验 …</span></span></span>
+
+    <span class="k-g">✓</span> 网关连通        <span class="k-g">✓</span> DNS 解析        <span class="chg"><span class="k-y">⚠ 路由追踪</span></span>
+    <span class="k-g">✓</span> ARP 表          <span class="k-g">✓</span> WiFi 信号       <span class="chg"><span class="k-y">⚠ TCP 连接</span></span>
+    <span class="k-g">✓</span> DHCP 服务       <span class="k-g">✓</span> 网页体验        <span class="chg"><span class="k-gray">… 外网连通</span></span>
+    <span class="chg"><span class="k-y">⚠ 代理检测</span></span>        <span class="k-gray">… MTU 探测</span>       <span class="k-gray">… IPv6 连通</span>
+    <span class="k-g">✓</span> 端口扫描        <span class="chg"><span class="k-r">✗ NAT 类型</span></span>       <span class="k-gray">… 环回测速</span>
+<span class="chg"><span class="new">  <span class="k-gray">测速/iperf3 等耗时项在普通模块全部完成后单独串行跑, 避免互相压低</span></span></span></pre></div>
+  </div>
+  <ul class="notes">
+    <li><b>整体进度条常驻顶部</b>：<code>█░</code> 块字符 + n/23 + 当前项，<code>\r\033[K</code> 单行刷新（VT 可用时）；每完成一项重绘列表，<b>完成=绿✓、警告=黄⚠、错误=红✗、进行中=灰…</b>，一眼看出哪项慢哪项出问题。</li>
+    <li><b>符号双编码</b>：色 + 形同时表达，色弱/黑白打印也不丢语义。</li>
+    <li><b>降级路径</b>：VT 不可用 → 自动回到现状的静态两列列表（方案 A 形态），功能零损失。</li>
+    <li><b>独占模块口径照旧</b>：测速类仍按 AGENTS.md 的独占规则串行，进度条如实反映顺序。</li>
+  </ul>
+
+  <h3>B-4 · 完成屏（结论前置：健康分区 + 状态分布条）</h3>
+  <div class="win">
+    <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>NetPulse.exe — 检测完成</div>
+    <div class="scr"><pre class="term"><span class="k-c">┌────────────────────────────────────────────────────────────┐</span>
+<span class="k-c">│</span>  <span class="k-bold">网络健康</span>                                                     <span class="k-c">│</span>
+<span class="chg"><span class="new"><span class="k-c">│</span>    <span class="k-g" style="font-size:15px"> 87</span> <span class="k-gray">/ 100</span>   <span class="k-g">B 级 · 良好</span>      <span class="k-gray">23 项实检 · 1 分 42 秒</span>      <span class="k-c">│</span></span></span>
+<span class="chg"><span class="new"><span class="k-c">│</span>    <span class="k-g">█████████████████████████░░░░</span>  <span class="k-gray">87</span>                          <span class="k-c">│</span></span></span>
+<span class="chg"><span class="new"><span class="k-c">│</span>    <span class="k-g">■</span> <span class="k-gray">完成 19</span>   <span class="k-y">■</span> <span class="k-gray">警告 2</span>   <span class="k-r">■</span> <span class="k-gray">异常 1</span>   <span class="k-gray">■ 未检测 1</span>            <span class="k-c">│</span></span></span>
+<span class="k-c">└────────────────────────────────────────────────────────────┘</span>
+
+  <span class="k-r">🔴 根因分析 (2/8 条规则触发, 整体高置信度)</span>
+
+  <span class="chg">[1] <span class="k-r">HIGH</span> · DNS 解析部分失败</span>
+      类别: DNS | 高置信度
+      <span class="chg"><span class="k-gray">影响模块: DNS 解析、网页体验</span></span>
+      建议:
+        更换 DNS 为 223.5.5.5 / 119.29.29.29 后复测
+<span class="chg">      <span class="k-gray">(状态分布条与 HTML 报告同源: 扣分 19 项口径, 豁免 iperf3/ipv6/proxy/nattype)</span></span>
+<span class="k-gray">────────────────────────────────────────────────────────────</span>
+  <span class="chg"><span class="k-g">📄 报告已保存</span> <span class="k-gray">→</span> reports\完整版_20261112_112030.html</span>
+  <span class="chg"><span class="new">  <span class="k-gray">[Enter] 返回菜单   [H] 打开报告</span></span></span></pre></div>
+  </div>
+  <ul class="notes">
+    <li><b>健康分区</b>：大号分数 + 等级徽章色 + 分数条 + 状态分布条，对应 HTML 报告的 hero + 状态分布条，数据同一来源（<code>report["counts"]</code> 扣分口径），并在框内一行小字写明豁免口径——避免「界面上 2 个红但健康分满分」式的口径困惑（这是 AGENTS.md 里踩过的坑）。</li>
+    <li><b>下一步引导</b>：完成屏直接给 [Enter]/[H] 快捷键，装维不用再滚屏找报告路径。</li>
+  </ul>
+
+  <h3>B-5 · 提示框统一（同一套框语言 + 圆角不引入）</h3>
+  <div class="win">
+    <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>提示框样例（scapy 缺失 / 异常上报告知）</div>
+    <div class="scr"><pre class="term"><span class="chg">  <span class="k-y">┌─ 需要安装组件 ─────────────────────────────────┐</span></span>
+  <span class="k-y">│</span> scapy 未安装: DHCP 完整检测(发现多服务器干扰)需要它。 <span class="k-y">│</span>
+  <span class="k-y">│</span> 完整检测还需 Npcap 抓包驱动 (Windows)。              <span class="k-y">│</span>
+  <span class="chg"><span class="k-y">└─────────────────────────────────────────────────┘</span></span>
+  是否下载安装? [<span class="k-g">Y</span>=安装 / <span class="k-r">N</span>=跳过] » █</pre></div>
+  </div>
+  <ul class="notes">
+    <li>全部提示框（scapy / 异常上报告知 / 抓包授权确认）统一为「标题嵌框 + 闭环 + 宽度按内容自适应」，宽度算法共用本次修好的 <code>_disp_width</code> 闭环函数，消灭手工排框。</li>
+    <li>确认选项统一「[Y=… / N=…] » 」格式与配色（绿可/红否）。</li>
+  </ul>
+</div>
+
+<!-- ══════════════ 方案 C ══════════════ -->
+<div class="plan">
+  <div class="plan-head">
+    <h2>方案 C · 全屏 TUI</h2>
+    <span class="pill bold">激进</span>
+  </div>
+  <p class="plan-desc">进入备用屏幕缓冲区（alternate screen），方向键选择、实时刷新整屏。观感最接近现代 CLI 工具（如 Windows Terminal 里的 k9s/lazygit）。但依赖较全的 VT 支持，且需要处理「诊断输出与全屏 UI 抢屏」的调度，复杂度显著上升。</p>
+  <div class="facts">
+    <div class="fact">工作量 <b>大（4-5 天）</b></div>
+    <div class="fact">风险 <b>中高（conhost VT 子集差异、退出恢复现场）</b></div>
+    <div class="fact">兼容 <b>Win10+ 优先；Win7/管道 自动降级为方案 B</b></div>
+    <div class="fact">效果幅度 <b>约 90%</b></div>
+  </div>
+
+  <h3>C-1 · 首页示意（方向键 + 高亮选中行）</h3>
+  <div class="win">
+    <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>NetPulse.exe — 全屏模式示意（VT 完整时）</div>
+    <div class="scr"><pre class="term"><span class="k-c">NetPulse v1.19.1</span>  <span class="k-gray">网络诊断 · 场景模式</span>                    <span class="k-gray">↑↓ 选择 · Enter 确认 · Q 退出</span>
+<span class="k-gray">────────────────────────────────────────────────────────────────</span>
+
+   <span class="k-c"> 1</span> <span class="k-bold">网络很慢</span>      <span class="k-gray">网页开得慢、下载慢、视频卡</span>
+   <span class="bg-card"><span class="k-c"> 2</span> <span class="k-bold" style="color:#61d6d6">经常断网</span>      <span class="k-c">时好时坏、WiFi 掉线、游戏掉线</span>              <span class="k-c">◀</span></span>
+   <span class="k-c"> 3</span> 网页打不开    <span class="k-gray">打不开特定网站、DNS 报错</span>
+
+   <span class="k-gray">工具: 6 现场检测 · 7 持续盯障 · 9 高级 · A 管理员 · C 上报开关</span>
+
+<span class="k-gray">────────────────────────────────────────────────────────────────</span>
+<span class="chg"><span class="new">  <span class="k-gray">⠋ 正在读取网络信息…</span>   <span class="k-gray">(Braille spinner, 仅 WT/新 conhost; 旧字体自动换 ▷▶▷)</span></span></span></pre></div>
+  </div>
+  <ul class="notes">
+    <li><b>收益</b>：方向键交互更「现代应用」；spinner、实时状态栏、退出后完整恢复原命令行内容。</li>
+    <li><b>代价</b>：conhost 的 VT 是子集（无 truecolor、部分序列行为差异），要按宿主探测逐项降级；诊断中途输出与全屏重绘要单一渲染循环；客户机环境不可控，测试面翻倍。对「装维在现场快进快出」的主场景收益有限——<b>建议缓做或不做</b>，方案 B 已覆盖 80% 观感收益。</li>
+  </ul>
+</div>
+
+<div class="divider"></div>
+
+<!-- ══════════════ 对比与清单 ══════════════ -->
+<h2>三案对比</h2>
+<table>
+  <tr><th>维度</th><th>方案 A 统一修饰</th><th>方案 B 现代重排（推荐）</th><th>方案 C 全屏 TUI</th></tr>
+  <tr><td>边框/线条统一</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+  <tr><td>语义色板收口</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+  <tr><td>Win7 乱码自动降级</td><td class="ok">✓（顺带修复）</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+  <tr><td>菜单卡片 + 说明副行</td><td class="dim">—（仅对齐）</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+  <tr><td>实时进度条</td><td class="dim">—</td><td class="ok">✓（VT 降级静态）</td><td class="ok">✓</td></tr>
+  <tr><td>完成屏健康分区</td><td class="warn">简化版</td><td class="ok">✓ 完整版</td><td class="ok">✓ 完整版</td></tr>
+  <tr><td>方向键交互 / 全屏</td><td class="dim">—</td><td class="dim">—</td><td class="ok">✓</td></tr>
+  <tr><td>对现有测试影响</td><td class="ok">极小</td><td class="warn">进度渲染需新增降级测试</td><td class="bad">大幅新增</td></tr>
+</table>
+
+<h2>变动与新增清单（以方案 B 为例）</h2>
+<table>
+  <tr><th>类型</th><th>位置</th><th>内容</th><th>对应画面</th></tr>
+  <tr><td class="warn">变更</td><td>启动横幅（run_diagnostics / 场景菜单头）</td><td><code>=</code>×60 → 闭环细框；权限徽标弱化</td><td>A-1 / B-1</td></tr>
+  <tr><td class="warn">变更</td><td>系统信息区</td><td>本机/网关/DNS 进横幅；公网 IP 联网后补行</td><td>B-1</td></tr>
+  <tr><td class="warn">变更</td><td>场景菜单（_scene_menu）</td><td>双区卡片网格 + 说明副行 + 列宽自适应</td><td>B-2</td></tr>
+  <tr><td class="bad">新增</td><td>诊断进度区</td><td>整体进度条 + 状态符号列表（VT 降级静态）</td><td>B-3</td></tr>
+  <tr><td class="warn">变更</td><td>完成屏（_scene_summary）</td><td>健康分区（分数条+分布条）+ 下一步快捷键</td><td>A-2 / B-4</td></tr>
+  <tr><td class="warn">变更</td><td>全部提示框</td><td>统一闭环框语言，宽度共用 <code>_disp_width</code> 函数</td><td>B-5</td></tr>
+  <tr><td class="bad">修复</td><td>VT/降色（_cli_enable_vt 调用点）</td><td>VT 失败 → 自动 <code>_C_NOCOLOR</code>，消灭 Win7 乱码</td><td>A-3</td></tr>
+  <tr><td class="bad">修复</td><td>语义色（终端侧局部映射）</td><td>收口为 <code>CLI_STATUS_COLORS</code>，与 HTML <code>STATUS_COLORS</code> 同语义</td><td>A-3</td></tr>
+  <tr><td class="warn">变更</td><td>输入提示符</td><td>统一 <code>» </code> 后缀与 [Y/N] 选项配色</td><td>A-1 / B-5</td></tr>
+</table>
+
+<h2>保持不变</h2>
+<div class="unchanged">
+  <b>不动的部分</b>：菜单编号与快捷键语义（1-9/A/C/0）· 场景对应的模块组合与口径 · 独占模块串行规则 · 健康分扣分口径（异常-20/错误-30/超时-10/警告-2）· <code>--json</code> / 管道输出（仍走 stderr 分流，不受任何视觉改动影响）· 现有全部测试的行为断言 · 提示文案内容（只动排版不动措辞，涉及文案改动单独列给你确认）。
+</div>
+
+<h2>技术约束（实施时遵守）</h2>
+<table>
+  <tr><th>约束</th><th>说明</th></tr>
+  <tr><td>16 色基线</td><td>全部视觉用 ANSI 16 色（亮色系）实现，conhost 与 WT 渲染一致；不引入 truecolor（除非未来检测到 <code>WT_SESSION</code> 单独增强）</td></tr>
+  <tr><td>字符白名单</td><td>只使用点阵字体有字形的字符：<code>┌┐└┘│─ ✓✗⚠…█░■● ·»</code>；<b>不用</b>圆角框 <code>╭</code>、Braille <code>⠋</code>（方案 C 特性单独降级）</td></tr>
+  <tr><td>宽度计算</td><td>一切对齐/补边走 <code>_disp_width</code>（ANSI 不计、CJK=2），本次告知框修复同源；终端宽度用 <code>shutil.get_terminal_size</code> 自适应</td></tr>
+  <tr><td>降级矩阵</td><td>VT 可用（Win10 conhost/WT）→ 完整形态；VT 不可用（Win7/重定向）→ 自动无色 + 静态列表；<code>--no-color</code> 永远强制；管道/<code>--json</code> 人读输出走 stderr 不受影响</td></tr>
+  <tr><td>测试</td><td>进度条/降级路径新增单测（mock VT False）；现有 test_log_report 等行为断言不动</td></tr>
+</table>
+
+</div>
+</body>
+</html>
