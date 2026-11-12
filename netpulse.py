@@ -24978,7 +24978,8 @@ _GUI_JS = r"""(function () {
     full: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/><path d="M7 13h6M7 16h4"/></svg>'
   };
   var COLORS = {};          // {状态中文: 颜色} — 来自 /api/scenarios, 唯一来源服务端
-  var state = { view: "home", pollTimer: null, data: null, meta: null, leftProgress: false };
+  var state = { view: "home", pollTimer: null, data: null, meta: null,
+                leftProgress: false, siteFlow: false };
 
   function $(s) { return document.querySelector(s); }
   function el(tag, cls, text) {
@@ -25011,8 +25012,9 @@ _GUI_JS = r"""(function () {
       var c = el("button", "g-card" + (s.id === "site" ? " site" : ""));
       c.type = "button";
       c.dataset.p = s.id;
+      var ICON = ICONS[s.id] || ICONS.full;   // 零插值常量模板 (取自常量表)
       var ic = el("span", "g-card-ic");
-      ic.insertAdjacentHTML("afterbegin", ICONS[s.id] || ICONS.full);   // 常量模板, 无插值
+      ic.insertAdjacentHTML("afterbegin", ICON);   // 测试闸白名单: 全大写常量标识符
       c.appendChild(ic);
       c.appendChild(el("span", "g-card-t", s.label));
       c.appendChild(el("span", "g-card-d", s.desc));
@@ -25065,9 +25067,29 @@ _GUI_JS = r"""(function () {
       row.appendChild(el("span", null, info[k] || k));
       grid.appendChild(row);
     });
-    if (d.phase === "site_ready") { show("site"); renderSiteCheck(); stopPoll(); return; }
+    if (d.phase === "site_ready") {
+      // 现场流程走到机房核对: 视图切换 + 向导/核对面板翻折必须一起做
+      // (审查 F2 —— site_ready 中刷新页面也要落在核对面板, 不能只翻视图)
+      stopPoll();
+      state.siteFlow = false;
+      show("site");
+      renderSiteCheck();
+      showSiteCheck();
+      return;
+    }
     if (d.phase === "done") { stopPoll(); openReport(); return; }
-    if (d.phase === "error") { stopPoll(); $("#p-err").textContent = d.error || "诊断失败"; }
+    if (d.phase === "error") {
+      stopPoll();
+      if (state.siteFlow) {
+        // 现场流程: 回现场视图并恢复向导, 错误写在向导卡 (核对面板尚未进入)
+        state.siteFlow = false;
+        show("site");
+        showSiteWizard();
+        $("#site-err").textContent = d.error || "诊断失败";
+      } else {
+        $("#p-err").textContent = d.error || "诊断失败";
+      }
+    }
     else { $("#p-err").textContent = ""; }
   }
   function fmtMs(ms) {
@@ -25078,7 +25100,9 @@ _GUI_JS = r"""(function () {
   function pollOnce() {
     get(API.progress).then(function (d) {
       renderProgress(d);
-      if (d.phase === "running" && !state.pollTimer) {
+      // 唯一轮询路径: running 续 1s; 现场流程 siteStart 已 ok 但服务端 phase
+      // 尚未翻转的瞬时 idle 也续 (否则现场诊断会停在无轮询的死态)
+      if ((d.phase === "running" || (state.siteFlow && d.phase === "idle")) && !state.pollTimer) {
         state.pollTimer = setInterval(pollOnce, 1000);
       }
     });
@@ -25099,6 +25123,16 @@ _GUI_JS = r"""(function () {
   }
 
   // ── 现场检测向导 ──
+  // 向导/核对面板翻折共用函数 (renderProgress 的 site_ready 进入与 error
+  // 恢复两条路径共用, 审查 F2: 不许只翻视图不动面板)
+  function showSiteCheck() {
+    $("#site-wizard").style.display = "none";
+    $("#site-check").style.display = "";
+  }
+  function showSiteWizard() {
+    $("#site-wizard").style.display = "";
+    $("#site-check").style.display = "none";
+  }
   function renderSiteCheck() {
     var box = $("#site-items"); box.textContent = "";
     (state.meta.site_items || []).forEach(function (it) {
@@ -25133,28 +25167,13 @@ _GUI_JS = r"""(function () {
                           tested_at: $("#site-time").value,
                           plan: $("#site-plan").value }).then(function (r) {
       if (!r || !r.ok) { $("#site-err").textContent = (r && r.err) || "启动失败"; return; }
-      // 诊断进行中 → 进度页; 完成后 site_ready 回到本页勾选
-      var wait = setInterval(function () {
-        get(API.progress).then(function (d) {
-          state.data = d;
-          if (d.phase === "running") { show("progress"); renderProgress(d); }
-          if (d.phase === "site_ready") {
-            clearInterval(wait);
-            renderSiteCheck();
-            show("site");
-            $("#site-wizard").style.display = "none";
-            $("#site-check").style.display = "";
-            return;
-          }
-          if (d.phase === "error") {
-            clearInterval(wait);
-            show("site");
-            $("#site-wizard").style.display = "";
-            $("#site-check").style.display = "none";
-            $("#site-err").textContent = d.error || "诊断失败";
-          }
-        });
-      }, 1000);
+      // 诊断轮询收敛为主轮询一路 (审查 F1): running 回进度页受 leftProgress
+      // 约束 (现场诊断中「返回主页」不再 ≤1s 被拉回), site_ready / error 的
+      // 视图与面板翻折由 renderProgress 统一处理; 不再另起 wait 循环形成
+      // 双路轮询
+      state.siteFlow = true;
+      state.leftProgress = false;
+      pollOnce();
     });
   }
   function finishSite() {
