@@ -59,6 +59,12 @@ class TestMainWiring(unittest.TestCase):
         mi.assert_called_once()
         mg.assert_not_called()
 
+    def test_gui_receives_pip_mirror(self):
+        """终审 #4: GUI 分支必须把 --pip-mirror 透传给 _run_gui (不变量)。"""
+        mg, _ = self._main(["--pip-mirror", "https://mirr.example/pip"], True)
+        mg.assert_called_once_with(install=True,
+                                   pip_mirror="https://mirr.example/pip")
+
     def test_cli_flag_keeps_menu(self):
         mg, mi = self._main(["--cli"], True)
         mi.assert_called_once()

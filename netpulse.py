@@ -24622,10 +24622,31 @@ def _GUI_RESET_FOR_TEST():
     del _GUI_BROWSER_PROC[:]   # Task 6: 浏览器子进程句柄 (防测试间泄漏)
 
 
+def _gui_verdict(report):
+    """GUI 报告页结论条数据 (终审 F4): 只透传不自算。
+
+    score/grade/label 取 report["health"] 既有字段 (与客户版报告 Hero 同源);
+    summary 对 report["summary"] (全口径 {模块: 状态}) 按状态中文计数 ——
+    与终端 _health_box_lines / HTML 状态分布条同一口径。health 缺失 → None。
+    """
+    health = (report or {}).get("health") or {}
+    if not health:
+        return None
+    counts = {}
+    for st in ((report or {}).get("summary") or {}).values():
+        counts[st] = counts.get(st, 0) + 1
+    return {"score": health.get("score"), "grade": health.get("grade"),
+            "label": health.get("label"), "summary": counts}
+
+
 def _GUI_LABELS(profile):
     """场景/全量诊断的中文标题 (主页卡与导出文件名共用)。"""
     if profile == "full":
         return "完整诊断"
+    if profile == "site":
+        # 终审 #5: site 不在 SCENE_LABELS, 原先回落成英文 profile id "site"
+        # (现场检测流程里导出的文件名带着英文), 与页面卡片文案「现场检测」同词
+        return "现场检测"
     return SCENE_LABELS.get(profile, str(profile))
 
 
@@ -24647,6 +24668,7 @@ class _GuiSession:
         self._started_at = None
         self._error = None
         self._report = None
+        self._verdict = None
         self._run = None
         self._files = []
         self._site = None
@@ -24677,6 +24699,9 @@ class _GuiSession:
                                if self._started_at else 0),
                 "error": self._error,
                 "has_report": self._report is not None,
+                # 终审 F2: 报告页结论条数据 (score/grade/label + 全口径计数),
+                # _run_diag / finalize_site 在报告构建成功处透传, 见 _gui_verdict
+                "verdict": self._verdict,
                 "files": list(self._files),
                 "site": dict(self._site) if self._site else None,
             }
@@ -24706,6 +24731,7 @@ class _GuiSession:
             self._started_at = time.time()
             self._error = None
             self._report = None
+            self._verdict = None
             self._run = None
             self._files = []
         return True, None
@@ -24752,6 +24778,7 @@ class _GuiSession:
             with self._lock:
                 self._run = run
                 self._report = report
+                self._verdict = _gui_verdict(report) if report else None
                 self._phase = "done" if report else "error"
                 if not report:
                     self._error = "报告构建失败"
@@ -24844,6 +24871,7 @@ class _GuiSession:
         with self._lock:
             self._report = report
             self._files = files
+            self._verdict = _gui_verdict(report)
             # 审查 I2: 一件都没成时回 site_ready — 勾选数据与诊断结果都在,
             # 用户可直接重试「生成报告」, 不被迫重跑 2-3 分钟诊断。
             self._phase = "done" if files else "site_ready"
@@ -24860,24 +24888,27 @@ class _GuiSession:
         base_dir = _desktop_netpulse_dir() or _report_dir()
         title = _GUI_LABELS(profile)
         ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        html_path = os.path.join(base_dir, "%s_%s.html" % (ts, title))
-        err = export_report(html_path, report=report)
-        if err:
-            return None, err
-        if kind == "html":
-            return html_path, None
-        if kind == "json":
-            json_path = html_path[:-5] + ".json"
-            err = export_report(json_path, report=report)
-            return (None, err) if err else (json_path, None)
         if kind == "pdf":
             chrome = _find_pdf_browser()
             if not chrome:
                 return None, "未检测到 Chrome/Edge, 无法自动出 PDF (可打开 HTML 后 Ctrl+P)"
+            # PDF 走无头打印, 打印源需要一份落盘 HTML (仅此类型附带);
+            # html/json 按扩展名直出, 互不搭车 (终审 #7)
+            html_path = os.path.join(base_dir, "%s_%s.html" % (ts, title))
+            err = export_report(html_path, report=report)
+            if err:
+                return None, err
             pdf_path = html_path[:-5] + ".pdf"
             err = _html_to_pdf(chrome, html_path, pdf_path)
             return (None, err) if err else (pdf_path, None)
-        return None, "未知导出类型: %s" % kind
+        # 终审 #7: json 不再先落一份 HTML (原实现多产用户没要的文件) —
+        # export_report 本身按扩展名路由, .json 直接出原始数据
+        ext = ".html" if kind == "html" else ".json" if kind == "json" else None
+        if not ext:
+            return None, "未知导出类型: %s" % kind
+        path = os.path.join(base_dir, "%s_%s%s" % (ts, title, ext))
+        err = export_report(path, report=report)
+        return (None, err) if err else (path, None)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -24950,6 +24981,16 @@ input,select{ font-family:inherit; }
 .g-card.site .g-card-t{ color:#fff; }
 .g-card.site .g-card-d{ color:#c7d7e8; }
 .g-card.site .g-card-go{ color:#8fb3d6; }
+/* 主页运行态 (终审 F2): 诊断进行中置灰场景卡; 顶部运行条可点回进度页 */
+.g-card:disabled{ opacity:.45; cursor:default; }
+.g-card:disabled:hover{ border-color:var(--rule); }
+.g-card.site:disabled:hover{ border-color:var(--navy); }
+.g-runbar{ display:flex; align-items:center; gap:10px; width:100%; margin-top:18px;
+           background:#eef3f9; border:1px solid var(--navy-2); border-radius:10px;
+           padding:11px 18px; font-size:13px; font-weight:700; color:var(--navy);
+           text-align:left; }
+.g-runbar:hover{ background:#e3ebf4; }
+#g-lastrep{ margin-left:auto; }
 .g-fullrow{ display:flex; align-items:center; gap:16px; margin-top:22px; padding-top:20px;
             border-top:1px solid var(--rule); }
 
@@ -25007,6 +25048,15 @@ input,select{ font-family:inherit; }
 /* ── 报告页 (设计稿第 4 节): 结论条 + 导出条 + 内嵌报告 ── */
 .g-verdict{ display:flex; align-items:center; gap:24px; background:var(--soft);
             border:1px solid var(--rule); border-radius:12px; padding:14px 26px; }
+.g-ver-score{ display:flex; align-items:baseline; flex:none; }
+.g-ver-score b{ font-size:46px; font-weight:800; letter-spacing:-1px; line-height:1;
+                color:var(--navy); }
+.g-ver-score small{ font-size:16px; font-weight:700; color:var(--mute); margin-left:4px; }
+.g-ver-badge{ flex:none; background:var(--green); color:#fff; font-size:13px; font-weight:700;
+              letter-spacing:1.5px; padding:5px 15px; border-radius:6px; white-space:nowrap; }
+.g-ver-counts{ display:flex; align-items:center; gap:14px; margin-top:6px; flex-wrap:wrap; }
+.g-ver-count{ display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--dim); }
+.g-ver-count i{ width:9px; height:9px; border-radius:50%; flex:none; }
 .g-verdict .g-ver-line{ font-size:15.5px; font-weight:700; }
 .g-verdict .g-ver-sub{ font-size:12px; color:var(--mute); margin-top:3px; letter-spacing:.3px; }
 .g-exports{ display:flex; align-items:center; gap:10px; margin-top:16px; flex-wrap:wrap; }
@@ -25079,6 +25129,7 @@ _GUI_JS = r"""(function () {
     full: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/><path d="M7 13h6M7 16h4"/></svg>'
   };
   var COLORS = {};          // {状态中文: 颜色} — 来自 /api/scenarios, 唯一来源服务端
+  var GRADES = {};          // {等级: 颜色} — 同一载荷 grade_colors, 结论条徽章用
   var state = { view: "home", pollTimer: null, data: null, meta: null,
                 leftProgress: false, siteFlow: false };
 
@@ -25139,9 +25190,24 @@ _GUI_JS = r"""(function () {
     });
   }
 
+  // ── 主页三态同步 (终审 F2): 诊断进行中置灰全部场景卡 + 顶部运行条 +
+  // 「查看上次报告」入口。pollOnce 每拍调用一次; DOMContentLoaded 的首拍
+  // 即覆盖刷新页面场景 (running 中刷新 → 卡片仍置灰、运行条仍可见)。
+  function updateHomeState(d) {
+    var running = d.phase === "running";
+    document.querySelectorAll("#cards .g-card").forEach(function (c) {
+      c.disabled = running;
+    });
+    $("#g-runbar").style.display = running ? "" : "none";
+    $("#g-lastrep").style.display = d.has_report ? "" : "none";
+  }
+
   // ── 进度页轮询 (1s) ──
   function renderProgress(d) {
     state.data = d;
+    // 终审 #6: error 终态收起「正在测试」卡 (spinner 不再空转), 错误文案照旧;
+    // 其余阶段恢复显示 (下一次运行回到 running 时自动回来)
+    $(".g-cur").style.display = (d.phase === "error") ? "none" : "";
     // 刷新/重开页面时已有进行中的诊断 → 直接回进度页 (brief 注释既定意图);
     // 用户主动返回主页后不再拉回 (state.leftProgress), 否则「返回主页」会失效
     if (d.phase === "running" && state.view === "home" && !state.leftProgress) show("progress");
@@ -25201,6 +25267,7 @@ _GUI_JS = r"""(function () {
   function pollOnce() {
     get(API.progress).then(function (d) {
       renderProgress(d);
+      updateHomeState(d);
       // 唯一轮询路径: running 续 1s; 现场流程 siteStart 已 ok 但服务端 phase
       // 尚未翻转的瞬时 idle 也续 (否则现场诊断会停在无轮询的死态)
       if ((d.phase === "running" || (state.siteFlow && d.phase === "idle")) && !state.pollTimer) {
@@ -25211,6 +25278,36 @@ _GUI_JS = r"""(function () {
   function stopPoll() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } }
 
   // ── 报告页: iframe 整页内嵌客户版报告 ──
+  // 结论条 (终审 F4): 大数字健康分 + 等级徽章 + 状态计数行。数据全部来自
+  // snapshot().verdict (服务端透传 report["health"] / report["summary"] 全口径
+  // 计数, 页面不自算); 等级徽章色 GRADES、计数点色 COLORS 均取自 /api/scenarios
+  // 载荷, JS 不内嵌色表。
+  var STATUS_ORDER = ["完成", "警告", "异常", "错误", "超时", "未检测"];
+  function renderVerdict(v) {
+    var has = !!(v && v.score !== null && v.score !== undefined);
+    $("#ver-score-wrap").style.display = has ? "" : "none";
+    var badge = $("#ver-grade");
+    if (!has) { badge.style.display = "none"; return; }
+    $("#ver-score").textContent = String(v.score);
+    var grade = v.grade || "";
+    badge.style.display = grade ? "" : "none";
+    badge.textContent = grade ? (grade + (v.label ? " · " + v.label : "")) : "";
+    badge.style.background = (grade && GRADES[grade]) ? GRADES[grade] : "";
+    var box = $("#ver-counts");
+    box.textContent = "";
+    if (v.summary) {
+      STATUS_ORDER.forEach(function (st) {
+        var n = v.summary[st];
+        if (!n) return;
+        var seg = el("span", "g-ver-count");
+        var dot = el("i");
+        dot.style.background = COLORS[st] || COLORS["未检测"] || "#94a3b8";
+        seg.appendChild(dot);
+        seg.appendChild(el("span", null, st + " " + n));
+        box.appendChild(seg);
+      });
+    }
+  }
   function openReport() {
     $("#g-frame").src = API.report;
     get(API.progress).then(function (d) {
@@ -25219,6 +25316,7 @@ _GUI_JS = r"""(function () {
       // 结论条只用快照既有字段; 分数/等级留在内嵌报告里, GUI 不自算 (口径统一)
       $("#ver-line").textContent = "诊断完成" + (d.label ? " · " + d.label : "");
       $("#ver-sub").textContent = "实检 " + d.done + "/" + d.total + " 项 · 用时 " + fmtMs(d.elapsed_ms);
+      renderVerdict(d.verdict);
     });
     show("report");
   }
@@ -25327,11 +25425,22 @@ _GUI_JS = r"""(function () {
       if (b) b.addEventListener("click", function () { doExport(k); });
     });
     $("#btn-site-start").addEventListener("click", submitSite);
+    // 终审 S4.1: 客户名空 → 开始按钮禁用 (按钮初始 disabled 由页面属性承载;
+    // submitSite 内的空值校验保留, 双保险)
+    $("#site-cust").addEventListener("input", function () {
+      $("#btn-site-start").disabled = !$("#site-cust").value.trim();
+    });
     $("#btn-site-finish").addEventListener("click", finishSite);
     $("#btn-site-back").addEventListener("click", function () { show("home"); });
+    // 主页运行条 / 上次报告入口 (终审 F2)
+    $("#g-runbar").addEventListener("click", function () {
+      show("progress"); pollOnce();
+    });
+    $("#g-lastrep").addEventListener("click", openReport);
     get(API.scenarios).then(function (meta) {
       state.meta = meta;
       COLORS = meta.status_colors || {};
+      GRADES = meta.grade_colors || {};
       renderHome(meta);
       pollOnce();     // 若已有进行中的诊断 (刷新场景), 直接回进度页
     });
@@ -25363,6 +25472,8 @@ def _gui_page():
             '<main id="view-home" class="g-view-home">'
             '<h1 class="g-h1">今天网络哪里不舒服？</h1>'
             '<div class="g-sub">点一张卡片就开始测，测完直接出报告。</div>'
+            '<button id="g-runbar" class="g-runbar" type="button" style="display:none">'
+            '诊断进行中 · 点击查看进度</button>'
             '<div id="cards" class="g-cards"></div>'
             '<div class="g-fullrow">'
             '<button id="btn-full" class="g-btn2" type="button">'
@@ -25370,7 +25481,9 @@ def _gui_page():
             'stroke-linecap="round" stroke-linejoin="round">'
             '<rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/>'
             '<path d="M7 13h6M7 16h4"/></svg>完整诊断</button>'
-            '<span id="full-count" class="g-dim"></span></div>'
+            '<span id="full-count" class="g-dim"></span>'
+            '<button id="g-lastrep" class="g-link" type="button" style="display:none">'
+            '查看上次报告</button></div>'
             "</main>\n"
             # ── 进度页 (设计稿第 3 节) ──
             '<main id="view-progress" class="g-view-prog" style="display:none">'
@@ -25386,9 +25499,13 @@ def _gui_page():
             '<p class="g-hint">诊断期间请勿断开网络或合上笔记本</p></main>\n'
             # ── 报告页 (设计稿第 4 节): 结论条 + 导出条 + 内嵌客户版报告 ──
             '<main id="view-report" class="g-rep" style="display:none">'
-            '<div class="g-verdict"><div>'
-            '<div class="g-ver-line" id="ver-line">诊断完成</div>'
-            '<div class="g-ver-sub" id="ver-sub"></div></div></div>'
+            '<div class="g-verdict">'
+            '<span id="ver-score-wrap" class="g-ver-score num" style="display:none">'
+            '<b id="ver-score"></b><small>/ 100</small></span>'
+            '<span id="ver-grade" class="g-ver-badge" style="display:none"></span>'
+            '<div><div class="g-ver-line" id="ver-line">诊断完成</div>'
+            '<div class="g-ver-sub" id="ver-sub"></div>'
+            '<div id="ver-counts" class="g-ver-counts"></div></div></div>'
             '<div class="g-exports">'
             '<button id="exp-html" class="g-btn" type="button" data-kind="html">'
             '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
@@ -25433,7 +25550,7 @@ def _gui_page():
             '<input id="site-plan" class="g-input" type="text" placeholder="如 300M，填写后报告自动判达标">'
             '<div class="g-fhint">可空：留空时报告只报实测值，不做达标判定。</div></div>'
             '<div class="g-form-foot">'
-            '<button id="btn-site-start" class="g-btn" type="button">开始检测</button>'
+            '<button id="btn-site-start" class="g-btn" type="button" disabled>开始检测</button>'
             '<span class="g-dim">大约 5–10 分钟，测完进入机房核对。</span>'
             '<button id="btn-site-back" class="g-link" type="button">返回</button></div>'
             '<div id="site-err" class="g-err"></div></div>'
@@ -25478,6 +25595,8 @@ def _gui_meta():
         "module_desc": module_desc,
         "status_colors": {st: STATUS_COLORS[sk]
                           for st, sk in STATUS_KEY.items()},
+        # 终审 F4: 报告页结论条等级徽章色, 同一载荷下发 (页面 JS 不内嵌色表)
+        "grade_colors": dict(GRADE_COLORS),
         "site_items": [{"key": it["key"], "cat": it["cat"],
                         "label": it["label"], "options": list(it["options"])}
                        for it in SITE_CHECK_ITEMS],
@@ -26138,7 +26257,8 @@ def main():
         return
     # 无参数/显式 --gui → 图形界面 (v1.21.0); --cli 或非 TTY → 传统菜单。
     if _gui_wanted(args, sys.stdout.isatty() if sys.stdout else False):
-        _run_gui(install=True)
+        # 终审 #4: pip 镜像透传 (与其他分支同口径), 否则 GUI 内装依赖固定走自动选源
+        _run_gui(install=True, pip_mirror=args.pip_mirror)
         return
     interactive_menu(install=args.install, pip_mirror=args.pip_mirror)
 

@@ -55,7 +55,12 @@ class TestGuiSession(unittest.TestCase):
     def _patch_pipeline(self, profile="slow", fail=False):
         keys = list(np.DIAGNOSE_PROFILES[profile])
         run = _fake_run(keys)
-        report = {"health": {"score": 92}, "fake": True}
+        # 终审 F2: health/summary 是真实 build_report 产物的既有键形态
+        # (health: score/grade/label; summary: {模块key: 状态中文} 全口径),
+        # verdict 断言依赖它们
+        report = {"health": {"score": 92, "grade": "A", "label": "网络良好"},
+                  "summary": {"dns": "完成", "web": "警告", "wifi": "异常"},
+                  "fake": True}
         def _rd(keys_, **kw):
             _seed_last_run(run)
             # brief 笔误修正: 原 `kw.get("progress_cb") and None` 是恒 None 的
@@ -87,6 +92,27 @@ class TestGuiSession(unittest.TestCase):
         self.assertEqual(snap["total"], len(keys))
         self.assertEqual(snap["done"], len(keys))
         self.assertTrue(snap["has_report"])
+
+    def test_verdict_passthrough(self):
+        """终审 F2: snapshot.verdict 只透传 report["health"] 既有字段 +
+        report["summary"] 全口径计数, 页面/GUI 不自算。"""
+        keys, run, report, p, pd, pb = self._patch_pipeline()
+        s = np._GuiSession()
+        with p, pd, pb, \
+             mock.patch.object(np, "_enrich_diagnosis_evidence",
+                               side_effect=lambda d, r, e: d):
+            s.start("slow")
+            s._thread.join(timeout=5)
+        v = s.snapshot()["verdict"]
+        self.assertEqual(v["score"], 92)
+        self.assertEqual(v["grade"], "A")
+        self.assertEqual(v["label"], "网络良好")
+        # 全口径计数: {状态中文: count}, 恰为 fake summary 三个模块的状态分布
+        self.assertEqual(v["summary"], {"完成": 1, "警告": 1, "异常": 1})
+
+    def test_site_label_chinese(self):
+        """终审 #5: site 导出文件名标题用中文「现场检测」, 不回落英文 profile id。"""
+        self.assertEqual(np._GUI_LABELS("site"), "现场检测")
 
     def test_busy_reject(self):
         keys, run, report, p, pd, pb = self._patch_pipeline()
@@ -165,6 +191,9 @@ class TestGuiSession(unittest.TestCase):
         self.assertTrue(p1.startswith(tmp))
         self.assertTrue(p2.endswith(".json"))
         self.assertTrue(p3.endswith(".pdf"))
+        # 终审 #7: json 导出不附带落 HTML — 全程 .html 只落 2 次
+        # (export("html") 一次 + pdf 无头打印源一次); 旧实现是 3 次
+        self.assertEqual(sum(1 for w in written if str(w).endswith(".html")), 2)
         # brief 笔误修正: 原断言要求 p1/p3 文件名全同, 但 export 每次调用各自
         # 取当前时间戳 (秒级), 跨秒边界必假失败; 改比「同名规则」= 标题段一致
         self.assertEqual(os.path.basename(p1).split("_", 2)[-1],
@@ -179,6 +208,7 @@ class TestGuiSession(unittest.TestCase):
         snap = s.snapshot()
         self.assertEqual(snap["phase"], "error")
         self.assertTrue(snap["error"])
+        self.assertIsNone(snap["verdict"])   # 无报告即无结论 (终审 F2)
 
 
 if __name__ == "__main__":
