@@ -72,3 +72,4 @@ ehthumbs.db
 # PPT/文档中间产物与 Office 锁文件
 output/
 ~$*
+.superpowers/
