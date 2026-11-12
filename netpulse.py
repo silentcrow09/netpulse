@@ -24594,6 +24594,191 @@ def _module_menu(install=False, pip_mirror=None):
     return False
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 本地 GUI 壳 (v1.21.0): 会话快照 / HTTP 服务 / 浏览器拉起。零第三方依赖。
+# 数据流: run_diagnostics(progress_cb=…) → _GuiSession(线程安全快照)
+#         → JSON API (页面 1s 轮询)。新代码不直接读写 LAST_RUN (收口规则 2):
+#         run dict 一律取自 run_diagnostics 返回值; build_report/export_report
+#         等既有函数内部的管线机制照旧沿用。
+# 状态色唯一来源 STATUS_COLORS/STATUS_KEY: API 组装载荷下发, 页面 JS 不内嵌色表。
+# ══════════════════════════════════════════════════════════════════════════
+
+_GUI_BROWSER_PROC = []   # 浏览器子进程句柄, 防 GC 回收进程对象
+_GUI_SHUTDOWN = threading.Event()   # GUI 停机信号 (Task 3 的 HTTP 服务线程消费)
+
+
+def _GUI_RESET_FOR_TEST():
+    """测试隔离: 清 GUI 区段模块级状态。Task 4/6 在此追加 handler 清理项。"""
+    _GUI_SHUTDOWN.clear()
+
+
+def _GUI_LABELS(profile):
+    """场景/全量诊断的中文标题 (主页卡与导出文件名共用)。"""
+    if profile == "full":
+        return "完整诊断"
+    return SCENE_LABELS.get(profile, str(profile))
+
+
+class _GuiSession:
+    """单轮诊断的线程安全状态快照 (GUI 进度通道唯一读写点)。
+
+    phase: idle → running → done / error;  现场检测另有 site_ready
+    (诊断完等机房勾选)。本类不读全局 LAST_RUN: run dict 来自
+    run_diagnostics 返回值。
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._phase = "idle"
+        self._profile = None
+        self._keys = []
+        self._module_status = {}
+        self._running = set()
+        self._started_at = None
+        self._error = None
+        self._report = None
+        self._run = None
+        self._files = []
+        self._site = None
+        self._thread = None
+
+    # -- 进度回调 (诊断线程调用, 见 run_diagnostics progress_cb 契约) --
+    def on_progress(self, ev):
+        with self._lock:
+            if ev.get("event") == "start":
+                self._running.add(ev["key"])
+            elif ev.get("event") == "done":
+                self._running.discard(ev["key"])
+                self._module_status[ev["key"]] = ev.get("status")
+
+    # -- 快照 (HTTP 线程调用; 返回可 JSON 化的 dict) --
+    def snapshot(self):
+        with self._lock:
+            done = sum(1 for v in self._module_status.values() if v)
+            return {
+                "phase": self._phase,
+                "profile": self._profile,
+                "label": _GUI_LABELS(self._profile) if self._profile else "",
+                "total": len(self._keys),
+                "done": done,
+                "running": sorted(self._running),
+                "module_status": dict(self._module_status),
+                "elapsed_ms": (int((time.time() - self._started_at) * 1000)
+                               if self._started_at else 0),
+                "error": self._error,
+                "has_report": self._report is not None,
+                "files": list(self._files),
+                "site": dict(self._site) if self._site else None,
+            }
+
+    def is_running(self):
+        with self._lock:
+            return self._phase in ("running",)
+
+    def report_html(self):
+        """内嵌报告页 (客户版) 的完整 HTML; 无报告返回 None。"""
+        with self._lock:
+            if not self._report:
+                return None
+            report = self._report
+        return render_report_html_customer(report)
+
+    # -- 诊断编排 (与终端 _run_scene 同一管线) --
+    def _begin(self, profile, keys):
+        with self._lock:
+            if self._phase == "running":
+                return False, "已有诊断在进行中"
+            self._phase = "running"
+            self._profile = profile
+            self._keys = list(keys)
+            self._module_status = {k: None for k in keys}
+            self._running = set()
+            self._started_at = time.time()
+            self._error = None
+            self._report = None
+            self._run = None
+            self._files = []
+        return True, None
+
+    def start(self, profile, install=True, pip_mirror=None):
+        """启动场景诊断或完整诊断。full=full_module_keys() (含 tcpcc 压测)。"""
+        if profile == "full":
+            keys = full_module_keys()
+        elif profile in DIAGNOSE_PROFILES:
+            keys = list(DIAGNOSE_PROFILES[profile])
+        else:
+            return False, "未知场景: %s" % profile
+        ok, err = self._begin(profile, keys)
+        if not ok:
+            return False, err
+        self._thread = threading.Thread(target=self._run_diag,
+                                        args=(keys, install, pip_mirror),
+                                        daemon=True, name="np-gui-diag")
+        self._thread.start()
+        return True, None
+
+    def _run_diag(self, keys, install, pip_mirror):
+        try:
+            run = run_diagnostics(keys, banner=False, parallel=True,
+                                  max_workers=4, install=install,
+                                  pip_mirror=pip_mirror, print_modules=False,
+                                  progress_cb=self.on_progress)
+            results = run.get("results") or {}
+            if not results:
+                raise RuntimeError("诊断未产生数据")
+            # 决议 (Task 2 审查): module_status 以最终 run dict 为准整体同步 —
+            # done 事件里的 status 是 _normalize_module_statuses 归一化前的
+            # 原值, 事件只负责过程进度; 最终状态以 run["status"] 为准
+            # (加锁, 先于 phase 翻转)。
+            with self._lock:
+                self._module_status = dict(run.get("status") or {})
+            profile = self._profile
+            rf = profile if profile in DIAGNOSE_PROFILES else None
+            diagnosis = _enrich_diagnosis_evidence(
+                diagnose(results, rule_filter=rf), results, run.get("evidence"))
+            report = build_report(
+                rule_filter=rf,
+                diagnosis=diagnosis.to_dict() if diagnosis else None)
+            with self._lock:
+                self._run = run
+                self._report = report
+                self._phase = "done" if report else "error"
+                if not report:
+                    self._error = "报告构建失败"
+        except Exception as e:
+            with self._lock:
+                self._phase = "error"
+                self._error = "%s: %s" % (type(e).__name__, e)
+
+    # -- 导出 (与终端 _export_scene_report 同目录同名规则) --
+    def export(self, kind):
+        with self._lock:
+            report, profile = self._report, self._profile
+        if not report:
+            return None, "尚无报告可导出"
+        base_dir = _desktop_netpulse_dir() or _report_dir()
+        title = _GUI_LABELS(profile)
+        ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        html_path = os.path.join(base_dir, "%s_%s.html" % (ts, title))
+        err = export_report(html_path, report=report)
+        if err:
+            return None, err
+        if kind == "html":
+            return html_path, None
+        if kind == "json":
+            json_path = html_path[:-5] + ".json"
+            err = export_report(json_path, report=report)
+            return (None, err) if err else (json_path, None)
+        if kind == "pdf":
+            chrome = _find_pdf_browser()
+            if not chrome:
+                return None, "未检测到 Chrome/Edge, 无法自动出 PDF (可打开 HTML 后 Ctrl+P)"
+            pdf_path = html_path[:-5] + ".pdf"
+            err = _html_to_pdf(chrome, html_path, pdf_path)
+            return (None, err) if err else (pdf_path, None)
+        return None, "未知导出类型: %s" % kind
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="netpulse.py",
