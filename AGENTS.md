@@ -108,6 +108,16 @@
   于屏幕缓冲区，退出备用屏幕会还原用户原窗口）；Windows Terminal 下该调用失败 →
   只靠「画布宽 ≤ 真实终端宽」保证不折行。
 
+## 本地 GUI 层（v1.21.0）
+
+入口判定在 `main()` 末尾 `_gui_wanted()`（纯函数）：无参数 + TTY 默认进 GUI，
+`--gui` 显式进，`--cli` / 非 TTY 走传统终端菜单，两参数同用 exit 4。四条约定：
+
+- 进度通道走 `progress_cb` + `_GuiSession` 快照，新代码不读 `LAST_RUN`；
+- 状态色唯一来源 `STATUS_COLORS`，经 `/api/scenarios` 下发，页面 JS 不内嵌色表；
+- 页面动态数据一律 `textContent`，禁止 innerHTML 插值；
+- `--cli`/`--json`/非 TTY 契约永不进 GUI。
+
 ## 诊断汇总口径（v1.19.x）
 
 终端诊断汇总框**只给两行**：健康分 + 异常模块数量，**不列异常模块清单**

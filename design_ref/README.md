@@ -7,6 +7,7 @@
 ```
 design_ref/
 ├── README.md              本文件
+├── gui/gui_design_v1.html      ← GUI 设计稿 (v1.21.0, 方案A 已选型)
 └── report_templates/
     ├── 模板D_现代仪表盘风.html    ← 已接入 (v1.14.10): 选项 6 一页客户报告
     └── assets/ct_logo_white.png     ← 同源 logo, 已被 netpulse.py 内嵌

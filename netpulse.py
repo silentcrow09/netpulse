@@ -25721,6 +25721,20 @@ def _run_gui(install=True, pip_mirror=None, shutdown_evt=None):
             pass
 
 
+def _gui_wanted(args, is_tty):
+    """无顶层模式时是否进 GUI (纯函数, 便于测试)。
+
+    --gui 显式进; --cli 显式不进; --json 不进 (stdout 必须是纯 JSON 的
+    契约, v1.15.0); 其余看是否交互终端 —— 非 TTY (管道/计划任务) 维持
+    旧菜单路径, 行为不变。
+    """
+    if getattr(args, "cli", False):
+        return False
+    if getattr(args, "json", False):
+        return False
+    return bool(getattr(args, "gui", False)) or bool(is_tty)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="netpulse.py",
@@ -25858,6 +25872,11 @@ def main():
                              "PDF; 需交互终端, 与其他模块互斥")
     parser.add_argument("--customer", metavar="NAME",
                         help="现场检测模式的客户名称预填 (配合 --site; 不填则终端询问)")
+    parser.add_argument("--gui", action="store_true",
+                        help="进入图形界面窗口 (v1.21.0); 无参数启动且为交互终端时"
+                             "已是默认, 本参数用于显式指定")
+    parser.add_argument("--cli", action="store_true",
+                        help="跳过图形界面, 直接进入传统终端菜单 (v1.21.0)")
     parser.add_argument("--capture", nargs="?", const="slice",
                         choices=["slice", "full"], default=None, metavar="MODE",
                         help="盯障期间抓包取证 (需 Npcap + 管理员; 默认关闭): "
@@ -25871,6 +25890,10 @@ def main():
                         help=f"抓包缓冲上限 MB (默认 {CAPTURE_DEFAULT_MB}, 最小 8); "
                              "超限挤掉最旧包并如实报告; 配合 --capture 使用")
     args = parser.parse_args()
+
+    if args.gui and args.cli:
+        print(_c("  错误: --gui 与 --cli 不能同时使用", C_RED))
+        sys.exit(4)
 
     # v1.15.0 (审查 P2): 抓包切片的保留期清理在**每次运行**都做, 不只在下次
     # 抓包时做 —— 旧版只在 _PcapCaptureSession.start() 里调, 于是「下次运行
@@ -26113,7 +26136,10 @@ def main():
             _export_reports(args.export)
         _exit_with_status()
         return
-    # 无参数 -> 进入交互式菜单
+    # 无参数/显式 --gui → 图形界面 (v1.21.0); --cli 或非 TTY → 传统菜单。
+    if _gui_wanted(args, sys.stdout.isatty() if sys.stdout else False):
+        _run_gui(install=True)
+        return
     interactive_menu(install=args.install, pip_mirror=args.pip_mirror)
 
 
