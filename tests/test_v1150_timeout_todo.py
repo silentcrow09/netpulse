@@ -184,8 +184,15 @@ class TestDiagnosisSectionNotClaimNoFault(_AllTimeoutBase):
         self.assertNotIn("无故障", sec)
         self.assertIn("未定位到根因", sec)
 
-    def test_no_fault_badge_kept_when_all_ok(self):
-        """正常报告仍写「✓ 无故障」, 别把闸门做成一刀切。"""
+    def test_all_ok_report_does_not_claim_no_fault(self):
+        """v1.20.0: 全部正常时也不再写「✓ 无故障」。
+
+        口径变更 (2026-11-12 实机反馈): 8 条是**根因规则**, 规则没命中 ≠
+        没故障 —— 同一份报告里常常还有模块级警告, 「✓ 无故障」与下方待办
+        清单直接打架。「整体高置信度」更是无根因时 overall_confidence=1.0
+        这个默认值编出来的数。现在统一写「未匹配到根因」。
+        (v1.15.0 曾要求"正常报告保留 ✓ 无故障", 该口径已被 v1.20.0 取代)
+        """
         keys = ["gateway"]
         old = N.LAST_RUN
         N.LAST_RUN = _mk_last_run(
@@ -198,7 +205,10 @@ class TestDiagnosisSectionNotClaimNoFault(_AllTimeoutBase):
         finally:
             N.LAST_RUN = old
         sec = N._render_diagnosis_section_html(rep["diagnosis"], report=rep)
-        self.assertIn("无故障", sec)
+        self.assertNotIn("无故障", sec)
+        self.assertNotIn("高置信度", sec)
+        self.assertNotIn("条规则", sec)
+        self.assertIn("未匹配到根因", sec)
 
 
 class TestWifiNoteNotMisleading(_AllTimeoutBase):

@@ -438,6 +438,23 @@ def _safe_iface_name(name):
     return s
 
 
+def _safe_ip_literal(ip):
+    """校验 IP 字面量能否安全插值进命令行。非法返回 None (调用方退化成占位)。
+
+    v1.20.0: DNS 建议命令 (netsh set dnsservers address=...) 里除了接口名,
+    **地址本身**也要过白名单 —— 系统 DNS 列表来自 Get-DnsClientServerAddress
+    (本地注册表里的字符串), 理论上能被写成任意文本, 而这条命令是要用户
+    复制后**提权执行**的。合法才回填, 否则调用方用占位符。
+    """
+    s = str(ip or "").strip()
+    if not s or len(s) > 45:
+        return None
+    try:
+        return str(ipaddress.ip_address(s))
+    except ValueError:
+        return None
+
+
 def _extract_admin_fix_commands(root_causes):
     """从根因建议里提取带 "(管理员)" 标记的命令 (去重保序)。
 
@@ -2005,6 +2022,18 @@ def _rule_nat_restricted(results_dict):
 _MTU_VALID_MIN = 68
 _MTU_VALID_MAX = 65535
 
+# v1.20.0 · 标准 MTU 与确认探测口径
+# 二分探测把「ICMP 没回包」与「包太大」混在一起处理: 丢一个包就会把收敛值
+# 压低若干字节 (实测 2026-11-12: 到 223.5.5.5 的路径 MTU 实为 1500, 报告却写
+# 1499 并报警 —— 结果里明明记着"不确定 10%", 判定时却没用它)。
+# 唯一能直接回答"会不会分片"的证据是: **标准载荷能不能过**。
+#   载荷 1472 + IP 头 20 + ICMP 头 8 = 1500, DF 置位, 能过 → 路径 MTU 就是 1500。
+_MTU_STANDARD = 1500
+_MTU_STANDARD_PAYLOAD = _MTU_STANDARD - 28      # 1472
+_MTU_CONFIRM_PROBES = 3                          # 确认探测次数
+_MTU_MIN_REPORT_DIFF = 8                          # 小于这个差值 = 测量噪声, 不作故障 (覆盖 PPPoE 1492)
+_MTU_CONFIRM_MIN_MTU = 1492                       # 收敛值低于此 = 明显受限, 不用再确认
+
 
 def _clean_local_mtus(local_mtus):
     """过滤本地接口 MTU 列表中的无效项 (探测侧与规则侧共用, 双保险)。
@@ -2702,8 +2731,9 @@ def _print_diagnosis(diagnosis):
     非 TTY / 用户跳过时零打扰。
     """
     if not diagnosis.root_causes:
-        print(_c(f"  ✓ 根因分析: 未发现故障 "
-                 f"(评估 {diagnosis.rules_evaluated} 条规则)", C_GREEN))
+        # v1.20.0: 规则没命中 ≠ 没故障 (同一轮里可能还有模块级警告), 不再断言
+        # 「未发现故障」, 也不报规则条数 (内部实现细节, 对装维无意义)。
+        print(_c("  ○ 根因分析: 未匹配到已知根因模式", C_GRAY))
         return
     print(_c(f"  🔴 根因分析 ({diagnosis.rules_fired}/{diagnosis.rules_evaluated} "
              f"条规则触发, 整体{_conf_band(diagnosis.overall_confidence)})",
@@ -2771,6 +2801,28 @@ def _build_trouble_ticket_text(report, diagnosis_dict):
     return "\n".join(lines)
 
 
+def _need_attention_count(report):
+    """待办清单里「需要关注」的条数 (与 _todo_issues_section 同口径)。
+
+    按 (severity, text) 去重、只算 异常/错误/警告 (信息级不进清单)。
+    用于诊断条的「N 项问题已列在下方」—— 数字必须与清单标题里的那个一致,
+    否则读者会以为漏了。
+    """
+    seen = set()
+    n = 0
+    for m in (report or {}).get("modules") or []:
+        for issue in (m.get("issues") or []) or []:
+            sev = issue.get("severity", "信息")
+            if sev not in ("异常", "错误", "警告"):
+                continue
+            key = (sev, (issue.get("text") or "").strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            n += 1
+    return n
+
+
 def _render_diagnosis_section_html(diagnosis_dict, report=None):
     """阶段 C · v1.3.0: HTML 报告根因摘要区块.
 
@@ -2800,12 +2852,21 @@ def _render_diagnosis_section_html(diagnosis_dict, report=None):
                     '</div></div>'
                     '</section>')
         # 健康时显示一行轻提示
+        # v1.20.0: 不再断言「无故障 / 整体高置信度 / 评估 N 条规则」。
+        #   - 8 条是**根因规则**, 没命中 ≠ 没故障 (同一份报告里常还有警告),
+        #     「✓ 无故障」是与下方待办清单直接打架的断言;
+        #   - 「整体高置信度」来自无根因时 overall_confidence=1.0 这个默认值,
+        #     是编出来的数;
+        #   - 「评估 N 条规则」是内部实现细节, 对装维没有意义。
+        # 现在只陈述事实: 没匹配到已知根因模式, 有几项问题在下面。
+        n_att = _need_attention_count(report) if report else 0
+        suffix = (f"{n_att} 项问题已列在下方" if n_att
+                  else "本次未发现已知根因模式")
         return ('<section class="diagnosis healthy" id="diagnosis">'
                 '<div class="dhead">'
-                '<span class="dbadge ok">✓ 无故障</span>'
-                f'<span class="dconf">整体{_conf_band(diagnosis_dict.get("overall_confidence", 1.0))}, '
-                f'评估 {diagnosis_dict.get("rules_evaluated", 0)} 条规则'
-                '</span></div>'
+                '<span class="dbadge neutral">未匹配到根因</span>'
+                f'<span class="dconf">{_html_esc(suffix)}</span>'
+                '</div></div>'
                 '</section>')
     cards = []
     for i, rc in enumerate(root_causes, 1):
@@ -2900,6 +2961,9 @@ _DIAGNOSIS_CSS = """
    「警告」和「错误」渲染出来一模一样。现与客户版 .badge.warn 同口径
    (橙底棕字), 警告/错误一眼可分。 */
 .diagnosis .dbadge.warn { background: #fef3c7; color: #9a3412; }
+/* v1.20.0 「未匹配到根因」徽章: 中性灰蓝, 不再冒充绿色 ✓ 无故障 ——
+   8 条根因规则没命中 ≠ 网络没故障 (同一份报告里常还有 4 条警告)。 */
+.diagnosis .dbadge.neutral { background: #e0f2fe; color: #075985; }
 .diagnosis .dconf { color: #64748b; font-size: 13px; }
 .diagnosis .rcard { padding: 12px 16px; border-left: 4px solid #94a3b8; margin-bottom: 12px; background: #f8fafc; border-radius: 0 6px 6px 0; }
 .diagnosis .rcard.severity-critical { border-color: #dc2626; background: #fef2f2; }
@@ -3659,7 +3723,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.19.0"
+APP_VERSION = "1.20.0"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -9370,14 +9434,6 @@ class DNSTester:  # @deprecated v1.2.0 (B8): 已迁移到 probe_dns_v2 (SECTION 
                           "固定异常 IP 而其它 DNS 正常, 可怀疑该 DNS 被污染",
             })
 
-        assessment = "正常"
-        if success_count < total_count * 0.5:
-            assessment = "DNS 解析异常"
-        elif avg_time > 100:
-            assessment = "DNS 响应慢"
-        if dns_hijack:
-            assessment = "DNS 疑似劫持"
-
         # 按 DNS 服务器聚合: 报告主视图每个服务器只展示一行,
         # 而非把 服务器×域名 的全部原始记录 (28+ 条) 平铺出来。
         per_server = []
@@ -9396,6 +9452,77 @@ class DNSTester:  # @deprecated v1.2.0 (B8): 已迁移到 probe_dns_v2 (SECTION 
                 "status": st,
             })
 
+        # v1.20.0: 哪些网卡在用哪些 DNS —— 报告要给"可粘去执行"的
+        # netsh 命令, 就必须知道命令要打在哪个接口上。
+        dns_iface = {}
+        try:
+            code, out, _ = run_ps(
+                "Get-DnsClientServerAddress -AddressFamily IPv4 | "
+                "Where-Object {$_.ServerAddresses -ne $null} | "
+                "Select-Object InterfaceAlias,ServerAddresses | ConvertTo-Json")
+            out = (out or "").strip()
+            if out:
+                data = json.loads(out)
+                if not isinstance(data, list):
+                    data = [data]
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    alias = str(item.get("InterfaceAlias") or "").strip()
+                    addrs = item.get("ServerAddresses") or []
+                    if isinstance(addrs, str):
+                        addrs = [addrs]
+                    for a in addrs:
+                        a = str(a).strip()
+                        if a:
+                            dns_iface.setdefault(a, alias)
+        except Exception:
+            dns_iface = {}
+
+        # ── v1.20.0: 按「当前系统 DNS」单独统计 ──
+        # 旧口径把**所有**服务器 (含用户根本不用的 5 台对比服务器) 混在一起
+        # 求平均, 再用这个平均判"慢不慢" → 实测 2026-11-12: 用户自己的
+        # AliDNS 实测 5.5ms (全场最快), 报告却写"平均 157ms 较慢"并建议
+        # "更换 DNS (阿里/腾讯/114)" —— 用户本来就在阿里 DNS 上。
+        # 现在: 指标与判定都只看当前系统 DNS, 对比服务器仅作参考列出。
+        cur_set = set(system_dns or [])
+        cur_items = [r for r in results if r["dns_server"] in cur_set]
+        cur_ok = [r for r in cur_items if r["success"]]
+        cur_total = len(cur_items)
+        cur_avg = (sum(r["time_ms"] for r in cur_ok) / len(cur_ok)
+                   if cur_ok else 0.0)
+        # 最快可用服务器 (用于"当前 DNS 慢时该换哪台"的建议)
+        usable = [s for s in per_server if s.get("ok")]
+        fastest = min(usable, key=lambda s: s.get("avg_ms", 9999)) if usable else None
+        # 当前 DNS 里"拖后腿"的那几台 (比当前 DNS 里最快的那台慢一倍以上且 >50ms)。
+        # 实测本机: 223.5.5.5 6.3ms 与 8.8.8.8 174.5ms 并存 → 平均 78ms,
+        # 笼统说"平均慢"没用, 要点名那台。
+        cur_servers = [s for s in per_server
+                       if s.get("dns_server") in cur_set and s.get("ok")]
+        cur_best = (min(cur_servers, key=lambda s: s.get("avg_ms", 9999))
+                    if cur_servers else None)
+        cur_slow = [s for s in cur_servers
+                    if cur_best and s.get("avg_ms", 0) >= max(50.0, cur_best.get("avg_ms", 0) * 2)]
+        # 失败明细 (哪台、哪个域名) —— 便于归因, 而不是只给一个总数
+        failed_items = [{"dns_server": r["dns_server"], "dns_name": r["dns_name"],
+                         "domain": r["domain"], "time_ms": r["time_ms"]}
+                        for r in results if not r["success"]]
+
+        # 判定只看当前 DNS: 成功率与平均响应
+        assessment = "正常"
+        if cur_total and cur_ok:
+            cur_rate = len(cur_ok) / cur_total
+            if cur_rate < 0.5:
+                assessment = "DNS 解析异常"
+            elif cur_avg > 100 or cur_slow:
+                # cur_slow: 当前 DNS 里混着明显更慢的那台 (如境外的 8.8.8.8)
+                # → 同样是"响应慢", 徽章必须与卡片里的警告一致
+                assessment = "DNS 响应慢"
+        elif cur_total:
+            assessment = "DNS 解析异常"
+        if dns_hijack:
+            assessment = "DNS 疑似劫持"
+
         self.results = {
             "system_dns": system_dns,
             "assessment": assessment,
@@ -9403,12 +9530,22 @@ class DNSTester:  # @deprecated v1.2.0 (B8): 已迁移到 probe_dns_v2 (SECTION 
             "success_count": success_count,
             "total_count": total_count,
             "avg_time_ms": round(avg_time, 1),
+            # v1.20.0: 当前 DNS 口径 (指标与判定都用它)
+            "current_success_count": len(cur_ok),
+            "current_total_count": cur_total,
+            "current_avg_ms": round(cur_avg, 1),
+            "fastest_server": fastest,
+            "current_best_server": cur_best,
+            "current_slow_servers": cur_slow,
+            "failed_items": failed_items,
+            "dns_interfaces": dns_iface,        # DNS 服务器 → 网卡别名
             "per_server": per_server,        # 聚合视图 (主表)
             "detail": results,               # 原始测试记录 (弱化的"详细测试记录")
             "issues": issues,
             "timestamp": datetime.now().isoformat(),
-            "summary": f"DNS 测试: {success_count}/{total_count} 成功, 平均 {avg_time:.0f}ms"
-                       + ("，疑似劫持" if dns_hijack else ""),
+            "summary": (f"DNS 测试: {success_count}/{total_count} 成功, "
+                        f"当前 DNS 平均 {cur_avg:.0f}ms"
+                        + ("，疑似劫持" if dns_hijack else "")),
         }
         if callback:
             callback(self.results["summary"])
@@ -9493,15 +9630,39 @@ def _probe_path_mtu(target):
             "probes": total_count,
         }
 
+    # ── v1.20.0: 标准载荷确认探测 ──
+    # 二分收敛值贴近标准时, 单次丢包就能把结果压低几字节 (实测: 路径 MTU 实为
+    # 1500 却测出 1499)。用**标准载荷 1472 字节 (DF 置位)** 再打 N 次:
+    #   有任意一次通 → 路径 MTU 就是 1500, 不得报分片风险;
+    #   全不通       → 二分收敛值就是真实路径 MTU。
+    path_mtu = best_mtu + 28
+    confirm_probes = 0
+    confirm_ok = 0
+    if path_mtu >= _MTU_CONFIRM_MIN_MTU:
+        confirm_probes = _MTU_CONFIRM_PROBES
+        for _ in range(confirm_probes):
+            code, out, _ = run_cmd(
+                f"ping -f -l {_MTU_STANDARD_PAYLOAD} -n 1 -w 2000 {target}",
+                timeout=5)
+            if ("TTL=" in out or "回复" in out or "Reply" in out):
+                confirm_ok += 1
+        if confirm_ok > 0:
+            path_mtu = _MTU_STANDARD
+
     return {
         "target": target,
-        "max_payload": best_mtu,
-        "path_mtu": best_mtu + 28,
-        "fragmentation_risk": best_mtu < 1472,
+        "max_payload": path_mtu - 28,
+        "path_mtu": path_mtu,
+        "fragmentation_risk": path_mtu < _MTU_STANDARD,
         "indeterminate_pct": round(
             indeterminate_count / total_count * 100, 1)
             if total_count else 0,
         "probes": total_count,
+        # 确认探测结论: True = 标准载荷可通 (路径 MTU 确认为 1500);
+        # False = 标准载荷不可通 (二分收敛值即真实值); None = 未做确认 (明显受限)
+        "mtu_confirmed": (confirm_ok > 0) if confirm_probes else None,
+        "confirm_result": (
+            f"{confirm_ok}/{confirm_probes} 通过" if confirm_probes else "未做确认"),
     }
 
 
@@ -9568,25 +9729,76 @@ class MTUDetector:
         # 出口接口排最前 (指标卡/摘要默认取 local[0] 展示"本机 MTU")
         local_mtus.sort(key=lambda lm: (not lm.get("egress"),))
 
-        # 评估
+        # 评估 (v1.20.0 重写判定口径)
+        #   报分片风险的前提是**本机确实能发出比路径承载更大的包**, 即
+        #   路径 MTU < 出口接口 MTU。若接口本身就配成 1492 (PPPoE), 路径也是
+        #   1492, 两者一致 → 主机根本发不出超限的包, 不是故障。
+        #   差值 < 8 字节 = 单次丢包造成的测量噪声 (探测侧已用标准载荷确认),
+        #   实测 2026-11-12: 路径 MTU 实为 1500 却测出 1499 并报警。
+        #   真报警时问题里带上**可执行的核实/修复命令** (报告层 _issues_mtu 渲染)。
         issues = []
+        eg_item = next((lm for lm in local_mtus if lm.get("egress")), None)
+        iface_mtu = (eg_item or {}).get("mtu") if eg_item else None
+        iface_name = (eg_item or {}).get("interface", "") if eg_item else ""
+        if not iface_mtu:
+            clean = _clean_local_mtus(local_mtus)
+            if clean:
+                iface_mtu = max(lm["mtu"] for lm in clean)
+                iface_name = next((lm.get("interface", "") or "" for lm in clean
+                                   if lm["mtu"] == iface_mtu), "")
         for r in results:
             if r.get("error"):
                 issues.append(f"到 {r['target']} 的 MTU 测量失败: {r['error']}")
                 continue
-            if r["path_mtu"] < 1500:
-                issues.append(f"到 {r['target']} 的路径 MTU ({r['path_mtu']}) 小于标准 1500，可能导致分片")
+            path_mtu = r.get("path_mtu") or 0
+            diff = _MTU_STANDARD - path_mtu
+            if diff < _MTU_MIN_REPORT_DIFF:
+                continue    # 测量噪声 (差 1~7 字节), 不作故障
+            if iface_mtu and path_mtu >= iface_mtu:
+                # 路径不小于本机出口接口 MTU → 主机发不出超限包, 一致, 不报
+                continue
+            issues.append({
+                "severity": "warning",
+                "message": (f"到 {r['target']} 的路径 MTU ({path_mtu}) 小于标准 "
+                            f"1500，可能导致分片"),
+                "detail": (f"路径 MTU {path_mtu}, 比标准少 {diff} 字节; 已用标准载荷 "
+                           f"{_MTU_STANDARD_PAYLOAD} 字节复核, 确认不可通"
+                           + (f"; 本机出口接口 {iface_name} 的 MTU 为 {iface_mtu}"
+                              if iface_name else "")),
+                "target": r["target"],
+                "path_mtu": path_mtu,
+                "diff": diff,
+                "iface": iface_name,
+                "iface_mtu": iface_mtu,
+                # 修复指引直接写进问题里 —— JSON 报告的技术员与 HTML 报告的
+                # 装维拿到的必须是同一套命令 (报告层优先用这里的 action)
+                "action": _mtu_fix_actions(r["target"], path_mtu, iface_name),
+            })
         for lm in local_mtus:
-            if lm["mtu"] < 1500 and lm["mtu"] > 0:
-                issues.append(f"接口 {lm['interface']} 的 MTU ({lm['mtu']}) 小于 1500 (可能是 PPPoE/VPN)")
+            if lm["mtu"] < _MTU_STANDARD and lm["mtu"] > 0:
+                # 本机接口 MTU < 1500 本身不是故障 (PPPoE 接口就配 1492),
+                # 降为信息级 —— 此前它被当成字符串 issue, 让 MTU 模块白挂警告。
+                issues.append({
+                    "severity": "info",
+                    "message": (f"接口 {lm['interface']} 的 MTU ({lm['mtu']}) 小于 "
+                                f"1500 (可能是 PPPoE/VPN)"),
+                    "detail": "",
+                    "iface": lm["interface"],
+                    "iface_mtu": lm["mtu"],
+                })
 
+        # v1.20.0: summary 只数真问题 (信息级条目不算), 与 _verdict_mtu 同口径
+        _n_real = sum(1 for i in issues
+                      if isinstance(i, str)
+                      or (isinstance(i, dict) and i.get("severity") != "info"))
         self.results = {
             "path_mtus": results,
             "local_mtus": local_mtus,
+            "egress_interface": iface_name,
             "issues": issues,
             "timestamp": datetime.now().isoformat(),
-            "summary": f"MTU 检测: {'存在分片风险' if issues else '正常'}" +
-                       (f" ({len(issues)} 个问题)" if issues else ""),
+            "summary": f"MTU 检测: {'存在分片风险' if _n_real else '正常'}" +
+                       (f" ({_n_real} 个问题)" if _n_real else ""),
         }
         if callback:
             callback(self.results["summary"])
@@ -9864,6 +10076,85 @@ class BufferbloatTester:
         return self.results
 
 
+# v1.20.0 · 虚拟/隧道接口识别 (IPv6 判级用)
+# 全局 IPv6 挂在虚拟接口上 ≠ 本机有运营商原生 IPv6:
+# ZeroTier / Wintun / Tailscale 等隧道会自己分配全球单播地址
+# (Windows 里 PrefixOrigin=Manual), 但本机并没有 IPv6 默认路由 ——
+# 直连 IPv6 会报 WinError 10051。
+# 实测 2026-11-12: 唯一全局地址 2a01:7a7:... 挂在 ZeroTier 上, 报告却判成
+# "IPv6 配置异常" 并建议"联系运营商开通", 对使用者是误导。
+_VIRTUAL_IFACE_KEYWORDS = (
+    "zerotier", "tailscale", "wireguard", "wintun", "tun", "tap",
+    "vethernet", "hyper-v", "virtualbox", "vmware", "docker", "wsl",
+    "isatap", "teredo", "6in4", "tunnel", "隧道", "clash", "mihomo",
+    "sing-box", "v2ray", "openvpn", "pptp", "l2tp", "ikev2",
+)
+
+
+def _is_virtual_iface(name):
+    """接口名/描述是否是虚拟网卡或隧道 (非物理网卡)。
+
+    与 _is_vpn_interface (只看 VPN 关键字) 的区别: 这里还覆盖虚拟化平台的
+    网卡 (Hyper-V / VirtualBox / WSL / Docker) 与常见加速器隧道 —— 它们
+    同样会带全球单播地址, 但不承载运营商下发的 IPv6。
+    """
+    if not name:
+        return False
+    n = str(name).lower()
+    return any(kw in n for kw in _VIRTUAL_IFACE_KEYWORDS)
+
+
+def _is_ipv6_global_addr(addr):
+    """是否是**全球单播**地址 (2000::/3)。
+
+    排除: ::1 / fe80::/10 链路本地 / fc00::/7 唯一本地 (ULA, 如 ZeroTier 的
+    fd9f:…)/ ff00::/8 组播。ULA 不是公网地址 —— 隧道网卡会自己分配一个
+    fd9f:: 开头的地址, 旧逻辑把它当"全局 IPv6"是误判来源之一。
+    """
+    a = str(addr or "").split("%")[0].strip().lower()
+    if not a or ":" not in a:
+        return False
+    if a == "::1":
+        return False
+    return a[0] in ("2", "3")
+
+
+def _ipv6_global_ifaces():
+    """取本机全球单播 IPv6 地址及其所属接口。返回 [(地址, 接口名), ...]。
+
+    Windows 权威来源 (Get-NetIPAddress), 比解析 ipconfig 文本可靠:
+    ipconfig 只给地址, 给不出地址挂在哪块网卡上。
+    取不到时返回 [] (调用方按"来源未知"处理, 不下结论)。
+    """
+    code, out, _ = run_ps(
+        "Get-NetIPAddress -AddressFamily IPv6 | "
+        "Where-Object {$_.IPAddress -notlike 'fe80*' -and $_.IPAddress -ne '::1'} | "
+        "Select-Object IPAddress,InterfaceAlias | ConvertTo-Json")
+    out = (out or "").strip()
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        data = [data]
+    rows = []
+    seen_iface = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        addr = str(item.get("IPAddress") or "").strip()
+        iface = str(item.get("InterfaceAlias") or "").strip()
+        if not _is_ipv6_global_addr(addr):
+            continue
+        if iface in seen_iface:      # 一块网卡多个全球地址 → 接口只留一次
+            continue
+        seen_iface.add(iface)
+        rows.append((addr, iface))
+    return rows
+
+
 class IPv6Tester:
     """IPv6 连通性检测"""
 
@@ -9902,8 +10193,22 @@ class IPv6Tester:
                     local_ipv6.append(addr)
                     if addr.startswith("fe80"):
                         has_link_local = True
-                    else:
+                    elif _is_ipv6_global_addr(addr):
                         has_global_ipv6 = True
+
+        # v1.20.0: 取全局 IPv6 的**所属接口** (Windows 权威来源)。
+        # ipconfig 只给地址, 给不出这个地址挂在物理网卡还是隧道上 ——
+        # 而这正是"本机有没有运营商原生 IPv6"的关键 (隧道网卡会自己分配
+        # 全球单播地址, 但本机并没有 IPv6 默认路由)。
+        global_ifaces = _ipv6_global_ifaces()
+        native_ifaces = [i for _a, i in global_ifaces if not _is_virtual_iface(i)]
+        virtual_ifaces = [i for _a, i in global_ifaces if _is_virtual_iface(i)]
+        if native_ifaces:
+            ipv6_source = "native"
+        elif virtual_ifaces:
+            ipv6_source = "virtual"
+        else:
+            ipv6_source = "none"
 
         # 2. 检查 IPv6 路由
         code, route_out, _ = run_cmd("route print ::/0")
@@ -9934,22 +10239,60 @@ class IPv6Tester:
             ipv6_dns = False
 
         if not has_global_ipv6:
-            issues.append("未检测到全局 IPv6 地址")
-        if has_global_ipv6 and not ipv6_connectivity:
+            issues.append({
+                "severity": "warning",
+                "message": "未检测到全局 IPv6 地址",
+                "detail": "本机没有运营商下发的 IPv6 地址, 纯 IPv6 网站与部分测评业务不可用",
+                "action": "如业务需要 IPv6, 联系运营商开通并确认路由器下发前缀",
+            })
+        elif ipv6_source == "virtual":
+            # v1.20.0: 全局 IPv6 全部来自虚拟/隧道接口 → 本机**没有**运营商
+            # 原生 IPv6。隧道网卡自己会分配全球单播地址 (PrefixOrigin=Manual),
+            # 但本机没有 IPv6 默认路由, 直连 IPv6 必然不通 —— 报成"异常"并
+            # 建议"联系运营商开通"是误导 (实测 2026-11-12: ZeroTier 上的
+            # 2a01:7a7:: 被判成 IPv6 配置异常)。降为信息级, 不进待办清单。
+            vnames = "、".join(virtual_ifaces[:3]) or "虚拟接口"
+            issues.append({
+                "severity": "info",
+                "message": (f"全局 IPv6 地址来自虚拟接口 ({vnames}), "
+                            f"本机没有运营商下发的原生 IPv6"),
+                "detail": ("隧道/虚拟网卡会自行分配全球单播地址, 但本机没有 IPv6 "
+                           "默认路由, 直连 IPv6 不通属预期, 不是配置故障"),
+                "action": ("如需 IPv6 请联系运营商开通并确认路由器下发前缀; "
+                           "仅使用 VPN/隧道时可忽略本项"),
+            })
+        elif not ipv6_connectivity:
             # Windows `route print ::/0` 不显示 ISATAP/6to4 隧道的默认路由, 所以
             # has_ipv6_route=False 不一定是配置问题。实际能 ping 通 2400:: 等
             # 目的地址才算真正的 IPv6 可用, 这里用更准确的措辞
             if has_ipv6_route:
-                issues.append("有 IPv6 路由但无法建立 IPv6 连接，可能是防火墙/MTU 问题")
+                issues.append({
+                    "severity": "critical",
+                    "message": "有 IPv6 路由但无法建立 IPv6 连接，可能是防火墙/MTU 问题",
+                    "detail": "本机有全局 IPv6 地址与默认路由, 但连不通 IPv6 目标",
+                    "action": "检查路由器/防火墙的 IPv6 放行与 MTU 设置",
+                })
             else:
-                issues.append("有 IPv6 地址但当前无法通过 IPv6 上外网 "
-                              "(本机配置了隧道方式的 IPv6, 系统命令查不到它的路由)。")
-        if has_global_ipv6 and not ipv6_dns:
-            issues.append("IPv6 DNS 解析失败")
+                issues.append({
+                    "severity": "critical",
+                    "message": "有 IPv6 地址但当前无法通过 IPv6 上外网 "
+                               "(本机配置了隧道方式的 IPv6, 系统命令查不到它的路由)。",
+                    "detail": "本机有全局 IPv6 地址, 但没有 IPv6 默认路由",
+                    "action": "联系运营商开通 IPv6 或检查路由器/防火墙配置",
+                })
+        elif not ipv6_dns:
+            issues.append({
+                "severity": "warning",
+                "message": "IPv6 DNS 解析失败",
+                "detail": "能建立 IPv6 连接, 但 IPv6 版的 DNS 解析不工作",
+                "action": "检查路由器 DNS 是否下发 IPv6 地址, 或换用支持 IPv6 的 DNS",
+            })
 
         assessment = "不支持"
-        if has_global_ipv6 and ipv6_connectivity:
+        if has_global_ipv6 and ipv6_connectivity and ipv6_source == "native":
             assessment = "IPv6 正常"
+        elif has_global_ipv6 and ipv6_source == "virtual":
+            assessment = "IPv6 来自虚拟接口（本机无原生 IPv6）"
         elif has_global_ipv6:
             assessment = "IPv6 配置异常"
         elif has_link_local:
@@ -9963,6 +10306,12 @@ class IPv6Tester:
             "ipv6_connectivity": ipv6_connectivity,
             "ipv6_dns": ipv6_dns,
             "ipv6_target": ipv6_target,
+            # v1.20.0: IPv6 来源判定 (native=物理接口上的运营商地址 /
+            # virtual=虚拟接口自带地址 / none=没有全局地址)
+            "ipv6_source": ipv6_source,
+            "ipv6_native": (ipv6_source == "native"),
+            "native_ifaces": native_ifaces,
+            "virtual_ifaces": virtual_ifaces,
             "issues": issues,
             "assessment": assessment,
             "timestamp": datetime.now().isoformat(),
@@ -10915,13 +11264,19 @@ class LANDeviceScanner:
 
         # 评估
         issues = []
+        # v1.20.0: 厂商补查披露**不是问题**, 是隐私声明。
+        # 此前它被塞进 issues, 而 determine_status 把任何字符串 issue 都当
+        # 真实问题 → LAN 模块被判「警告」白扣 2 分, 而模块卡里查不到任何原因
+        # (实测 2026-11-12: 6 台设备厂商全部识别成功, 仍被判警告)。
+        # 挪到独立 disclosures 字段, 由报告层按信息级渲染, 披露内容一字不减。
+        disclosures = []
         # v1.15.2 (审查 P2): 厂商补查会把完整 MAC 发给第三方 —— 此前**无任何
         # 披露**。这里按实际发出的请求数披露 (没补查就不提, 免得刷屏),
         # 域名从服务常量生成。
         if _OUI_ONLINE_SENT["n"] > 0:
             _oui_host = urlsplit(
                 OUI_ONLINE_SERVICE.replace("{mac}", "0")).netloc
-            issues.append(
+            disclosures.append(
                 f"{_OUI_ONLINE_SENT['n']} 个未知厂商前缀经 {_oui_host} 在线补查 "
                 f"(只发该设备的 MAC 地址); 设 NP_NO_ONLINE_OUI=1 可关闭")
         if not devices:
@@ -10942,6 +11297,7 @@ class LANDeviceScanner:
             "devices": devices,
             "device_count": len(devices),
             "issues": issues,
+            "disclosures": disclosures,
             "assessment": assessment,
             "timestamp": datetime.now().isoformat(),
             "summary": f"LAN 扫描: 发现 {len(devices)} 台设备",
@@ -16914,33 +17270,79 @@ def _metrics_external(res):
 def _verdict_dns(res):
     if "error" in res:
         return res.get("error", "检测失败")
+    succ = res.get("success_count", 0)
+    tot = res.get("total_count", 0)
     if res.get("dns_hijack"):
-        return f"DNS 疑似劫持 ({res.get('success_count', 0)}/{res.get('total_count', 0)} 成功)"
-    return (f"DNS 测试: {res.get('success_count', 0)}/{res.get('total_count', 0)} 成功, "
-            f"平均 {res.get('avg_time_ms', 0)}ms")
+        return f"DNS 疑似劫持 ({succ}/{tot} 成功)"
+    # v1.20.0: 结论只讲**当前系统 DNS** 的实测值, 对比服务器的总数只作旁注
+    sys_dns = res.get("system_dns") or []
+    cur_avg = res.get("current_avg_ms")
+    if cur_avg is None:
+        cur_avg = res.get("avg_time_ms", 0)
+    cur_label = ", ".join(sys_dns) if sys_dns else "当前 DNS"
+    return (f"当前 DNS ({cur_label}) 平均 {cur_avg}ms · "
+            f"对比测试 {succ}/{tot} 成功")
 
 
 def _metrics_dns(res):
-    out = []
-    succ = res.get("success_count", 0)
-    tot = res.get("total_count", 0)
-    avg = res.get("avg_time_ms", 0)
+    """DNS 指标卡 (v1.20.0: 按「当前系统 DNS」统计, 对比服务器只作参考)。
 
-    out.append(("成功率", f"{succ}/{tot}",
-                "err" if succ < tot * 0.5 else "warn" if succ < tot else "ok"))
-    out.append(("平均响应", f"{avg} ms",
-                "err" if avg >= 200 else "warn" if avg >= 50 else "ok"))
-    # 按服务器选最快的 3 个
+    旧口径把 6 台服务器 (含 5 台用户根本不用的对比机) 混在一起求平均 ——
+    实测 2026-11-12: 用户自己的 AliDNS 实测 5.5ms (全场最快), 报告却显示
+    "平均 157.1ms" 并把它标成警告色, 读者会以为自己用的 DNS 慢。
+    """
+    out = []
+    cur_avg = res.get("current_avg_ms")
+    cur_ok = res.get("current_success_count")
+    cur_tot = res.get("current_total_count")
+    if cur_avg is None:      # 老数据 (无当前 DNS 口径) → 回落旧字段
+        cur_avg = res.get("avg_time_ms", 0)
+    if cur_ok is None:
+        cur_ok = res.get("success_count", 0)
+    if cur_tot is None:
+        cur_tot = res.get("total_count", 0)
+    sys_dns = res.get("system_dns") or []
+    lvl = "err" if cur_avg >= 200 else "warn" if cur_avg >= 50 else "ok"
+    cur_set = set(sys_dns or [])
+    # 当前 DNS 逐台表现 (一眼看出是哪一台拖后腿)
+    cur_per = {s.get("dns_server"): s for s in (res.get("per_server") or [])
+               if s.get("dns_server") in cur_set}
+    parts = []
+    for ip in (sys_dns or []):
+        s = cur_per.get(ip)
+        if s:
+            parts.append(f"{s.get('dns_name') or ip} {s.get('avg_ms')}ms")
+    hint = ("本机配置的 DNS: " + ", ".join(sys_dns)) if sys_dns else ""
+    if parts:
+        hint += "（" + " / ".join(parts) + "）"
+    if cur_tot:
+        hint += f"· 实测 {cur_ok}/{cur_tot} 成功"
+    out.append(("当前 DNS 平均", f"{cur_avg} ms", lvl, hint))
+    rate_lvl = ("err" if cur_tot and cur_ok < cur_tot * 0.5
+                else "warn" if cur_tot and cur_ok < cur_tot else "ok")
+    out.append(("当前 DNS 成功率", f"{cur_ok}/{cur_tot}", rate_lvl,
+                "只统计本机在用的 DNS 服务器"))
     per = res.get("per_server", [])
     for s in sorted(per, key=lambda x: x.get("avg_ms", 9999))[:3]:
         st = s.get("status", "正常")
-        out.append((s.get("dns_name") or s.get("dns_server", "?"),
+        name = s.get("dns_name") or s.get("dns_server", "?")
+        if s.get("dns_server") in cur_set:
+            name = f"当前 {name}"
+        out.append((name,
                     f"{s.get('avg_ms', '?')} ms ({s.get('ok', 0)}/{s.get('total', 0)})",
                     "err" if st in ("不可用", "部分失败") else "ok"))
     return out
 
 
 def _issues_dns(res):
+    """DNS 问题项 (v1.20.0: 判据与建议都按「当前系统 DNS」走)。
+
+    旧版两个毛病:
+      1. 用**混算平均**判慢 → 明明当前 DNS 是全场最快, 却报"157ms 较慢";
+      2. 建议固定写死"尝试更换 DNS 服务器 (阿里/腾讯/114)" → 对一台已经在
+         阿里 DNS 上的机器是废话 (实测 2026-11-12 用户原话: "你这个建议不准确")。
+    现在: 当前 DNS 达标就明确说"无需更换"; 真慢才点名实测最快的那台并给命令。
+    """
     out = []
     if res.get("dns_hijack"):
         out.append({
@@ -16949,24 +17351,95 @@ def _issues_dns(res):
             "impact": "可能被劫持到错误的服务器, 隐私泄露, 部分网站访问异常",
             "action": "检查路由器 DNS 设置, 改用 AliDNS (223.5.5.5) / DNSPod (119.29.29.29)"
         })
-    succ = res.get("success_count", 0)
-    tot = res.get("total_count", 0)
-    if tot and succ < tot * 0.8:
+    cur_avg = res.get("current_avg_ms")
+    if cur_avg is None:
+        cur_avg = res.get("avg_time_ms", 0)
+    cur_ok = res.get("current_success_count")
+    if cur_ok is None:
+        cur_ok = res.get("success_count", 0)
+    cur_tot = res.get("current_total_count")
+    if cur_tot is None:
+        cur_tot = res.get("total_count", 0)
+    sys_dns = res.get("system_dns") or []
+    cur_label = ", ".join(sys_dns) if sys_dns else "当前 DNS"
+    fastest = res.get("fastest_server") or {}
+    f_name = fastest.get("dns_name") or ""
+    f_ip = fastest.get("dns_server") or ""
+    f_avg = fastest.get("avg_ms", 0)
+    cur_is_fastest = bool(f_ip) and f_ip in (sys_dns or [])
+    # 当前 DNS 里"拖后腿"的那几台 (比当前 DNS 里最快的那台慢一倍以上且 >50ms)。
+    # 探测侧已算好 (current_best_server / current_slow_servers), 报告层直接读;
+    # 老数据没这两个字段时才自己兜底算一遍。
+    cur_best = res.get("current_best_server") or None
+    cur_slow = res.get("current_slow_servers") or []
+    if cur_best is None:
+        cur_servers = [s for s in (res.get("per_server") or [])
+                       if s.get("dns_server") in set(sys_dns or []) and s.get("ok")]
+        cur_best = (min(cur_servers, key=lambda s: s.get("avg_ms", 9999))
+                    if cur_servers else None)
+        cur_slow = [s for s in cur_servers
+                    if cur_best and s.get("avg_ms", 0) >= max(50.0, cur_best.get("avg_ms", 0) * 2)]
+    dns_iface = res.get("dns_interfaces") or {}
+    failed = res.get("failed_items") or []
+    # 1) 当前 DNS 失败率过高
+    if cur_tot and cur_ok < cur_tot * 0.8:
         out.append({
-            "severity": "警告" if succ >= tot * 0.5 else "异常",
-            "text": f"DNS 解析失败 {tot - succ}/{tot}",
+            "severity": "警告" if cur_ok >= cur_tot * 0.5 else "异常",
+            "text": f"当前 DNS ({cur_label}) 解析失败 {cur_tot - cur_ok}/{cur_tot}",
             "impact": "网页/APP 加载慢, 部分域名可能无法访问",
-            "action": "尝试更换 DNS 服务器 (阿里/腾讯/114)"
+            "action": ("检查网卡 DNS 设置, 以及本机的代理/VPN 客户端"
+                       " (会劫持 DNS 查询); "
+                       + (f"可改用实测最快的 {f_name} ({f_ip})" if f_ip else "")),
         })
-    # 慢响应: 与 assessment "DNS 响应慢" (avg>100ms) 口径一致, 补出卡片行,
-    # 避免"徽章警告、卡片无内容" (该场景成功率正常时原实现不输出任何 issue)
-    avg = res.get("avg_time_ms", 0)
-    if tot and succ >= tot * 0.8 and avg > 100:
+    # 2) 当前 DNS 里有明显拖后腿的那台 (实测常是境外 DNS 在国内被限速)
+    if cur_slow and cur_best:
+        slow_txt = ", ".join(f"{s.get('dns_name')} ({s.get('dns_server')}, "
+                             f"{s.get('avg_ms')}ms)" for s in cur_slow)
+        best_name = cur_best.get("dns_name") or ""
+        best_ip = cur_best.get("dns_server") or ""
+        best_ms = cur_best.get("avg_ms")
+        best_txt = f"{best_name} ({best_ip}, {best_ms}ms)"
+        cmd_iface = _safe_iface_name(dns_iface.get(best_ip) or "") or "<接口名>"
+        cmd_ip = _safe_ip_literal(best_ip) or "<DNS服务器地址>"
         out.append({
             "severity": "警告",
-            "text": f"DNS 平均响应 {avg:.0f}ms 较慢",
+            "text": f"当前 DNS 里 {slow_txt} 明显慢于 {best_txt}",
+            "impact": ("解析慢会让网页/APP 首次加载变慢; 境外 DNS 在国内常被限速或"
+                       "干扰, 也会拖慢整个解析链路"),
+            "action": (f"建议把当前 DNS 只留 {best_name} ({best_ip}) 那台 (管理员): "
+                       f"netsh interface ipv4 set dnsservers name=\"{cmd_iface}\" "
+                       f"source=static address={cmd_ip} primary"),
+        })
+    # 3) 当前 DNS 整体慢
+    elif cur_tot and cur_avg > 100:
+        cmd_ip3 = _safe_ip_literal(f_ip) or "<DNS服务器地址>"
+        out.append({
+            "severity": "警告",
+            "text": f"当前 DNS ({cur_label}) 平均响应 {cur_avg:.0f}ms 较慢",
             "impact": "网页/APP 首次加载可能偏慢",
-            "action": "尝试更换 DNS 服务器 (阿里/腾讯/114)"
+            "action": (f"当前 DNS 实测 {cur_avg:.0f}ms, 本次对比最快是 {f_name} "
+                       f"({f_ip}, {f_avg}ms); 如需切换 (管理员): netsh interface "
+                       f"ipv4 set dnsservers \"<接口名>\" static {cmd_ip3} primary"),
+        })
+    # 4) 当前 DNS 达标 → 明确说"无需更换" (回应旧版"建议换 DNS"的老毛病)
+    elif cur_tot and cur_is_fastest:
+        out.append({
+            "severity": "信息",
+            "text": (f"当前 DNS ({cur_label}) 实测 {cur_avg:.0f}ms, "
+                     f"本次对比中最快, 无需更换"),
+            "impact": "",
+            "action": "",
+        })
+    # 4) 对比用的公共 DNS 有失败项 → 单列一条信息项 (与本机在用的 DNS 分开)
+    if failed:
+        sample = ", ".join(f"{f.get('dns_name', '?')}·{f.get('domain', '?')}"
+                           for f in failed[:4])
+        out.append({
+            "severity": "信息",
+            "text": f"{len(failed)} 个对比查询失败/超时 ({sample})",
+            "impact": ("来自对比用的公共 DNS, 不代表本机在用的 DNS 有问题; "
+                       "常见原因: 该 DNS 限流/不可达, 或本机代理拦截 UDP"),
+            "action": "",
         })
     # info 级: 不同 DNS 解析结果不一致 (多为 CDN 轮询, 正常现象) —
     # 原实现丢弃了这条原始 info, 导致顶部"信息项"计数与卡片内容对不上
@@ -17853,9 +18326,14 @@ def _issues_egress(res):
 def _verdict_mtu(res):
     if "error" in res:
         return res.get("error", "检测失败")
-    issues = res.get("issues", [])
-    if issues:
-        return f"MTU 检测: {len(issues)} 个问题"
+    issues = res.get("issues", []) or []
+    # v1.20.0: 信息级条目 (如"本机接口 MTU 1492, 可能是 PPPoE") 不算问题,
+    # 不进计数 —— 否则模块结论会写"1 个问题"而待办清单里一条都没有。
+    n_real = sum(1 for i in issues
+                 if isinstance(i, str)
+                 or (isinstance(i, dict) and i.get("severity") != "info"))
+    if n_real:
+        return f"MTU 检测: {n_real} 个问题"
     return "MTU 路径正常"
 
 
@@ -17866,8 +18344,17 @@ def _metrics_mtu(res):
         if p.get("error"):
             out.append((f"到 {p.get('target', '?')}", "测量失败", "warn"))
         else:
+            # v1.20.0: 把确认探测结论写进提示 —— 装维问"凭什么说是 1500"时,
+            # 提示里就有"标准载荷 1472 字节复核通过 (3/3 次)"可看。
+            hint = ""
+            if p.get("mtu_confirmed") is True:
+                hint = (f"标准载荷 {_MTU_STANDARD_PAYLOAD} 字节复核通过 "
+                        f"({p.get('confirm_result', '')})")
+            elif p.get("mtu_confirmed") is False:
+                hint = (f"标准载荷 {_MTU_STANDARD_PAYLOAD} 字节复核不可通 "
+                        f"({p.get('confirm_result', '')})")
             out.append((f"到 {p.get('target', '?')}", f"MTU {p.get('path_mtu', '?')}",
-                        "ok" if not p.get("fragmentation_risk") else "warn"))
+                        "ok" if not p.get("fragmentation_risk") else "warn", hint))
 
     local = res.get("local_mtus", [])
     if local:
@@ -17877,15 +18364,71 @@ def _metrics_mtu(res):
     return out
 
 
+def _mtu_fix_actions(target, path_mtu, iface):
+    """MTU 修复指引 (v1.20.0): 核实命令 + 修复命令 + 复查 + 复测。
+
+    报告里出现"路径 MTU 小于标准"时, 用户需要的是**能直接粘去执行的东西**,
+    而不是"检查一下 MTU 配置"这种无落点的话。四段按顺序给:
+
+      1. 核实  —— 5 次全通即路径 MTU=1500, 说明之前的告警是测量误差, 不用改;
+      2. 修复  —— 确认超限后再改本机接口 MTU (管理员);
+      3. 复查  —— 看接口 MTU 是否已生效;
+      4. 复测  —— 重跑本模块。
+
+    接口名与目标地址都会被插值进提权执行的命令 → 都要过白名单
+    (接口名走 _safe_iface_name; 目标必须是合法 IP)。
+    """
+    tgt = str(target or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F.:]{1,64}", tgt):
+        tgt = "目标地址"
+    try:
+        mtu_val = int(path_mtu)
+    except (TypeError, ValueError):
+        mtu_val = 0
+    safe_if = _safe_iface_name(iface)
+    if_name_part = f"\"{safe_if}\"" if safe_if else "\"接口名\""
+    lines = [
+        f"1. 先核实 (5 次全通即路径 MTU=1500, 之前的告警是测量误差, 不用改): "
+        f"ping -f -l {_MTU_STANDARD_PAYLOAD} -n 5 {tgt}",
+    ]
+    if mtu_val:
+        lines.append(
+            f"2. 确认超限后再改本机接口 MTU (管理员): netsh interface ipv4 set "
+            f"subinterface {if_name_part} mtu={mtu_val} store=persistent")
+    else:
+        lines.append(
+            f"2. 确认超限后再改本机接口 MTU (管理员): netsh interface ipv4 set "
+            f"subinterface {if_name_part} mtu=<实测路径MTU> store=persistent")
+    lines.append("3. 复查: netsh interface ipv4 show subinterfaces")
+    lines.append("4. 复测: netpulse mtu")
+    return "\n".join(lines)
+
+
 def _issues_mtu(res):
     out = []
-    for issue in res.get("issues", []):
+    for issue in res.get("issues", []) or []:
         if isinstance(issue, str):
             out.append({
                 "severity": "警告",
                 "text": issue,
                 "impact": "可能导致数据包分片, 降低传输效率",
                 "action": "检查网络设备 MTU 配置 (PPPoE 通常 1492)"
+            })
+        elif isinstance(issue, dict):
+            # v1.20.0: 结构化问题 (探测侧已带实测值与目标) → 渲染可执行命令
+            sev = issue.get("severity") or "警告"
+            is_info = (sev == "info")
+            action = issue.get("action") or ""
+            if not is_info and not action:
+                action = _mtu_fix_actions(issue.get("target"),
+                                          issue.get("path_mtu"),
+                                          issue.get("iface"))
+            out.append({
+                "severity": "信息" if is_info else "警告",
+                "text": issue.get("message") or "",
+                "impact": (issue.get("detail")
+                           or "路径 MTU 小于标准 1500, 大包会被拆分, 降低传输效率"),
+                "action": action,
             })
     return out
 
@@ -17941,6 +18484,14 @@ def _verdict_ipv6(res):
 
 def _metrics_ipv6(res):
     out = []
+    # v1.20.0: 全局 IPv6 只来自虚拟接口时, "不可达/失败"是预期结果,
+    # 不能渲染成红色故障 —— 卡片要说的是"本机没有原生 IPv6"。
+    if res.get("ipv6_source") == "virtual":
+        vnames = "、".join((res.get("virtual_ifaces") or ["虚拟接口"])[:2])
+        out.append(("全局地址", f"有（{vnames}）", "warn"))
+        out.append(("连通性", "无原生 IPv6", "warn"))
+        out.append(("IPv6 DNS", "不适用", "warn"))
+        return out
     out.append(("全局地址", "有" if res.get("has_global_ipv6") else "无",
                 "ok" if res.get("has_global_ipv6") else "warn"))
     out.append(("连通性", "正常" if res.get("ipv6_connectivity") else "不可达",
@@ -17962,8 +18513,18 @@ def _issues_ipv6(res):
         sev = "信息"
     else:
         sev = "警告"
-    for issue in res.get("issues", []):
-        if isinstance(issue, str):
+    for issue in res.get("issues", []) or []:
+        if isinstance(issue, dict):
+            # v1.20.0: 探测侧已带明确严重级别 → 直接用, 不再靠 assessment 反推
+            s = issue.get("severity") or ""
+            out.append({
+                "severity": ("异常" if s == "critical"
+                             else "警告" if s == "warning" else "信息"),
+                "text": issue.get("message") or "",
+                "impact": issue.get("detail") or "",
+                "action": issue.get("action") or "",
+            })
+        elif isinstance(issue, str):
             out.append({
                 "severity": sev,
                 "text": issue,
@@ -18269,6 +18830,12 @@ def _issues_lan(res):
     out = []
     if "error" in res:
         return out
+    # v1.20.0: 厂商补查披露从 issues 挪到 disclosures (见 LANDeviceScanner.detect),
+    # 这里按信息级渲染 —— 披露必须始终可见, 但它不是问题、不进待办清单。
+    for d in (res.get("disclosures") or []):
+        if d:
+            out.append({"severity": "信息", "text": str(d),
+                        "impact": "", "action": ""})
     devs = res.get("devices") or []
     if res.get("device_count", 0) == 0 and not devs:
         out.append({"severity": "警告", "text": "未扫描到任何局域网设备",
@@ -18859,7 +19426,7 @@ def _present_module(key, raw_result, status):
                     has_tech = True
                     break
 
-    return {
+    out = {
         "key": key,
         "name": name,
         "status": status,
@@ -18869,6 +19436,12 @@ def _present_module(key, raw_result, status):
         "has_tech_details": has_tech,
         "raw": raw_result or {},   # 客户报告不展示, JSON 报告用
     }
+    # v1.20.0: 徽章文案可被模块内容覆盖 (IPv6 来自虚拟接口时显示「提示」)。
+    # 「完成」会被读成"IPv6 正常", 实际是本机没有运营商原生 IPv6 —— 用
+    # 「提示」表达"检测完成但有件小事要说", 不新增状态值, 计数/评分口径不变。
+    if key == "ipv6" and (raw_result or {}).get("ipv6_source") == "virtual":
+        out["badge_text"] = "提示"
+    return out
 
 
 # 健康评分: 0-100
@@ -18881,6 +19454,12 @@ HEALTH_GRADE_TABLE = [
     (40, "D", "欠佳"),
     (0,  "F", "严重"),
 ]
+
+# 健康分扣分表 —— **唯一来源** (v1.20.0)。
+# compute_health_score 与报告层的「扣分明细」(模块标题栏标记 + 算式行)
+# 共用这一份常量, 别在两处各写死数字 (曾出现报告写 -2 而分数按 -5 扣的
+# 口径漂移风险)。未列出的状态 (完成/未检测) 不扣分。
+SCORE_PENALTY = {"异常": 20, "错误": 30, "警告": 2, "超时": 10}
 
 def _score_scope_counts(status_map):
     """按状态映射拆出 (扣分口径 counts, 全口径 all_counts, 豁免模块数)。
@@ -18925,10 +19504,10 @@ def compute_health_score(counts, text_counts=None):
     多条 issue 算成多项异常, 与一览徽章数对不上。
     """
     score = 100
-    score -= counts.get("异常", 0) * 20
-    score -= counts.get("错误", 0) * 30
-    score -= counts.get("警告", 0) * 2
-    score -= counts.get("超时", 0) * 10
+    score -= counts.get("异常", 0) * SCORE_PENALTY.get("异常", 20)
+    score -= counts.get("错误", 0) * SCORE_PENALTY.get("错误", 30)
+    score -= counts.get("警告", 0) * SCORE_PENALTY.get("警告", 2)
+    score -= counts.get("超时", 0) * SCORE_PENALTY.get("超时", 10)
     score = max(0, min(100, score))
 
     tc = text_counts if text_counts is not None else counts
@@ -18959,6 +19538,27 @@ def compute_health_score(counts, text_counts=None):
             }
     return {"score": 0, "grade": "F", "label": "严重",
             "verdict": "严重 · 存在多项严重问题"}
+
+
+def _score_formula(report):
+    """健康分算式 (一行): 「92 / 100 ＝ 100 − 警告 4×2」。
+
+    只列**参与计分**的扣分项 (豁免模块不参与计分, 也不进算式);
+    全部达标时写「无扣分项」。直接读 ``report["counts"]`` —— 它与
+    health.score 出自同一次 _score_scope_counts 拆分 (单一来源),
+    算式与分数不可能分叉; 不在这里再从 summary 重拆一遍豁免
+    (summary 按 keys 生成, 与 status 键集合不一致的构造下会漏项)。
+    """
+    counts = report.get("counts") or {}
+    parts = []
+    for st in ("错误", "异常", "超时", "警告"):
+        n = int(counts.get(st, 0) or 0)
+        if n:
+            parts.append(f"{st} {n}×{SCORE_PENALTY[st]}")
+    if not parts:
+        return "100 / 100 ＝ 无扣分项"
+    score = (report.get("health") or {}).get("score", 100)
+    return f"{score} / 100 ＝ 100 − " + " − ".join(parts)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -19141,12 +19741,20 @@ def build_report(rule_filter=None, diagnosis=None, site_check=None,
             run["results"], rule_filter=rule_filter,
             evidence_by_module=run.get("evidence")).to_dict()
 
+    # v1.20.0: 顶栏/主机信息里的「IPv6 公网」其实是第三方服务回报的**出口**
+    # 地址 —— 本机没有原生 IPv6 时它多半来自代理/隧道出口, 不能当本机 IPv6
+    # 展示。ipv6 模块没跑时保持原样 (不下结论)。
+    system_info = dict(run["system"] or {})
+    _ipv6_res = run["results"].get("ipv6") or {}
+    if isinstance(_ipv6_res, dict) and "ipv6_native" in _ipv6_res:
+        system_info["ipv6_native"] = bool(_ipv6_res.get("ipv6_native"))
+
     return {
         "app": run["app"],
         "version": run["version"],
         "schema_version": SCHEMA_VERSION,   # v1.9.0: evidence 升一等结构 (Schema v1.2)
         "generated_at": run["generated_at"],
-        "system": run["system"],
+        "system": system_info,
         "health": health,
         "counts": counts,
         "exempt_count": exempt_count,        # 评分豁免的模块数 (iperf3/ipv6/proxy/nattype)
@@ -19237,6 +19845,7 @@ HEADER_MAP = {
     # MTU
     "max_payload": "最大负载", "path_mtu": "路径 MTU",
     "fragmentation_risk": "分片风险", "indeterminate_pct": "不确定(%)",
+    "mtu_confirmed": "标准载荷复核", "confirm_result": "复核结果",
     "probes": "探测次数", "mtu": "MTU",
     # 路由表（补充）
     "is_default": "是否默认",
@@ -19969,6 +20578,9 @@ body{background:#eef1f6;color:#1e293b;font:14px/1.65 -apple-system,BlinkMacSyste
    强制换行成两行(被 gauge 132px+gap 36px 挤到宽度 < 文字), 与健康卡
    "两行观感"同类 — 用 nowrap + ellipsis 截断次要时间戳, 保留 verdict */
 .hero .meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
+/* v1.20.0 健康分算式行: 「92 / 100 ＝ 100 − 警告 4×2」——
+   让总分怎么来的直接可见, 不用自己拿模块状态去反推。 */
+.hero .formula{font-size:12.5px;color:#475569;margin-top:5px;font-family:Cascadia Mono,Consolas,monospace}
 .hero .meta span{font-size:12px;color:#64748b;background:#f4f6fa;border:1px solid #e6e9f0;border-radius:999px;padding:2.5px 11px;font-family:Cascadia Mono,Consolas,monospace}
 .hero .meta span b{color:#1e293b;font-weight:600}
 /* 分数环形 */
@@ -20042,6 +20654,9 @@ body{background:#eef1f6;color:#1e293b;font:14px/1.65 -apple-system,BlinkMacSyste
 .badge.fatal,.b.fatal{background:#fecaca;color:#7f1d1d}
 .badge.idle,.b.idle{background:#e2e8f0;color:#475569}
 .badge.timeout,.b.timeout{background:#cbd5e1;color:#1e293b}
+/* v1.20.0 「提示」徽章: 检测完成但有件小事要说 (不是故障, 不扣分)。
+   用中性蓝, 区别于绿色"完成"(会被读成一切正常)与橙色"警告"(会被读成问题)。 */
+.badge.hint,.b.hint{background:#e0f2fe;color:#075985}
 .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
 %%DOT_COLORS%%
 /* 模块卡 (details 折叠, 问题模块自动展开) */
@@ -20059,6 +20674,13 @@ details.mod.idle>summary .ic{background:#f1f5f9;color:#64748b}
 details.mod>summary .nm{font-size:14.5px;font-weight:700;flex:none}
 details.mod>summary .vd{font-size:12px;color:#64748b;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 details.mod>summary .b{font-size:11px;font-weight:700;padding:2px 11px;border-radius:999px;flex:none}
+/* v1.20.0 扣分标记 (标题栏右侧): 「−N 分」= 该模块从健康分里扣了几分;
+   「豁免」= 评分豁免模块, 它的问题不计入总分。 */
+details.mod>summary .dt{font-size:11px;font-weight:700;padding:2px 9px;border-radius:999px;flex:none;line-height:1.4}
+details.mod>summary .dt.deduct{background:#fee2e2;color:#991b1b}
+details.mod>summary .dt.deduct.warn{background:#fef3c7;color:#9a3412}
+details.mod>summary .dt.deduct.timeout{background:#e2e8f0;color:#334155}
+details.mod>summary .dt.exempt{background:#f1f5f9;color:#64748b}
 details.mod>summary .arr{color:#94a3b8;font-size:11px;transition:transform .15s}
 details.mod[open]>summary .arr{transform:rotate(90deg)}
 /* 🔗 复制模块链接按钮 */
@@ -20371,6 +20993,9 @@ def _stats_overview_sections(counts, modules, report, exempt_count, total_module
     for m in modules:
         st = m["status"]
         sk = SKEY.get(st, "idle")
+        # v1.20.0: 徽章文案可被模块内容覆盖 (如 IPv6 虚拟接口 → 「提示」)
+        badge_text = m.get("badge_text") or st
+        badge_sk = "hint" if m.get("badge_text") else sk
         # 概览行只显示"结论"前 60 字, 避免太长
         verdict_short = m["verdict"][:60] + ("…" if len(m["verdict"]) > 60 else "")
         overview_items.append(
@@ -20379,7 +21004,7 @@ def _stats_overview_sections(counts, modules, report, exempt_count, total_module
             f"<span class='dot {sk}'></span>"
             f"<span class='name'>{_html_esc(m['name'])}</span>"
             f"<span class='verdict'>{_html_esc(verdict_short)}</span>"
-            f"<span class='badge {sk}'>{_html_esc(st)}</span>"
+            f"<span class='badge {badge_sk}'>{_html_esc(badge_text)}</span>"
             f"</a>"
             f"</li>"
         )
@@ -20469,6 +21094,9 @@ def _module_cards_section(modules, report, SKEY):
     for m in modules:
         st = m["status"]
         sk = SKEY.get(st, "idle")
+        # v1.20.0: 徽章文案可被模块内容覆盖 (如 IPv6 虚拟接口 → 「提示」)
+        badge_text = m.get("badge_text") or st
+        badge_sk = "hint" if m.get("badge_text") else sk
         # 关键指标
         metrics = m.get("key_metrics", [])
         if metrics:
@@ -20600,13 +21228,28 @@ def _module_cards_section(modules, report, SKEY):
         }
         mod_icon = mod_icons.get(sk, "○")
         open_attr = " open" if auto_open else ""
+        # v1.20.0: 标题栏右侧的扣分标记 —— 让"这个模块扣了几分"直接可见,
+        # 不用自己拿总分去猜。豁免模块标「豁免」(它的问题不计入总分)。
+        deduct_tag_html = ""
+        if m["key"] in SCORE_EXEMPT_MODULES:
+            deduct_tag_html = (
+                "<span class='dt exempt' title='评分豁免模块: 该模块的问题不计入健康分'>"
+                "豁免</span>")
+        else:
+            _pen = SCORE_PENALTY.get(st, 0)
+            if _pen:
+                deduct_tag_html = (
+                    f"<span class='dt deduct {sk}' "
+                    f"title='该模块的状态「{_html_attr(st)}」从健康分里扣 {_pen} 分'>"
+                    f"−{_pen} 分</span>")
         mod_blocks.append(f"""
 <details class="mod {sk}" id="mod-{_html_attr(m["key"])}"{open_attr}>
   <summary>
     <span class="ic {sk}">{mod_icon}</span>
     <span class="nm">{_html_esc(m['name'])}</span>
     <span class="vd"{v_title}>{_html_esc(v_short)}</span>
-    <span class="b {sk}">{_html_esc(st)}</span>
+    <span class="b {badge_sk}">{_html_esc(badge_text)}</span>
+    {deduct_tag_html}
     <a class="anchor" href="#mod-{_html_attr(m['key'])}" data-mod="mod-{_html_attr(m['key'])}"
        title="复制本模块链接">🔗</a>
     <span class="arr">▸</span>
@@ -20657,7 +21300,12 @@ def _host_info_section(sys_i):
             loc.append(sys_i["asn"])
         sys_pairs.append(("出口位置", " / ".join(loc)))
     if sys_i.get("ipv6_public_ip"):
-        sys_pairs.append(("IPv6 公网", sys_i["ipv6_public_ip"]))
+        if sys_i.get("ipv6_native") is False:
+            # v1.20.0: 本机没有原生 IPv6 时, 第三方服务回报的 IPv6 是**出口**
+            # 地址 (代理/隧道), 不能当本机 IPv6 展示
+            sys_pairs.append(("IPv6 出口（非本机原生）", sys_i["ipv6_public_ip"]))
+        else:
+            sys_pairs.append(("IPv6 公网", sys_i["ipv6_public_ip"]))
 
     host_cards = "".join(
         f"<div class='host-card'><div class='lab'>{_html_esc(lab)}</div>"
@@ -20963,7 +21611,14 @@ def render_report_html_customer(report):
     if sys_i.get("asn") or sys_i.get("geo"):
         hero_meta.append(f"📍 <b>{_html_esc(' / '.join(x for x in (sys_i.get('geo'), sys_i.get('asn')) if x))}</b>")
     if sys_i.get("ipv6_public_ip"):
-        hero_meta.append(f"IPv6 <b>{_html_esc(sys_i['ipv6_public_ip'])}</b>")
+        if sys_i.get("ipv6_native") is False:
+            # v1.20.0: 本机没有原生 IPv6 → 第三方服务回报的 IPv6 是出口地址
+            # (代理/隧道), 不能当本机 IPv6 展示
+            hero_meta.append((
+                f"IPv6 出口 <b>{_html_esc(sys_i['ipv6_public_ip'])}</b>",
+                "第三方服务回报的出口地址 (经代理/隧道), 非本机原生 IPv6"))
+        else:
+            hero_meta.append(f"IPv6 <b>{_html_esc(sys_i['ipv6_public_ip'])}</b>")
     # v1.5.0: 检测耗时 + 检测范围。只跑几个模块时健康分 100 极容易被读成
     # "23 项全正常", 必须显式写出覆盖了多少项
     dur_txt = _fmt_duration(report.get("duration_ms"))
@@ -21002,6 +21657,7 @@ def render_report_html_customer(report):
       <b>{_html_esc(report['app'])}</b><span class="ver">v{_html_esc(report['version'])}</span></div>
     <h1>网络诊断报告</h1>
     <div class="sub">{_html_esc(health.get('verdict', ''))} · 生成于 {_html_esc(g)}</div>
+    <div class="formula">{_html_esc(_score_formula(report))}</div>
     <div class="meta">{meta_chips}</div>
   </div>
   <div class="gauge">
