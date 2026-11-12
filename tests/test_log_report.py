@@ -736,6 +736,35 @@ class TestLogNotice(_TmpCfg, unittest.TestCase):
             N._offer_log_reporting_notice()
         m_in.assert_not_called()
 
+    def test_notice_box_encloses_text(self):
+        """告知框必须闭环且包住文字 (回归: 旧版横线只画到 47 列, 右侧缺口)。"""
+        import io as _io
+
+        class _TtyBuf(_io.StringIO):
+            """替换 stdout 且 isatty()=True —— 否则函数按非 TTY 静默跳过。"""
+
+            def isatty(self):
+                return True
+
+        buf = _TtyBuf()
+        with mock.patch.object(N.sys.stdin, "isatty", return_value=True), \
+             mock.patch("builtins.input", return_value="y"), \
+             mock.patch("sys.stdout", new=buf):
+            N._offer_log_reporting_notice()
+        rows = [N._ANSI_RE.sub("", ln) for ln in buf.getvalue().splitlines()]
+        rows = [ln for ln in rows if ln.lstrip()[:1] in ("┌", "│", "└")]
+        self.assertGreaterEqual(len(rows), 4, "告知框边框行没渲染出来")
+        # 每行末列都是边框字符 —— 右侧不许缺角
+        for r in rows:
+            self.assertTrue(r.rstrip().endswith(("┐", "│", "┘")),
+                            f"右侧缺角: {r!r}")
+        # 顶/底横线与内容行显示宽度一致 —— 中文按 2 列算不许溢出边框
+        widths = {N._disp_width(r) for r in rows}
+        self.assertEqual(len(widths), 1,
+                         f"边框各行宽度不一致 (文字溢出): {sorted(widths)}")
+        self.assertTrue(any("异常类型" in r for r in rows),
+                        "提示内容必须出现在框内")
+
 
 class TestLogCliSwitch(_TmpCfg, unittest.TestCase):
     """CLI --log-report 开关 (自动化场景用, 无需进交互菜单)。"""

@@ -22799,10 +22799,19 @@ def _offer_log_reporting_notice():
     if _log_notice_shown():
         return _log_reporting_enabled()
     try:
-        print(_c("\n  ┌─ 异常自动上报 ─────────────────────────────", C_CYAN))
-        for line in _log_notice_text():
-            print(_c("  │ " + line if line else "  │", C_GRAY))
-        print(_c("  └──────────────────────────────────────────────", C_CYAN))
+        lines = _log_notice_text()
+        # 回归修复: 旧版上下横线画到约 47 列就断, 而文字行按显示宽度 (中文=2 列)
+        # 最宽 67 列 —— 右侧既无竖线也无右角, 看起来像"边框没包住文字、右边缺一截"。
+        # 现按 _disp_width (CJK=2, ANSI 不计) 动态算内宽, 补齐右侧 │/┐/┘,
+        # 与 scapy 提示框同款闭环样式; 总宽 ≈72 列, 80 列最小控制台也放得下。
+        inner_w = max(_disp_width(s) for s in lines) + 2   # +2: 两侧各留一空格
+        head = "─ 异常自动上报 "
+        print(_c("\n  ┌" + head + "─" * (inner_w - _disp_width(head)) + "┐",
+                 C_CYAN))
+        for line in lines:
+            print(_c("  │ " + line + " " * (inner_w - 1 - _disp_width(line))
+                     + "│", C_GRAY))
+        print(_c("  └" + "─" * inner_w + "┘", C_CYAN))
         ans = input(_c("  是否保持开启上报? [Y=开启 / N=关闭]: ", C_GREEN)).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
