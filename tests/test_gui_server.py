@@ -57,6 +57,20 @@ class TestGuiServer(unittest.TestCase):
         st, _ = _req(self.port, "GET", "/api/progress", token="wrong")
         self.assertEqual(st, 403)
 
+    def test_token_non_ascii_403(self):
+        # I1 (审查): hmac.compare_digest 的 str 路径遇非 ASCII 抛 TypeError,
+        # 被外层 except 兜成 500 并泄漏内部报错文本。契约要求未认证一律
+        # 403 forbidden。header 与 ?t= 两个取值通道都要锁:
+        #   header: latin-1 字符 'ÿ' (服务端按 latin-1 解码 → 非 ASCII str)
+        #   query : %FF (parse_qs unquote errors='replace' → U+FFFD 非 ASCII str)
+        st, raw = _req(self.port, "GET", "/api/progress",
+                       headers={"X-NetPulse-Token": "ÿ"})
+        self.assertEqual(st, 403)
+        self.assertIn(b"forbidden", raw)
+        st, raw = _req(self.port, "GET", "/api/progress?t=%FF")
+        self.assertEqual(st, 403)
+        self.assertIn(b"forbidden", raw)
+
     def test_scenarios_payload(self):
         st, raw = _req(self.port, "GET", "/api/scenarios?t=" + self.token)
         self.assertEqual(st, 200)

@@ -25409,8 +25409,15 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
         tok = (urllib_parse.parse_qs(q.query).get("t") or [None])[0]
         if not tok:
             tok = self.headers.get("X-NetPulse-Token")
-        return (isinstance(tok, str) and isinstance(self.token, str)
-                and hmac.compare_digest(tok, self.token))
+        if not (isinstance(tok, str) and isinstance(self.token, str)):
+            return False
+        # I1 (审查): compare_digest 的 str 路径遇非 ASCII 字符抛 TypeError,
+        # 被 do_GET/do_POST 外层 except 兜成 500 并泄漏内部报错文本。
+        # 统一 encode 成 bytes 比较, 任何输入 (latin-1 header / %FF 查询串)
+        # 都落回 403; tok 可能含不可编码的代理字符, 用 replace 兜底 ——
+        # 不影响"相等才放行"语义 (真 token 是纯 ASCII urlsafe, 不会被替位)。
+        return hmac.compare_digest(tok.encode("utf-8", "replace"),
+                                   self.token.encode("utf-8"))
 
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         data = body if isinstance(body, bytes) else \
