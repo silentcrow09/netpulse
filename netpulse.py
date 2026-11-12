@@ -24612,6 +24612,36 @@ import http.server
 import hmac
 import urllib.parse as urllib_parse
 
+# 顶栏联网状态 (v1.21.0 收尾): 探测线程的数据源 + 互斥锁。ok 三态:
+# True=通 / False=不通 / None=未测 (页面显示「检测中」)。
+_GUI_NET = {"ok": None, "ts": 0.0}
+_GUI_NET_LOCK = threading.Lock()
+_GUI_NET_HOSTPORT = ("223.5.5.5", 53)  # 公共 DNS TCP 53, 与盯障默认目标一致
+
+
+def _gui_conn_check(host=None, port=None, timeout=2.0):
+    """单次连通性探测: TCP 建连公共 DNS 53 端口。返回 True/False (异常=False)。"""
+    try:
+        import socket as _s
+        hp = (host, port) if host else _GUI_NET_HOSTPORT
+        with _s.create_connection(hp, timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _gui_net_watch(shutdown_evt=None):
+    """每 30 秒探测一次, 结果写 _GUI_NET (顶栏圆点数据源)。启动即先测一次。"""
+    while not (shutdown_evt is not None and shutdown_evt.is_set()):
+        ok = _gui_conn_check()
+        with _GUI_NET_LOCK:
+            _GUI_NET["ok"] = ok
+            _GUI_NET["ts"] = time.time()
+        if shutdown_evt is not None:
+            shutdown_evt.wait(30.0)
+        else:
+            time.sleep(30.0)
+
 
 def _GUI_RESET_FOR_TEST():
     """测试隔离: 清 GUI 区段模块级状态。Task 4/6 在此追加 handler 清理项。"""
@@ -24620,6 +24650,9 @@ def _GUI_RESET_FOR_TEST():
     _GuiHandler.token = None
     _GuiHandler.shutdown_evt = None
     del _GUI_BROWSER_PROC[:]   # Task 6: 浏览器子进程句柄 (防测试间泄漏)
+    with _GUI_NET_LOCK:        # 顶栏联网状态探测数据源 (v1.21.0 收尾)
+        _GUI_NET["ok"] = None
+        _GUI_NET["ts"] = 0.0
 
 
 def _gui_verdict(report):
@@ -24950,8 +24983,10 @@ input,select{ font-family:inherit; }
          border:1px solid var(--rule); border-radius:999px; padding:5px 15px;
          font-size:12.5px; font-weight:600; color:var(--dim); }
 .g-host svg{ width:13px; height:13px; color:var(--mute); flex:none; }
-.g-dot-ok{ width:11px; height:11px; flex:none; border-radius:50%; background:var(--green);
-           box-shadow:0 0 0 3px #1e6e4422; }
+/* 顶栏联网状态圆点 (v1.21.0 收尾): 颜色由 JS 按探测结果赋 style,
+   CSS 只定形状, 默认灰 (未测) —— 不给默认绿, 避免首帧闪绿。 */
+.g-dot{ width:11px; height:11px; flex:none; border-radius:50%; background:var(--mute); }
+.g-netword{ font-size:10px; color:var(--dim); }
 
 /* ── 各视图容器 padding (对齐设计稿各节) ── */
 .g-view-home{ padding:32px 36px 30px; }
@@ -25114,6 +25149,7 @@ _GUI_JS = r"""(function () {
     export: Q("/api/export"),
     siteStart: Q("/api/site/start"),
     siteFinish: Q("/api/site/finish"),
+    netstatus: Q("/api/netstatus"),
     shutdown: Q("/api/shutdown")
   };
   // 场景卡图标 (内联 SVG 常量, 复制自 design_ref/gui/gui_design_v1.html 第 1 节;
@@ -25409,6 +25445,22 @@ _GUI_JS = r"""(function () {
     }
   });
 
+  // ── 顶栏联网状态: 服务端探测线程每 30s 更新, 页面只读结果同周期刷新 ──
+  function refreshNet() {
+    $("#net-dot").parentElement.title = "每 30 秒探测 223.5.5.5:53";
+    get(API.netstatus).then(function (r) {
+      var dot = $("#net-dot"), word = $("#net-word");
+      if (!dot) return;
+      if (r && r.ok === true) {
+        dot.style.background = "var(--green)"; word.textContent = "在线";
+      } else if (r && r.ok === false) {
+        dot.style.background = "var(--red)"; word.textContent = "未联网";
+      } else {
+        dot.style.background = "var(--mute)"; word.textContent = "检测中";
+      }
+    }).catch(function () {});   // API 不可达: 圆点保持默认灰
+  }
+
   // ── 启动 ──
   document.addEventListener("DOMContentLoaded", function () {
     $("#btn-full").addEventListener("click", function () { startRun("full"); });
@@ -25437,6 +25489,9 @@ _GUI_JS = r"""(function () {
       show("progress"); pollOnce();
     });
     $("#g-lastrep").addEventListener("click", openReport);
+    // 顶栏联网状态: 首帧即测, 与服务端探测同周期刷新
+    refreshNet();
+    setInterval(refreshNet, 30000);
     get(API.scenarios).then(function (meta) {
       state.meta = meta;
       COLORS = meta.status_colors || {};
@@ -25466,7 +25521,8 @@ def _gui_page():
             '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
             'stroke-linecap="round" stroke-linejoin="round">'
             '<rect x="3" y="5" width="18" height="13" rx="2"/><path d="M8 21h8M12 18v3"/></svg>'
-            '<i class="g-dot-ok" title="网络正常"></i><span id="hostname"></span></span>'
+            '<i id="net-dot" class="g-dot"></i><span id="net-word" class="g-netword"></span>'
+            '<span id="hostname"></span></span>'
             "</header>\n"
             # ── 主页 (设计稿第 1 节) ──
             '<main id="view-home" class="g-view-home">'
@@ -25673,6 +25729,11 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, _gui_meta())
             if p == "/api/progress":
                 return self._send(200, self.session.snapshot())
+            if p == "/api/netstatus":
+                # 顶栏联网状态数据源 (探测线程写, 锁内读)
+                with _GUI_NET_LOCK:
+                    ok = _GUI_NET["ok"]
+                return self._send(200, {"ok": ok})
             if p == "/api/report":
                 html = self.session.report_html()
                 if not html:
@@ -25818,6 +25879,9 @@ def _run_gui(install=True, pip_mirror=None, shutdown_evt=None):
     except OSError as e:
         print(_c("  ✗ 图形界面服务启动失败 (%s)。" % e, C_RED))
         return
+    # 顶栏联网状态探测线程 (v1.21.0 收尾): 随退出事件自然停止
+    threading.Thread(target=_gui_net_watch, args=(shutdown_evt,),
+                     daemon=True, name="np-gui-net").start()
     url = "http://127.0.0.1:%d/?t=%s" % (port, token)
     how = _gui_launch_browser(url)
     if how == "none":

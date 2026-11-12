@@ -63,6 +63,7 @@ class TestGuiLaunch(unittest.TestCase):
         printed = {}
         with mock.patch.object(np, "_start_gui_server",
                                return_value=(None, 54321, "tok")), \
+             mock.patch.object(np, "_gui_conn_check", return_value=True), \
              mock.patch.object(np, "_gui_launch_browser",
                                side_effect=lambda url: printed.update(
                                    url=url) or "none"), \

@@ -8,9 +8,12 @@
   P3 POST /api/run 启动成功; busy 时 409
   P4 GET /api/report 无报告 404, 有报告返回 HTML
   P5 POST /api/shutdown 触发事件
+  P6 GET /api/netstatus → {"ok": ...} (顶栏联网状态数据源, 锁内读 _GUI_NET)
+  P7 _gui_conn_check 三态 (通/不通/OSError→False) + _gui_net_watch 单轮写状态
 """
 import json
 import os
+import socket
 import sys
 import http.client
 import threading
@@ -137,6 +140,52 @@ class TestGuiServer(unittest.TestCase):
         st, raw = _req(self.port, "POST", "/api/run?t=" + self.token,
                        body={"profile": "slow"})
         self.assertEqual(st, 409)
+
+    def test_netstatus_api(self):
+        # P6: 探测线程之外, 测试直接在锁内摆状态 → API 原样透传
+        self.addCleanup(np._GUI_RESET_FOR_TEST)
+        with np._GUI_NET_LOCK:
+            np._GUI_NET["ok"] = True
+        st, raw = _req(self.port, "GET", "/api/netstatus?t=" + self.token)
+        self.assertEqual(st, 200)
+        self.assertEqual(json.loads(raw), {"ok": True})
+        with np._GUI_NET_LOCK:
+            np._GUI_NET["ok"] = False
+        st, raw = _req(self.port, "GET", "/api/netstatus?t=" + self.token)
+        self.assertEqual(json.loads(raw), {"ok": False})
+
+    def test_gui_conn_check_three_states(self):
+        # P7a: 探测函数就近 `import socket as _s` → 与顶层 socket 同一模块
+        # 对象, mock `socket.create_connection` 本身即可命中。
+        with mock.patch("socket.create_connection") as m:
+            self.assertTrue(np._gui_conn_check())
+            args, kwargs = m.call_args
+            self.assertEqual(args[0], np._GUI_NET_HOSTPORT)   # 默认目标
+            self.assertEqual(kwargs["timeout"], 2.0)
+            m.reset_mock()
+            self.assertTrue(np._gui_conn_check(host="127.0.0.1", port=1))
+            self.assertEqual(m.call_args[0][0], ("127.0.0.1", 1))
+        with mock.patch("socket.create_connection", side_effect=OSError("no")):
+            self.assertFalse(np._gui_conn_check())
+        # socket.timeout 是 OSError 子类 (超时 = 不通, 不冒泡)
+        with mock.patch("socket.create_connection",
+                        side_effect=socket.timeout("t/o")):
+            self.assertFalse(np._gui_conn_check())
+
+    def test_gui_net_watch_single_cycle(self):
+        # P7b: 一次性循环 —— 先置位的 evt 会让循环体一次都不跑 (条件在顶上),
+        # 所以在首次探测的 mock 里置位: 探测→写状态→wait 立即返回→退出, 恰一轮。
+        self.addCleanup(np._GUI_RESET_FOR_TEST)
+        evt = threading.Event()
+
+        def _probe():
+            evt.set()
+            return True
+
+        with mock.patch.object(np, "_gui_conn_check", side_effect=_probe):
+            np._gui_net_watch(evt)
+        self.assertIs(np._GUI_NET["ok"], True)
+        self.assertGreater(np._GUI_NET["ts"], 0.0)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@
   P1 _gui_page() 是完整 HTML 文档 (doctype/关闭标签)
   P2 零外链: 无 http(s):// 资源引用、无 <link、无 <script src、无 <img
   P3 页面为纯静态: 无 format 占位符痕迹 ({...} 模板残留)
-  P4 JS 轮询 /api/progress, sendBeacon 关窗, iframe 加载 /api/report
+  P4 JS 轮询 /api/progress 与 /api/netstatus, sendBeacon 关窗, iframe 加载 /api/report
   P5 动态渲染只用 textContent: innerHTML 赋值一律禁止 (含 += 逃逸形态);
      insertAdjacentHTML 只允许注入全大写常量标识符 (零插值常量模板),
      其余参数形态 (字符串拼接 / 小写变量 / 函数调用) 一律 FAIL
@@ -67,6 +67,7 @@ class TestGuiPage(unittest.TestCase):
         self.assertIn('/api/progress', p)
         self.assertIn('/api/scenarios', p)
         self.assertIn('/api/report', p)
+        self.assertIn('/api/netstatus', p)
         self.assertIn('sendBeacon', p)
 
     def test_no_innerhtml_interpolation(self):
