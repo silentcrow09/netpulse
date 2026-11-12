@@ -341,5 +341,83 @@ class TestSceneSummary(unittest.TestCase):
         self.assertNotIn("=====", out, "等号横线应彻底退场")
 
 
+class TestModuleMenuCompact(unittest.TestCase):
+    """2026-11-12 反馈: 高级菜单内容多到默认窗口放不下 —— 行数预算锁。"""
+
+    def test_line_budget_fits_default_window(self):
+        """横幅 3 行 + 菜单体 + 空行 + 脚注 + 分隔线 ≤ 25 行 (默认窗口 30 行)。"""
+        total = 3 + len(N._module_menu_lines()) + 3
+        self.assertLessEqual(total, 25, f"高级菜单超出一屏预算: {total} 行")
+
+    def test_all_modules_listed(self):
+        text = N._ANSI_RE.sub("", "\n".join(N._module_menu_lines()))
+        for _cat, keys, _d in N.MODULE_CATEGORIES:
+            for k in keys:
+                self.assertIn(N.MODULE_MAP[k][0], text, f"菜单缺模块 {k}")
+        for letter in ("a", "b", "c"):
+            self.assertIn(f"[{letter}]", text)
+        self.assertNotIn("快捷:", text, "旧版重复的快捷行应已移除")
+
+
+class TestDiagnosisSummary(unittest.TestCase):
+    """2026-11-12 反馈: 多模块诊断终端只给一段总结, 不逐模块铺开。"""
+
+    def test_summary_counts_and_attention(self):
+        results = {"gateway": "完成", "dns": "完成", "wifi": "警告",
+                   "tcpstats": "异常", "web": "超时", "arp": "未检测"}
+        rows = _plain(N._diagnosis_summary_lines(results))
+        self.assertIn("✓ 完成 2", rows[0])
+        self.assertIn("⚠ 警告 1", rows[0])
+        self.assertIn("✗ 异常 1", rows[0])
+        self.assertIn("○ 超时 1", rows[0])
+        self.assertIn("○ 未检测 1", rows[0])
+        self.assertIn("需关注", rows[1])
+        # 需关注名单必须带模块中文名与状态 (未检测不算关注项)
+        self.assertIn(f"{N.MODULE_MAP['wifi'][0]} (警告)", rows[1])
+        self.assertIn(f"{N.MODULE_MAP['tcpstats'][0]} (异常)", rows[1])
+        self.assertNotIn(N.MODULE_MAP["arp"][0], rows[1])
+
+    def test_summary_all_ok(self):
+        rows = _plain(N._diagnosis_summary_lines(
+            {"gateway": "完成", "dns": "完成"}))
+        self.assertIn("✓ 全部完成，未发现问题", rows[1])
+
+    def test_print_modules_false_skips_flood(self):
+        """print_modules=False: 无 ▶ 逐模块块, 保留诊断汇总框。"""
+        import io as _io
+
+        class _Buf(_io.StringIO):
+            def isatty(self):
+                return True
+
+        buf = _Buf()
+        fake = ({"gateway": "完成"}, {"gateway": {"status": "完成"}})
+        with mock.patch.object(N, "_run_diagnostics_sequential",
+                               return_value=fake), \
+             mock.patch("sys.stdout", new=buf):
+            N.run_diagnostics(["gateway"], banner=False,
+                              print_modules=False)
+        out = buf.getvalue()
+        self.assertNotIn("▶", out, "print_modules=False 不得逐模块打印")
+        self.assertIn("诊断汇总", out)
+        self.assertIn("┌─ 诊断汇总", out)
+
+    def test_print_modules_default_keeps_details(self):
+        """默认 (CLI) 行为不变: 逐模块块照打, 既有测试的 ▶ 断言不回归。"""
+        import io as _io
+
+        class _Buf(_io.StringIO):
+            def isatty(self):
+                return True
+
+        buf = _Buf()
+        fake = ({"gateway": "完成"}, {"gateway": {"status": "完成"}})
+        with mock.patch.object(N, "_run_diagnostics_sequential",
+                               return_value=fake), \
+             mock.patch("sys.stdout", new=buf):
+            N.run_diagnostics(["gateway"], banner=False)
+        self.assertIn("▶", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

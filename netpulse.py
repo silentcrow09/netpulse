@@ -15414,6 +15414,35 @@ def _module_progress_row(idx, total, name, status=None):
     return _c(prefix + "… " + name, C_GRAY)
 
 
+def _diagnosis_summary_lines(results):
+    """诊断汇总内容行 (2026-11-12 精简): 状态计数 + 需关注名单。纯函数。
+
+    results: {key: status} (状态归一后)。多模块跑法终端不再逐模块铺开
+    (详细指标在 HTML/JSON 报告与 --verbose), 这里只给一段总结:
+      ✓ 完成 19   ⚠ 警告 2   ✗ 异常 1
+      需关注: 路由追踪 (警告) · NAT 类型 (异常)
+    全部完成且无关注项时补一行绿色结论。
+    """
+    cnt_by = {}
+    for st in results.values():
+        cnt_by[st] = cnt_by.get(st, 0) + 1
+    segs = []
+    for st in STATUS_BAR_ORDER:
+        if cnt_by.get(st):
+            mark, color = CLI_STATUS_MARKS.get(st, ("○", C_GRAY))
+            segs.append(_c(f"{mark} {st} {cnt_by[st]}", color))
+    attention = [(MODULE_MAP.get(k, (k, k))[0], st)
+                 for k, st in results.items()
+                 if st not in ("完成", "正常", "未检测")]
+    inner = ["  ".join(segs) if segs else _c("无结果", C_GRAY)]
+    if attention:
+        inner.append(_c("需关注: " + " · ".join(
+            f"{n} ({st})" for n, st in attention), C_YELLOW))
+    elif cnt_by.get("完成") or cnt_by.get("正常"):
+        inner.append(_c("✓ 全部完成，未发现问题", C_GREEN))
+    return inner
+
+
 # 终端侧状态语义轴的唯一来源 (与报告层 STATUS_COLORS 同语义, 对齐 AGENTS.md
 # 「不要另立映射」的口径)。「超时」在报告层是中性深灰 #334155 ("没跑完, 不是坏"),
 # 终端原先画红与「异常/错误」同级刺眼属语义错配, 现对齐为灰 (16 色基线取 C_GRAY)。
@@ -15767,7 +15796,7 @@ def _restore_stdout_on_exit(fn):
 @_restore_stdout_on_exit
 def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
                    banner=True, install=False, parallel=False, max_workers=4,
-                   pip_mirror=None):
+                   pip_mirror=None, print_modules=True):
     """执行指定模块并打印结果与汇总。返回本次运行的完整数据 dict。
 
     v1.15.2 (审查 P1-16 · 收口规则): 返回值由 `{key: status}` 改为**完整 run
@@ -15782,6 +15811,10 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
               后按 keys 顺序打印, 避免交错混乱。
     max_workers: 并行模式下的最大并发数 (--max-workers N)。
     pip_mirror: 显式指定 pip 镜像 (--pip-mirror)。
+    print_modules: 终端是否逐模块打印 `▶ 名称 [状态]` + 结论块 (2026-11-12
+              精简)。菜单/场景多模块跑法传 False —— 详细数据在 HTML/JSON
+              报告里, 终端只给底部一段汇总框; CLI 与单模块默认 True 不变。
+              as_json 的载荷收集不受影响 (循环照跑, 只是不打印人读块)。
     """
     global _C_NOCOLOR, LAST_RUN
     _C_NOCOLOR = no_color
@@ -15919,44 +15952,24 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
     results = _normalize_module_statuses(results, full)
 
     # 详细结果 (按 keys 顺序, 避免 parallel 模式输出乱序)
+    # print_modules=False: 终端不逐模块铺开 (2026-11-12 用户拍板 —— 详细
+    # 指标在 HTML/JSON 报告里, 终端只留底部一段汇总框)
     for key in keys:
         res = full.get(key, {"error": "未执行"})
         status = results.get(key, "错误")
         name = MODULE_MAP.get(key, (key, key))[0]
-        prefix = ""
-        if use_parallel:
-            prefix = ""  # parallel 模式启动/完成行已打印, 这里只打 result
-        else:
-            pass  # 顺序模式也已经在 detect() 前/后打了
-        print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge(status))
         if as_json:
             # 人读输出已改道 stderr; 这里只收集载荷, 末尾统一写 stdout
             _json_payload[key] = _cli_print_result(res, as_json=True, key=key)
-        else:
+        elif print_modules:
+            print(_c(f"▶ {name}", C_BOLD) + "  " + _cli_status_badge(status))
             _cli_print_result(res, verbose=verbose, key=key)
 
-    # 汇总
-    print()
-    print(_c("=" * 60, C_BLUE))
-    print(_c("  诊断汇总", C_BOLD))
-    print(_c("-" * 60, C_GRAY))
-    cnt = {}
-    cells = []
-    for key, st in results.items():
-        n = MODULE_MAP[key][0]
-        cells.append(_cli_status_badge(st) + " " + _c(n, C_WHITE))
-        cnt[st] = cnt.get(st, 0) + 1
-    for line in _columnize(cells, columns=2, gap=4):
-        print("  " + line)
-    print(_c("-" * 60, C_GRAY))
-    summ = []
-    if cnt.get("完成"): summ.append(_c(f"正常 {cnt['完成']}", C_GREEN))
-    if cnt.get("警告"): summ.append(_c(f"警告 {cnt['警告']}", C_YELLOW))
-    if cnt.get("异常"): summ.append(_c(f"异常 {cnt['异常']}", C_RED))
-    if cnt.get("错误"): summ.append(_c(f"错误 {cnt['错误']}", C_RED))
-    if cnt.get("超时"): summ.append(_c(f"超时 {cnt['超时']}", C_RED))
-    print("  " + "   ".join(summ) if summ else "  无结果")
-    print(_c("=" * 60, C_BLUE))
+    # 诊断汇总 (2026-11-12 精简): 一段总结框替代 "=" 条 + 两列全模块清单 ——
+    # 状态计数 + 需关注名单; 详细指标在 HTML/JSON 报告与 --verbose
+    for ln in _draw_box(_diagnosis_summary_lines(results), title="诊断汇总",
+                        border_color=C_BLUE, text_color=C_GRAY):
+        print(ln)
 
     # 记录本次运行的完整数据, 供报告生成使用
     # v1.9.0: Evidence 升为一等结构 — v2 分支夹带在 res 里的过渡键 _evidence
@@ -22561,7 +22574,7 @@ def run_site_visit(customer=None, install=False, pip_mirror=None):
              "独占串行不影响其它模块)", C_BOLD))
     keys = [k for k in all_module_keys() if k not in ("port", "iperf3")]
     run_diagnostics(keys, banner=False, parallel=True, install=install,
-                    pip_mirror=pip_mirror)
+                    pip_mirror=pip_mirror, print_modules=False)
     if not LAST_RUN or not LAST_RUN.get("results"):
         print(_c("  诊断未产生数据, 已中止 (可重跑或用普通模式排查)。", C_RED))
         return
@@ -22943,7 +22956,8 @@ def _run_scene(profile, install=False, pip_mirror=None):
     print(_c("  预计 1-3 分钟, 请稍候...", C_GRAY))
     try:
         run_diagnostics(keys, banner=False, parallel=True, max_workers=4,
-                        install=install, pip_mirror=pip_mirror)
+                        install=install, pip_mirror=pip_mirror,
+                        print_modules=False)
     # (Exception, KeyboardInterrupt): Ctrl+C 是 BaseException, 只捕 Exception
     # 会把原始回溯打到客户屏幕上, _format_error_for_user 的中断文案成死分支 (审查 #4)
     except (Exception, KeyboardInterrupt) as e:
@@ -23336,12 +23350,50 @@ def interactive_menu(install=False, pip_mirror=None):
         return
 
 
+def _module_menu_lines():
+    """高级菜单内容行 (2026-11-12 紧凑化): 与场景菜单同风格的分区 + 两列模块行。
+
+    压缩要点: 分区标题 `[字母] 分类 (副题灰)`, 行内两列 `NN 名称` (键号青),
+    去掉独立工程师说明行与括号长注释 —— 命令收进脚注一行。
+    模块名按显示宽 pad 到全局一致 ("链路速率" 8 宽 vs "LAN 设备扫描" 12 宽,
+    不 pad 会让左列右端参差); 用 ASCII 空格 pad (全角空格在 Consolas 下仅
+    0.37 倍 ASCII 宽, 不能用作 pad)。历史上 cell 末尾的 " (key)" 段因 cmd +
+    Consolas 汉字实宽 1.629 倍导致像素错位而移除, 用户仍可用序号/分类字母选择。
+    纯排版函数, 便于测试行数预算 (默认 30 行窗口内放下)。
+    """
+    all_names = [MODULE_MAP[k][0]
+                 for _cat_keys in (kc[1] for kc in MODULE_CATEGORIES)
+                 for k in _cat_keys]
+    name_max_w = max((_disp_width(n) for n in all_names), default=0)
+    out = []
+    idx = 0
+    for ci, (cat_name, keys, desc) in enumerate(MODULE_CATEGORIES):
+        if ci > 0:
+            out.append("")
+        letter = MODULE_NAME_LETTER.get(cat_name, "")
+        tag = _c(f"[{letter}]", C_CYAN) if letter else ""
+        out.append(_c(f"  {tag} {cat_name}", C_WHITE)
+                   + _c(f"  {desc}", C_GRAY))
+        cells = []
+        for k in keys:
+            idx += 1
+            n = MODULE_MAP[k][0]
+            padded = n + " " * (name_max_w - _disp_width(n))
+            cells.append(_c(str(idx).rjust(2), C_CYAN) + " "
+                         + _c(padded, C_WHITE))
+        for line in _columnize(cells, columns=2, gap=6):
+            out.append("  " + line)
+    return out
+
+
 def _module_menu(install=False, pip_mirror=None):
     """原模块清单菜单 (v1.6.0 起为场景层 [9] 高级选项)。
 
     行为与 v1.5.x 一致 (模块编号 / 分类 / 0 全部 / m 盯障 / e 导出 / q 退出);
     返回语义 (v1.9.3): r = 返回场景层主菜单 → True; q / Ctrl+C / EOF → False
     (通知场景层结束整个程序)。
+    2026-11-12 紧凑化: 排版收敛为 _module_menu_lines (场景菜单同风格),
+    命令脚注一行, 默认 30 行命令行窗口整屏放下。
     """
     # v1.15.2 (审查 P1-16): 最近一次诊断的完整数据。run_diagnostics 现在返回
     # run dict, 这里存成局部变量供下游显式取用 (调试包等), 避免再直读全局。
@@ -23351,53 +23403,17 @@ def _module_menu(install=False, pip_mirror=None):
         notice = _update_notice_line()
         for ln in _menu_banner_lines(notice=notice, subtitle="命令行网络诊断"):
             print(ln)
-        print(_c("  工程师模式 (模块级诊断)。运行完成后可返回场景模式主菜单。",
-                 C_WHITE))
-        idx = 0
-        # 全局模块名最大显示宽, 跨分类统一 (保证所有 cell 内的模块名
-        # 右端对齐到同一显示列, 行内/行间都齐)
-        all_names = [MODULE_MAP[k][0]
-                     for _cat_keys in (kc[1] for kc in MODULE_CATEGORIES)
-                     for k in _cat_keys]
-        name_max_w_global = max((_disp_width(n) for n in all_names), default=0)
-        for ci, (cat_name, keys, desc) in enumerate(MODULE_CATEGORIES):
-            if ci > 0:
-                print()
-            letter = MODULE_NAME_LETTER.get(cat_name, "")
-            tag = _c(f"[{letter}]", C_CYAN) if letter else ""
-            print(_c(f"  {tag} {cat_name}", C_BOLD) +
-                  _c(f"  {desc}", C_GRAY))
-            cells = []
-            # 模块名按显示宽 pad 到全局一致 (e.g. "链路速率" 8 宽 vs
-            # "LAN 设备扫描" 12 宽, 不 pad 会让行间左列模块名右端参差)。
-            # 用 ASCII 空格 pad: 跨终端/跨字体渲染稳定 (全角空格在
-            # Windows Consolas 下仅 0.37 倍 ASCII 宽, 不能用作 pad)。
-            #
-            # 历史上 cell 末尾还跟了 " (key)" 一段, 后因 cmd + Consolas
-            # 字体下汉字实际仅 1.629 倍 ASCII 宽 (非理论 2.0 倍), 加上
-            # key 长度参差 (3-11 字符) 后 cell 实际像素宽差异过大, pad
-            # 整数 ASCII 空格无法在 Consolas 下做到像素级行间对齐, 故
-            # 移除 (key) 段以减小 cell 宽差异 (现仅 0.06 字符位, 肉眼看不出)。
-            # 用户仍可通过序号 (1-23) 或分类字母 (a/b/c) 选模块, 不受影响。
-            name_max_w = name_max_w_global
-            for k in keys:
-                idx += 1
-                n = MODULE_MAP[k][0]
-                name_padded = n + " " * (name_max_w - _disp_width(n))
-                cells.append(
-                    _c(str(idx).rjust(2), C_CYAN) + ". " +
-                    _c(name_padded, C_WHITE))
-            for line in _columnize(cells, columns=2, gap=4):
-                print("    " + line)
+        for ln in _module_menu_lines():
+            print(ln)
         print()
-        print(f"    {_c(' 0', C_CYAN)}. 运行全部诊断 {_c('(默认并发, 含Ookla测速+TCP并发压测)', C_GRAY)}")
-        print(f"    {_c(' m', C_CYAN)}. 盯障模式 {_c('(600秒找偶发掉线, Ctrl+C可提前停)', C_GRAY)}")
-        print(f"    {_c(' e', C_CYAN)}. 导出上次诊断报告")
-        print(f"    {_c(' d', C_CYAN)}. 生成调试包 {_c('(脱敏zip: 报告+证据+日志, 上报排障用)', C_GRAY)}")
-        print(f"    {_c(' r', C_CYAN)}. 返回场景模式主菜单")
-        print(f"    {_c(' q', C_CYAN)}. 退出")
-        print(_c("  快捷: 0=全部 a/b/c=按分类 m=盯障 e=导出 d=调试包 r=返回场景 q=退出", C_GRAY))
-        print(_c("-" * 60, C_GRAY))
+        # 命令脚注一行化 (2026-11-12 紧凑化): 旧版 6 行选项 + 快捷行内容重复
+        print(_c("    ", C_GRAY) + _c("0", C_CYAN) + _c(" 全部诊断   ", C_GRAY)
+              + _c("m", C_CYAN) + _c(" 盯障   ", C_GRAY)
+              + _c("e", C_CYAN) + _c(" 导出报告   ", C_GRAY)
+              + _c("d", C_CYAN) + _c(" 调试包   ", C_GRAY)
+              + _c("r", C_CYAN) + _c(" 返回场景   ", C_GRAY)
+              + _c("q", C_CYAN) + _c(" 退出", C_GRAY))
+        print(_c("─" * min(_term_width() - 2, 76), C_GRAY))
         try:
             choice = input(_c("  输入 » ", C_GREEN)).strip()
         except (EOFError, KeyboardInterrupt):
@@ -23538,7 +23554,11 @@ def _module_menu(install=False, pip_mirror=None):
         # 菜单模式: 多模块默认并发 (与 CLI `all --parallel` 对齐)。
         # run_diagnostics 内部 `parallel and len(keys) > 1` 会自动避免
         # 单模块走并发 (无意义且会浪费线程开销)。
-        last_run = run_diagnostics(keys, banner=False, parallel=True, max_workers=4)
+        # print_modules: 多模块跑法终端不逐模块铺开 (2026-11-12 用户拍板),
+        # 只给一段汇总框; 单模块仍打印完整结论 (工程师单测就是看指标)。
+        last_run = run_diagnostics(keys, banner=False, parallel=True,
+                                   max_workers=4,
+                                   print_modules=len(keys) == 1)
         if sys.stdout.isatty():
             # 单独跑测速时跳过"生成综合诊断报告"询问: 测速已自动保存独立的
             # 专业测速报告 (HTML+JSON), 再问会产生冗余的 netdiag_report_*
