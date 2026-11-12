@@ -24792,7 +24792,13 @@ class _GuiSession:
                                   progress_cb=self.on_progress)
             if not (run.get("results") or {}):
                 raise RuntimeError("诊断未产生数据")
+            # 决议 (Task 2 审查, 同 _run_diag): module_status 以最终 run dict
+            # 为准整体同步 — done 事件带归一化前原值 (site 集含 loopback,
+            # 环回未跑时事件是「错误」, run["status"] 里才是「未检测」),
+            # 事件只负责过程进度; 最终状态以 run["status"] 为准
+            # (加锁, 先于 phase 翻转)。
             with self._lock:
+                self._module_status = dict(run.get("status") or {})
                 self._run = run
                 self._phase = "site_ready"     # 等机房勾选 (页面切核对步)
         except Exception as e:
@@ -24837,8 +24843,12 @@ class _GuiSession:
         with self._lock:
             self._report = report
             self._files = files
-            self._phase = "done"
-        return True, err_first
+            # 审查 I2: 一件都没成时回 site_ready — 勾选数据与诊断结果都在,
+            # 用户可直接重试「生成报告」, 不被迫重跑 2-3 分钟诊断。
+            self._phase = "done" if files else "site_ready"
+        if files:
+            return True, err_first        # err_first 非空 = 部分失败, 前端提示
+        return False, err_first
 
     # -- 导出 (与终端 _export_scene_report 同目录同名规则) --
     def export(self, kind):

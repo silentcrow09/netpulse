@@ -145,6 +145,51 @@ class TestGuiSite(unittest.TestCase):
         self.assertEqual(type(self)._last_build["meta_manual"]["customer"],
                          "张伟·幸福小区3-502")
 
+    def test_finalize_all_exports_fail_keeps_site_ready(self):
+        # 审查 I2: 一件都没成 → ok=False, phase 回 site_ready (勾选数据不丢,
+        # 不被迫重跑诊断), 可直接二次 finalize 成功
+        s = np._GuiSession()
+        tmp = tempfile.mkdtemp()
+        self._run_site(s)
+        with mock.patch.object(np, "_site_report_base",
+                               return_value=os.path.join(tmp, "现场检测_测试")), \
+             mock.patch.object(np, "export_report",
+                               return_value="磁盘写入失败"), \
+             mock.patch.object(np, "_find_pdf_browser", return_value=None):
+            ok, err = s.finalize_site({}, note="")
+            self.assertFalse(ok)
+            self.assertTrue(err)
+        self.assertEqual(s.snapshot()["phase"], "site_ready")
+        with mock.patch.object(np, "_site_report_base",
+                               return_value=os.path.join(tmp, "现场检测_测试")), \
+             mock.patch.object(np, "export_report", return_value=None), \
+             mock.patch.object(np, "_find_pdf_browser", return_value=None):
+            ok2, err2 = s.finalize_site({"onu_led": "LOS 告警"}, note="换线")
+            self.assertTrue(ok2)
+            self.assertIsNone(err2)
+        snap = s.snapshot()
+        self.assertEqual(snap["phase"], "done")
+        self.assertTrue(snap["has_report"])
+
+    def test_finalize_partial_success_is_done(self):
+        # 审查 I2: 部分成功 (PDF 失败, 三件套成了) → ok=True, phase=done,
+        # files 非空, err 带失败原因 (前端提示「部分导出失败」)
+        s = np._GuiSession()
+        tmp = tempfile.mkdtemp()
+        self._run_site(s)
+        with mock.patch.object(np, "_site_report_base",
+                               return_value=os.path.join(tmp, "现场检测_测试")), \
+             mock.patch.object(np, "export_report", return_value=None), \
+             mock.patch.object(np, "_find_pdf_browser",
+                               return_value="C:/x/edge.exe"), \
+             mock.patch.object(np, "_html_to_pdf", return_value="浏览器超时"):
+            ok, err = s.finalize_site({}, note="")
+            self.assertTrue(ok)
+            self.assertEqual(err, "PDF: 浏览器超时")
+        snap = s.snapshot()
+        self.assertEqual(snap["phase"], "done")
+        self.assertEqual(len(snap["files"]), 3)
+
     def test_finalize_without_chromium(self):
         s = np._GuiSession()
         tmp = tempfile.mkdtemp()
