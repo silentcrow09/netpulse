@@ -34,6 +34,21 @@ v1.22.0 终审修复波:
       (忙错误标记) 兜底同样 409
   P15 site_ready → POST /api/monitor/start: 现场检测收尾等待机房勾选时
       网络已空闲, 盯障 start 允许 (终审 #7, 按现状语义断言)
+
+v1.23.0 模块勾选面板 (Task 1: 服务端 keys 形态 + module_catalog + 配置注入):
+  P16 keys 组合启动 → progress label=「模块组合 (2 项)」; 管线收去重后
+      组合; diagnose rule_filter=None (组合落全规则口径)
+  P17 keys 去重保序: ["mtu","dns","mtu"] → 管线 keys=["mtu","dns"],
+      label 计数 2
+  P18 keys 非法 (未知 key / 空数组 / 非数组 / 非字符串项) 与 profile 同现
+      → 400 {"ok":false,"err":...} 且不启动
+  P19 keys 形态忙分诊沿用: 诊断 running → 409 (同 profile 形态)
+  P20 module_catalog: 24 项、分组 6/5/13、顺序与 MODULE_REGISTRY 一致、
+      中文名同源 MODULE_MAP、cat ∈ a/b/c 与 MODULE_CATEGORIES 同源
+  P21 port_targets 注入: 非法 → 400 不启动不写; 对应模块不在 keys →
+      不消费; 合法 → PORT_PROBE_CONFIG["targets"] 逐段写入
+  P22 iperf3_server / use_speedtest_net 注入: 非法 iperf3 → 400 不写
+      (CLI 同口径); 留空不消费; 仅对应模块在 keys 里才写
 """
 import json
 import os
@@ -559,6 +574,241 @@ class TestGuiServer(unittest.TestCase):
             np._gui_net_watch(evt)
         self.assertIs(np._GUI_NET["ok"], True)
         self.assertGreater(np._GUI_NET["ts"], 0.0)
+
+
+# ============================================================
+# v1.23.0 模块勾选面板 (Task 1): keys 形态 + module_catalog + 配置注入
+# ============================================================
+
+class TestKeysRun(unittest.TestCase):
+    """keys 组合形态 (P16-P19/P21/P22) 与 module_catalog (P20)。
+
+    mock 的是 run_diagnostics 管线 (非 MonitorSession 类替身) → 沿用
+    test_gui_server 既有管线 mock 风格 (同 test_gui_session.py 手法)。
+    """
+
+    def setUp(self):
+        np._GUI_RESET_FOR_TEST()
+        self.session = np._GuiSession()
+        self.evt = threading.Event()
+        self.srv, self.port, self.token = np._start_gui_server(
+            self.session, self.evt)
+        self.addCleanup(lambda: (self.evt.set(), self.srv.shutdown(),
+                                 self.srv.server_close()))
+        # 配置注入写的是进程级 CONFIG alias 常量, 测试间必须还原
+        self._cfg_old = (list(np.PORT_PROBE_CONFIG["targets"]),
+                         np.SPEEDTEST_CONFIG["iperf3_server"],
+                         np.SPEEDTEST_CONFIG["iperf3_port"],
+                         np.SPEEDTEST_CONFIG["use_speedtest_net"])
+        self.addCleanup(self._restore_config)
+
+    def _restore_config(self):
+        np.PORT_PROBE_CONFIG["targets"] = list(self._cfg_old[0])
+        (np.SPEEDTEST_CONFIG["iperf3_server"],
+         np.SPEEDTEST_CONFIG["iperf3_port"],
+         np.SPEEDTEST_CONFIG["use_speedtest_net"]) = self._cfg_old[1:]
+
+    # -- 管线替身 (test_gui_session.py 风格): 捕获管线入参 + 触发进度事件 --
+    def _patch_pipeline(self, captured):
+        report = {"health": {"score": 90}}
+
+        def _rd(keys, **kw):
+            captured["keys"] = list(keys)
+            run = {"status": {k: "完成" for k in keys},
+                   "results": {k: {"fake": 1} for k in keys},
+                   "evidence": {}, "keys": list(keys), "system": {},
+                   "duration_ms": 1, "total_modules": len(keys)}
+            # run_diagnostics 管线副作用: build_report 内部读 LAST_RUN
+            if np.LAST_RUN is None:
+                np.LAST_RUN = dict(run)
+            else:
+                np.LAST_RUN.clear()
+                np.LAST_RUN.update(run)
+            cb = kw.get("progress_cb")
+            if cb:
+                for k in keys:
+                    cb({"event": "start", "key": k})
+                    cb({"event": "done", "key": k, "status": "完成"})
+            return run
+
+        def _cap_diag(results, rule_filter=None):
+            captured["rule_filter"] = rule_filter
+            return type("D", (), {"to_dict": lambda self: {}})()
+
+        p_rd = mock.patch.object(np, "run_diagnostics", side_effect=_rd)
+        p_dg = mock.patch.object(np, "diagnose", side_effect=_cap_diag)
+        p_en = mock.patch.object(np, "_enrich_diagnosis_evidence",
+                                 side_effect=lambda d, r, e: d)
+        p_bd = mock.patch.object(np, "build_report",
+                                 side_effect=lambda **kw: report)
+        return p_rd, p_dg, p_en, p_bd
+
+    def _wait_done(self):
+        for _ in range(100):
+            if self.session.snapshot()["phase"] in ("done", "error"):
+                break
+            time.sleep(0.1)
+        return self.session.snapshot()
+
+    def _post(self, body):
+        return _req(self.port, "POST", "/api/run?t=" + self.token, body=body)
+
+    # -- P16: keys 组合启动 → label + 管线 keys + rf=None --
+    def test_keys_run_label_and_pipeline(self):
+        captured = {}
+        pipes = self._patch_pipeline(captured)
+        with pipes[0], pipes[1], pipes[2], pipes[3]:
+            st, raw = self._post({"keys": ["dns", "mtu"]})
+            self.assertEqual(st, 200)
+            self.assertTrue(json.loads(raw)["ok"])
+            snap = self._wait_done()
+        self.assertEqual(snap["phase"], "done")
+        self.assertEqual(snap["label"], "模块组合 (2 项)")
+        self.assertEqual(captured["keys"], ["dns", "mtu"])
+        self.assertIsNone(captured["rule_filter"])   # 组合 → 全规则口径
+        st, raw = _req(self.port, "GET",
+                       "/api/progress?t=" + self.token)
+        self.assertEqual(json.loads(raw)["label"], "模块组合 (2 项)")
+
+    # -- P17: 去重保序 --
+    def test_keys_dedupe_preserves_order(self):
+        captured = {}
+        pipes = self._patch_pipeline(captured)
+        with pipes[0], pipes[1], pipes[2], pipes[3]:
+            st, raw = self._post({"keys": ["mtu", "dns", "mtu"]})
+            self.assertEqual(st, 200)
+            snap = self._wait_done()
+        self.assertEqual(snap["phase"], "done")
+        self.assertEqual(captured["keys"], ["mtu", "dns"])
+        self.assertEqual(snap["label"], "模块组合 (2 项)")
+        self.assertEqual(snap["total"], 2)
+
+    # -- P18: 非法 / 空 / 非数组 / 非字符串项 / 同现 → 400 不启动 --
+    def test_keys_invalid_and_conflict_400(self):
+        cases = [
+            {"keys": ["dns", "nope"]},          # 未知 key
+            {"keys": []},                        # 空
+            {"keys": "dns"},                     # 非数组
+            {"keys": ["dns", 123]},              # 非字符串项
+            {"keys": ["dns"], "profile": "slow"},   # 同现
+        ]
+        for body in cases:
+            st, raw = self._post(body)
+            self.assertEqual(st, 400, body)
+            d = json.loads(raw)
+            self.assertFalse(d["ok"])
+            self.assertTrue(d.get("err"), body)
+        snap = self.session.snapshot()
+        self.assertEqual(snap["phase"], "idle")   # 全部未启动
+        self.assertEqual(snap["label"], "")
+
+    # -- P19: keys 形态忙分诊沿用 409 --
+    def test_keys_busy_409(self):
+        self.session._phase = "running"    # 直摆忙 (同 test_run_conflict_409)
+        st, raw = self._post({"keys": ["dns"]})
+        self.assertEqual(st, 409)
+        self.assertEqual(json.loads(raw)["reason"], "running")
+
+    # -- P20: module_catalog 同源与分组 --
+    def test_module_catalog(self):
+        st, raw = _req(self.port, "GET",
+                       "/api/scenarios?t=" + self.token)
+        self.assertEqual(st, 200)
+        cat = json.loads(raw)["module_catalog"]
+        self.assertEqual(len(cat), 24)
+        # 顺序 = MODULE_REGISTRY 注册表顺序 (key 与中文名逐一同源)
+        self.assertEqual([it["key"] for it in cat], np.full_module_keys())
+        for it in cat:
+            self.assertEqual(it["name"], np.MODULE_MAP[it["key"]][0])
+            self.assertIn(it["cat"], ("a", "b", "c"))
+        # 分组 6/5/13, 组内顺序与 MODULE_CATEGORIES 同源
+        by = {}
+        for it in cat:
+            by.setdefault(it["cat"], []).append(it["key"])
+        self.assertEqual([len(by["a"]), len(by["b"]), len(by["c"])],
+                         [6, 5, 13])
+        for letter, (name, keys, _desc) in zip(
+                np.MODULE_CATEGORY_LETTERS, np.MODULE_CATEGORIES):
+            self.assertEqual(by[letter], keys)
+
+    # -- P21: port_targets 注入 --
+    def test_port_targets_injection(self):
+        old = list(np.PORT_PROBE_CONFIG["targets"])
+        pipes = self._patch_pipeline({})
+        # 非法 (端口非数字) → 400, 不启动, 不写
+        st, raw = self._post({"keys": ["port"],
+                              "port_targets": "1.2.3.4:abc"})
+        self.assertEqual(st, 400)
+        self.assertEqual(self.session.snapshot()["phase"], "idle")
+        self.assertEqual(np.PORT_PROBE_CONFIG["targets"], old)
+        # 非法 (范围倒序) → 400
+        st, raw = self._post({"keys": ["port"],
+                              "port_targets": "10.0.0.1:443-80"})
+        self.assertEqual(st, 400)
+        self.assertEqual(np.PORT_PROBE_CONFIG["targets"], old)
+        # 对应模块不在 keys → 不消费 (不校验不写), 正常启动
+        with pipes[0], pipes[1], pipes[2], pipes[3]:
+            st, raw = self._post({"keys": ["dns"],
+                                  "port_targets": "garbage-no-colon"})
+            self.assertEqual(st, 200)
+            self._wait_done()
+        self.assertEqual(np.PORT_PROBE_CONFIG["targets"], old)
+        # 合法 → 逐段写入 (去空白, 保序)
+        with pipes[0], pipes[1], pipes[2], pipes[3]:
+            st, raw = self._post({"keys": ["dns", "port"],
+                                  "port_targets":
+                                      "223.5.5.5:53, 10.0.0.1:1-1024"})
+            self.assertEqual(st, 200)
+            self._wait_done()
+        self.assertEqual(np.PORT_PROBE_CONFIG["targets"],
+                         ["223.5.5.5:53", "10.0.0.1:1-1024"])
+        # 留空 = 不消费 (落回「未提供目标」既有语义)
+        with pipes[0], pipes[1], pipes[2], pipes[3]:
+            st, raw = self._post({"keys": ["port"], "port_targets": "  "})
+            self.assertEqual(st, 200)
+            self._wait_done()
+        self.assertEqual(np.PORT_PROBE_CONFIG["targets"],
+                         ["223.5.5.5:53", "10.0.0.1:1-1024"])
+
+    # -- P22: iperf3_server / use_speedtest_net 注入 --
+    def test_iperf3_ookla_injection(self):
+        pipes = self._patch_pipeline({})
+        # 非法 iperf3 服务器 → 400 不写 (CLI sys.exit(4) 同口径)
+        st, raw = self._post({"keys": ["iperf3"],
+                              "iperf3_server": "a b:5201"})
+        self.assertEqual(st, 400)
+        self.assertEqual(self.session.snapshot()["phase"], "idle")
+        self.assertIsNone(np.SPEEDTEST_CONFIG["iperf3_server"])
+        # 合法 → 拆 host/port 写入 (与 CLI 写入键一致)
+        with pipes[0], pipes[1], pipes[2], pipes[3]:
+            st, raw = self._post({"keys": ["iperf3"],
+                                  "iperf3_server": "1.2.3.4:5201"})
+            self.assertEqual(st, 200)
+            self._wait_done()
+        self.assertEqual(np.SPEEDTEST_CONFIG["iperf3_server"], "1.2.3.4")
+        self.assertEqual(np.SPEEDTEST_CONFIG["iperf3_port"], 5201)
+        # 仅 speedtest 在 keys 里才消费 Ookla 开关
+        with pipes[0], pipes[1], pipes[2], pipes[3]:
+            st, raw = self._post({"keys": ["speedtest"],
+                                  "use_speedtest_net": True})
+            self.assertEqual(st, 200)
+            self._wait_done()
+        self.assertIs(np.SPEEDTEST_CONFIG["use_speedtest_net"], True)
+        # speedtest 不在 keys → 不消费: 先摆 False 基线, 请求带 True 也不被改写
+        np.SPEEDTEST_CONFIG["use_speedtest_net"] = False
+        with pipes[0], pipes[1], pipes[2], pipes[3]:
+            st, raw = self._post({"keys": ["dns"],
+                                  "use_speedtest_net": True})
+            self.assertEqual(st, 200)
+            self._wait_done()
+        self.assertIs(np.SPEEDTEST_CONFIG["use_speedtest_net"], False)
+        # 留空 iperf3 服务器 = 不消费 (落回「未检测」既有语义), 不覆盖已写值
+        with pipes[0], pipes[1], pipes[2], pipes[3]:
+            st, raw = self._post({"keys": ["iperf3"],
+                                  "iperf3_server": "   "})
+            self.assertEqual(st, 200)
+            self._wait_done()
+        self.assertEqual(np.SPEEDTEST_CONFIG["iperf3_server"], "1.2.3.4")
 
 
 if __name__ == "__main__":

@@ -24673,8 +24673,13 @@ def _gui_verdict(report):
             "label": health.get("label"), "summary": counts}
 
 
-def _GUI_LABELS(profile):
-    """场景/全量诊断的中文标题 (主页卡与导出文件名共用)。"""
+def _GUI_LABELS(profile, keys=None):
+    """场景/全量诊断的中文标题 (主页卡与导出文件名共用)。
+
+    v1.23.0: keys 组合模式 (profile 空 + keys 非空) → 「模块组合 (N 项)」。
+    """
+    if keys and not profile:
+        return "模块组合 (%d 项)" % len(keys)
     if profile == "full":
         return "完整诊断"
     if profile == "site":
@@ -24682,6 +24687,69 @@ def _GUI_LABELS(profile):
         # (现场检测流程里导出的文件名带着英文), 与页面卡片文案「现场检测」同词
         return "现场检测"
     return SCENE_LABELS.get(profile, str(profile))
+
+
+def _gui_validate_keys(keys):
+    """v1.23.0 keys 组合白名单校验 (服务端, F4 红线: 防绕过):
+    非空、均为 MODULE_REGISTRY 已知 key、去重保序。
+    返回 (clean_keys, None) 或 (None, err)。"""
+    if not isinstance(keys, list) or not keys:
+        return None, "keys 必须为非空数组"
+    clean = []
+    for k in keys:
+        if not isinstance(k, str) or k not in MODULE_MAP:
+            return None, "未知模块: %s" % (k,)
+        if k not in clean:
+            clean.append(k)
+    return clean, None
+
+
+def _gui_apply_run_config(d, keys):
+    """v1.23.0 keys 形态的内联配置注入 (启动前写既有 CONFIG 常量)。
+
+    spec 冻结口径: 组合运行结束不回滚 — GUI 常驻进程内后续轮次以面板
+    当前值为准 (与 CLI 单次进程语义差异可接受)。仅当对应模块在 keys 里
+    才消费对应字段:
+      port_targets      → PORT_PROBE_CONFIG["targets"]: 逗号分隔, 逐段
+                          _parse_target 校验 (brief 写"正则", 按仓内先例
+                          修正为复用终端同源解析器 — 附带 IPv6/范围越界/
+                          倒序校验), 非法 → err 400
+      iperf3_server     → SPEEDTEST_CONFIG["iperf3_server"/"iperf3_port"]:
+                          _parse_iperf3_server 校验拆分 (非法 → err 400,
+                          CLI sys.exit(4) 同口径), 写入键与 CLI 一致
+      use_speedtest_net → SPEEDTEST_CONFIG["use_speedtest_net"] (bool 直写)
+    留空 (空串/纯空白) = 不消费, 落回模块既有「未提供目标/未检测」语义。
+    校验全部通过才落盘 (不做部分写入)。返回 None 或 err 字符串。
+    """
+    keyset = set(keys)
+    writes = []
+    if "port" in keyset:
+        raw = str(d.get("port_targets") or "").strip()
+        if raw:
+            specs = []
+            for seg in raw.replace("，", ",").split(","):
+                seg = seg.strip()
+                if not seg:
+                    continue
+                if _parse_target(seg) is None:
+                    return "端口目标格式非法: %s" % seg
+                specs.append(seg)
+            if specs:
+                writes.append((PORT_PROBE_CONFIG, "targets", specs))
+    if "iperf3" in keyset:
+        raw = str(d.get("iperf3_server") or "").strip()
+        if raw:
+            parsed = _parse_iperf3_server(raw)
+            if parsed is None:
+                return "iperf3 服务器地址非法: %s" % raw
+            writes.append((SPEEDTEST_CONFIG, "iperf3_server", parsed[0]))
+            writes.append((SPEEDTEST_CONFIG, "iperf3_port", parsed[1]))
+    if "speedtest" in keyset and "use_speedtest_net" in d:
+        writes.append((SPEEDTEST_CONFIG, "use_speedtest_net",
+                       bool(d.get("use_speedtest_net"))))
+    for cfg, key, val in writes:
+        cfg[key] = val
+    return None
 
 
 class _GuiSession:
@@ -24724,7 +24792,9 @@ class _GuiSession:
             return {
                 "phase": self._phase,
                 "profile": self._profile,
-                "label": _GUI_LABELS(self._profile) if self._profile else "",
+                # v1.23.0: keys 组合模式 (profile=None) label 由 keys 推导
+                "label": _GUI_LABELS(self._profile, self._keys)
+                         if (self._profile or self._keys) else "",
                 "total": len(self._keys),
                 "done": done,
                 "running": sorted(self._running),
@@ -24775,9 +24845,20 @@ class _GuiSession:
             self._files = []
         return True, None
 
-    def start(self, profile, install=True, pip_mirror=None):
-        """启动场景诊断或完整诊断。full=full_module_keys() (含 tcpcc 压测)。"""
-        if profile == "full":
+    def start(self, profile=None, keys=None, install=True, pip_mirror=None):
+        """启动场景诊断或完整诊断。full=full_module_keys() (含 tcpcc 压测)。
+
+        v1.23.0 keys 形态: keys 优先于 profile; 白名单校验 (非空、⊆
+        MODULE_REGISTRY 全集、去重保序) 失败返回 (False, err)。组合走
+        既有 run_diagnostics 管线, label=「模块组合 (N 项)」; rule_filter
+        天然为 None (组合不在 DIAGNOSE_PROFILES → 全规则评估)。
+        """
+        if keys is not None:
+            keys, err = _gui_validate_keys(keys)
+            if err:
+                return False, err
+            profile = None
+        elif profile == "full":
             keys = full_module_keys()
         elif profile in DIAGNOSE_PROFILES:
             keys = list(DIAGNOSE_PROFILES[profile])
@@ -24921,11 +25002,12 @@ class _GuiSession:
     # -- 导出 (与终端 _export_scene_report 同目录同名规则) --
     def export(self, kind):
         with self._lock:
-            report, profile = self._report, self._profile
+            report, profile, keys = self._report, self._profile, self._keys
         if not report:
             return None, "尚无报告可导出"
         base_dir = _desktop_netpulse_dir() or _report_dir()
-        title = _GUI_LABELS(profile)
+        # v1.23.0: keys 组合模式 → 标题「模块组合 (N 项)」 (文件名同源)
+        title = _GUI_LABELS(profile, keys)
         ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         if kind == "pdf":
             chrome = _find_pdf_browser()
@@ -26743,6 +26825,14 @@ def _gui_meta():
                 "desc": "定时监测外网, 抓偶发掉线/抖动", "modules": 0}]
         ),
         "module_desc": module_desc,
+        # v1.23.0: 模块勾选面板目录 (F4 红线: 数据唯一来源 MODULE_CATEGORIES
+        # /MODULE_MAP, 页面不内嵌清单); cat 字母同源 MODULE_CATEGORY_LETTERS
+        "module_catalog": [
+            {"key": k, "name": MODULE_MAP[k][0],
+             "cat": MODULE_CATEGORY_LETTERS[ci]}
+            for ci, (_cname, ckeys, _cdesc) in enumerate(MODULE_CATEGORIES)
+            for k in ckeys
+        ],
         "status_colors": {st: STATUS_COLORS[sk]
                           for st, sk in STATUS_KEY.items()},
         # 终审 F4: 报告页结论条等级徽章色, 同一载荷下发 (页面 JS 不内嵌色表)
@@ -26862,14 +26952,33 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
             if data is None:
                 return self._send(400, {"error": "bad json"})
             if p == "/api/run":
-                profile = str((data or {}).get("profile") or "")
+                # v1.23.0 双形态: {profile} (现状不变) / {keys:[...]} (新),
+                # 二选一同现 400。keys 路径: 服务端白名单校验 (非法 → 400)
+                # + 内联配置注入 (仅对应模块在 keys 里才消费); 忙 409 分诊
+                # 沿用, 原子闸仍在 _begin (_GUI_ACT_LOCK 内查忙+置位)。
+                d = data or {}
+                req_keys = d.get("keys")
+                req_profile = d.get("profile")
+                if req_keys is not None and req_profile is not None:
+                    return self._send(400, {"ok": False,
+                                            "err": "keys 与 profile 只能二选一"})
                 if self.session.is_running():
                     return self._send(409, {"ok": False, "reason": "running"})
                 if self.monitor is not None and self.monitor.is_running():
                     # v1.22.0: 盯障进行中, 诊断入口同样 409 (互斥第二道
                     # 防线在 _begin: _GUI_ACT_LOCK 内原子复查)
                     return self._send(409, {"ok": False, "reason": "busy"})
-                ok, err = self.session.start(profile)
+                if req_keys is not None:
+                    keys, err = _gui_validate_keys(req_keys)
+                    if err:
+                        return self._send(400, {"ok": False, "err": err})
+                    # 注入先于 start: 诊断线程起跑即读 CONFIG, 不能竞速
+                    err = _gui_apply_run_config(d, keys)
+                    if err:
+                        return self._send(400, {"ok": False, "err": err})
+                    ok, err = self.session.start(keys=keys)
+                else:
+                    ok, err = self.session.start(str(req_profile or ""))
                 return self._send(200 if ok else 400,
                                   {"ok": ok, "err": err})
             if p == "/api/export":
