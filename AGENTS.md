@@ -129,6 +129,11 @@
   HTTP 层 409 与页面禁用双保险；锁不可重入，路由层只做分诊不持锁调 start。
   `/api/shutdown` 在盯障进行中且非 force 时拒绝（防孤儿 `ping -t` 与丢报告）；
   `_run_gui` finally 必须 `monitor.stop()`。
+- **keys 形态白名单（v1.23.0）**：`/api/run` 的 `{keys:[...]}` 形态必须服务端
+  白名单校验（非空、⊆ `MODULE_MAP` 全集、去重保序、与 `profile` 互斥出现）；
+  组合的根因评估走 `diagnose(rule_filter=None)` 全规则，不伪造场景规则集；
+  `module_catalog` 数据唯一来源 `MODULE_REGISTRY`/`MODULE_CATEGORIES`，
+  页面不得内嵌模块清单。
 
 ## 诊断汇总口径（v1.19.x）
 

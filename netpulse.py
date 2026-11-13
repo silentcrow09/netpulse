@@ -3723,7 +3723,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.22.0"
+APP_VERSION = "1.23.0"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
