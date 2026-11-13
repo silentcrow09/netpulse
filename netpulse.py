@@ -24972,9 +24972,16 @@ def _gui_resume_load():
     keys = clean.get("keys") or []
     done = clean.get("completed") or {}
     if keys and all(k in done for k in keys):
+        # 删前复核: 读文件与删文件之间可能恰好有并发写入 (os.replace 是原子
+        # 替换) —— 删的必须还是这个「全测完」的点, 免得把刚写好的新点删了。
         try:
-            os.remove(path)
-        except OSError:
+            with open(path, encoding="utf-8") as f:
+                again = _gui_resume_clean(json.load(f))
+            akeys = (again or {}).get("keys") or []
+            adone = (again or {}).get("completed") or {}
+            if akeys and all(k in adone for k in akeys):
+                os.remove(path)
+        except Exception:
             pass
         return None, "上次的诊断已经全测完了，没有要接着跑的项目"
     return clean, None
@@ -25344,7 +25351,12 @@ class _GuiSession:
                 # 报「没有可接着跑的诊断」。
                 ran = sum(1 for k in self._keys if self._module_status.get(k))
                 if ran >= len(self._keys) and self._keys:
-                    _gui_resume_discard()
+                    # v1.24.0 复核: 续跑轮次 → 来源点也全测完了 → 删掉 (没有可续
+                    # 的了); 普通新一轮 → 磁盘上的旧点**保留** (spec F4「普通新
+                    # 一轮跑完不删旧点」—— 删了等于把上一轮已测完的成果抹掉;
+                    # 与关窗落盘那条路径保持一致, 别让同一情形两种结果)。
+                    if resume_ctx:
+                        _gui_resume_discard()
                 else:
                     err = self._save_resume_point(run, resume_ctx)
                     with self._lock:

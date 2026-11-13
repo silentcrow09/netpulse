@@ -50,6 +50,15 @@ def _done(key):
     return {"status": "完成", "result": {"fake": key}}
 
 
+def _run_dict(keys, results=None, status=None):
+    return {"app": "NetPulse", "version": "1.24.0",
+            "generated_at": __import__("datetime").datetime.now(),
+            "system": {}, "status": status or {k: "完成" for k in keys},
+            "results": results or {k: {"fake": k} for k in keys},
+            "evidence": {}, "keys": list(keys), "duration_ms": 100,
+            "total_modules": len(np.MODULE_MAP)}
+
+
 class _AllDoneCase(unittest.TestCase):
     """公共装置: 隔离续跑点路径 + 清掉跨类型忙检。"""
 
@@ -184,6 +193,55 @@ class TestAllDoneNoResumePoint(_AllDoneCase):
         seg = js[i:i + 700]
         self.assertIn("r.done >= r.total", seg,
                       "横幅渲染要对「全测完」兜底 (verify S4.5)")
+
+    # ── A10 停止路径全测完 → 旧点保留 (与关窗路径一致) ──
+    def test_stop_path_all_done_keeps_old_point(self):
+        old = _point(["gateway", "dns"], {"gateway": _done("gateway")})
+        self._write_point(old)
+        s = np._GuiSession()
+
+        def _fake(keys, **kw):
+            cb = kw.get("progress_cb")
+            for k in keys:
+                if cb:
+                    cb({"event": "start", "key": k})
+                    cb({"event": "done", "key": k, "status": "完成",
+                        "result": {"fake": k}})
+            s.stop()                     # 全跑完之后才点停止
+            return _run_dict(keys)
+
+        with mock.patch.object(np, "run_diagnostics", side_effect=_fake):
+            s.start(keys=["wifi", "tcpstats"])
+            s._thread.join(5)
+        snap = s.snapshot()
+        self.assertEqual(snap["phase"], "cancelled", snap["phase"])
+        pt = self._read_point()
+        self.assertIsNotNone(pt,
+                             "停止路径与关窗落盘路径一致: 旧点保留 (别抹掉上一轮成果)")
+        self.assertEqual(sorted(pt["completed"]), ["gateway"])
+
+    # ── A11 停止路径 + 续跑轮次全测完 → 来源点删掉 ──
+    def test_stop_path_resume_all_done_discards_source_point(self):
+        src = _point(["gateway", "dns"], {"gateway": _done("gateway")})
+        self._write_point(src)
+        s = np._GuiSession()
+
+        def _fake(keys, **kw):
+            cb = kw.get("progress_cb")
+            for k in keys:
+                if cb:
+                    cb({"event": "start", "key": k})
+                    cb({"event": "done", "key": k, "status": "完成",
+                        "result": {"fake": k}})
+            s.stop()
+            return _run_dict(keys)
+
+        with mock.patch.object(np, "run_diagnostics", side_effect=_fake):
+            ok, err = s.start_resume()
+            self.assertTrue(ok, err)
+            s._thread.join(5)
+        self.assertFalse(os.path.exists(self.resume_path),
+                         "续跑轮次全测完 → 来源点也没有可续的了, 该删")
 
 
 if __name__ == "__main__":
