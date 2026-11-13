@@ -15,6 +15,8 @@
      其余参数形态 (字符串拼接 / 小写变量 / 函数调用) 一律 FAIL
   P6 v1.22.0 盯障三视图锚点 (mon-config/mon-live/mon-report) + 第 7 卡
      (ICONS.monitor + /api/scenarios 下发 monitor 条目, 与终端菜单同语义)
+  P7 F1 回修: runbar 三态优先级 monRun → diagRun → monDone (盯障完成的
+     粘滞终态不得覆盖诊断进行中入口); beforeunload 两条文案标点统一全角
 """
 import os
 import sys
@@ -104,6 +106,34 @@ class TestGuiPage(unittest.TestCase):
         self.assertEqual(len(mon), 1, "场景载荷缺「持续盯障」条目")
         self.assertEqual(mon[0]["label"], "持续盯障")
         self.assertIn("偶发掉线", mon[0]["desc"])
+
+    def test_runbar_priority_diag_over_mon_done(self):
+        # P7 (F1 回修): applyHomeState 的 runbar 分支顺序必须是
+        # monRun → diagRun → monDone —— monDone 是粘滞终态 (下次盯障前
+        # 一直在), 若优先于 diagRun, 盯障完成后跑诊断时 runbar 仍显示
+        # 「盯障完成」点开旧报告, 诊断入口被覆盖。
+        js = self.page.split("<script>")[1]
+        i_mon = js.find('bar.textContent = "盯障进行中 · 点击查看";')
+        i_diag = js.find('bar.textContent = "诊断进行中 · 点击查看进度";')
+        i_done = js.find('bar.textContent = "盯障完成 · 点击查看报告";')
+        self.assertTrue(0 <= i_mon < i_diag < i_done,
+                        "runbar 分支顺序必须 monRun → diagRun → monDone "
+                        "(find: %d/%d/%d)" % (i_mon, i_diag, i_done))
+        # runbar 点击跳转同优先级: diagRunning 时必须走诊断进度页
+        i_click_diag = js.find('} else if (state.diagRunning) {')
+        self.assertTrue(i_click_diag > 0,
+                        "runbar click 缺 diagRunning 分支")
+        self.assertTrue(i_click_diag < js.find(
+            '} else if (state.monPhase === "done") {'),
+            "click 分支顺序必须 monRun → diagRunning → monDone")
+
+    def test_beforeunload_punctuation_uniform(self):
+        # P7b (一致性回修): beforeunload 两条确认文案标点统一全角逗号
+        # (盯障文案为任务书钦定原文; 诊断文案向其对齐, 中文 UI 规范)。
+        self.assertIn("诊断仍在进行，关闭窗口将终止本次诊断", self.page)
+        self.assertNotIn("诊断仍在进行, 关闭窗口将终止本次诊断", self.page)
+        self.assertIn("盯障进行中，关闭窗口将终止本次盯障且丢失未生成的报告",
+                      self.page)
 
     def test_no_innerhtml_interpolation(self):
         # F3 (审查): 新闸 —— += 形态与 insertAdjacentHTML 非常量参数都要拦

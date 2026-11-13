@@ -25807,6 +25807,8 @@ _GUI_JS = r"""(function () {
   //   诊断 running → 全部卡禁用 + 运行条「诊断进行中」;
   //   盯障 running → 除盯障卡外全部禁用 + 运行条「盯障进行中」(点回实时页);
   //   盯障 done   → 运行条「盯障完成」(点开报告)。
+  // runbar 优先级 monRun → diagRun → monDone (F1 回修): monDone 是粘滞
+  // 终态 (下次盯障前一直在), 不得压过诊断进行中的入口。
   function updateHomeState(d) {
     state.diagRunning = d.phase === "running";
     applyHomeState();
@@ -25826,12 +25828,14 @@ _GUI_JS = r"""(function () {
     if (monRun) {
       bar.style.display = "";
       bar.textContent = "盯障进行中 · 点击查看";
+    } else if (diagRun) {
+      bar.style.display = "";
+      bar.textContent = "诊断进行中 · 点击查看进度";
     } else if (monDone) {
       bar.style.display = "";
       bar.textContent = "盯障完成 · 点击查看报告";
     } else {
-      bar.textContent = "诊断进行中 · 点击查看进度";
-      bar.style.display = diagRun ? "" : "none";
+      bar.style.display = "none";
     }
     $("#g-lastrep").style.display =
       (state.data && state.data.has_report) ? "" : "none";
@@ -26024,6 +26028,9 @@ _GUI_JS = r"""(function () {
   // 只管拉, 服务端 ≥5s 节流)。文本一律 textContent; 曲线几何 (数值计算
   // 的坐标) 经 setAttribute 写入 SVG 属性 — innerHTML 闸禁用。四路状态
   // 点色取自 status_colors (状态轴不内嵌), 曲线/事件红琥珀随设计稿类名。
+  // verdict 徽章文案以设计稿为准 (stable=「网络稳定」等); 内嵌报告渲染器
+  // _render_monitor_html 的 v_name (stable=「监测稳定」) 是终端报告口径,
+  // 不随页面改 — 同一 verdict 两处名称差异已知且可接受 (报告壳 vs 报告体)。
   var VERDICTS = {
     stable: ["网络稳定", ""], degraded: ["质量劣化", "warn"],
     mixed: ["混合问题", "bad"], internal: ["内网侧问题", "bad"],
@@ -26322,7 +26329,7 @@ _GUI_JS = r"""(function () {
       ev.preventDefault();
       ev.returnValue = mon
         ? "盯障进行中，关闭窗口将终止本次盯障且丢失未生成的报告"
-        : "诊断仍在进行, 关闭窗口将终止本次诊断";
+        : "诊断仍在进行，关闭窗口将终止本次诊断";
       return ev.returnValue;
     }
   });
@@ -26406,11 +26413,14 @@ _GUI_JS = r"""(function () {
       post(Q("/api/open-folder"), {});
     });
     $("#btn-mon-home2").addEventListener("click", function () { show("home"); });
-    // 主页运行条 / 上次报告入口 (终审 F2 + v1.22.0 盯障语义)
+    // 主页运行条 / 上次报告入口 (终审 F2 + v1.22.0 盯障语义; F1 回修:
+    // 点击跳转与显示同优先级 monRun → diagRunning → monDone)
     $("#g-runbar").addEventListener("click", function () {
       if (state.monPhase === "running") {
         show("mon-live");
         startMonPoll();
+      } else if (state.diagRunning) {
+        show("progress"); pollOnce();
       } else if (state.monPhase === "done") {
         openMonReport();
       } else {
