@@ -24871,6 +24871,11 @@ def _gui_apply_run_config(d, keys):
 _GUI_RESUME_FILE = "resume.json"
 _GUI_RESUME_MAX_AGE = 7 * 24 * 3600      # 续跑点最多留 7 天 (过期自动清理)
 _GUI_RESUME_PATH = None                 # 测试隔离用 (见 _GUI_RESET_FOR_TEST)
+# 续跑点写入互斥 (v1.24.0 终审复核): 两条落盘路径可能并发 —— worker 收尾
+# 线程与关窗信标线程 (用户点「停止」后立刻关窗)。共用同一个 tmp 文件名时
+# 两条线程各自以 "w" 打开它分多次写, 内容互相串接 → 落盘文件不是合法 JSON,
+# 这一轮的成果静默丢失 (实测 60 轮里 31 轮损坏)。
+_GUI_RESUME_WRITE_LOCK = threading.Lock()
 
 
 def _gui_resume_path():
@@ -24914,6 +24919,9 @@ def _gui_resume_save(payload):
 
     原子写: 先写同目录临时文件再 os.replace —— 进程被杀/断电不会留半截文件
     (半截 JSON 读回来是「损坏」, 白白丢掉已测完的成果)。
+
+    v1.24.0 终审复核: 写互斥 + tmp 名带进程/线程号 —— 两条落盘路径 (worker
+    收尾 / 关窗信标) 并发时不会再互相串接内容。
     """
     if not isinstance(payload, dict) or not payload:
         return False, "续跑点内容为空"
@@ -24922,23 +24930,29 @@ def _gui_resume_save(payload):
         os.makedirs(os.path.dirname(path), exist_ok=True)
     except Exception as e:
         return False, "续跑点目录不可写（%s）" % e
-    tmp = path + ".tmp"
+    tmp = "%s.tmp.%d.%d" % (path, os.getpid(), threading.get_ident())
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            # default=str: 模块结果里可能有非 JSON 原生类型 (dataclass 等),
-            # 落盘时退化成字符串; 读回只用于续跑合并, 不影响当轮报告。
-            json.dump(payload, f, ensure_ascii=False, default=str)
-        # v1.24.0 终审复核: Windows 上读方持有 resume.json 句柄时, os.replace
-        # 会 WinError 5 (拒绝访问) —— 退避重试几次, 别让这一轮的成果因为
-        # 几毫秒的占用没存下来 (os.replace 本身是原子的, 失败只是目标被占用)。
-        for attempt in range(4):
-            try:
-                os.replace(tmp, path)
-                return True, None
-            except PermissionError:
-                if attempt == 3:
-                    raise
-                time.sleep(0.06 * (attempt + 1))
+        with _GUI_RESUME_WRITE_LOCK:
+            with open(tmp, "w", encoding="utf-8") as f:
+                # default=str: 模块结果里可能有非 JSON 原生类型 (dataclass 等),
+                # 落盘时退化成字符串; 读回只用于续跑合并, 不影响当轮报告。
+                json.dump(payload, f, ensure_ascii=False, default=str)
+            # v1.24.0 终审复核: Windows 上读方持有 resume.json 句柄时,
+            # os.replace 会 WinError 5 (拒绝访问) —— 退避重试几次, 别让这一轮
+            # 的成果因为几毫秒的占用没存下来 (os.replace 本身是原子的, 失败
+            # 只是目标被占用)。
+            last_err = None
+            for attempt in range(4):
+                try:
+                    os.replace(tmp, path)
+                    last_err = None
+                    break
+                except PermissionError as e:
+                    last_err = e
+                    if attempt < 3:
+                        time.sleep(0.06 * (attempt + 1))
+            if last_err is not None:
+                raise last_err
         return True, None
     except Exception as e:
         try:
@@ -24955,7 +24969,7 @@ def _gui_resume_load():
     - 文件不存在 → (None, None)   —— 没有续跑点, 不是错误
     - 文件损坏 / 结构非法 → (None, 提示文案) —— 当作没有续跑点, 不崩溃
     - 超过 7 天 → 删文件, (None, None)
-    - 点里的项目**全测完了** → 删文件, (None, 说明文案) —— 没有可续的
+    - 点里的项目**全测完了** → **不删文件**, (None, 说明文案) —— 没有可续的
       (spec F4「全都测完的轮次不写点」; 说明文案给「接着跑」入口用,
       让用户知道为什么续不了, 而不是看见一个死按钮)
     """
@@ -24964,8 +24978,12 @@ def _gui_resume_load():
         if not os.path.exists(path):
             return None, None
         if (time.time() - os.path.getmtime(path)) > _GUI_RESUME_MAX_AGE:
+            # 删前复核文件没被换过: 写点用 os.replace 原子替换, 若此刻恰好有
+            # 并发写点, 删的必须还是那个过期点, 免得把刚写好的新点删了。
             try:
-                os.remove(path)
+                st = os.stat(path)
+                if (time.time() - st.st_mtime) > _GUI_RESUME_MAX_AGE:
+                    os.remove(path)
             except Exception:
                 pass
             return None, None
@@ -24977,8 +24995,8 @@ def _gui_resume_load():
     if clean is None:
         return None, "续跑点内容无效, 已忽略"
     # v1.24.0 复核: 「全测完」的点没有可续的 —— 当作没有 (spec F4「全都测完
-    # 的轮次不写点」)。顺手清掉这个垃圾文件, 免得主页横幅写成「上次诊断没跑完
-    # · 实检 N/N 项」自相矛盾 (verify S4.5)。
+    # 的轮次不写点」)。主页横幅别写成「上次诊断没跑完 · 实检 N/N 项」自相矛盾
+    # (verify S4.5)。
     keys = clean.get("keys") or []
     done = clean.get("completed") or {}
     if keys and all(k in done for k in keys):

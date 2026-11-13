@@ -27,6 +27,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -159,6 +160,8 @@ class TestAllDoneNoResumePoint(_AllDoneCase):
                         "读点不删文件 (读路径带删除副作用会误删并发写的新点)")
 
     # ── A12 读点过程中并发写的新点不被删 (锁住「读路径不删」这条) ──
+    # 注: 本例锁的是「并发写点不丢」; 「读路径不删」的主闸是 A5 (本例对
+    # 「复核读 + 删」那种写法不敏感 —— 复核恰好读到新点时不会删)。
     def test_concurrent_write_during_load_survives(self):
         self._write_point(_point(["gateway", "dns"],
                                   {"gateway": _done("gateway"),
@@ -183,6 +186,8 @@ class TestAllDoneNoResumePoint(_AllDoneCase):
                          "并发写的新点内容要原样还在")
 
     # ── A13 Windows: os.replace 撞上占用 → 退避重试后成功 ──
+    # 注: `np.os` 就是全局 `os` 模块, 这个 patch 在 with 块内会拦住进程内
+    # **所有** os.replace 调用 (本仓库测试串行, 无实害, 但要知道这个影响面)。
     def test_save_retries_when_target_is_locked(self):
         real_replace = os.replace
         calls = {"n": 0}
@@ -201,6 +206,44 @@ class TestAllDoneNoResumePoint(_AllDoneCase):
         pt, _ = np._gui_resume_load()
         self.assertIsNotNone(pt)
         self.assertEqual(sorted(pt["completed"]), ["gateway"])
+
+    # ── A14 并发落盘 → 续跑点仍是合法 JSON (成果不能被写坏) ──
+    def test_concurrent_saves_keep_file_valid(self):
+        """两条落盘路径可能并发 (用户点「停止」后立刻关窗)。
+
+        修复前两条线程共用同一个 tmp 文件名, 各自以 "w" 打开它分多次写,
+        内容互相串接 → 落盘文件不是合法 JSON → 读回时当损坏忽略 → 这一轮
+        的成果静默丢失 (实测 60 轮里 31 轮损坏)。
+        """
+        p1 = _point(["gateway", "dns"], {"gateway": _done("gateway")})
+        p2 = _point(["gateway", "dns", "wifi"],
+                    {"gateway": _done("gateway"), "wifi": _done("wifi")})
+        errors, bad = [], []
+        for _ in range(20):
+            barrier = threading.Barrier(2)
+
+            def _save(p):
+                barrier.wait(5)
+                ok, err = np._gui_resume_save(p)
+                if not ok:
+                    errors.append(err)
+
+            ts = [threading.Thread(target=_save, args=(p,))
+                  for p in (p1, p2)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(10)
+            try:
+                with open(self.resume_path, encoding="utf-8") as f:
+                    json.load(f)
+            except Exception as e:
+                bad.append(repr(e))
+        self.assertEqual(bad, [],
+                         "并发落盘把续跑点写坏了 (两条线程的内容串接在一起)")
+        self.assertEqual(errors, [], "并发落盘不该报错: %s" % errors[:3])
+        pt, err = np._gui_resume_load()
+        self.assertIsNotNone(pt, "并发落盘后读不出续跑点: %s" % err)
 
     # ── A6 读点: 没测完的点照常读 ──
     def test_partial_point_still_loads(self):
