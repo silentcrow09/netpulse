@@ -469,6 +469,10 @@
       "description": "现场检测模式手输元数据 (客户名/检测时间/签约带宽)。普通模式为空对象。",
       "additionalProperties": true
     },
+    "note": {
+      "type": "string",
+      "description": "v1.24.0 报告级备注 (例: 续跑说明「本轮为续跑, 其中 N 项的数据来自上一次运行」)。无备注时该字段不出现。"
+    },
     "meta": {
       "type": "object",
       "description": "兼容视图: v1.4.0 之前的消费方读 meta.host / meta.app。",

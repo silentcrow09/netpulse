@@ -16472,7 +16472,8 @@ def _restore_stdout_on_exit(fn):
 @_restore_stdout_on_exit
 def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
                    banner=True, install=False, parallel=False, max_workers=4,
-                   pip_mirror=None, print_modules=True, progress_cb=None):
+                   pip_mirror=None, print_modules=True, progress_cb=None,
+                   cancel_evt=None):
     """执行指定模块并打印结果与汇总。返回本次运行的完整数据 dict。
 
     v1.15.2 (审查 P1-16 · 收口规则): 返回值由 `{key: status}` 改为**完整 run
@@ -16495,6 +16496,12 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
               "key": K, "status": 状态}。None 时行为与旧版逐字节一致;
               回调异常被吞掉 (进度通知绝不打断诊断)。
               as_json 的载荷收集不受影响 (循环照跑, 只是不打印人读块)。
+    cancel_evt: 可选取消闸 (v1.24.0 GUI 专用)。threading.Event, 置位后调度层
+              **不再启动新模块** (并发段: worker 取到任务时查一次; 独占段:
+              进入每个测速类模块前查一次)。已经在跑的模块等它自己跑完 ——
+              模块内部没有中止开关, 硬杀会留下下载残留、污染后续测量。
+              被跳过的模块不产生结果 → 报告里显示「未检测」(既有状态值, 不
+              新增状态)。None 时行为与旧版逐字节一致 (终端调用点不传)。
     """
     global _C_NOCOLOR, LAST_RUN
     _C_NOCOLOR = no_color
@@ -16621,10 +16628,10 @@ def run_diagnostics(keys, verbose=False, as_json=False, no_color=False,
     if use_parallel:
         results, full = _run_diagnostics_parallel(
             keys, max_workers=max_workers, total=len(keys),
-            progress_cb=progress_cb)
+            progress_cb=progress_cb, cancel_evt=cancel_evt)
     else:
         results, full = _run_diagnostics_sequential(
-            keys, is_tty=IS_TTY, progress_cb=progress_cb)
+            keys, is_tty=IS_TTY, progress_cb=progress_cb, cancel_evt=cancel_evt)
 
     # v1.15.0 (审查 P1-13): 状态归一前置 —— 「未配置」不是故障。
     # 在这里改写后, 模块标题行 / CLI 汇总 / LAST_RUN["status"] / 报告计数 /
@@ -16872,12 +16879,16 @@ def _extract_evidence_map(full):
     return results, evidence
 
 
-def _run_diagnostics_sequential(keys, is_tty, progress_cb=None):
+def _run_diagnostics_sequential(keys, is_tty, progress_cb=None,
+                                cancel_evt=None):
     """顺序模式: 保留 TTY 实时进度行 (\\r\\033[K 刷新), 详细 result 留给主循环统一打。
     每个模块有独立超时 (_run_module_with_timeout), 单个模块卡死不会拖住整个流程。"""
     results = {}
     full = {}
     for key in keys:
+        # v1.24.0: 已请求停止 → 不再启动新模块 (手头在跑的那个等它自己跑完)
+        if cancel_evt is not None and cancel_evt.is_set():
+            break
         name, cls = MODULE_MAP[key]
         if progress_cb:
             try:
@@ -16914,7 +16925,12 @@ def _run_diagnostics_sequential(keys, is_tty, progress_cb=None):
         full[key] = res
         if progress_cb:
             try:
-                progress_cb({"event": "done", "key": key, "status": status})
+                # v1.24.0: done 事件带该模块的完整结果 (result) —— 关窗落盘与
+                # 续跑点需要「已完成项目」的数据, 只靠最终 run dict 拿不到
+                # (那要等整轮结束, 关窗时进程已经要退了)。既有消费者忽略
+                # 新键即可, 事件契约是只加不改。
+                progress_cb({"event": "done", "key": key, "status": status,
+                             "result": res})
             except Exception:
                 pass
     return results, full
@@ -16938,7 +16954,8 @@ def _print_cols(rows):
             _safe_print(colored)
 
 
-def _run_diagnostics_parallel(keys, max_workers, total, progress_cb=None):
+def _run_diagnostics_parallel(keys, max_workers, total, progress_cb=None,
+                              cancel_evt=None):
     """并行模式: 4 worker 并发跑, 启动和完成行都按 keys 顺序打印。
 
     设计要点:
@@ -17000,6 +17017,11 @@ def _run_diagnostics_parallel(keys, max_workers, total, progress_cb=None):
         # try/except —— 旧版这里没有, 一次异常会从 worker 冒到主线程
         # (fut.result() 重新抛出) → 整轮诊断中断, 现场模式等于白跑一趟。
         # 单模块异常降级为 ("错误", {...}), 其余模块照跑, 报告照出。
+        # v1.24.0: 已请求停止 → 该模块**不启动** (不产生结果 → 报告里是「未
+        # 检测」)。检查点放在 worker 真正开工前: 并发段的全部任务早已提交,
+        # 只有在这里查才能拦住「还没轮到」的那些模块。
+        if cancel_evt is not None and cancel_evt.is_set():
+            return key
         name = MODULE_MAP.get(key, (key, key))[0]
         if progress_cb:
             try:
@@ -17019,7 +17041,10 @@ def _run_diagnostics_parallel(keys, max_workers, total, progress_cb=None):
             completed[key] = (name, status, res)
         if progress_cb:
             try:
-                progress_cb({"event": "done", "key": key, "status": status})
+                # v1.24.0: done 事件带该模块的完整结果 (同顺序模式, 事件契约
+                # 只加不改) —— 关窗落盘 / 续跑点要用。
+                progress_cb({"event": "done", "key": key, "status": status,
+                             "result": res})
             except Exception:
                 pass
         return key
@@ -17060,6 +17085,9 @@ def _run_diagnostics_parallel(keys, max_workers, total, progress_cb=None):
 
     # 独占阶段: 测速/Bufferbloat/iperf3/TCP 并发逐个跑
     for key in solo_keys:
+        # v1.24.0: 已请求停止 → 不再启动测速类模块 (它们一跑就是几分钟)
+        if cancel_evt is not None and cancel_evt.is_set():
+            break
         _run_one(key)
         _refresh()
 
@@ -19688,7 +19716,7 @@ def _normalize_module_statuses(statuses, results=None):
 
 
 def build_report(rule_filter=None, diagnosis=None, site_check=None,
-                 meta_manual=None, site_note=None):
+                 meta_manual=None, site_note=None, run=None, note=None):
     """基于最近一次诊断运行 (LAST_RUN) 构造完整报告数据结构 (双视图)。
 
     rule_filter: 场景 profile id (可选, v1.6.1)。透传根因分析 — 导出报告的
@@ -19700,6 +19728,11 @@ def build_report(rule_filter=None, diagnosis=None, site_check=None,
                  显式传参, 不读 LAST_RUN (收口规则); 白名单外 key/值忽略。
     meta_manual: 现场手输元信息 {"customer", "tested_at", "plan"} (v1.13.0, 可选)。
     site_note:   现场备注自由文本 (v1.13.0, 可选, 有值才渲染)。
+    run:         可选的 run dict (v1.24.0)。None → 沿用全局 LAST_RUN (既有
+                 行为, 既有调用点零影响); 续跑合并后显式传参 —— 新代码不碰
+                 全局 (收口规则: 存量引用只减不增)。
+    note:        报告级备注 (v1.24.0)。例如续跑说明「本轮为续跑, 其中 N 项的
+                 数据来自上一次运行」; 空串不渲染 (既有报告输出逐字节不变)。
 
     返回结构 (供 render_report_html_customer / render_report_json 使用):
       {
@@ -19726,9 +19759,9 @@ def build_report(rule_filter=None, diagnosis=None, site_check=None,
         }
       }
     """
-    if not LAST_RUN:
+    run = run if run is not None else LAST_RUN
+    if not run:
         return None
-    run = LAST_RUN
 
     # v1.15.0 (审查 P1-13): 状态归一前置 —— 「未配置」不是故障, 计数 / verdict /
     # 退出码必须共用同一份 summary (旧版改写只做在客户视图且在计数之后,
@@ -19803,6 +19836,8 @@ def build_report(rule_filter=None, diagnosis=None, site_check=None,
         "site_check": _normalize_site_check(site_check),
         "site_note": (str(site_note).strip() if site_note else ""),
         "meta_manual": dict(meta_manual) if isinstance(meta_manual, dict) else {},
+        # v1.24.0: 报告级备注 (续跑说明等)。空串 = 不渲染, 既有报告不变。
+        "note": (str(note).strip() if note else ""),
         "tech": {
             "raw_results": run["results"],
             "module_keys": run["keys"],
@@ -21600,6 +21635,20 @@ def _tech_appendix_section(report):
 
 
     return standards_section
+
+
+def _hero_sub_line(report, health, g):
+    """Hero 副行: 结论 + 生成时间 (+ v1.24.0 的报告级备注)。
+
+    三段拼完再整体转义 —— 没有备注时输出与旧版逐字节一致 (既有报告不变)。
+    """
+    text = "%s · 生成于 %s" % (health.get("verdict", ""), g)
+    note = str((report or {}).get("note") or "").strip()
+    if note:
+        text += " · " + note
+    return text
+
+
 def render_report_html_customer(report):
     """渲染客户版 HTML 报告。
 
@@ -21651,8 +21700,17 @@ def render_report_html_customer(report):
         hero_meta.append(f"耗时 <b>{_html_esc(dur_txt)}</b>")
     sel = report.get("selected_modules")
     tot = report.get("total_modules")
+    # v1.24.0: 实际跑完几项 —— 从技术附录的原始结果条目数取 (唯一事实来源)。
+    # 提前停止时 请求数 > 实跑数, 还按 sel 写会显示「24 项全覆盖」, 那是假的
+    # (报告里明明有 12 项显示「未检测」)。既有报告 requested == ran, 分支
+    # 不走, 输出逐字节不变。
+    ran = len(((report.get("tech") or {}).get("raw_results") or {}))
     if isinstance(sel, int) and isinstance(tot, int) and tot > 0:
-        if sel < tot:
+        if ran and ran < sel:
+            hero_meta.append(
+                (f"检测范围 <b>{ran}/{tot}</b> 项",
+                 f"本轮提前结束, {sel - ran} 项未检测"))
+        elif sel < tot:
             # 部分检测: title 里说清未覆盖多少项, 避免只看到分数就下结论
             hero_meta.append(
                 (f"检测范围 <b>{sel}/{tot}</b> 项",
@@ -21681,7 +21739,7 @@ def render_report_html_customer(report):
     <div class="app"><div class="mark"></div>
       <b>{_html_esc(report['app'])}</b><span class="ver">v{_html_esc(report['version'])}</span></div>
     <h1>网络诊断报告</h1>
-    <div class="sub">{_html_esc(health.get('verdict', ''))} · 生成于 {_html_esc(g)}</div>
+    <div class="sub">{_html_esc(_hero_sub_line(report, health, g))}</div>
     <div class="formula">{_html_esc(_score_formula(report))}</div>
     <div class="meta">{meta_chips}</div>
   </div>
@@ -21947,6 +22005,10 @@ def render_report_json(report, indent=2):
         "site_check": report.get("site_check", {}),
         "site_note": report.get("site_note", ""),
         "meta_manual": report.get("meta_manual", {}),
+        # v1.24.0: 报告级备注 (续跑说明等)。恒导出 (无备注时空串) —— schema
+        # 与导出必须逐字段对齐 (tests/test_schema_export_consistency.py 双向
+        # 锁死), 少一次导出就等于 schema 在说谎。
+        "note": str(report.get("note") or "").strip(),
         # 兼容视图: v1.4.0 之前的消费方读 meta.host / meta.app
         "meta": {
             "app": report["app"],
@@ -24783,12 +24845,229 @@ def _gui_apply_run_config(d, keys):
     return None
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# GUI 续跑点 (v1.24.0): 诊断中途停止后, 把「已经测完的项目」落盘 ——
+# 关窗、退出程序都不丢; 下次打开 NetPulse 提示「上次没跑完, 接着跑?」。
+#
+# 位置: %LOCALAPPDATA%\NetPulse\resume.json (与 log_report.json 同目录约定)。
+# 只保留**一个**未完成轮次 (设计如此, 见 spec 非范围) —— 新一轮停止时覆盖。
+# 写失败绝不打断当轮流程 (只是没法续跑, 报告照出)。
+# ────────────────────────────────────────────────────────────────────────────
+
+_GUI_RESUME_FILE = "resume.json"
+_GUI_RESUME_MAX_AGE = 7 * 24 * 3600      # 续跑点最多留 7 天 (过期自动清理)
+
+
+def _gui_resume_path():
+    """续跑点路径: %LOCALAPPDATA%\\NetPulse\\resume.json"""
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    return os.path.join(base, "NetPulse", _GUI_RESUME_FILE)
+
+
+def _gui_resume_clean(data):
+    """校验并清洗续跑点内容。返回清洗后的 dict, 结构非法返回 None。
+
+    清洗规则: completed 里某个模块的 result 不是 dict (坏数据) → **剔除该
+    模块**, 续跑时当它没测完、重跑一遍 —— 绝不把坏数据带进报告。
+    """
+    if not isinstance(data, dict):
+        return None
+    keys = data.get("keys")
+    if not isinstance(keys, list) or not keys:
+        return None
+    done = data.get("completed")
+    if not isinstance(done, dict):
+        return None
+    clean = {}
+    for k, item in done.items():
+        if not isinstance(item, dict):
+            continue
+        res = item.get("result")
+        if not isinstance(res, dict):
+            continue                      # 坏数据 → 重跑该模块
+        clean[k] = {"status": item.get("status"),
+                    "result": res}
+    out = dict(data)
+    out["completed"] = clean
+    return out
+
+
+def _gui_resume_save(payload):
+    """把续跑点原子写入磁盘。返回 (True, None) 或 (False, 错误文案)。
+
+    原子写: 先写同目录临时文件再 os.replace —— 进程被杀/断电不会留半截文件
+    (半截 JSON 读回来是「损坏」, 白白丢掉已测完的成果)。
+    """
+    if not isinstance(payload, dict) or not payload:
+        return False, "续跑点内容为空"
+    path = _gui_resume_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception as e:
+        return False, "续跑点目录不可写: %s" % e
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            # default=str: 模块结果里可能有非 JSON 原生类型 (dataclass 等),
+            # 落盘时退化成字符串; 读回只用于续跑合并, 不影响当轮报告。
+            json.dump(payload, f, ensure_ascii=False, default=str)
+        os.replace(tmp, path)
+        return True, None
+    except Exception as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False, "续跑点保存失败: %s" % e
+
+
+def _gui_resume_load():
+    """读续跑点。返回 (payload, None) 或 (None, 错误文案)。
+
+    - 文件不存在 → (None, None)   —— 没有续跑点, 不是错误
+    - 文件损坏 / 结构非法 → (None, 提示文案) —— 当作没有续跑点, 不崩溃
+    - 超过 7 天 → 删文件, (None, None)
+    """
+    path = _gui_resume_path()
+    try:
+        if not os.path.exists(path):
+            return None, None
+        if (time.time() - os.path.getmtime(path)) > _GUI_RESUME_MAX_AGE:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            return None, None
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None, "续跑点读取失败, 已忽略"
+    clean = _gui_resume_clean(data)
+    if clean is None:
+        return None, "续跑点内容无效, 已忽略"
+    return clean, None
+
+
+def _gui_resume_discard():
+    """删掉续跑点 (用户选「重新开始」/ 续跑跑完后调用)。返回是否删掉了。"""
+    path = _gui_resume_path()
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _gui_resume_summary(point):
+    """续跑点的展示摘要 (主页横幅用): 场景名 / 已完成项数 / 请求项数 / 时间。
+
+    point 为 None → 返回 None (没有可续的轮次, 页面不显示横幅)。
+    """
+    if not isinstance(point, dict):
+        return None
+    keys = point.get("keys") or []
+    done = point.get("completed") or {}
+    ts = point.get("saved_at_ts") or 0
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        ts = 0
+    when = ""
+    if ts > 0:
+        try:
+            when = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+        except Exception:
+            when = ""
+    return {
+        "profile": point.get("profile"),
+        "label": point.get("label") or "",
+        "done": len(done),
+        "total": len(keys),
+        "keys": list(keys),
+        "when": when,
+    }
+
+
+def _gui_merge_runs(resume_ctx, new_run):
+    """续跑合并: 上次已完成的项目 + 本轮新跑的项目 → 一份完整 run dict。
+
+    - keys 取原始请求全集 (报告据此给没测的项留「未检测」占位);
+    - results / status 取并集 (本轮新跑的覆盖同名 key);
+    - evidence 走既有 _extract_evidence_map (过渡键 _evidence 在这里摘出);
+    - duration_ms 为两段之和 (诚实反映总耗时)。
+    """
+    saved = (resume_ctx or {}).get("completed") or {}
+    saved_results = {}
+    saved_status = {}
+    for k, item in saved.items():
+        if not isinstance(item, dict):
+            continue
+        res = item.get("result")
+        if isinstance(res, dict):
+            saved_results[k] = res
+            saved_status[k] = item.get("status")
+    new_results = dict((new_run or {}).get("results") or {})
+    new_status = dict((new_run or {}).get("status") or {})
+    results = dict(saved_results)
+    results.update(new_results)
+    status = dict(saved_status)
+    status.update(new_status)
+    keys = list((resume_ctx or {}).get("keys") or [])
+    if not keys:
+        keys = list((new_run or {}).get("keys") or [])
+    clean, evidence = _extract_evidence_map(results)
+    merged = dict(new_run or {})
+    merged["status"] = status
+    merged["results"] = clean
+    merged["evidence"] = evidence
+    merged["keys"] = keys
+    merged["duration_ms"] = (int((resume_ctx or {}).get("duration_ms") or 0)
+                             + int((new_run or {}).get("duration_ms") or 0))
+    merged["total_modules"] = int((new_run or {}).get("total_modules")
+                                   or len(MODULE_MAP))
+    return merged
+
+
+def _gui_resume_note(resume_ctx):
+    """续跑轮次的报告备注 (写进 report["note"], 空串不渲染)。
+
+    复用上次的结果 = 数据来自两个时间点 —— 报告里必须写出来, 不隐瞒。
+    """
+    if not resume_ctx:
+        return ""
+    done = len((resume_ctx.get("completed") or {}))
+    if not done:
+        return ""
+    when = ""
+    ts = resume_ctx.get("saved_at_ts") or 0
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        ts = 0
+    if ts > 0:
+        try:
+            when = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+        except Exception:
+            when = ""
+    if when:
+        return ("本轮为续跑: 其中 %d 项的数据来自上一次运行 (%s)" % (done, when))
+    return "本轮为续跑: 其中 %d 项的数据来自上一次运行" % done
+
+
 class _GuiSession:
     """单轮诊断的线程安全状态快照 (GUI 进度通道唯一读写点)。
 
     phase: idle → running → done / error;  现场检测另有 site_ready
     (诊断完等机房勾选)。本类不读全局 LAST_RUN: run dict 来自
     run_diagnostics 返回值。
+
+    v1.24.0 增补两个 phase: stopping (已请求停止, 等当前模块收尾) 与
+    cancelled (已停止, 部分报告已出)。停止是**软取消** —— 不再启动新模块,
+    手头那项跑完就收工 (模块内部没有中止开关, 硬杀会留下下载残留、污染
+    后续测速)。两者都算「在跑」, 互斥不放宽。
     """
 
     def __init__(self):
@@ -24806,6 +25085,12 @@ class _GuiSession:
         self._files = []
         self._site = None
         self._thread = None
+        # ── v1.24.0 取消 / 续跑 ──
+        self._cancel_evt = None       # 本轮取消闸 (threading.Event)
+        self._stop_requested = False  # 用户点过「停止」
+        self._partial = {}            # key -> {"status", "result"} 已完成项目
+        self._resume_ctx = None       # 续跑上下文 (复用的结果 + 上次时间)
+        self._label_suffix = ""       # 续跑轮次的标题后缀 「（续跑）」
 
     # -- 进度回调 (诊断线程调用, 见 run_diagnostics progress_cb 契约) --
     def on_progress(self, ev):
@@ -24815,17 +25100,25 @@ class _GuiSession:
             elif ev.get("event") == "done":
                 self._running.discard(ev["key"])
                 self._module_status[ev["key"]] = ev.get("status")
+                # v1.24.0: 累积已完成项目的结果 —— 关窗落盘与续跑点都要用
+                # (整轮结束时才有 run dict, 关窗那一刻拿不到)。
+                res = ev.get("result")
+                if isinstance(res, dict):
+                    self._partial[ev["key"]] = {"status": ev.get("status"),
+                                                "result": res}
 
     # -- 快照 (HTTP 线程调用; 返回可 JSON 化的 dict) --
     def snapshot(self):
         with self._lock:
             done = sum(1 for v in self._module_status.values() if v)
+            remaining = len(self._keys) - done
+            reused = len((self._resume_ctx or {}).get("completed") or {})
             return {
                 "phase": self._phase,
                 "profile": self._profile,
                 # v1.23.0: keys 组合模式 (profile=None) label 由 keys 推导
-                "label": _GUI_LABELS(self._profile, self._keys)
-                         if (self._profile or self._keys) else "",
+                "label": (_GUI_LABELS(self._profile, self._keys)
+                          if (self._profile or self._keys) else "") + self._label_suffix,
                 "total": len(self._keys),
                 "done": done,
                 "running": sorted(self._running),
@@ -24839,11 +25132,18 @@ class _GuiSession:
                 "verdict": self._verdict,
                 "files": list(self._files),
                 "site": dict(self._site) if self._site else None,
+                # ── v1.24.0 取消 / 续跑 ──
+                "can_stop": self._phase in ("running", "stopping"),
+                "stop_requested": self._stop_requested,
+                "cancelled": self._phase == "cancelled",
+                "remaining": max(0, remaining),
+                "reused": reused,
             }
 
     def is_running(self):
         with self._lock:
-            return self._phase in ("running",)
+            # stopping 也算在跑 —— 收尾期间互斥不能放开 (spec F1)
+            return self._phase in ("running", "stopping")
 
     def report_html(self):
         """内嵌报告页 (客户版) 的完整 HTML; 无报告返回 None。"""
@@ -24854,12 +25154,13 @@ class _GuiSession:
         return render_report_html_customer(report)
 
     # -- 诊断编排 (与终端 _run_scene 同一管线) --
-    def _begin(self, profile, keys):
+    def _begin(self, profile, keys, resume_ctx=None):
         # v1.22.0: 查忙 + 置 running 全程持 _GUI_ACT_LOCK — 三类活动
         # (诊断/现场检测/盯障) 的跨类型互斥铁律, 锁外查锁内置位就会
         # 双查双过。self._lock 是 RLock, _gui_net_busy 回查自身可重入。
         with _GUI_ACT_LOCK, self._lock:
-            if self._phase == "running":
+            if self._phase in ("running", "stopping"):
+                # v1.24.0: stopping 也要拒 —— 收尾期间不能开新一轮
                 return False, "已有诊断在进行中"
             if _gui_net_busy():          # v1.22.0: 跨类型互斥 (盯障等)
                 return False, _GUI_BUSY_MSG
@@ -24874,7 +25175,36 @@ class _GuiSession:
             self._verdict = None
             self._run = None
             self._files = []
+            # ── v1.24.0: 本轮取消闸 / 续跑上下文 ──
+            self._cancel_evt = threading.Event()
+            self._stop_requested = False
+            self._partial = {}
+            self._resume_ctx = resume_ctx
+            self._label_suffix = "（续跑）" if resume_ctx else ""
+            if resume_ctx:
+                # 续跑: 上次已测完的项目先把状态铺上 (网格里显示原状态色),
+                # 本轮只跑剩下的那些。
+                for k, item in (resume_ctx.get("completed") or {}).items():
+                    if k in self._module_status:
+                        self._module_status[k] = item.get("status")
         return True, None
+
+    # -- 停止 (v1.24.0) --
+    def stop(self):
+        """请求停止本轮诊断 (幂等)。
+
+        软取消: 不再启动新模块, 手头那项跑完就收尾 (模块内部无中止开关,
+        硬杀会留下载残留、污染后续测速)。返回 True = 已受理。
+        """
+        with self._lock:
+            if self._phase != "running":
+                return False
+            self._stop_requested = True
+            self._phase = "stopping"
+            evt = self._cancel_evt
+        if evt is not None:
+            evt.set()
+        return True
 
     def start(self, profile=None, keys=None, install=True, pip_mirror=None):
         """启动场景诊断或完整诊断。full=full_module_keys() (含 tcpcc 压测)。
@@ -24902,39 +25232,143 @@ class _GuiSession:
         self._thread.start()
         return True, None
 
-    def _run_diag(self, keys, install, pip_mirror):
+    def _run_diag(self, keys, install, pip_mirror, resume_ctx=None):
         try:
             run = run_diagnostics(keys, banner=False, parallel=True,
                                   max_workers=4, install=install,
                                   pip_mirror=pip_mirror, print_modules=False,
-                                  progress_cb=self.on_progress)
+                                  progress_cb=self.on_progress,
+                                  cancel_evt=self._cancel_evt)
             results = run.get("results") or {}
+            with self._lock:
+                stopped = self._stop_requested
             if not results:
+                if stopped:
+                    # 一项都没测完就停了 → 没有报告可出, 但已测完的(0 项)也
+                    # 没有可留的。诚实报错, 不假装完成。
+                    with self._lock:
+                        self._phase = "cancelled"
+                        self._error = "已停止, 还没测出任何结果"
+                    return
                 raise RuntimeError("诊断未产生数据")
-            # 决议 (Task 2 审查): module_status 以最终 run dict 为准整体同步 —
+            # 续跑: 上次已完成的项目 + 本轮新跑的项目 → 合并成一份完整数据
+            if resume_ctx:
+                run = _gui_merge_runs(resume_ctx, run)
+                results = run.get("results") or {}
+            # 决议 (Task 2 审查): module_status 以最终 run dict 为准 ——
             # done 事件里的 status 是 _normalize_module_statuses 归一化前的
             # 原值, 事件只负责过程进度; 最终状态以 run["status"] 为准
             # (加锁, 先于 phase 翻转)。
+            # v1.24.0: 改成**合并**而非整体替换 —— 提前停止时未启动的模块要
+            # 留在网格里 (显示为空心「未测」), 续跑时上次的已完成项也要留下。
             with self._lock:
-                self._module_status = dict(run.get("status") or {})
+                merged_status = {k: self._module_status.get(k)
+                                 for k in self._keys}
+                merged_status.update(run.get("status") or {})
+                self._module_status = merged_status
             profile = self._profile
             rf = profile if profile in DIAGNOSE_PROFILES else None
             diagnosis = _enrich_diagnosis_evidence(
                 diagnose(results, rule_filter=rf), results, run.get("evidence"))
             report = build_report(
                 rule_filter=rf,
-                diagnosis=diagnosis.to_dict() if diagnosis else None)
+                diagnosis=diagnosis.to_dict() if diagnosis else None,
+                run=run,
+                note=_gui_resume_note(resume_ctx))
             with self._lock:
                 self._run = run
                 self._report = report
                 self._verdict = _gui_verdict(report) if report else None
-                self._phase = "done" if report else "error"
+                self._phase = ("cancelled" if stopped else "done") if report else "error"
                 if not report:
                     self._error = "报告构建失败"
+            if stopped:
+                # 提前结束 → 把已测完的项目落盘 (关窗、退出都不丢, 见 spec F4)
+                self._save_resume_point(run, resume_ctx)
+            else:
+                # 正常跑完 (含续跑跑完) → 清掉续跑点 (主页别再提示「上次没跑完」)
+                _gui_resume_discard()
         except Exception as e:
             with self._lock:
                 self._phase = "error"
                 self._error = "%s: %s" % (type(e).__name__, e)
+
+    # -- 续跑 (v1.24.0) --
+    def start_resume(self, install=True, pip_mirror=None):
+        """从落盘的续跑点继续: 只跑没测过的模块, 测过的复用上次结果。
+
+        返回 (ok, err)。没有续跑点 → (False, 提示文案)。
+        """
+        point, err = _gui_resume_load()
+        if not point:
+            return False, err or "没有可接着跑的诊断"
+        keys = list(point.get("keys") or [])
+        completed = point.get("completed") or {}
+        remaining = [k for k in keys if k not in completed]
+        profile = point.get("profile")
+        if profile not in DIAGNOSE_PROFILES and profile != "full":
+            profile = None
+        if not remaining:
+            # 全都测过了 (极少见: 停止请求刚好落在最后一个模块之后) →
+            # 不再跑, 直接用已存的结果出报告。
+            ok, err = self._begin(profile, keys, resume_ctx=point)
+            if not ok:
+                return False, err
+            self._thread = threading.Thread(
+                target=self._run_diag, args=([], install, pip_mirror, point),
+                daemon=True, name="np-gui-resume")
+            self._thread.start()
+            return True, None
+        ok, err = self._begin(profile, keys, resume_ctx=point)
+        if not ok:
+            return False, err
+        self._thread = threading.Thread(
+            target=self._run_diag,
+            args=(remaining, install, pip_mirror, point),
+            daemon=True, name="np-gui-resume")
+        self._thread.start()
+        return True, None
+
+    # -- 续跑点落盘 (v1.24.0) --
+    def _save_resume_point(self, run, resume_ctx=None):
+        """把本轮已测完的项目写进续跑点 (停止后 / 关窗时调用)。
+
+        续跑轮次要把「上次已存的」与「这轮新测的」合并存 —— 否则第二次停止
+        会把第一次的成果丢掉。返回错误文案 (None = 成功或没必要存)。
+        """
+        with self._lock:
+            partial = dict(self._partial)
+            profile = self._profile
+            all_keys = list(self._keys)
+        completed = {}
+        prev = (resume_ctx or {}).get("completed") or {}
+        for k, item in prev.items():
+            if isinstance(item, dict) and isinstance(item.get("result"), dict):
+                completed[k] = {"status": item.get("status"),
+                                "result": item.get("result")}
+        if not partial:
+            return None
+        results = {k: v["result"] for k, v in partial.items()
+                   if isinstance(v.get("result"), dict)}
+        statuses = {k: v.get("status") for k, v in partial.items()}
+        # 状态归一 (与报告层同一口径: 「未配置」类算「未检测」)
+        statuses = _normalize_module_statuses(statuses, results)
+        for k, res in results.items():
+            completed[k] = {"status": statuses.get(k), "result": res}
+        payload = {
+            "schema": 1,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "saved_at_ts": time.time(),
+            "profile": profile,
+            "label": _GUI_LABELS(profile, all_keys),
+            "keys": all_keys,
+            "completed": completed,
+            "duration_ms": int((run or {}).get("duration_ms") or 0),
+            "total_modules": int((run or {}).get("total_modules")
+                                 or len(MODULE_MAP)),
+        }
+        ok, err = _gui_resume_save(payload)
+        return None if ok else err
 
     # -- 现场检测 (与终端 run_site_visit :23538 同口径) --
     def start_site(self, customer, tested_at=None, plan="",
@@ -24966,7 +25400,10 @@ class _GuiSession:
             run = run_diagnostics(keys, banner=False, parallel=True,
                                   max_workers=4, install=install,
                                   pip_mirror=pip_mirror, print_modules=False,
-                                  progress_cb=self.on_progress)
+                                  progress_cb=self.on_progress,
+                                  cancel_evt=self._cancel_evt)
+            with self._lock:
+                stopped = self._stop_requested
             if not (run.get("results") or {}):
                 raise RuntimeError("诊断未产生数据")
             # 决议 (Task 2 审查, 同 _run_diag): module_status 以最终 run dict
@@ -24974,10 +25411,20 @@ class _GuiSession:
             # 环回未跑时事件是「错误」, run["status"] 里才是「未检测」),
             # 事件只负责过程进度; 最终状态以 run["status"] 为准
             # (加锁, 先于 phase 翻转)。
+            # v1.24.0: 合并而非替换 (提前停止时未启动的模块留在网格里)。
             with self._lock:
-                self._module_status = dict(run.get("status") or {})
+                merged_status = {k: self._module_status.get(k)
+                                 for k in self._keys}
+                merged_status.update(run.get("status") or {})
+                self._module_status = merged_status
                 self._run = run
-                self._phase = "site_ready"     # 等机房勾选 (页面切核对步)
+                if stopped:
+                    # v1.24.0 (spec F6): 现场检测可停止, 但**不支持续跑** ——
+                    # 现场结论要一次跑完才成立。诚实说明, 不假装能接着跑。
+                    self._phase = "cancelled"
+                    self._error = "现场检测已停止, 现场流程不支持续跑, 请重新检测"
+                else:
+                    self._phase = "site_ready"     # 等机房勾选 (页面切核对步)
         except Exception as e:
             with self._lock:
                 self._phase = "error"
@@ -25032,11 +25479,14 @@ class _GuiSession:
     def export(self, kind):
         with self._lock:
             report, profile, keys = self._report, self._profile, self._keys
+            suffix = self._label_suffix
         if not report:
             return None, "尚无报告可导出"
         base_dir = _desktop_netpulse_dir() or _report_dir()
         # v1.23.0: keys 组合模式 → 标题「模块组合 (N 项)」 (文件名同源)
-        title = _GUI_LABELS(profile, keys)
+        # v1.24.0: 续跑轮次标题带「（续跑）」 (文件名同源 —— 报告里混了
+        # 上一次的数据, 文件名要看得出来)
+        title = _GUI_LABELS(profile, keys) + suffix
         ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         if kind == "pdf":
             chrome = _find_pdf_browser()
