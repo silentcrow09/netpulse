@@ -1,0 +1,929 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetPulse 诊断中途取消 / 续跑 · 设计稿 v1（选型用）</title>
+<style>
+  /* ════════════════════════════════════════════════════════════
+     NetPulse v1.24.0 「诊断中途取消 / 续跑」设计稿 v1
+     视觉语言沿用已定稿的 GUI 壳层（design_ref/gui/gui_design_v1.html 方案A）
+     与已上线 netpulse.py 的 _GUI_CSS 同值：
+       --navy:#0a3b6e --navy-2:#2a5485 --red:#b3261e --amber:#ad6e10
+       --green:#1e6e44 --text:#1a2230 --dim:#5b6472 --mute:#98a2ad
+       --rule:#d8dde5 --soft:#f6f7f9
+     全部系统字体，零外部资源（无 CDN / 无图片 / 无外链），真实字号 1:1
+     ════════════════════════════════════════════════════════════ */
+  :root{
+    --navy:#0a3b6e; --navy-2:#2a5485; --red:#b3261e; --amber:#ad6e10; --green:#1e6e44;
+    --text:#1a2230; --dim:#5b6472; --mute:#98a2ad; --rule:#d8dde5; --soft:#f6f7f9;
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ background:#dfe3e9; }
+  body{ font-family:"Inter","Microsoft YaHei","PingFang SC",sans-serif; color:var(--text);
+        font-size:14px; line-height:1.65; padding:46px 40px 110px; -webkit-font-smoothing:antialiased; }
+  .num{ font-variant-numeric:tabular-nums; font-feature-settings:"tnum"; }
+
+  h1{ font-size:26px; font-weight:800; letter-spacing:.4px; }
+  h1 .brandtag{ display:inline-block; background:var(--navy); color:#fff; font-size:15px; font-weight:800;
+                border-radius:8px; padding:3px 10px; letter-spacing:1px; vertical-align:3px; margin-right:12px; }
+  .meta{ font-size:12.5px; color:var(--mute); margin-top:8px; letter-spacing:.3px; }
+  .lead{ font-size:13.5px; color:var(--dim); margin-top:14px; max-width:1000px; }
+  .lead b{ color:var(--text); }
+
+  .sec{ margin-top:58px; }
+  .sec-head{ display:flex; align-items:baseline; gap:14px; border-bottom:2px solid var(--navy);
+             padding-bottom:10px; margin-bottom:12px; }
+  .sec-head .no{ font-size:13px; font-weight:800; color:var(--navy); letter-spacing:2.5px; white-space:nowrap; }
+  .sec-head .t{ font-size:20px; font-weight:800; letter-spacing:.5px; }
+  .sec-head .pill{ font-size:11.5px; font-weight:700; letter-spacing:1.5px; padding:2px 12px;
+                   border-radius:999px; white-space:nowrap; }
+  .pill.navy{ background:var(--navy); color:#fff; }
+  .pill.ghost{ background:#fff; color:var(--navy-2); border:1px solid var(--navy-2); }
+  .sec-desc{ font-size:13px; color:var(--dim); max-width:1000px; margin:2px 2px 0; }
+
+  .win{ width:1160px; max-width:100%; margin:18px auto 8px; background:#fff; border:1px solid #c6ccd4;
+        border-radius:10px; overflow:hidden; box-shadow:0 26px 52px -30px rgba(13,35,60,.38); }
+  .win-title{ height:40px; background:#eef1f5; border-bottom:1px solid #e0e4ea; display:flex;
+              align-items:center; padding:0 14px; position:relative; }
+  .win-title .dots{ display:inline-flex; gap:6px; }
+  .win-title .dots i{ width:10px; height:10px; border-radius:50%; background:#c3cad3; }
+  .win-title .wt{ position:absolute; left:0; right:0; text-align:center; font-size:12.5px;
+                  color:var(--dim); font-weight:600; letter-spacing:.5px; pointer-events:none; }
+  .win-btns{ margin-left:auto; display:flex; align-items:center; gap:18px; color:#7b8593; font-size:13px; line-height:1; }
+  .win-btns .x{ font-size:14px; color:#5b6472; }
+
+  .notes{ font-size:12.5px; color:var(--dim); margin:10px auto 0; width:1160px; max-width:100%; }
+  .notes li{ margin-left:20px; margin-top:3px; }
+  .notes b{ color:var(--text); }
+  .notes .k{ color:var(--navy); font-weight:700; }
+
+  /* 变体标注框（就地标注「新增」/「变更」） */
+  .mark{ display:inline-block; font-size:11px; font-weight:800; letter-spacing:1.5px; color:var(--amber);
+         border:1.5px dashed var(--amber); border-radius:5px; padding:1px 8px; background:#fffdf5; }
+  .mark.new{ color:var(--green); border-color:var(--green); background:#f4fbf6; }
+  .marked{ outline:2px dashed #d9b45a; outline-offset:6px; border-radius:8px; }
+
+  /* ═══ 清单表 ═══ */
+  .tbl{ background:#fff; border:1px solid var(--rule); border-radius:10px; overflow:hidden; margin-top:16px; }
+  table.list{ width:100%; border-collapse:collapse; }
+  table.list th{ background:var(--soft); text-align:left; font-size:12px; letter-spacing:1.5px;
+                 color:var(--dim); font-weight:700; padding:10px 16px; border-bottom:1px solid var(--rule); white-space:nowrap; }
+  table.list td{ padding:11px 16px; border-bottom:1px solid var(--soft); font-size:13px; color:var(--text); vertical-align:top; }
+  table.list tr:last-child td{ border-bottom:none; }
+  table.list td.dim{ color:var(--dim); }
+  table.list .secno{ color:var(--navy); font-weight:700; white-space:nowrap; }
+  .pill-add{ display:inline-block; background:#eaf4ee; color:var(--green); font-size:11px; font-weight:700;
+             letter-spacing:1.5px; padding:1px 11px; border-radius:999px; }
+  .pill-chg{ display:inline-block; background:#fdf6e6; color:var(--amber); font-size:11px; font-weight:700;
+             letter-spacing:1.5px; padding:1px 11px; border-radius:999px; }
+  .unchanged{ background:var(--soft); border:1px solid var(--rule); border-radius:10px;
+              padding:14px 18px; font-size:13px; color:var(--dim); margin-top:16px; line-height:1.8; }
+  .unchanged b{ color:var(--text); }
+  .unchanged .lab{ font-size:12px; letter-spacing:2px; color:var(--mute); font-weight:700; display:block; margin-bottom:2px; }
+  code{ font-family:Consolas,"Courier New",monospace; font-size:12px; background:#eef1f5;
+        border:1px solid var(--rule); border-radius:4px; padding:0 6px; color:var(--navy); }
+
+  /* ═══ 流程图 ═══ */
+  .flow{ display:flex; align-items:stretch; margin:18px 0 6px; }
+  .fstep{ flex:1; background:#fff; border:1px solid var(--rule); border-radius:10px; padding:14px 18px 12px; }
+  .fstep .h{ font-size:14px; font-weight:700; color:var(--navy); }
+  .fstep .d{ font-size:12px; color:var(--dim); margin-top:4px; line-height:1.6; }
+  .farrow{ width:34px; display:flex; align-items:center; justify-content:center; color:var(--mute); font-size:20px; }
+
+  /* ═══ 变体并排 ═══ */
+  /* 变体整宽上下对照: 应用窗口真实宽度 1160px, 字号 1:1 —— 半栏放不下,
+     缩略会失真, 故竖排对比, 末尾给对比小结表 */
+  .variants{ margin-top:18px; }
+  .vwrap{ background:#fff; border:1px solid var(--rule); border-radius:12px; overflow:hidden;
+          margin-bottom:26px; }
+  .vhead{ display:flex; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid var(--rule);
+          background:var(--soft); }
+  .vhead .vt{ font-size:14px; font-weight:800; color:var(--navy); }
+  .vhead .vd{ font-size:12px; color:var(--dim); }
+  .vhead .rec{ margin-left:auto; font-size:11px; font-weight:800; letter-spacing:1.2px; color:#fff;
+               background:var(--green); border-radius:999px; padding:2px 10px; }
+  .vbody{ padding:16px 18px 18px; }
+  .vbody .cap{ font-size:12px; color:var(--mute); margin-top:10px; }
+
+  /* ═══ 应用窗口内元素（与 _GUI_CSS 同值 1:1） ═══ */
+  .g-top{ height:58px; display:flex; align-items:center; gap:12px; padding:0 24px; border-bottom:1px solid var(--rule); }
+  .g-mark{ width:34px; height:34px; border-radius:9px; background:var(--navy); color:#fff; font-size:14px;
+           font-weight:800; letter-spacing:.5px; display:flex; align-items:center; justify-content:center; }
+  .g-brand{ font-size:17px; font-weight:800; color:var(--navy); letter-spacing:.3px; }
+  .g-ver{ font-size:11px; font-weight:600; letter-spacing:.5px; color:var(--mute);
+          border:1px solid var(--rule); border-radius:999px; padding:2px 11px; }
+  .g-spring{ margin-left:auto; }
+  .g-host{ display:flex; align-items:center; gap:8px; background:var(--soft); border:1px solid var(--rule);
+           border-radius:999px; padding:5px 15px; font-size:12.5px; font-weight:600; color:var(--dim); }
+  .g-host svg{ width:13px; height:13px; color:var(--mute); flex:none; }
+  .g-view-home{ padding:32px 36px 30px; }
+  .g-view-prog{ padding:30px 36px 26px; }
+  .g-rep{ padding:26px 32px 30px; }
+  .g-h1{ font-size:26px; font-weight:800; letter-spacing:.3px; }
+  .g-sub{ font-size:13px; color:var(--dim); margin-top:5px; }
+  .g-cards{ display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-top:24px; }
+  .g-card{ background:var(--soft); border:1px solid var(--rule); border-radius:12px;
+           padding:20px 20px 18px; min-height:158px; display:flex; flex-direction:column;
+           text-align:left; color:var(--text); }
+  .g-card-ic{ width:46px; height:46px; border-radius:11px; background:#fff; border:1px solid var(--rule);
+              display:flex; align-items:center; justify-content:center; color:var(--navy); margin-bottom:14px; }
+  .g-card-ic svg{ width:24px; height:24px; }
+  .g-card-t{ font-size:16.5px; font-weight:700; letter-spacing:.2px; }
+  .g-card-d{ font-size:12.5px; color:var(--dim); margin-top:6px; line-height:1.6; }
+  .g-card-go{ margin-top:auto; padding-top:12px; font-size:11.5px; font-weight:700; letter-spacing:1px; color:var(--mute); }
+  .g-card.site{ background:var(--navy); border-color:var(--navy); }
+  .g-card.site .g-card-ic{ background:rgba(255,255,255,.13); border-color:rgba(255,255,255,.28); color:#fff; }
+  .g-card.site .g-card-t{ color:#fff; }
+  .g-card.site .g-card-d{ color:#c7d7e8; }
+  .g-card.site .g-card-go{ color:#8fb3d6; }
+  .g-fullrow{ display:flex; align-items:center; gap:16px; margin-top:22px; padding-top:20px;
+              border-top:1px solid var(--rule); }
+
+  .g-prog{ display:flex; align-items:flex-end; gap:26px; padding-bottom:20px; border-bottom:1px solid var(--rule); }
+  .g-big{ font-size:46px; font-weight:800; letter-spacing:-1px; line-height:1; color:var(--navy); }
+  .g-time{ margin-left:auto; text-align:right; padding-bottom:2px; }
+  .g-time .lab{ font-size:11px; letter-spacing:2px; color:var(--mute); font-weight:700; }
+  .g-time .g-dim{ font-size:21px; font-weight:700; color:var(--text); }
+  .g-bar{ height:10px; background:var(--soft); border:1px solid var(--rule); border-radius:999px;
+          margin-top:16px; position:relative; overflow:hidden; }
+  .g-bar>i{ position:absolute; top:0; bottom:0; left:0; width:0; background:var(--navy-2);
+            border-radius:999px; transition:width .3s; }
+  .g-cur{ margin-top:20px; background:var(--soft); border:1px solid var(--rule);
+          border-left:3px solid var(--navy-2); border-radius:10px; padding:16px 22px;
+          display:flex; align-items:center; gap:18px; }
+  .g-spin{ width:22px; height:22px; flex:none; border-radius:50%; border:2.5px solid #d9e2ee;
+           border-top-color:var(--navy-2); animation:gspin 1s linear infinite; }
+  @keyframes gspin{ to{ transform:rotate(360deg); } }
+  .g-cur .lab{ font-size:11px; letter-spacing:2.5px; color:var(--navy-2); font-weight:700; }
+  .g-cur b{ display:block; font-size:17px; font-weight:700; margin-top:2px; }
+  .g-lights{ margin-top:24px; display:grid; grid-template-columns:1fr 1fr; column-gap:44px; }
+  .g-light{ display:flex; align-items:center; gap:12px; padding:7.5px 2px;
+            border-bottom:1px solid var(--soft); font-size:13.5px; color:var(--text); }
+  .g-light i{ width:10px; height:10px; flex:none; border-radius:50%; }
+  .g-light.cur i{ background:var(--navy-2); animation:gpulse 1.6s ease-out infinite; }
+  @keyframes gpulse{ 0%{ box-shadow:0 0 0 0 rgba(42,84,133,.40);}
+                   70%{ box-shadow:0 0 0 7px rgba(42,84,133,0);}
+                   100%{ box-shadow:0 0 0 0 rgba(42,84,133,0);} }
+  .g-hint{ margin-top:22px; padding-top:14px; border-top:1px solid var(--rule); text-align:center;
+           font-size:12.5px; color:var(--mute); }
+
+  .g-btn{ display:inline-flex; align-items:center; gap:8px; border-radius:7px; font-size:13px;
+          font-weight:600; padding:9px 18px; letter-spacing:.3px;
+          background:var(--navy); border:1px solid var(--navy); color:#fff; }
+  .g-btn svg{ width:15px; height:15px; }
+  .g-btn.line{ background:#fff; border-color:var(--rule); color:var(--text); }
+  .g-btn2{ display:inline-flex; align-items:center; gap:8px; border-radius:7px; font-size:13px;
+           font-weight:600; padding:9px 18px; letter-spacing:.3px;
+           background:#fff; border:1px solid var(--navy-2); color:var(--navy); }
+  .g-btn2 svg{ width:15px; height:15px; }
+  .g-link{ background:none; border:none; color:var(--mute); font-size:12.5px; font-weight:600; padding:0; }
+  .g-link2{ background:none; border:none; color:var(--navy); font-size:13px; font-weight:600; padding:0; }
+  .g-dim{ font-size:12.5px; color:var(--mute); }
+  .g-err{ color:var(--red); font-size:12.5px; margin-top:12px; min-height:1.2em; }
+
+  .btn{ display:inline-flex; align-items:center; gap:8px; border-radius:7px; font-size:13px;
+        font-weight:600; padding:9px 18px; letter-spacing:.3px; }
+  .btn svg{ width:15px; height:15px; }
+  .btn-primary{ background:var(--navy); border:1px solid var(--navy); color:#fff; }
+  .btn-line{ background:#fff; border:1px solid var(--rule); color:var(--text); }
+  .btn-danger{ background:#fff; border:1px solid var(--red); color:var(--red); font-weight:700; }
+  .btn-danger.dis{ border-color:var(--mute); color:var(--mute); font-weight:600; }
+
+  /* 续跑横幅 (主页新增) */
+  .g-resume{ display:flex; align-items:center; gap:14px; margin-top:18px; padding:14px 18px;
+             background:#fffdf5; border:1px solid #e0c98a; border-left:3px solid var(--amber);
+             border-radius:10px; }
+  .g-resume .ri{ width:34px; height:34px; flex:none; border-radius:9px; background:#fff;
+                 border:1px solid #e0c98a; display:flex; align-items:center; justify-content:center; color:var(--amber); }
+  .g-resume .ri svg{ width:18px; height:18px; }
+  .g-resume .rt{ font-size:14px; font-weight:700; }
+  .g-resume .rd{ font-size:12.5px; color:var(--dim); margin-top:2px; }
+  .g-resume .ops{ margin-left:auto; display:flex; align-items:center; gap:10px; }
+
+  /* 停止后的结论条 (进度页顶部) */
+  .g-stopbar{ display:flex; align-items:center; gap:16px; margin-bottom:20px; padding:16px 22px;
+              background:var(--soft); border:1px solid var(--rule); border-left:3px solid var(--amber);
+              border-radius:10px; }
+  .g-stopbar .st{ font-size:17px; font-weight:700; }
+  .g-stopbar .sd{ font-size:12.5px; color:var(--dim); margin-top:2px; }
+  .g-stopbar .ops{ margin-left:auto; display:flex; align-items:center; gap:10px; }
+
+  /* 已停止小结页 (变体 B) */
+  .g-sum{ max-width:620px; background:#fff; border:1px solid var(--rule); border-radius:12px;
+          padding:26px 28px 24px; }
+  .g-sum .h{ font-size:22px; font-weight:800; letter-spacing:.3px; }
+  .g-sum .d{ font-size:13px; color:var(--dim); margin-top:6px; }
+  .g-sum .stat{ display:flex; gap:28px; margin:18px 0 20px; padding:14px 0;
+                border-top:1px solid var(--soft); border-bottom:1px solid var(--soft); }
+  .g-sum .stat .k{ font-size:11px; letter-spacing:2px; color:var(--mute); font-weight:700; }
+  .g-sum .stat .v{ font-size:26px; font-weight:800; color:var(--navy); margin-top:2px; }
+  .g-sum .foot{ display:flex; align-items:center; gap:12px; }
+  .g-sum .foot .g-link{ margin-left:auto; }
+
+  /* 报告页结论条 */
+  .g-verdict{ display:flex; align-items:center; gap:24px; background:var(--soft); border:1px solid var(--rule);
+              border-radius:12px; padding:14px 26px; }
+  .g-ver-score{ display:flex; align-items:baseline; flex:none; }
+  .g-ver-score b{ font-size:46px; font-weight:800; letter-spacing:-1px; line-height:1; color:var(--navy); }
+  .g-ver-score small{ font-size:16px; font-weight:700; color:var(--mute); margin-left:4px; }
+  .g-ver-badge{ flex:none; background:var(--green); color:#fff; font-size:13px; font-weight:700;
+                letter-spacing:1.5px; padding:5px 15px; border-radius:6px; white-space:nowrap; }
+  .g-ver-line{ font-size:15.5px; font-weight:700; }
+  .g-ver-sub{ font-size:12px; color:var(--mute); margin-top:3px; letter-spacing:.3px; }
+  .g-ver-counts{ display:flex; align-items:center; gap:14px; margin-top:6px; flex-wrap:wrap; }
+  .g-ver-count{ display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--dim); }
+  .g-ver-count i{ width:9px; height:9px; border-radius:50%; flex:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1><span class="brandtag">NP</span>诊断中途取消 / 续跑 · 设计稿 v1</h1>
+  <div class="meta">
+    特性：二期 #3 · 目标版本 <b>v1.24.0</b> · 壳层视觉沿用已定稿的 GUI 方案 A
+    （<code>design_ref/gui/gui_design_v1.html</code>）· 页面元素与已上线
+    <code>netpulse.py</code> 的 <code>_GUI_CSS</code> 同值 1:1
+  </div>
+  <p class="lead">
+    本稿只画<b>本特性要动的地方</b>：进度页加「停止」、停止后的呈现、主页加续跑横幅、
+    报告页的续跑说明。其余界面<b>一个字不改</b>。停止按钮的落位与停止后的呈现各给两套
+    变体，请圈选；<b>变体 A / A 为推荐组合</b>。
+  </p>
+
+  <!-- ══════════════════ 第 0 节 · 总览 ══════════════════ -->
+  <div class="sec" id="sec0">
+    <div class="sec-head">
+      <span class="no">00</span><span class="t">总览 · 变更与新增清单</span>
+      <span class="pill navy">先看这张表</span>
+    </div>
+
+    <div class="flow">
+      <div class="fstep">
+        <div class="h">跑一轮诊断</div>
+        <div class="d">进度页推进中（现有页面，不变）</div>
+      </div>
+      <div class="farrow">→</div>
+      <div class="fstep">
+        <div class="h">点「停止」</div>
+        <div class="d">不再启动新模块，手头这项目跑完就收工（最长约 3 分钟）</div>
+      </div>
+      <div class="farrow">→</div>
+      <div class="fstep">
+        <div class="h">出部分报告</div>
+        <div class="d">首屏写明「检测范围 12/24 项」，没跑的显示「未检测」</div>
+      </div>
+      <div class="farrow">→</div>
+      <div class="fstep">
+        <div class="h">接着跑</div>
+        <div class="d">只跑剩下 12 项，测完的复用；关窗也不丢，下次开程序接着跑</div>
+      </div>
+    </div>
+
+    <div class="tbl">
+      <table class="list">
+        <tr><th style="width:88px">类型</th><th style="width:150px">位置</th>
+            <th>内容</th><th style="width:110px">对应本稿</th></tr>
+        <tr>
+          <td><span class="pill-chg">变更</span></td>
+          <td>进度页 · 右上角</td>
+          <td>新增「停止」按钮（红色描边）；点击先弹确认</td>
+          <td class="secno">第 1 节</td>
+        </tr>
+        <tr>
+          <td><span class="pill-chg">变更</span></td>
+          <td>进度页 · 运行中</td>
+          <td>新增「正在收尾」提示条；停止按钮变为禁用态</td>
+          <td class="secno">第 2 节</td>
+        </tr>
+        <tr>
+          <td><span class="pill-chg">变更</span></td>
+          <td>进度页 · 已停止</td>
+          <td>新增「已停止」结论条 + 「继续跑剩下的 N 项」入口</td>
+          <td class="secno">第 3 节</td>
+        </tr>
+        <tr>
+          <td><span class="pill-add">新增</span></td>
+          <td>主页 · 顶部</td>
+          <td>新增续跑横幅（跨重启后出现）：场景名 / 实检项数 / 上次时间 + 两个按钮</td>
+          <td class="secno">第 4 节</td>
+        </tr>
+        <tr>
+          <td><span class="pill-add">新增</span></td>
+          <td>报告页 · 结论条</td>
+          <td>续跑轮次的结论行注明「续跑」与上次运行时间</td>
+          <td class="secno">第 5 节</td>
+        </tr>
+        <tr>
+          <td><span class="pill-add">新增</span></td>
+          <td>报告首屏 · Hero</td>
+          <td>「检测范围」chip 按实际跑完项数写（12/24），提前结束时注明「本轮提前结束」</td>
+          <td class="secno">第 6 节</td>
+        </tr>
+      </table>
+    </div>
+
+    <div class="unchanged">
+      <span class="lab">不变的部分</span>
+      主页场景卡、模块勾选面板、现场检测流程、盯障三视图、报告页版式与导出条、终端全部
+      行为 —— <b>一律不改</b>。模块状态沿用既有六种（完成 / 警告 / 异常 / 错误 / 超时 /
+      未检测），<b>不新增</b>「已取消」这类状态；没跑完的项目统一显示灰色「未检测」。
+    </div>
+  </div>
+
+  <!-- ══════════════════ 第 1 节 · 停止按钮 ══════════════════ -->
+  <div class="sec" id="sec1">
+    <div class="sec-head">
+      <span class="no">01</span><span class="t">变更 · 进度页的「停止」按钮</span>
+      <span class="pill ghost">两套变体，请圈选</span>
+    </div>
+    <p class="sec-desc">
+      两个变体只差「按钮放哪」，功能完全一样：点了先弹确认「确认停止本轮诊断？已完成的
+      项目会保留，之后可以接着跑。」确认后不再启动新模块。
+    </p>
+
+    <div class="variants">
+      <div class="vwrap">
+        <div class="vhead">
+          <span class="vt">变体 A · 右上角</span>
+          <span class="rec">推荐</span>
+        </div>
+        <div class="vbody">
+          <div class="win">
+            <div class="win-title">
+              <span class="dots"><i></i><i></i><i></i></span>
+              <span class="wt">NetPulse 网络诊断</span>
+              <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+            </div>
+            <div class="g-view-prog">
+              <div class="g-prog">
+                <span class="g-big num">9<small style="font-size:18px;font-weight:700;color:var(--mute)">/ 24</small></span>
+                <span style="font-size:12.5px;color:var(--dim)">已完成 <b style="color:var(--text)">9</b> 项 · 共 <b style="color:var(--text)">24</b> 项（场景「网络很慢」）</span>
+                <span class="g-time"><span class="lab">已耗时</span><div class="g-dim num">02:11</div></span>
+                <span class="marked" style="margin-left:18px;">
+                  <span class="btn btn-danger">
+                    <svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>停止
+                  </span>
+                </span>
+              </div>
+              <div class="g-bar"><i style="width:37%"></i></div>
+              <div class="g-cur">
+                <span class="g-spin"></span>
+                <span><span class="lab">正在测试</span><b>网页打开测速</b></span>
+              </div>
+              <div class="g-lights">
+                <div class="g-light"><i style="background:#1e6e44"></i>网关连通</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>公网出口</div>
+                <div class="g-light"><i style="background:#b3261e"></i>DNS 解析</div>
+                <div class="g-light"><i style="background:#ad6e10"></i>路由追踪</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>WiFi 信号</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>ARP 表</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>DHCP 服务</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>端口扫描</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>NAT 类型</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>MTU 探测</div>
+                <div class="g-light cur"><i></i>网页打开测速</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>IPv6 连通</div>
+                <div class="g-light"><i style="background:#98a2ad"></i>代理检测</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>下载测速</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>上传测速</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>网页延迟</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>延迟抖动</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>环回测速</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>局域网测速</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>连接稳定性</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>TCP 连接</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>外网连通</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>系统网络状态</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>报告生成</div>
+              </div>
+              <div class="g-hint">诊断期间请勿断开网络或合上笔记本。</div>
+            </div>
+          </div>
+          <div class="cap">
+            停止与「已耗时」同一行、贴着右上角 —— 手不用往下移，视线不用离开进度数字。
+            右侧的「已耗时」让出一点间距，数字仍靠右对齐。
+          </div>
+        </div>
+      </div>
+
+      <div class="vwrap">
+        <div class="vhead">
+          <span class="vt">变体 B · 页面底部</span>
+        </div>
+        <div class="vbody">
+          <div class="win">
+            <div class="win-title">
+              <span class="dots"><i></i><i></i><i></i></span>
+              <span class="wt">NetPulse 网络诊断</span>
+              <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+            </div>
+            <div class="g-view-prog">
+              <div class="g-prog">
+                <span class="g-big num">9<small style="font-size:18px;font-weight:700;color:var(--mute)">/ 24</small></span>
+                <span style="font-size:12.5px;color:var(--dim)">已完成 <b style="color:var(--text)">9</b> 项 · 共 <b style="color:var(--text)">24</b> 项（场景「网络很慢」）</span>
+                <span class="g-time"><span class="lab">已耗时</span><div class="g-dim num">02:11</div></span>
+              </div>
+              <div class="g-bar"><i style="width:37%"></i></div>
+              <div class="g-cur">
+                <span class="g-spin"></span>
+                <span><span class="lab">正在测试</span><b>网页打开测速</b></span>
+              </div>
+              <div class="g-lights">
+                <div class="g-light"><i style="background:#1e6e44"></i>网关连通</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>公网出口</div>
+                <div class="g-light"><i style="background:#b3261e"></i>DNS 解析</div>
+                <div class="g-light"><i style="background:#ad6e10"></i>路由追踪</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>WiFi 信号</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>ARP 表</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>DHCP 服务</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>端口扫描</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>NAT 类型</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>MTU 探测</div>
+                <div class="g-light cur"><i></i>网页打开测速</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>IPv6 连通</div>
+                <div class="g-light"><i style="background:#98a2ad"></i>代理检测</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>下载测速</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>上传测速</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>网页延迟</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>延迟抖动</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>环回测速</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>局域网测速</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>连接稳定性</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>TCP 连接</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>外网连通</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>系统网络状态</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>报告生成</div>
+              </div>
+              <div class="marked" style="margin-top:18px;display:flex;align-items:center;gap:14px;">
+                <span class="btn btn-danger">
+                  <svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>停止
+                </span>
+                <button class="g-link" type="button">返回主页</button>
+              </div>
+              <div class="g-hint">诊断期间请勿断开网络或合上笔记本。</div>
+            </div>
+          </div>
+          <div class="cap">
+            停止与「返回主页」并排在底部 —— 收尾类操作归到一处，但按钮离进度数字远，
+            长表格下要往下滚才看得到。
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <ul class="notes">
+      <li>按钮口径与盯障页的「停止盯障」一致（<span class="k">btn-danger</span>：白底红字红框），
+        不引入第四种按钮样式。</li>
+      <li>文案就两个字「停止」，不用「中止检测」「结束本轮」这类说法。</li>
+      <li>点击后弹确认框：<b>「确认停止本轮诊断？已完成的项目会保留，之后可以接着跑。」</b></li>
+    </ul>
+
+    <div class="tbl">
+      <table class="list">
+        <tr><th style="width:110px">变体</th><th style="width:190px">按钮落位</th>
+            <th>装维视角的差别</th><th style="width:96px">圈选</th></tr>
+        <tr>
+          <td class="secno">变体 A</td>
+          <td>进度页右上角</td>
+          <td>视线一直在进度数字上；停止按钮始终可见，长列表也不用往下滚</td>
+          <td>☐</td>
+        </tr>
+        <tr>
+          <td class="secno">变体 B</td>
+          <td>页面底部</td>
+          <td>停止与「返回主页」归到一处，但按钮离进度数字远，模块多时要滚到底才看得到</td>
+          <td>☐</td>
+        </tr>
+      </table>
+    </div>
+  </div>
+
+  <!-- ══════════════════ 第 2 节 · 收尾中 ══════════════════ -->
+  <div class="sec" id="sec2">
+    <div class="sec-head">
+      <span class="no">02</span><span class="t">变更 · 「正在收尾」状态</span>
+      <span class="pill ghost">按变体 A 的落位画</span>
+    </div>
+    <p class="sec-desc">
+      点了确认之后、当前这项目跑完之前，页面停在这个状态。手头那项目跑完就自动出报告，
+      不再等剩下的。
+    </p>
+
+    <div class="win">
+      <div class="win-title">
+        <span class="dots"><i></i><i></i><i></i></span>
+        <span class="wt">NetPulse 网络诊断</span>
+        <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+      </div>
+      <div class="g-view-prog">
+        <div class="g-prog">
+          <span class="g-big num">9<small style="font-size:18px;font-weight:700;color:var(--mute)">/ 24</small></span>
+          <span style="font-size:12.5px;color:var(--dim)">已完成 <b style="color:var(--text)">9</b> 项 · 共 <b style="color:var(--text)">24</b> 项（场景「网络很慢」）</span>
+          <span class="g-time"><span class="lab">已耗时</span><div class="g-dim num">02:24</div></span>
+          <span class="marked" style="margin-left:18px;">
+            <span class="btn btn-danger dis">
+              <svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>正在收尾…
+            </span>
+          </span>
+        </div>
+        <div class="g-bar"><i style="width:37%"></i></div>
+
+        <div class="marked" style="margin-top:20px;background:var(--soft);border:1px solid var(--rule);
+             border-left:3px solid var(--amber);border-radius:10px;padding:14px 20px;display:flex;align-items:center;gap:14px;">
+          <span style="width:20px;height:20px;flex:none;border-radius:50%;border:2.5px solid #d9e2ee;
+               border-top-color:var(--navy-2);animation:gspin 1s linear infinite;"></span>
+          <span>
+            <span style="font-size:13.5px;font-weight:700;">已停止调度，等当前项目跑完就出报告</span>
+            <span style="display:block;font-size:12.5px;color:var(--dim);margin-top:2px;">
+              手头这项目最长要 3 分钟，跑完就出结果，剩下的不再测。</span>
+          </span>
+        </div>
+
+        <div class="g-lights">
+          <div class="g-light"><i style="background:#1e6e44"></i>网关连通</div>
+          <div class="g-light"><i style="background:#1e6e44"></i>公网出口</div>
+          <div class="g-light"><i style="background:#b3261e"></i>DNS 解析</div>
+          <div class="g-light"><i style="background:#ad6e10"></i>路由追踪</div>
+          <div class="g-light"><i style="background:#1e6e44"></i>WiFi 信号</div>
+          <div class="g-light"><i style="background:#1e6e44"></i>ARP 表</div>
+          <div class="g-light"><i style="background:#1e6e44"></i>DHCP 服务</div>
+          <div class="g-light"><i style="background:#1e6e44"></i>端口扫描</div>
+          <div class="g-light"><i style="background:#1e6e44"></i>NAT 类型</div>
+          <div class="g-light"><i style="background:#1e6e44"></i>MTU 探测</div>
+          <div class="g-light cur"><i></i>网页打开测速</div>
+          <div class="g-light"><i style="background:#98a2ad"></i>代理检测</div>
+          <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>下载测速</div>
+          <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>上传测速</div>
+          <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>网页延迟</div>
+          <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>延迟抖动</div>
+          <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>环回测速</div>
+          <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>局域网测速</div>
+          <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>连接稳定性</div>
+          <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>TCP 连接</div>
+          <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>外网连通</div>
+          <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>系统网络状态</div>
+          <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>报告生成</div>
+        </div>
+        <div class="g-hint">诊断期间请勿断开网络或合上笔记本。</div>
+      </div>
+    </div>
+    <ul class="notes">
+      <li>网格里<b>还在跑的那一项保持蓝色脉冲点</b>（它确实还在跑），其余未启动项维持空心
+        「等待」点 —— 用户一眼能看出「哪些测了、哪些没测」。</li>
+      <li>提示条用琥珀色左边线（<span class="k">--amber</span>，与「警告」语义一致），
+        不是红色 —— 这不是故障，是用户自己的操作。</li>
+      <li>这段时间里现场检测 / 盯障 / 新诊断一律拒（409），提示条不额外解释互斥。</li>
+    </ul>
+  </div>
+
+  <!-- ══════════════════ 第 3 节 · 已停止 ══════════════════ -->
+  <div class="sec" id="sec3">
+    <div class="sec-head">
+      <span class="no">03</span><span class="t">变更 · 「已停止」后的呈现</span>
+      <span class="pill ghost">两套变体，请圈选</span>
+    </div>
+    <p class="sec-desc">
+      部分报告已经出好了。问题是：接下来给装维两个动作 —— <b>接着跑</b>、<b>看报告</b>。
+      变体 A 留在进度页原地，变体 B 跳到独立小结页。
+    </p>
+
+    <div class="variants">
+      <div class="vwrap">
+        <div class="vhead">
+          <span class="vt">变体 A · 进度页原地</span>
+          <span class="rec">推荐</span>
+        </div>
+        <div class="vbody">
+          <div class="win">
+            <div class="win-title">
+              <span class="dots"><i></i><i></i><i></i></span>
+              <span class="wt">NetPulse 网络诊断</span>
+              <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+            </div>
+            <div class="g-view-prog">
+              <div class="marked g-stopbar">
+                <div>
+                  <div class="st">已停止 · 实检 12/24 项</div>
+                  <div class="sd">剩下的 12 项没测。报告已生成，可以先看结果，或者接着跑。</div>
+                </div>
+                <div class="ops">
+                  <span class="g-btn">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 12h13"/><path d="M13 6l6 6-6 6"/></svg>继续跑剩下的 12 项
+                  </span>
+                  <span class="g-btn2">查看报告</span>
+                </div>
+              </div>
+              <div class="g-prog" style="border-bottom:none;">
+                <span class="g-big num" style="color:var(--mute)">12<small style="font-size:18px;font-weight:700;color:var(--mute)">/ 24</small></span>
+                <span style="font-size:12.5px;color:var(--dim)">已完成 <b style="color:var(--text)">12</b> 项 · 共 <b style="color:var(--text)">24</b> 项（场景「网络很慢」）</span>
+                <span class="g-time"><span class="lab">已耗时</span><div class="g-dim num">03:26</div></span>
+              </div>
+              <div class="g-bar"><i style="width:50%"></i></div>
+              <div class="g-lights">
+                <div class="g-light"><i style="background:#1e6e44"></i>网关连通</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>公网出口</div>
+                <div class="g-light"><i style="background:#b3261e"></i>DNS 解析</div>
+                <div class="g-light"><i style="background:#ad6e10"></i>路由追踪</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>WiFi 信号</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>ARP 表</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>DHCP 服务</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>端口扫描</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>NAT 类型</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>MTU 探测</div>
+                <div class="g-light"><i style="background:#98a2ad"></i>代理检测</div>
+                <div class="g-light"><i style="background:#1e6e44"></i>IPv6 连通</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>下载测速</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>上传测速</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>网页延迟</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>延迟抖动</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>环回测速</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>局域网测速</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>连接稳定性</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>TCP 连接</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>外网连通</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>系统网络状态</div>
+                <div class="g-light"><i style="background:transparent;border:1.5px solid #98a2ad"></i>报告生成</div>
+              </div>
+              <div style="margin-top:18px;"><button class="g-link" type="button">返回主页</button></div>
+            </div>
+          </div>
+          <div class="cap">
+            不跳页：网格、进度数字、耗时都还在原处，装维能看到「哪 12 项测了、哪 12 项没测」。
+          </div>
+        </div>
+      </div>
+
+      <div class="vwrap">
+        <div class="vhead">
+          <span class="vt">变体 B · 独立小结页</span>
+        </div>
+        <div class="vbody">
+          <div class="win">
+            <div class="win-title">
+              <span class="dots"><i></i><i></i><i></i></span>
+              <span class="wt">NetPulse 网络诊断</span>
+              <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+            </div>
+            <div class="g-view-prog">
+              <div class="g-sum marked">
+                <div class="h">已停止</div>
+                <div class="d">这一轮测到一半就停了，已完成的项目都保住了。</div>
+                <div class="stat">
+                  <div>
+                    <div class="k">实检</div>
+                    <div class="v num">12/24</div>
+                  </div>
+                  <div>
+                    <div class="k">已耗时</div>
+                    <div class="v num" style="font-size:21px;">03:26</div>
+                  </div>
+                  <div>
+                    <div class="k">场景</div>
+                    <div class="v" style="font-size:21px;">网络很慢</div>
+                  </div>
+                </div>
+                <div class="foot">
+                  <span class="g-btn">继续跑剩下的 12 项</span>
+                  <span class="g-btn2">查看报告</span>
+                  <button class="g-link" type="button">返回主页</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="cap">
+            干净的一屏结论，但<b>看不出哪几项测了</b> —— 要回进度页才看得到明细。
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <ul class="notes">
+      <li>两个变体都提供<b>「继续跑剩下的 12 项」</b>与<b>「查看报告」</b>两个出口，
+        按钮字保持短。</li>
+      <li>「未测的 12 项」在网格里是<b>空心灰点</b>（既有「等待 / 未检测」口径），
+        不新增颜色、不新增状态。</li>
+      <li>续跑入口的按钮上写明剩几项，避免用户以为要重头再跑一遍。</li>
+    </ul>
+
+    <div class="tbl">
+      <table class="list">
+        <tr><th style="width:110px">变体</th><th style="width:190px">停止后落在哪</th>
+            <th>装维视角的差别</th><th style="width:96px">圈选</th></tr>
+        <tr>
+          <td class="secno">变体 A</td>
+          <td>进度页原地</td>
+          <td>网格、进度数字、耗时都在原处，一眼看清「哪 12 项测了、哪 12 项没测」；要接着跑不用再点页面</td>
+          <td>☐</td>
+        </tr>
+        <tr>
+          <td class="secno">变体 B</td>
+          <td>独立小结页</td>
+          <td>一屏结论干净，但看不出哪几项测了，要回进度页才看得到明细</td>
+          <td>☐</td>
+        </tr>
+      </table>
+    </div>
+  </div>
+
+  <!-- ══════════════════ 第 4 节 · 主页续跑横幅 ══════════════════ -->
+  <div class="sec" id="sec4">
+    <div class="sec-head">
+      <span class="no">04</span><span class="t">新增 · 主页的续跑横幅</span>
+      <span class="pill navy">跨重启后出现</span>
+    </div>
+    <p class="sec-desc">
+      关窗、退出程序都不丢已完成的部分。下次打开 NetPulse，主页顶部先问一句「接着跑吗」。
+    </p>
+
+    <div class="win">
+      <div class="win-title">
+        <span class="dots"><i></i><i></i><i></i></span>
+        <span class="wt">NetPulse 网络诊断</span>
+        <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+      </div>
+      <div class="g-top">
+        <span class="g-mark">NP</span>
+        <span class="g-brand">NetPulse</span>
+        <span class="g-ver">v1.24.0</span>
+        <span class="g-spring"></span>
+        <span class="g-host">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4.5" width="18" height="15" rx="2"/><path d="M3 9h18"/></svg>
+          DESKTOP-7K2M9PQ
+        </span>
+      </div>
+      <div class="g-view-home">
+        <div class="g-h1">网络诊断</div>
+        <div class="g-sub">选一个场景开始，测完直接出报告。</div>
+
+        <div class="marked g-resume">
+          <span class="ri">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>
+          </span>
+          <span>
+            <div class="rt">上次诊断没跑完</div>
+            <div class="rd">网络很慢 · 实检 12/24 项 · 昨天 15:30 · 已完成的项目都还在</div>
+          </span>
+          <span class="ops">
+            <span class="g-btn">接着跑</span>
+            <span class="g-btn2">重新开始</span>
+          </span>
+        </div>
+
+        <div class="g-cards">
+          <div class="g-card">
+            <span class="g-card-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 16a8 8 0 1 1 14 0"/><path d="M12 16 8.6 11.4"/><circle cx="12" cy="16" r="1.5"/></svg></span>
+            <span class="g-card-t">网络很慢</span>
+            <span class="g-card-d">打开网页慢、看视频卡、下载不动，多半卡在链路质量。</span>
+            <span class="g-card-go">点击开始 →</span>
+          </div>
+          <div class="g-card">
+            <span class="g-card-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2.5 12.5h4l2.5-5.5 3.5 10 2.5-4.5h6.5"/></svg></span>
+            <span class="g-card-t">网络断了</span>
+            <span class="g-card-d">彻底断网、时断时续，先看是断在哪一段。</span>
+            <span class="g-card-go">点击开始 →</span>
+          </div>
+          <div class="g-card site">
+            <span class="g-card-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 4.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-13a2 2 0 0 0-2-2h-2"/><path d="M8.8 13.5l2.3 2.3 4.3-4.6"/></svg></span>
+            <span class="g-card-t">现场检测</span>
+            <span class="g-card-d">到客户家跑一整套，自动出一页纸的现场报告。</span>
+            <span class="g-card-go">点击开始 →</span>
+          </div>
+        </div>
+        <div class="g-fullrow">
+          <span class="g-dim">全部 24 项, 含压测, 客户网络慎用</span>
+          <span style="margin-left:auto;"><button class="g-link2" type="button">高级模块组合 ›</button></span>
+        </div>
+      </div>
+    </div>
+    <ul class="notes">
+      <li>横幅<b>只在一轮没跑完、且程序重开后出现</b>；正常跑完不出现。</li>
+      <li>三件事说清楚：<b>哪一轮</b>（场景名）、<b>跑到哪</b>（实检 12/24 项）、<b>什么时候</b>
+        （昨天 15:30）。</li>
+      <li>「重新开始」= 丢掉上次的进度从头跑，不弹二次确认（丢的是没测完的部分，
+        不是已完成的数据）。</li>
+      <li>横幅用琥珀色（<span class="k">--amber</span>）浅底 + 左边线，和「警告」语义一致；
+        不用红色 —— 这不是故障。</li>
+    </ul>
+  </div>
+
+  <!-- ══════════════════ 第 5 节 · 报告页 ══════════════════ -->
+  <div class="sec" id="sec5">
+    <div class="sec-head">
+      <span class="no">05</span><span class="t">新增 · 报告页的续跑说明</span>
+      <span class="pill navy">一句话</span>
+    </div>
+    <p class="sec-desc">
+      续跑出来的报告，数据来自两个时间点。结论行要把这件事说出来，别让人以为是同一时刻
+      测的。
+    </p>
+
+    <div class="win">
+      <div class="win-title">
+        <span class="dots"><i></i><i></i><i></i></span>
+        <span class="wt">NetPulse 网络诊断</span>
+        <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+      </div>
+      <div class="g-rep">
+        <div class="marked g-verdict">
+          <span class="g-ver-score"><b>92</b><small>/ 100</small></span>
+          <span class="g-ver-badge">A</span>
+          <div>
+            <div class="g-ver-line">诊断完成 · 网络很慢（续跑）</div>
+            <div class="g-ver-sub">实检 24/24 项 · 用时 06:12 · 其中 12 项的数据来自昨天 15:30 那轮</div>
+            <div class="g-ver-counts">
+              <span class="g-ver-count"><i style="background:#16a34a"></i>完成 18</span>
+              <span class="g-ver-count"><i style="background:#d97706"></i>警告 3</span>
+              <span class="g-ver-count"><i style="background:#dc2626"></i>异常 1</span>
+              <span class="g-ver-count"><i style="background:#94a3b8"></i>超时 1</span>
+              <span class="g-ver-count"><i style="background:#94a3b8"></i>未检测 1</span>
+            </div>
+          </div>
+        </div>
+        <div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap;">
+          <span class="g-btn">存 HTML 报告</span>
+          <span class="g-btn line">导出 PDF</span>
+          <span class="g-btn line">存原始数据</span>
+          <span class="g-btn line">打开报告文件夹</span>
+        </div>
+      </div>
+    </div>
+    <ul class="notes">
+      <li>结论行标题带「<b>（续跑）</b>」，导出文件名同源：<code>2026-11-13_1612_网络很慢（续跑）.html</code>。</li>
+      <li>副行写明「其中 N 项的数据来自上次那轮（时间）」—— 复用不隐瞒。</li>
+      <li>正常跑完的轮次，这两处<b>一个字都不多</b>（既有报告输出保持逐字节一致）。</li>
+    </ul>
+  </div>
+
+  <!-- ══════════════════ 第 6 节 · 报告首屏 ══════════════════ -->
+  <div class="sec" id="sec6">
+    <div class="sec-head">
+      <span class="no">06</span><span class="t">新增 · 报告首屏的覆盖口径</span>
+      <span class="pill ghost">只改一个数字</span>
+    </div>
+    <p class="sec-desc">
+      提前结束时，报告首屏的「检测范围」不能写成「24 项全覆盖」—— 那是假的。改成按实际
+      跑完的项数写，并注明哪些没测。
+    </p>
+
+    <div class="tbl">
+      <table class="list">
+        <tr><th style="width:210px">情形</th><th style="width:330px">首屏 chip</th><th>说明</th></tr>
+        <tr>
+          <td>正常跑完</td>
+          <td><code>检测范围 24 项全覆盖</code></td>
+          <td class="dim">与 v1.23.0 逐字节一致，不动</td>
+        </tr>
+        <tr>
+          <td>只选了部分模块（既有）</td>
+          <td><code>检测范围 3/24 项</code> + 「本次仅运行所选模块, 其余 21 项未检测」</td>
+          <td class="dim">既有口径，不动</td>
+        </tr>
+        <tr>
+          <td><b>提前停止</b>（本特性）</td>
+          <td><code>检测范围 12/24 项</code> + 「本轮提前结束, 12 项未检测」</td>
+          <td class="dim">新分支；只有实际跑完 &lt; 请求数时才走</td>
+        </tr>
+      </table>
+    </div>
+    <ul class="notes">
+      <li>「实际跑完几项」从报告技术附录里的原始结果条目数取（唯一事实来源），不另算一套。</li>
+      <li>没跑到的模块在报告里显示灰色<b>「未检测」</b>，<b>不扣分</b> —— 没测 ≠ 有问题。</li>
+    </ul>
+  </div>
+
+  <!-- ══════════════════ 第 7 节 · 文案表 ══════════════════ -->
+  <div class="sec" id="sec7">
+    <div class="sec-head">
+      <span class="no">07</span><span class="t">文案对照表</span>
+      <span class="pill ghost">装维大白话</span>
+    </div>
+    <div class="tbl">
+      <table class="list">
+        <tr><th style="width:150px">位置</th><th>文案</th></tr>
+        <tr><td>进度页按钮</td><td>停止</td></tr>
+        <tr><td>停止确认框</td><td>确认停止本轮诊断？已完成的项目会保留，之后可以接着跑。</td></tr>
+        <tr><td>收尾提示条</td><td>已停止调度，等当前项目跑完就出报告</td></tr>
+        <tr><td>收尾提示条副行</td><td>手头这项目最长要 3 分钟，跑完就出结果，剩下的不再测。</td></tr>
+        <tr><td>已停止结论条</td><td>已停止 · 实检 12/24 项</td></tr>
+        <tr><td>已停止结论条副行</td><td>剩下的 12 项没测。报告已生成，可以先看结果，或者接着跑。</td></tr>
+        <tr><td>续跑按钮</td><td>继续跑剩下的 12 项</td></tr>
+        <tr><td>主页横幅标题</td><td>上次诊断没跑完</td></tr>
+        <tr><td>主页横幅副行</td><td>网络很慢 · 实检 12/24 项 · 昨天 15:30 · 已完成的项目都还在</td></tr>
+        <tr><td>主页横幅按钮</td><td>接着跑 / 重新开始</td></tr>
+        <tr><td>报告结论行</td><td>诊断完成 · 网络很慢（续跑）</td></tr>
+        <tr><td>报告副行</td><td>实检 24/24 项 · 用时 06:12 · 其中 12 项的数据来自昨天 15:30 那轮</td></tr>
+        <tr><td>落盘失败提示</td><td>续跑点保存失败（不影响本轮报告）</td></tr>
+        <tr><td>现场检测停止后</td><td>现场检测不支持续跑，请重新检测</td></tr>
+      </table>
+    </div>
+    <ul class="notes">
+      <li>全稿不用「中止」「断点」「checkpoint」「增量」这类词；装维看得懂的是「停了」「接着跑」
+        「已完成的项目还在」。</li>
+      <li>「未检测」沿用既有灰色状态词，<b>不新增</b>「已取消」。</li>
+    </ul>
+  </div>
+
+</div>
+</body>
+</html>
