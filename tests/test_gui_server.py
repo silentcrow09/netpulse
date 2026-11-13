@@ -46,9 +46,15 @@ v1.23.0 模块勾选面板 (Task 1: 服务端 keys 形态 + module_catalog + 配
   P20 module_catalog: 24 项、分组 6/5/13、顺序与 MODULE_REGISTRY 一致、
       中文名同源 MODULE_MAP、cat ∈ a/b/c 与 MODULE_CATEGORIES 同源
   P21 port_targets 注入: 非法 → 400 不启动不写; 对应模块不在 keys →
-      不消费; 合法 → PORT_PROBE_CONFIG["targets"] 逐段写入
+      不消费; 合法 → PORT_PROBE_CONFIG["targets"] 逐段写入; 留空 →
+      本轮重置 targets=[] (终审修复: 每轮请求自决定, 不沿用旧值)
   P22 iperf3_server / use_speedtest_net 注入: 非法 iperf3 → 400 不写
-      (CLI 同口径); 留空不消费; 仅对应模块在 keys 里才写
+      (CLI 同口径); 留空 → server 重置 None; use_speedtest_net 仅
+      speedtest 在 keys 里才消费, 字段缺失重置 False
+  P23 每轮自决定 (终审 #1/#2): keys 开 Ookla 后 {profile:"slow"} 不带
+      字段 → use_speedtest_net 重置 False (不跨轮残留); 非布尔
+      (字符串 "false") 按缺失处理走重置, 不被 bool() 误判 True
+  P24 keys 组合导出 (终审 #4): export path 文件名带「模块组合 (N 项)」
 
 v1.23.0 模块勾选面板 (Task 2: 页面资产):
   P20b module_cats: 分类名/副题 {"a":{"name","desc"}} 与 MODULE_CATEGORIES
@@ -778,13 +784,19 @@ class TestKeysRun(unittest.TestCase):
             self._wait_done()
         self.assertEqual(np.PORT_PROBE_CONFIG["targets"],
                          ["223.5.5.5:53", "10.0.0.1:1-1024"])
-        # 留空 = 不消费 (落回「未提供目标」既有语义)
+        # 留空 = 本轮重置默认 (终审修复: 每轮请求自决定, 不沿用上轮旧值)
         with pipes[0], pipes[1], pipes[2], pipes[3]:
             st, raw = self._post({"keys": ["port"], "port_targets": "  "})
             self.assertEqual(st, 200)
             self._wait_done()
-        self.assertEqual(np.PORT_PROBE_CONFIG["targets"],
-                         ["223.5.5.5:53", "10.0.0.1:1-1024"])
+        self.assertEqual(np.PORT_PROBE_CONFIG["targets"], [])
+        # 重置后下轮再显式给合法目标 → 照常写入 (每轮自决定双向成立)
+        with pipes[0], pipes[1], pipes[2], pipes[3]:
+            st, raw = self._post({"keys": ["port"],
+                                  "port_targets": "223.5.5.5:53"})
+            self.assertEqual(st, 200)
+            self._wait_done()
+        self.assertEqual(np.PORT_PROBE_CONFIG["targets"], ["223.5.5.5:53"])
 
     # -- P22: iperf3_server / use_speedtest_net 注入 --
     def test_iperf3_ookla_injection(self):
@@ -818,13 +830,70 @@ class TestKeysRun(unittest.TestCase):
             self.assertEqual(st, 200)
             self._wait_done()
         self.assertIs(np.SPEEDTEST_CONFIG["use_speedtest_net"], False)
-        # 留空 iperf3 服务器 = 不消费 (落回「未检测」既有语义), 不覆盖已写值
+        # 留空 = 本轮重置 (终审修复): server 回 None (「未检测」诚实降级)
         with pipes[0], pipes[1], pipes[2], pipes[3]:
             st, raw = self._post({"keys": ["iperf3"],
                                   "iperf3_server": "   "})
             self.assertEqual(st, 200)
             self._wait_done()
-        self.assertEqual(np.SPEEDTEST_CONFIG["iperf3_server"], "1.2.3.4")
+        self.assertIsNone(np.SPEEDTEST_CONFIG["iperf3_server"])
+
+    # -- P23: 每轮自决定 — profile 形态重置 + bool 防御 (终审 #1/#2) --
+    def test_ookla_not_leak_into_profile_run(self):
+        """面板开 Ookla 后, 场景卡 {profile:"slow"} 请求不带该字段 →
+        无条件重置 False。slow 含 speedtest, 不重置会静默沿用 True
+        污染场景运行 (spec F2/S3.1「留空 = 诚实降级」)。"""
+        pipes = self._patch_pipeline({})
+        with pipes[0], pipes[1], pipes[2], pipes[3]:
+            st, raw = self._post({"keys": ["speedtest"],
+                                  "use_speedtest_net": True})
+            self.assertEqual(st, 200)
+            self._wait_done()
+        self.assertIs(np.SPEEDTEST_CONFIG["use_speedtest_net"], True)
+        with pipes[0], pipes[1], pipes[2], pipes[3]:
+            st, raw = self._post({"profile": "slow"})
+            self.assertEqual(st, 200)
+            self._wait_done()
+        self.assertIs(np.SPEEDTEST_CONFIG["use_speedtest_net"], False)
+
+    def test_use_speedtest_net_bool_defense(self):
+        """非布尔 (字符串 "false") 按缺失处理走重置 — 不被
+        bool("false")==True 静默误开 (终审 #2)。"""
+        pipes = self._patch_pipeline({})
+        np.SPEEDTEST_CONFIG["use_speedtest_net"] = True   # 摆脏基线
+        with pipes[0], pipes[1], pipes[2], pipes[3]:
+            st, raw = self._post({"keys": ["speedtest"],
+                                  "use_speedtest_net": "false"})
+            self.assertEqual(st, 200)
+            self._wait_done()
+        self.assertIs(np.SPEEDTEST_CONFIG["use_speedtest_net"], False)
+
+    # -- P24: keys 组合导出文件名带「模块组合 (N 项)」 (终审 #4) --
+    def test_keys_export_label_in_filename(self):
+        captured = {}
+        pipes = self._patch_pipeline(captured)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        written = []
+        def _fake_export(path, rule_filter=None, report=None, layout="full"):
+            written.append(path)
+            return None
+        with pipes[0], pipes[1], pipes[2], pipes[3], \
+             mock.patch.object(np, "_desktop_netpulse_dir",
+                               return_value=tmp), \
+             mock.patch.object(np, "export_report",
+                               side_effect=_fake_export):
+            st, raw = self._post({"keys": ["dns", "mtu"]})
+            self.assertEqual(st, 200)
+            self._wait_done()
+            st, raw = _req(self.port, "POST",
+                           "/api/export?t=" + self.token,
+                           body={"kind": "html"})
+            self.assertEqual(st, 200)
+            self.assertIsNone(json.loads(raw)["err"])
+        self.assertTrue(written)
+        # export path 参数的文件名段带组合标题 (v1.23.0 _GUI_LABELS 同源)
+        self.assertIn("模块组合 (2 项)", os.path.basename(written[0]))
 
 
 if __name__ == "__main__":

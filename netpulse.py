@@ -24704,28 +24704,52 @@ def _gui_validate_keys(keys):
     return clean, None
 
 
-def _gui_apply_run_config(d, keys):
-    """v1.23.0 keys 形态的内联配置注入 (启动前写既有 CONFIG 常量)。
+def _gui_profile_keys(profile):
+    """profile id → 本轮模块集; 未知场景 → None。
 
-    spec 冻结口径: 组合运行结束不回滚 — GUI 常驻进程内后续轮次以面板
-    当前值为准 (与 CLI 单次进程语义差异可接受)。仅当对应模块在 keys 里
-    才消费对应字段:
-      port_targets      → PORT_PROBE_CONFIG["targets"]: 逗号分隔, 逐段
-                          _parse_target 校验 (brief 写"正则", 按仓内先例
-                          修正为复用终端同源解析器 — 附带 IPv6/范围越界/
-                          倒序校验), 非法 → err 400
+    v1.23.0 终审修复波抽出: start() 与 /api/run 注入段共用同一解析,
+    防两处口径漂移。full=full_module_keys() (含 port/iperf3, 注入段
+    对其同样生效); site 走 start_site 专属流程不在此列。
+    """
+    if profile == "full":
+        return full_module_keys()
+    if profile in DIAGNOSE_PROFILES:
+        return list(DIAGNOSE_PROFILES[profile])
+    return None
+
+
+def _gui_apply_run_config(d, keys):
+    """v1.23.0 (终审修复波) /api/run 每轮配置注入: 注入状态完全由本轮
+    请求决定 (profile 形态与 keys 形态统一 — 场景卡请求不带字段, 面板
+    上轮注入不跨轮残留, spec F2/S3.1「留空 = 诚实降级」)。
+
+    仅当对应模块在本轮模块集 (keys) 里才消费对应字段:
+      port_targets      → PORT_PROBE_CONFIG["targets"]: 缺失/留空 →
+                          重置 [] (诚实「未提供目标」); 显式 → 逗号分隔
+                          逐段 _parse_target 校验 (brief 写"正则", 按仓内
+                          先例修正为复用终端同源解析器 — 附带 IPv6/范围
+                          越界/倒序校验), 非法 → err 400
       iperf3_server     → SPEEDTEST_CONFIG["iperf3_server"/"iperf3_port"]:
-                          _parse_iperf3_server 校验拆分 (非法 → err 400,
-                          CLI sys.exit(4) 同口径), 写入键与 CLI 一致
-      use_speedtest_net → SPEEDTEST_CONFIG["use_speedtest_net"] (bool 直写)
-    留空 (空串/纯空白) = 不消费, 落回模块既有「未提供目标/未检测」语义。
-    校验全部通过才落盘 (不做部分写入)。返回 None 或 err 字符串。
+                          缺失/留空 → 重置 server=None (「未检测」);
+                          显式 → _parse_iperf3_server 校验拆分 (非法 →
+                          err 400, CLI sys.exit(4) 同口径), 写入键与
+                          CLI 一致
+      use_speedtest_net → SPEEDTEST_CONFIG["use_speedtest_net"]: 缺失 →
+                          无条件重置 False (v1.21 起 GUI 场景/全量默认即
+                          False, 面板显式开才 True, True 不跨轮残留);
+                          显式 → 必须为真布尔才消费 (仅 speedtest 在
+                          keys), 非布尔 (如字符串 "false") 按缺失处理走
+                          重置 — 防 bool("false")==True 静默误开
+    校验全部通过才落盘 (不做部分写入, 重置项与写入项同批生效)。
+    返回 None 或 err 字符串。
     """
     keyset = set(keys)
     writes = []
     if "port" in keyset:
         raw = str(d.get("port_targets") or "").strip()
-        if raw:
+        if not raw:
+            writes.append((PORT_PROBE_CONFIG, "targets", []))
+        else:
             specs = []
             for seg in raw.replace("，", ",").split(","):
                 seg = seg.strip()
@@ -24734,19 +24758,26 @@ def _gui_apply_run_config(d, keys):
                 if _parse_target(seg) is None:
                     return "端口目标格式非法: %s" % seg
                 specs.append(seg)
-            if specs:
-                writes.append((PORT_PROBE_CONFIG, "targets", specs))
+            writes.append((PORT_PROBE_CONFIG, "targets", specs))
     if "iperf3" in keyset:
         raw = str(d.get("iperf3_server") or "").strip()
-        if raw:
+        if not raw:
+            writes.append((SPEEDTEST_CONFIG, "iperf3_server", None))
+        else:
             parsed = _parse_iperf3_server(raw)
             if parsed is None:
                 return "iperf3 服务器地址非法: %s" % raw
             writes.append((SPEEDTEST_CONFIG, "iperf3_server", parsed[0]))
             writes.append((SPEEDTEST_CONFIG, "iperf3_port", parsed[1]))
-    if "speedtest" in keyset and "use_speedtest_net" in d:
-        writes.append((SPEEDTEST_CONFIG, "use_speedtest_net",
-                       bool(d.get("use_speedtest_net"))))
+    if "use_speedtest_net" not in d:
+        writes.append((SPEEDTEST_CONFIG, "use_speedtest_net", False))
+    elif isinstance(d.get("use_speedtest_net"), bool):
+        if "speedtest" in keyset:
+            writes.append((SPEEDTEST_CONFIG, "use_speedtest_net",
+                           d["use_speedtest_net"]))
+    else:
+        # 非布尔 (如字符串 "false") → 按缺失处理走重置 (bool() 陷阱)
+        writes.append((SPEEDTEST_CONFIG, "use_speedtest_net", False))
     for cfg, key, val in writes:
         cfg[key] = val
     return None
@@ -24858,12 +24889,10 @@ class _GuiSession:
             if err:
                 return False, err
             profile = None
-        elif profile == "full":
-            keys = full_module_keys()
-        elif profile in DIAGNOSE_PROFILES:
-            keys = list(DIAGNOSE_PROFILES[profile])
         else:
-            return False, "未知场景: %s" % profile
+            keys = _gui_profile_keys(profile)
+            if keys is None:
+                return False, "未知场景: %s" % profile
         ok, err = self._begin(profile, keys)
         if not ok:
             return False, err
@@ -27321,9 +27350,11 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
             if data is None:
                 return self._send(400, {"error": "bad json"})
             if p == "/api/run":
-                # v1.23.0 双形态: {profile} (现状不变) / {keys:[...]} (新),
-                # 二选一同现 400。keys 路径: 服务端白名单校验 (非法 → 400)
-                # + 内联配置注入 (仅对应模块在 keys 里才消费); 忙 409 分诊
+                # v1.23.0 双形态: {profile} / {keys:[...]}, 二选一同现 400。
+                # keys 路径: 服务端白名单校验 (非法 → 400) + 每轮配置注入;
+                # profile 路径同样走注入段 (字段缺失按重置默认 — 场景卡
+                # 请求不带字段, 面板上轮注入不跨轮残留, v1.23.0 终审修复
+                # 波); 未知场景不碰配置仍由 start() 回 400。忙 409 分诊
                 # 沿用, 原子闸仍在 _begin (_GUI_ACT_LOCK 内查忙+置位)。
                 d = data or {}
                 req_keys = d.get("keys")
@@ -27347,7 +27378,13 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
                         return self._send(400, {"ok": False, "err": err})
                     ok, err = self.session.start(keys=keys)
                 else:
-                    ok, err = self.session.start(str(req_profile or ""))
+                    profile = str(req_profile or "")
+                    keys = _gui_profile_keys(profile)
+                    if keys is not None:
+                        err = _gui_apply_run_config(d, keys)
+                        if err:
+                            return self._send(400, {"ok": False, "err": err})
+                    ok, err = self.session.start(profile)
                 return self._send(200 if ok else 400,
                                   {"ok": ok, "err": err})
             if p == "/api/export":
