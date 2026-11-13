@@ -4,11 +4,17 @@
 验证点:
   P1 _gui_page() 是完整 HTML 文档 (doctype/关闭标签)
   P2 零外链: 无 http(s):// 资源引用、无 <link、无 <script src、无 <img
+     (v1.22.0: SVG 命名空间标识符 "http://www.w3.org/2000/svg" 是 URI 标识
+     而非外链资源 — createElementNS 必需、浏览器从不对其发起请求, 白名单放行)
   P3 页面为纯静态: 无 format 占位符痕迹 ({...} 模板残留)
-  P4 JS 轮询 /api/progress 与 /api/netstatus, sendBeacon 关窗, iframe 加载 /api/report
+  P4 JS 轮询 /api/progress 与 /api/netstatus, sendBeacon 关窗, iframe 加载
+     /api/report; v1.22.0: /api/monitor/* 五条 + createElementNS 曲线 +
+     confirm 停止
   P5 动态渲染只用 textContent: innerHTML 赋值一律禁止 (含 += 逃逸形态);
      insertAdjacentHTML 只允许注入全大写常量标识符 (零插值常量模板),
      其余参数形态 (字符串拼接 / 小写变量 / 函数调用) 一律 FAIL
+  P6 v1.22.0 盯障三视图锚点 (mon-config/mon-live/mon-report) + 第 7 卡
+     (ICONS.monitor + /api/scenarios 下发 monitor 条目, 与终端菜单同语义)
 """
 import os
 import sys
@@ -55,8 +61,13 @@ class TestGuiPage(unittest.TestCase):
         self.assertNotIn('<link', p)
         self.assertNotIn('<script src', p)
         self.assertNotIn('<img', p)
+        # SVG 命名空间是 URI 标识符而非外链资源 (浏览器从不 dereference),
+        # createElementNS 必需; 白名单这一处, 其余 http(s):// 一律禁止。
+        p = p.replace('"http://www.w3.org/2000/svg"', "")
         for bad in ('http://', 'https://'):
             self.assertNotIn(bad, p, "外链资源: %s" % bad)
+        self.assertIn('"http://www.w3.org/2000/svg"', self.page,
+                      "createElementNS 的 SVG 命名空间常量必须存在")
 
     def test_no_template_placeholder(self):
         self.assertNotIn('{profile}', self.page)
@@ -69,6 +80,30 @@ class TestGuiPage(unittest.TestCase):
         self.assertIn('/api/report', p)
         self.assertIn('/api/netstatus', p)
         self.assertIn('sendBeacon', p)
+        # v1.22.0 盯障: 五条 API + createElementNS 逐点绘制 + confirm 后停止
+        for api in ("/api/monitor/progress", "/api/monitor/curve",
+                    "/api/monitor/report", "/api/monitor/start",
+                    "/api/monitor/stop"):
+            self.assertIn(api, p, "盯障 API 缺失: %s" % api)
+        self.assertIn("createElementNS", p,
+                      "曲线 SVG 必须用 createElementNS 逐点绘制")
+        self.assertIn("confirm(", p, "停止盯障必须先 confirm")
+
+    def test_monitor_view_anchors(self):
+        # P6: 三视图锚点 + 第 7 卡链路 (图标常量 / data-p 机制 / 元数据通道)
+        p = self.page
+        for vid in ("view-mon-config", "view-mon-live", "view-mon-report"):
+            self.assertIn('id="%s"' % vid, p, "缺视图锚点: %s" % vid)
+        self.assertIn('show("mon-config")', p, "第 7 卡点击必须进配置页")
+        self.assertIn('show("mon-live")', p, "runbar 必须能回实时页")
+        self.assertIn("monitor: '<svg", p, "第 7 卡图标常量缺失")
+        self.assertIn("dataset.p", p, "卡片 data-p 机制缺失")
+        # 第 7 卡数据通道: /api/scenarios 下发 monitor 条目 (与终端菜单同语义)
+        meta = np._gui_meta()
+        mon = [s for s in meta["scenarios"] if s["id"] == "monitor"]
+        self.assertEqual(len(mon), 1, "场景载荷缺「持续盯障」条目")
+        self.assertEqual(mon[0]["label"], "持续盯障")
+        self.assertIn("偶发掉线", mon[0]["desc"])
 
     def test_no_innerhtml_interpolation(self):
         # F3 (审查): 新闸 —— += 形态与 insertAdjacentHTML 非常量参数都要拦

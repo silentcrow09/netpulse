@@ -14,6 +14,8 @@ ping, 不写真实报告目录。
   P6 互斥: session running → monitor.start 拒; monitor running → session 拒;
      同类 running → 二次 start 拒
   P7 report_html: 文件存在 → bytes; 文件被删/无报告 → None
+  P8 编排落盘后 progress_payload 带报告页结论块 (verdict/conclusion/advice/
+     early/files + targets/error 元信息); running 期不含 verdict
 """
 import os
 import shutil
@@ -360,6 +362,44 @@ class TestGuiMonitor(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         self.assertIsNone(np._GuiMonitor().report_html())   # 无报告 → None
+
+    # -- P8 编排落盘后的结论块 (Task 3 报告页数据源) --
+
+    def test_progress_payload_outcome_after_done(self):
+        # 落盘完成后 progress_payload 必须带报告页结论条所需字段:
+        # verdict/conclusion/advice/early/files; running 期不下发 verdict
+        # (报告尚未生成, 前端不得提前渲染结论)。
+        m = np._GuiMonitor()
+        fake = self._fake_session()
+        fake.build_result.return_value = {
+            "verdict": "degraded", "conclusion_text": "外网抖动两段",
+            "advice": "查光猫光衰"}
+        rec, p_ms, p_save = self._patch_ms(fake)
+        with p_ms, p_save:
+            ok, err, _ = m.start(600, ext_target="1.2.3.4")
+            self.assertTrue(ok, err)
+            running_payload = m.progress_payload()
+            self.assertNotIn("verdict", running_payload)
+            m.stop()
+            m._thread.join(timeout=5)
+        self.assertEqual(m.snapshot()["phase"], "done")
+        # 载荷 ≥2s 节流: 回拨时间戳强制重算 (同 P5 手法), 立即读到 done 态
+        with m._lock:
+            m._ts_prog = 0.0
+        d = m.progress_payload()
+        self.assertEqual(d["phase"], "done")
+        self.assertEqual(d["verdict"], "degraded")
+        self.assertEqual(d["conclusion"], "外网抖动两段")
+        self.assertEqual(d["advice"], "查光猫光衰")
+        self.assertTrue(d["early"])
+        self.assertTrue(d["error"] is None)
+        # targets 元信息: 外网目标透传, 网关键存在 (替身会话未置 _gw_ip → None)
+        self.assertEqual(d["targets"]["ext"], "1.2.3.4")
+        self.assertIn("gw", d["targets"])
+        # files: 由 html 落盘名推三件套同名清单 (csv/json/html)
+        self.assertEqual(d["files"],
+                         ["monitor_x.csv", "monitor_x.json",
+                          "monitor_x.html"])
 
 
 if __name__ == "__main__":

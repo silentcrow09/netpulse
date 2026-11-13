@@ -22,6 +22,10 @@ v1.22.0 盯障路由 (Task 2):
   P12 Task 1 审查 4 条 Minor 回归: ①提交窗口内 stop 不丢 ②编排线程
       start 失败回滚 idle+清孤儿 ③int OverflowError 并入时长不合法
       ④curve_payload 返回缓存副本
+
+v1.22.0 页面资产 (Task 3):
+  P13 /api/shutdown 守卫: 盯障 running + 非 force → 409 (防丢当轮报告);
+      force 放行且先尽力 monitor.stop(); 诊断 running 的既有 409 保持
 """
 import json
 import os
@@ -135,8 +139,13 @@ class TestGuiServer(unittest.TestCase):
         self.assertEqual(st, 200)
         meta = json.loads(raw)
         ids = {s["id"] for s in meta["scenarios"]}
-        self.assertEqual(ids - {"site"}, set(np.DIAGNOSE_PROFILES))
+        self.assertEqual(ids - {"site", "monitor"}, set(np.DIAGNOSE_PROFILES))
         self.assertIn("site", ids)
+        # v1.22.0 第 7 卡「持续盯障」必须在场景载荷中 (页面按 payload 渲染)
+        mon = [s for s in meta["scenarios"] if s["id"] == "monitor"]
+        self.assertEqual(len(mon), 1)
+        self.assertEqual(mon[0]["label"], "持续盯障")
+        self.assertIn("偶发掉线", mon[0]["desc"])   # 与终端菜单同语义
         for st_cn, color in meta["status_colors"].items():
             self.assertEqual(np.STATUS_COLORS.get(np.STATUS_KEY.get(st_cn)),
                              color, "状态色必须来自 STATUS_COLORS")
@@ -190,6 +199,29 @@ class TestGuiServer(unittest.TestCase):
                        body={"force": False})
         self.assertEqual(st, 200)
         self.assertTrue(self.evt.is_set())
+
+    def test_shutdown_guard_monitor_running(self):
+        # P13 (Task 3 生命周期必收项): 盯障 running 时非 force 关停必须
+        # 409 (防丢当轮报告 + 孤儿 ping -t); force 放行且先尽力 monitor.stop()。
+        tok = "?t=" + self.token
+        mon = np._GuiHandler.monitor      # setUp 缺省自建的实例
+        mon._phase = "running"            # 直摆忙 (同 P10 手法)
+        st, raw = _req(self.port, "POST", "/api/shutdown" + tok,
+                       body={"force": False})
+        self.assertEqual(st, 409)
+        self.assertFalse(self.evt.is_set())       # 未放行退出
+        st, raw = _req(self.port, "POST", "/api/shutdown" + tok,
+                       body={"force": True})
+        self.assertEqual(st, 200)
+        self.assertTrue(self.evt.is_set())        # force 放行
+        self.assertTrue(mon._stop_requested)      # 放行前已尽力停止盯障
+        # 诊断 running 的既有 409 口径保持不变 (回归锁)
+        self.evt.clear()
+        mon._phase = "idle"
+        self.session._phase = "running"
+        st, _ = _req(self.port, "POST", "/api/shutdown" + tok,
+                     body={"force": False})
+        self.assertEqual(st, 409)
 
     def test_run_conflict_409(self):
         self.session._phase = "running"     # 直接摆成忙

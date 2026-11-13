@@ -25008,6 +25008,7 @@ class _GuiMonitor:
         self._early = False
         self._error = None
         self._paths = None            # {"html": ..., "json": ...}
+        self._outcome = None          # v1.22.0: done 态结论块 (报告页数据源)
         self._session = None          # MonitorSession (复用, 零修改)
         self._stop_evt = threading.Event()
         self._thread = None
@@ -25154,6 +25155,13 @@ class _GuiMonitor:
                 self._ended_at = time.time()
                 if paths:
                     self._paths = {"html": paths[0], "json": paths[1]}
+                    # v1.22.0 (Task 3): 结论三件套只在此暂存, 经
+                    # progress_payload 在 done 态下发 (报告页结论条数据源;
+                    # running 期不下发, 前端不得提前渲染结论)
+                    self._outcome = {
+                        "verdict": res.get("verdict"),
+                        "conclusion": res.get("conclusion_text"),
+                        "advice": res.get("advice")}
                     self._phase = "done"
                 else:
                     self._phase = "error"
@@ -25206,7 +25214,8 @@ class _GuiMonitor:
     def _compute_progress(self, now):
         """进度载荷重算 (持有 _lock): 10s 窗口连通计数 (与 progress_line
         同窗) + 全程丢包率 + 事件预览 (独立 ≥5s 节流)。session 缺席
-        (未启动) 返回空壳。"""
+        (未启动) 返回空壳。v1.22.0 附 targets/error 元信息; done 态附
+        报告页结论块 (verdict/conclusion/advice/early/files)。"""
         payload = {
             "phase": self._phase,
             "elapsed_s": self._elapsed_s(),
@@ -25218,10 +25227,19 @@ class _GuiMonitor:
             "events_preview": {k: 0 for k in ("outage", "dns_fail",
                                               "jitter_burst", "latency_spike")},
             "load": self._load,
+            "targets": {"gw": None,
+                        "ext": self._ext_target or "223.5.5.5"},
+            "error": self._error,
         }
         session = self._session
         if session is None:
             return payload
+        # 网关 IP 由 MonitorSession.start 解析 (同模块私有态只读, 供实时页
+        # 「网关 x.x.x.x · 外网 x.x.x.x」元信息行)。isinstance 守卫: 真实
+        # 会话是 str|None; 测试替身 (Mock) 的动态属性不是 str → 下发 None,
+        # 不污染 JSON 载荷。
+        gw_ip = getattr(session, "_gw_ip", None)
+        payload["targets"]["gw"] = gw_ip if isinstance(gw_ip, str) else None
         snap = session.snapshot()
         win0 = now - 10.0
         for key in ("gw", "ext"):
@@ -25236,6 +25254,18 @@ class _GuiMonitor:
         if snap["tcp"]:
             payload["connect"]["tcp_ok"] = snap["tcp"][-1][1] is not None
         payload["events_preview"] = self._compute_events(now, snap)
+        if self._phase == "done" and self._outcome is not None:
+            # v1.22.0 (Task 3): done 态结论块 — verdict 三件套 + 提前终止
+            # 标 + 三件套文件名 (csv/json/html 同名同 stamp, 由 html 推导)
+            payload["verdict"] = self._outcome.get("verdict")
+            payload["conclusion"] = self._outcome.get("conclusion")
+            payload["advice"] = self._outcome.get("advice")
+            payload["early"] = self._early
+            stem = os.path.splitext(os.path.basename(
+                (self._paths or {}).get("html") or ""))[0]
+            if stem:
+                payload["files"] = [stem + ".csv", stem + ".json",
+                                    stem + ".html"]
         return payload
 
     @staticmethod
@@ -25341,13 +25371,15 @@ class _GuiMonitor:
 # ────────────────────────────────────────────────────────────────────────────
 # GUI 单页资产 (v1.21.0 Task 3): 纯静态壳。动态数据全部经 API + JS textContent
 # 渲染, 本区段零插值、零外链 (无 http(s):// / <link / <script src / <img),
-# 由 tests/test_gui_page.py 闸住。
+# 由 tests/test_gui_page.py 闸住。v1.22.0 追加盯障三视图 (mon-config/mon-live/
+# mon-report) 与主页第 7 卡, 曲线 SVG 由 JS createElementNS 逐点绘制。
 # 视觉规范: design_ref/gui/gui_design_v1.html 方案A「亮色仪表盘」(第 1 节主页 /
 # 第 3 节进度 / 第 4 节报告 / 第 5 节现场检测), :root 变量逐字一致, 图标为
-# 设计稿内联 SVG; 设计稿 1160px 画布概念对应满窗口布局 (GUI 是真实窗口)。
-# 状态色唯一来源服务端: 亮灯点颜色由 JS 从 /api/scenarios 的 status_colors
-# 注入 style, CSS 只定义形状/边框; 「进行中」蓝脉冲是 UI 态 (品牌蓝), 不是
-# 状态色轴上的值, 因此允许出现在 CSS。
+# 设计稿内联 SVG; 盯障三视图对齐 design_ref/gui/monitor_design_v1.html
+# (Simon 已确认定稿); 设计稿 1160px 画布概念对应满窗口布局 (GUI 是真实窗口)。
+# 状态色唯一来源服务端: 亮灯点/四路状态点颜色由 JS 从 /api/scenarios 的
+# status_colors 注入 style, CSS 只定义形状/边框; 「进行中」蓝脉冲是 UI 态
+# (品牌蓝), 不是状态色轴上的值, 因此允许出现在 CSS。
 # ────────────────────────────────────────────────────────────────────────────
 
 _GUI_CSS = """
@@ -25529,6 +25561,143 @@ iframe#g-frame{ width:100%; height:calc(100vh - 120px); border:0; margin-top:16p
 .g-siteit b{ font-size:13.5px; font-weight:600; }
 #site-items select{ height:32px; border:1px solid var(--rule); border-radius:7px; padding:0 10px;
                     font-size:12.5px; color:var(--text); background:#fff; }
+
+/* ── 盯障三视图 (v1.22.0, design_ref/gui/monitor_design_v1.html 三节 1:1) ──
+   四路状态点/✓✗ 的颜色属状态语义轴, 由 JS 从 status_colors 注入, CSS 只定
+   形状 (与主页亮灯点同规); 曲线/事件计数的红琥珀灰是设计稿的严重度口音色,
+   不在状态轴上, 随设计稿保留为类。 */
+.btn{ display:inline-flex; align-items:center; gap:8px; border-radius:7px; font-size:13px;
+      font-weight:600; padding:9px 18px; letter-spacing:.3px; }
+.btn svg{ width:15px; height:15px; }
+.btn-primary{ background:var(--navy); border:1px solid var(--navy); color:#fff; }
+.btn-primary:hover{ background:var(--navy-2); border-color:var(--navy-2); }
+.btn-line{ background:#fff; border:1px solid var(--rule); color:var(--text); }
+.btn-line:hover{ background:var(--soft); }
+.btn-danger{ background:#fff; border:1px solid var(--red); color:var(--red); font-weight:700; }
+.btn-danger:hover{ background:#fdf3f2; }
+.alt-note{ font-size:12.5px; color:var(--mute); }
+.backlink{ font-size:12.5px; color:var(--mute); background:none; border:none; padding:0; }
+.backlink:hover{ color:var(--navy); }
+.fcard{ border:1px solid var(--rule); border-radius:12px; padding:22px 26px 24px; background:#fff; }
+.field{ margin-bottom:18px; }
+.field:last-of-type{ margin-bottom:20px; }
+.flabel{ font-size:13px; font-weight:600; margin-bottom:7px; }
+.input{ width:100%; height:38px; border:1px solid var(--rule); border-radius:7px; padding:0 13px;
+        font-size:13.5px; font-family:inherit; color:var(--text); background:#fff; }
+.input::placeholder{ color:#a8b2bd; }
+.fhint{ font-size:11.5px; color:var(--mute); margin-top:6px; }
+.form-foot{ display:flex; align-items:center; gap:14px; margin-top:4px; }
+.g-badge{ background:var(--green); color:#fff; font-size:13px; font-weight:700; letter-spacing:1.5px;
+          padding:5px 15px; border-radius:6px; white-space:nowrap; }
+.g-badge.warn{ background:var(--amber); }
+.g-badge.bad{ background:var(--red); }
+.g-badge.dim{ background:var(--mute); }
+.pbar{ height:10px; background:#eef1f5; border:1px solid var(--rule); border-radius:999px;
+       margin-top:16px; position:relative; overflow:hidden; }
+.pbar i{ position:absolute; top:0; bottom:0; left:0; width:0; background:var(--navy-2);
+         border-radius:999px; transition:width .3s; }
+.cfg{ padding:30px 36px 28px; }
+.cfg .fcard{ max-width:780px; margin:0 auto; }
+.cfg-h{ font-size:21px; font-weight:800; letter-spacing:.3px; }
+.cfg-sub{ font-size:13px; color:var(--dim); margin-top:4px; padding-bottom:16px;
+          border-bottom:1px solid var(--soft); margin-bottom:18px; }
+.chips{ display:flex; align-items:stretch; gap:10px; flex-wrap:wrap; }
+.chip{ border:1px solid var(--rule); background:#fff; border-radius:8px; padding:4px 16px; height:52px;
+       display:flex; flex-direction:column; justify-content:center; text-align:center; }
+.chip:hover{ border-color:var(--navy-2); }
+.chip b{ display:block; font-size:14px; font-weight:700; letter-spacing:.2px; line-height:1.45; }
+.chip small{ display:block; font-size:10.5px; color:var(--mute); margin-top:1px; letter-spacing:.5px;
+             line-height:1.3; }
+.chip.on{ background:var(--navy); border-color:var(--navy); }
+.chip.on b{ color:#fff; }
+.chip.on small{ color:#b9cde2; }
+.chip-ct{ display:flex; align-items:center; gap:7px; border:1px solid var(--rule); border-radius:8px;
+          background:#fff; padding:0 14px; height:52px; }
+.chip-ct input{ border:none; outline:none; width:86px; height:50px; font-family:inherit; font-size:14px;
+                color:var(--text); background:transparent; }
+.chip-ct .suf{ font-size:12px; color:var(--mute); }
+.swrow{ display:flex; align-items:center; gap:12px; height:38px; }
+.switch{ width:42px; height:24px; border-radius:999px; background:#c9d1da; position:relative; flex:none;
+         border:none; padding:0; }
+.switch i{ position:absolute; top:3px; left:3px; width:18px; height:18px; border-radius:50%;
+           background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.25); transition:left .15s; }
+.switch.on{ background:var(--navy-2); }
+.switch.on i{ left:21px; }
+.swstate{ font-size:13px; font-weight:700; color:var(--dim); }
+.mn{ padding:28px 36px 24px; }
+.mn-top{ display:flex; align-items:flex-end; gap:28px; padding-bottom:18px;
+         border-bottom:1px solid var(--rule); }
+.mn-num{ font-size:44px; font-weight:800; letter-spacing:-1px; line-height:1; color:var(--navy); }
+.mn-num small{ font-size:17px; font-weight:700; color:var(--mute); letter-spacing:0; margin-left:6px; }
+.mn-conn{ padding-bottom:4px; }
+.mn-conn .lab{ font-size:11px; letter-spacing:2px; color:var(--mute); font-weight:700; }
+.mn-conn .v{ font-size:21px; font-weight:700; margin-top:2px; }
+.mn-meta{ margin-left:auto; text-align:right; font-size:12px; color:var(--dim); padding-bottom:6px; }
+.badge-run{ margin-left:0; margin-bottom:6px; display:inline-flex; align-items:center; gap:8px;
+            background:var(--navy-2); color:#fff; font-size:13px; font-weight:700; letter-spacing:1.5px;
+            padding:6px 16px; border-radius:999px; }
+.badge-run i{ width:8px; height:8px; border-radius:50%; background:#fff;
+              animation:mblink 1.6s ease-out infinite; }
+@keyframes mblink{ 0%{ opacity:1; } 50%{ opacity:.35; } 100%{ opacity:1; } }
+.quad{ display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:20px; }
+.qcell{ background:var(--soft); border:1px solid var(--rule); border-radius:10px; padding:12px 16px 11px; }
+.q-top{ display:flex; align-items:center; gap:9px; }
+.qdot{ width:10px; height:10px; border-radius:50%; flex:none; background:transparent;
+       border:1.5px solid var(--mute); }
+.qname{ font-size:14.5px; font-weight:700; }
+.qmark{ font-size:13px; font-weight:800; margin-left:2px; }
+.qsub{ font-size:12px; color:var(--dim); margin-top:5px; }
+.qsub b{ font-weight:700; }
+.chart-card{ border:1px solid var(--rule); border-radius:12px; background:#fff; padding:14px 20px 10px;
+             margin-top:16px; }
+.cap-row{ display:flex; align-items:baseline; }
+.cap-row .lab{ font-size:11px; letter-spacing:2.5px; color:var(--mute); font-weight:700; }
+.cap-row .r{ margin-left:auto; font-size:11.5px; color:var(--mute); }
+.chart-holder{ width:840px; max-width:100%; margin:4px auto 0; }
+.chart-svg{ display:block; width:100%; height:auto; }
+.chart-svg text{ font-family:inherit; }
+.chart-svg .t{ font-size:11px; fill:var(--mute); }
+.chart-svg .t.dim{ fill:var(--dim); }
+.chart-svg .t.end{ text-anchor:end; }
+.chart-svg .t.mid{ text-anchor:middle; }
+.chart-svg .ax{ stroke:var(--rule); stroke-width:1; }
+.chart-svg .ax.base{ stroke:#d3d9e1; }
+.chart-svg .ln{ fill:none; stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
+.chart-svg .ln.gw{ stroke:var(--navy); }
+.chart-svg .ln.wan{ stroke:var(--amber); }
+.chart-svg .lgw.gw{ fill:var(--navy); }
+.chart-svg .lgw.wan{ fill:var(--amber); }
+.chart-svg .loss{ fill:#fff; stroke:var(--red); stroke-width:2; }
+.chart-svg .chipbg{ fill:var(--soft); stroke:var(--rule); }
+.ev-grid{ display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:10px; }
+.evcard{ background:#fff; border:1px solid var(--rule); border-radius:10px; padding:12px 16px 10px; }
+.ev-num{ font-size:24px; font-weight:800; line-height:1.15; }
+.ev-num .u{ font-size:12px; font-weight:600; color:var(--mute); margin-left:2px; letter-spacing:0; }
+.ev-num.red{ color:var(--red); }
+.ev-num.amber{ color:var(--amber); }
+.ev-num.dim{ color:var(--dim); }
+.ev-lab{ font-size:12px; color:var(--dim); margin-top:2px; letter-spacing:.5px; }
+.loadbar{ margin-top:16px; display:flex; align-items:center; gap:12px;
+          background:#faf5ea; border:1px solid #e8dcc2; border-left:3px solid var(--amber);
+          border-radius:10px; padding:10px 18px; font-size:12.5px; color:var(--dim); }
+.loadbar svg{ width:16px; height:16px; flex:none; color:var(--amber); }
+.loadbar b{ color:var(--text); }
+.mn-foot{ margin-top:20px; padding-top:16px; border-top:1px solid var(--rule); display:flex;
+          align-items:center; gap:14px; }
+.mn-back{ margin-left:auto; font-size:12.5px; color:var(--mute); background:none; border:none;
+          padding:0; }
+.mn-back:hover{ color:var(--navy); }
+.mrp{ padding:28px 36px 30px; }
+.mrp-conc{ display:flex; align-items:center; gap:20px; background:var(--soft); border:1px solid var(--rule);
+           border-radius:12px; padding:18px 24px; }
+.mrp-line{ font-size:15px; font-weight:700; }
+.mrp-sug{ font-size:12.5px; color:var(--dim); margin-top:4px; }
+.mrp-tag{ margin-left:auto; align-self:flex-start; flex:none; font-size:11px; color:var(--mute);
+          border:1px solid var(--rule); background:#fff; border-radius:999px; padding:3px 12px;
+          letter-spacing:.5px; white-space:nowrap; }
+.mrp-actions{ display:flex; gap:10px; margin-top:18px; }
+.mrp-files{ margin-top:10px; font-size:12px; color:var(--mute); }
+iframe#mon-frame{ width:100%; height:calc(100vh - 300px); border:0; margin-top:16px; }
 """
 
 _GUI_JS = r"""(function () {
@@ -25544,7 +25713,12 @@ _GUI_JS = r"""(function () {
     siteStart: Q("/api/site/start"),
     siteFinish: Q("/api/site/finish"),
     netstatus: Q("/api/netstatus"),
-    shutdown: Q("/api/shutdown")
+    shutdown: Q("/api/shutdown"),
+    monProgress: Q("/api/monitor/progress"),
+    monCurve: Q("/api/monitor/curve"),
+    monReport: Q("/api/monitor/report"),
+    monStart: Q("/api/monitor/start"),
+    monStop: Q("/api/monitor/stop")
   };
   // 场景卡图标 (内联 SVG 常量, 复制自 design_ref/gui/gui_design_v1.html 第 1 节;
   // 键 = DIAGNOSE_PROFILES profile id + site / full)。纯常量模板、不含变量插值,
@@ -25556,12 +25730,16 @@ _GUI_JS = r"""(function () {
     gaming: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="7.5" width="19" height="9.5" rx="4.75"/><path d="M8 10.2v4M6 12.2h4"/><circle cx="15.6" cy="11" r="1" fill="currentColor" stroke="none"/><circle cx="18" cy="13.4" r="1" fill="currentColor" stroke="none"/></svg>',
     wifi: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 10.2a11.5 11.5 0 0 1 15 0" opacity=".22"/><path d="M7.3 13.2a7.5 7.5 0 0 1 9.4 0" opacity=".45"/><path d="M10 16.1a3.6 3.6 0 0 1 4 0"/><circle cx="12" cy="18.7" r="1.2" fill="currentColor" stroke="none"/></svg>',
     site: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-13a2 2 0 0 0-2-2h-2"/><rect x="9" y="2.5" width="6" height="4" rx="1"/><path d="M8.8 13.5l2.3 2.3 4.3-4.6"/></svg>',
-    full: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/><path d="M7 13h6M7 16h4"/></svg>'
+    full: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/><path d="M7 13h6M7 16h4"/></svg>',
+    monitor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13.5" r="7.5"/><path d="M12 10v3.5l2.5 2"/><path d="M9.5 3.5h5"/><path d="M12 3.5v2.5"/></svg>'
   };
   var COLORS = {};          // {状态中文: 颜色} — 来自 /api/scenarios, 唯一来源服务端
   var GRADES = {};          // {等级: 颜色} — 同一载荷 grade_colors, 结论条徽章用
   var state = { view: "home", pollTimer: null, data: null, meta: null,
-                leftProgress: false, siteFlow: false };
+                leftProgress: false, siteFlow: false,
+                // v1.22.0 盯障: phase 随 monPoll 刷新 (关窗守卫/主页状态用)
+                diagRunning: false, monPhase: null, monTimer: null,
+                monLast: null, monLoad: false, monMins: 30, curMs: {} };
 
   function $(s) { return document.querySelector(s); }
   function el(tag, cls, text) {
@@ -25577,10 +25755,11 @@ _GUI_JS = r"""(function () {
   }
   function get(url) { return fetch(url).then(function (r) { return r.json(); }); }
 
-  // ── 视图切换: 四个 section, display 控制 ──
+  // ── 视图切换: 七个 section, display 控制 ──
   function show(view) {
     state.view = view;
-    ["home", "progress", "report", "site"].forEach(function (v) {
+    ["home", "progress", "report", "site",
+     "mon-config", "mon-live", "mon-report"].forEach(function (v) {
       var n = $("#view-" + v);
       if (n) n.style.display = (v === view) ? "" : "none";
     });
@@ -25603,6 +25782,9 @@ _GUI_JS = r"""(function () {
       c.appendChild(el("span", "g-card-go", "点击开始 →"));
       if (s.id === "site") {
         c.addEventListener("click", function () { show("site"); });
+      } else if (s.id === "monitor") {
+        // v1.22.0 第 7 卡「持续盯障」→ 配置页
+        c.addEventListener("click", function () { show("mon-config"); });
       } else {
         c.addEventListener("click", function () { startRun(s.id); });
       }
@@ -25620,16 +25802,39 @@ _GUI_JS = r"""(function () {
     });
   }
 
-  // ── 主页三态同步 (终审 F2): 诊断进行中置灰全部场景卡 + 顶部运行条 +
-  // 「查看上次报告」入口。pollOnce 每拍调用一次; DOMContentLoaded 的首拍
-  // 即覆盖刷新页面场景 (running 中刷新 → 卡片仍置灰、运行条仍可见)。
+  // ── 主页状态合成 (终审 F2 + v1.22.0 盯障扩展): pollOnce / monPoll 两路
+  // 轮询各自刷新 state, 统一在这里落 DOM ——
+  //   诊断 running → 全部卡禁用 + 运行条「诊断进行中」;
+  //   盯障 running → 除盯障卡外全部禁用 + 运行条「盯障进行中」(点回实时页);
+  //   盯障 done   → 运行条「盯障完成」(点开报告)。
   function updateHomeState(d) {
-    var running = d.phase === "running";
+    state.diagRunning = d.phase === "running";
+    applyHomeState();
+  }
+  function applyHomeState() {
+    var diagRun = !!state.diagRunning;
+    var monRun = state.monPhase === "running";
+    var monDone = state.monPhase === "done";
     document.querySelectorAll("#cards .g-card").forEach(function (c) {
-      c.disabled = running;
+      if (monRun) {
+        c.disabled = c.dataset.p !== "monitor";
+      } else {
+        c.disabled = diagRun;      // 诊断/现场进行中: 含盯障卡全禁用
+      }
     });
-    $("#g-runbar").style.display = running ? "" : "none";
-    $("#g-lastrep").style.display = d.has_report ? "" : "none";
+    var bar = $("#g-runbar");
+    if (monRun) {
+      bar.style.display = "";
+      bar.textContent = "盯障进行中 · 点击查看";
+    } else if (monDone) {
+      bar.style.display = "";
+      bar.textContent = "盯障完成 · 点击查看报告";
+    } else {
+      bar.textContent = "诊断进行中 · 点击查看进度";
+      bar.style.display = diagRun ? "" : "none";
+    }
+    $("#g-lastrep").style.display =
+      (state.data && state.data.has_report) ? "" : "none";
   }
 
   // ── 进度页轮询 (1s) ──
@@ -25814,6 +26019,292 @@ _GUI_JS = r"""(function () {
     });
   }
 
+  // ── v1.22.0 盯障 (mon-config → mon-live → mon-report) ──
+  // 数据通道: /api/monitor/progress (1s 轮询) + /api/monitor/curve (前端
+  // 只管拉, 服务端 ≥5s 节流)。文本一律 textContent; 曲线几何 (数值计算
+  // 的坐标) 经 setAttribute 写入 SVG 属性 — innerHTML 闸禁用。四路状态
+  // 点色取自 status_colors (状态轴不内嵌), 曲线/事件红琥珀随设计稿类名。
+  var VERDICTS = {
+    stable: ["网络稳定", ""], degraded: ["质量劣化", "warn"],
+    mixed: ["混合问题", "bad"], internal: ["内网侧问题", "bad"],
+    carrier: ["运营商侧问题", "bad"], dns: ["解析侧问题", "warn"],
+    target_unreachable: ["目标不可达", "warn"],
+    no_data: ["无有效数据", "dim"]
+  };
+  var SVGNS = "http://www.w3.org/2000/svg";
+
+  function mmss(s) {
+    s = Math.max(0, Math.round(s || 0));
+    var m = Math.floor(s / 60), r = s % 60;
+    return m + ":" + (r < 10 ? "0" : "") + r;
+  }
+  function fmtDur(s) {
+    if (s % 60 === 0) return (s / 60) + " 分钟";
+    return s + " 秒";
+  }
+
+  function setChip(min) {
+    state.monMins = min;
+    document.querySelectorAll("#mon-chips .chip").forEach(function (c) {
+      c.className = "chip" + (Number(c.dataset.min) === min ? " on" : "");
+    });
+  }
+  function monMinutes() {
+    var raw = $("#mon-min-custom").value.trim();
+    if (!raw) return state.monMins;
+    var n = Number(raw);
+    if (!isFinite(n) || n <= 0 || Math.floor(n) !== n) return null;
+    return n;
+  }
+
+  function startMon() {
+    var mins = monMinutes();
+    var msg = $("#mon-cfg-msg");
+    msg.style.color = "";
+    if (mins === null) { msg.textContent = "请输入有效的盯障分钟数"; return; }
+    var body = { minutes: mins, load: state.monLoad };
+    var target = $("#mon-target").value.trim();
+    if (target) body.target = target;
+    post(API.monStart, body).then(function (r) {
+      if (r && r.ok) {
+        state.monPhase = "running";
+        $("#mon-live-err").textContent = "";
+        if (r.effective_s !== mins * 60) {
+          // 钳位回显 (就地留在配置页, 返回时可见; 实时页计时按真实值走)
+          msg.style.color = "var(--green)";
+          msg.textContent = "已按 " + fmtDur(r.effective_s) +
+            " 执行（最短 30 秒，最长 24 小时）";
+        } else {
+          msg.textContent = "";
+        }
+        show("mon-live");
+        startMonPoll();
+      } else if (r && r.reason === "busy") {
+        msg.textContent = "已有网络活动在进行中";
+      } else {
+        msg.textContent = (r && r.err) || "启动失败";
+      }
+    });
+  }
+  function stopMon() {
+    if (!confirm("确认提前结束本次盯障？结束后自动生成报告。")) return;
+    post(API.monStop, {}).then(function (r) {
+      if (!(r && r.ok)) {
+        $("#mon-live-err").textContent = (r && r.err) || "停止失败";
+      }
+    });
+  }
+
+  function startMonPoll() {
+    if (!state.monTimer) {
+      monPoll();
+      state.monTimer = setInterval(monPoll, 1000);
+    }
+  }
+  function stopMonPoll() {
+    if (state.monTimer) { clearInterval(state.monTimer); state.monTimer = null; }
+  }
+  function monPoll() {
+    get(API.monProgress).then(function (d) {
+      state.monLast = d;
+      state.monPhase = d.phase;
+      if (d.phase === "running") {
+        renderMonLive(d);
+        startMonPoll();               // 续 1s (幂等)
+        get(API.monCurve).then(drawCurve);
+      } else {
+        stopMonPoll();
+        if (d.phase === "done") {
+          // 到时/停止收尾完成 → 实时页在前台就直接进报告页
+          if (state.view === "mon-live") openMonReport();
+        } else if (d.phase === "error") {
+          $("#mon-live-err").textContent = d.error || "盯障失败";
+        } else if (state.view === "mon-live") {
+          // 启动竞态兜底: 实时页在前台但服务端瞬时 idle (start 应答与
+          // 置位间的窄窗) → 续轮, 不让页面停在无轮询的死态
+          // (与诊断轮询 siteFlow+idle 续轮同款先例)
+          startMonPoll();
+        }
+      }
+      applyHomeState();
+    });
+  }
+
+  function renderMonLive(d) {
+    $("#mon-elapsed").textContent = mmss(d.elapsed_s);
+    $("#mon-total").textContent = "/ " + mmss(d.duration_s);
+    var pct = d.duration_s
+      ? Math.min(100, Math.round(d.elapsed_s * 100 / d.duration_s)) : 0;
+    $("#mon-pbar").style.width = pct + "%";
+    var loss = d.loss_pct ? d.loss_pct.ext : null;
+    $("#mon-conn").textContent =
+      (loss === null || loss === undefined) ? "—" : (100 - loss).toFixed(1) + "%";
+    var tg = d.targets || {};
+    $("#mon-meta").textContent =
+      "网关 " + (tg.gw || "—") + " · 外网 " + (tg.ext || "—");
+    renderQuad(d);
+    renderMonEvents(d);
+    var bar = $("#mon-loadbar");
+    if (d.load) {
+      bar.style.display = "";
+      $("#mon-load-txt").textContent =
+        "主动负载已开启（开始 60 秒后施加 15 秒下载负载）";
+    } else {
+      bar.style.display = "none";
+    }
+  }
+
+  // 四路状态行: ✓ 绿 / ✗ 红 / 等待灰 (色取 status_colors, CSS 只定形状)
+  function qCell(name, st, sub) {
+    var cell = el("div", "qcell");
+    var top = el("div", "q-top");
+    var dot = el("i", "qdot");
+    var mark = el("span", "qmark");
+    if (st === "ok") {
+      dot.style.background = COLORS["完成"] || "";
+      dot.style.border = "none";
+      mark.textContent = "✓";
+      mark.style.color = COLORS["完成"] || "";
+    } else if (st === "err") {
+      dot.style.background = COLORS["异常"] || "";
+      dot.style.border = "none";
+      mark.textContent = "✗";
+      mark.style.color = COLORS["异常"] || "";
+    } else {
+      dot.style.border = "1.5px solid " + (COLORS["未检测"] || "#94a3b8");
+    }
+    top.appendChild(dot);
+    top.appendChild(el("span", "qname", name));
+    top.appendChild(mark);
+    cell.appendChild(top);
+    cell.appendChild(el("div", "qsub num", sub));
+    return cell;
+  }
+  function msTxt(v) {
+    return (v === null || v === undefined) ? "—" : v + "ms";
+  }
+  function renderQuad(d) {
+    var grid = $("#mon-quad");
+    grid.textContent = "";
+    var c = d.connect || {};
+    var gw = c.gw || {}, ext = c.ext || {};
+    var ev = d.events_preview || {};
+    var gwData = (gw.ok || 0) + (gw.loss10 || 0) > 0;
+    var extData = (ext.ok || 0) + (ext.loss10 || 0) > 0;
+    grid.appendChild(qCell("网关",
+      gwData ? (gw.ok > 0 ? "ok" : "err") : "wait",
+      "当前 " + msTxt(state.curMs.gw) + " · 丢包 " +
+      (gwData ? String(gw.loss10 || 0) : "—")));
+    grid.appendChild(qCell("外网",
+      extData ? (ext.ok > 0 ? "ok" : "err") : "wait",
+      "当前 " + msTxt(state.curMs.ext) + " · 丢包 " +
+      (extData ? String(ext.loss10 || 0) : "—")));
+    grid.appendChild(qCell("DNS", c.dns_ok ? "ok" : "err",
+      "失败 " + (ev.dns_fail || 0)));
+    grid.appendChild(qCell("TCP", c.tcp_ok ? "ok" : "err",
+      c.tcp_ok ? "正常" : "失败 · 未恢复"));
+  }
+
+  // 事件计数四卡 (前台粗略提示, 0 值灰色弱化)
+  function renderMonEvents(d) {
+    var grid = $("#mon-events");
+    grid.textContent = "";
+    var ev = d.events_preview || {};
+    [["outage", "中断", "red"], ["latency_spike", "高延迟", "amber"],
+     ["jitter_burst", "抖动", "amber"], ["dns_fail", "DNS 失败", "amber"]
+    ].forEach(function (def) {
+      var n = ev[def[0]] || 0;
+      var card = el("div", "evcard");
+      var num = el("div", "ev-num " + (n ? def[2] : "dim") + " num");
+      num.appendChild(document.createTextNode(String(n)));
+      num.appendChild(el("span", "u", "次"));
+      card.appendChild(num);
+      card.appendChild(el("div", "ev-lab", def[1]));
+      grid.appendChild(card);
+    });
+  }
+
+  // 延迟双曲线: createElementNS 逐点绘制。窗口 0..window_s 映射 x 50..830,
+  // ms 0..500 映射 y 210..34 (上限截断); 丢包点 (ms=null) 画红圈进顶层
+  // mon-loss-g (设计稿 z 序: 红圈压在两条折线之上), 折线在丢包处断开;
+  // 当前 ms 存 state.curMs 供四路状态行取数。
+  function drawCurve(c) {
+    var win = (c && c.window_s) || 600;
+    var lossG = $("#mon-loss-g");
+    if (lossG) lossG.textContent = "";
+    plotStream($("#mon-gw-g"), lossG, c && c.gw, win, "ln gw", "gw");
+    plotStream($("#mon-ext-g"), lossG, c && c.ext, win, "ln wan", "ext");
+  }
+  function plotStream(g, lossG, pts, win, cls, key) {
+    if (!g) return;
+    g.textContent = "";
+    var lastMs = null, lastY = 210, run = [];
+    (pts || []).forEach(function (p) {
+      var x = 50 + (p[0] / win) * 780;
+      if (x > 830) x = 830;
+      if (p[1] === null || p[1] === undefined) {
+        flushRun(g, run, cls);
+        run = [];
+        var dot = document.createElementNS(SVGNS, "circle");
+        dot.setAttribute("class", "loss");
+        dot.setAttribute("cx", x.toFixed(1));
+        dot.setAttribute("cy", lastY.toFixed(1));
+        dot.setAttribute("r", "4.5");
+        (lossG || g).appendChild(dot);
+      } else {
+        var y = 210 - p[1] * 0.352;
+        if (y < 34) y = 34;
+        if (y > 210) y = 210;
+        lastY = y;
+        lastMs = p[1];
+        run.push(x.toFixed(1) + "," + y.toFixed(1));
+      }
+    });
+    flushRun(g, run, cls);
+    state.curMs[key] = lastMs;
+  }
+  function flushRun(g, run, cls) {
+    if (run.length < 2) return;
+    var pl = document.createElementNS(SVGNS, "polyline");
+    pl.setAttribute("class", cls);
+    pl.setAttribute("points", run.join(" "));
+    g.appendChild(pl);
+  }
+
+  // 结束报告页: 结论条 (verdict 徽章 + 结论/建议 + 提前终止标) + 内嵌
+  // 整页报告 + 三件套文件行。数据取最近一次 progress 载荷的 done 态结论块。
+  function openMonReport() {
+    stopMonPoll();
+    var d = state.monLast || {};
+    var badge = $("#mon-verdict-badge");
+    var v = VERDICTS[d.verdict] || [d.verdict || "", "warn"];
+    badge.className = "g-badge" + (v[1] ? " " + v[1] : "");
+    badge.textContent = v[0];
+    $("#mon-conclusion").textContent = d.conclusion || "盯障报告已生成";
+    $("#mon-advice").textContent =
+      d.advice ? "建议：" + d.advice.split("\n").join("；") : "";
+    var tag = $("#mon-early-tag");
+    if (d.early) {
+      tag.style.display = "";
+      tag.textContent = "提前终止 · 实际 " + mmss(d.elapsed_s) +
+        " / 计划 " + mmss(d.duration_s);
+    } else {
+      tag.style.display = "none";
+    }
+    var files = $("#mon-files");
+    files.textContent = "";
+    if (d.files && d.files.length) {
+      files.appendChild(document.createTextNode(
+        "已生成盯障三件套（reports 文件夹）："));
+      d.files.forEach(function (f, i) {
+        if (i) files.appendChild(document.createTextNode(" · "));
+        files.appendChild(document.createTextNode(f));
+      });
+    }
+    $("#mon-frame").src = API.monReport;   // 每次进入强制重载
+    show("mon-report");
+  }
+
   // ── 导出按钮 ──
   function doExport(kind) {
     post(API.export, { kind: kind }).then(function (r) {
@@ -25823,17 +26314,23 @@ _GUI_JS = r"""(function () {
     });
   }
 
-  // ── 关窗生命周期: 空闲直接退出; 诊断中先确认 ──
+  // ── 关窗生命周期: 空闲直接退出; 诊断/盯障进行中先确认 (v1.22.0 纳入盯障) ──
   window.addEventListener("beforeunload", function (ev) {
-    var busy = state.data && state.data.phase === "running";
-    if (busy) {
+    var diag = state.data && state.data.phase === "running";
+    var mon = state.monPhase === "running";
+    if (diag || mon) {
       ev.preventDefault();
-      ev.returnValue = "诊断仍在进行, 关闭窗口将终止本次诊断";
+      ev.returnValue = mon
+        ? "盯障进行中，关闭窗口将终止本次盯障且丢失未生成的报告"
+        : "诊断仍在进行, 关闭窗口将终止本次诊断";
       return ev.returnValue;
     }
   });
   window.addEventListener("unload", function () {
-    var busy = state.data && state.data.phase === "running";
+    // beacon 语义不变: 忙 = 任一活动进行中 → force 关停 (服务端放行前
+    // 尽力 monitor.stop(), 不留孤儿 ping)
+    var busy = (state.data && state.data.phase === "running")
+      || state.monPhase === "running";
     if (navigator.sendBeacon) {
       navigator.sendBeacon(API.shutdown, JSON.stringify({ force: !!busy }));
     }
@@ -25878,14 +26375,54 @@ _GUI_JS = r"""(function () {
     });
     $("#btn-site-finish").addEventListener("click", finishSite);
     $("#btn-site-back").addEventListener("click", function () { show("home"); });
-    // 主页运行条 / 上次报告入口 (终审 F2)
+    // ── 盯障三视图 (v1.22.0) ──
+    document.querySelectorAll("#mon-chips .chip").forEach(function (c) {
+      c.addEventListener("click", function () {
+        $("#mon-min-custom").value = "";
+        setChip(Number(c.dataset.min));
+      });
+    });
+    $("#mon-min-custom").addEventListener("input", function () {
+      // 自定义分钟数生效时取消预设高亮; 清空则回落到已选预设
+      if (this.value.trim()) {
+        document.querySelectorAll("#mon-chips .chip").forEach(function (c) {
+          c.className = "chip";
+        });
+      } else {
+        setChip(state.monMins);
+      }
+    });
+    $("#mon-load-sw").addEventListener("click", function () {
+      state.monLoad = !state.monLoad;
+      this.className = "switch" + (state.monLoad ? " on" : "");
+      this.setAttribute("aria-pressed", state.monLoad ? "true" : "false");
+      $("#mon-load-state").textContent = state.monLoad ? "开" : "关（默认）";
+    });
+    $("#btn-mon-start").addEventListener("click", startMon);
+    $("#btn-mon-back").addEventListener("click", function () { show("home"); });
+    $("#btn-mon-stop").addEventListener("click", stopMon);
+    $("#btn-mon-home").addEventListener("click", function () { show("home"); });
+    $("#btn-mon-folder").addEventListener("click", function () {
+      post(Q("/api/open-folder"), {});
+    });
+    $("#btn-mon-home2").addEventListener("click", function () { show("home"); });
+    // 主页运行条 / 上次报告入口 (终审 F2 + v1.22.0 盯障语义)
     $("#g-runbar").addEventListener("click", function () {
-      show("progress"); pollOnce();
+      if (state.monPhase === "running") {
+        show("mon-live");
+        startMonPoll();
+      } else if (state.monPhase === "done") {
+        openMonReport();
+      } else {
+        show("progress"); pollOnce();
+      }
     });
     $("#g-lastrep").addEventListener("click", openReport);
     // 顶栏联网状态: 首帧即测, 与服务端探测同周期刷新
     refreshNet();
     setInterval(refreshNet, 30000);
+    // 盯障轮询首拍即启动: 刷新页面时盯障进行中/已完成都能恢复入口
+    startMonPoll();
     get(API.scenarios).then(function (meta) {
       state.meta = meta;
       COLORS = meta.status_colors || {};
@@ -26012,6 +26549,121 @@ def _gui_page():
             '<div class="g-form-foot">'
             '<button id="btn-site-finish" class="g-btn" type="button">生成报告</button></div>'
             '<div id="site-err2" class="g-err"></div></div></main>\n'
+            # ── 盯障 · 配置页 (v1.22.0, 设计稿第 1 节 1:1) ──
+            '<main id="view-mon-config" class="cfg" style="display:none">'
+            '<div class="fcard">'
+            '<div class="cfg-h">持续盯障</div>'
+            '<div class="cfg-sub">持续监测网关 / 外网的延迟与丢包，抓偶发断线和抖动，'
+            '结束后自动生成报告。</div>'
+            '<div class="field"><div class="flabel">盯多久</div>'
+            '<div class="chips" id="mon-chips">'
+            '<button class="chip" type="button" data-min="10">'
+            '<b class="num">10 分钟</b><small>快速摸底</small></button>'
+            '<button class="chip on" type="button" data-min="30">'
+            '<b class="num">30 分钟</b><small>常用</small></button>'
+            '<button class="chip" type="button" data-min="60">'
+            '<b class="num">1 小时</b><small>长时观察</small></button>'
+            '<span class="chip-ct"><input id="mon-min-custom" class="num" '
+            'type="text" placeholder="自定义"><span class="suf">分钟</span></span>'
+            '</div>'
+            '<div class="fhint">到时自动结束并出报告；填了自定义分钟数就按自定义来。</div></div>'
+            '<div class="field"><div class="flabel">外网目标</div>'
+            '<input id="mon-target" class="input" type="text" '
+            'placeholder="默认 223.5.5.5，可改域名或 IP">'
+            '<div class="fhint">网关不用填、始终会盯；这里只改外网一路，留空用默认。</div></div>'
+            '<div class="field"><div class="flabel">主动负载</div>'
+            '<div class="swrow">'
+            '<button id="mon-load-sw" class="switch" type="button" aria-pressed="false">'
+            '<i></i></button>'
+            '<span id="mon-load-state" class="swstate">关（默认）</span></div>'
+            '<div class="fhint">打开后：开始盯障 60 秒后开始 15 秒下载负载，'
+            '用于逼出高负载下的问题。</div></div>'
+            '<div class="form-foot">'
+            '<button id="btn-mon-start" class="btn btn-primary" type="button">'
+            '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none">'
+            '<path d="M8 5.8v12.4c0 .9 1 1.4 1.7.9l9.6-6.2c.7-.4.7-1.4 0-1.8'
+            'L9.7 4.9c-.7-.5-1.7 0-1.7.9Z"/></svg>开始盯障</button>'
+            '<span class="alt-note">盯满所选时长自动出报告，中途可随时停止。</span>'
+            '<button id="btn-mon-back" class="backlink" type="button" '
+            'style="margin-left:auto">← 返回主页</button></div>'
+            '<div id="mon-cfg-msg" class="g-err"></div>'
+            '</div></main>\n'
+            # ── 盯障 · 实时页 (v1.22.0, 设计稿第 2 节 1:1) ──
+            '<main id="view-mon-live" class="mn" style="display:none">'
+            '<div class="mn-top">'
+            '<span class="mn-num num"><span id="mon-elapsed">00:00</span>'
+            '<small class="num" id="mon-total">/ 00:00</small></span>'
+            '<span class="mn-conn"><span class="lab">连通率</span>'
+            '<div id="mon-conn" class="v num">—</div></span>'
+            '<span id="mon-meta" class="mn-meta num"></span>'
+            '<span class="badge-run"><i></i>监测中</span></div>'
+            '<div class="pbar"><i id="mon-pbar"></i></div>'
+            '<div id="mon-quad" class="quad"></div>'
+            '<div class="chart-card"><div class="cap-row">'
+            '<span class="lab">延迟曲线</span>'
+            '<span class="r num">每 5 秒一个采样点 · 曲线实时右移</span></div>'
+            '<div class="chart-holder">'
+            '<svg id="mon-chart" class="chart-svg" width="840" height="240" '
+            'viewBox="0 0 840 240">'
+            '<line class="ax" x1="50" y1="34" x2="830" y2="34"/>'
+            '<line class="ax" x1="50" y1="104.4" x2="830" y2="104.4"/>'
+            '<line class="ax" x1="50" y1="174.8" x2="830" y2="174.8"/>'
+            '<line class="ax base" x1="50" y1="210" x2="830" y2="210"/>'
+            '<text class="t end" x="44" y="38">500</text>'
+            '<text class="t end" x="44" y="108">300</text>'
+            '<text class="t end" x="44" y="178">100</text>'
+            '<text class="t end" x="44" y="214">0</text>'
+            '<text class="t end" x="44" y="20">ms</text>'
+            '<text class="t" x="50" y="231">10 分钟前</text>'
+            '<text class="t mid" x="440" y="231">5 分钟前</text>'
+            '<text class="t end" x="830" y="231">现在</text>'
+            '<rect class="lgw gw" x="56" y="8" width="14" height="10" rx="2"/>'
+            '<text class="t dim" x="76" y="17">网关</text>'
+            '<rect class="lgw wan" x="124" y="8" width="14" height="10" rx="2"/>'
+            '<text class="t dim" x="144" y="17">外网</text>'
+            '<rect class="chipbg" x="726" y="8" width="104" height="18" rx="9"/>'
+            '<text class="t dim mid" x="778" y="20.5">最近 10 分钟</text>'
+            '<g id="mon-gw-g"></g><g id="mon-ext-g"></g><g id="mon-loss-g"></g>'
+            '</svg></div></div>'
+            '<div class="cap-row" style="margin-top:16px">'
+            '<span class="lab">事件计数</span>'
+            '<span class="r">完整事件以结束报告为准</span></div>'
+            '<div id="mon-events" class="ev-grid"></div>'
+            '<div id="mon-loadbar" class="loadbar" style="display:none">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round" stroke-linejoin="round">'
+            '<path d="M12 4v10"/><path d="M8 10.5l4 4 4-4"/><path d="M5 18.5h14"/></svg>'
+            '<span id="mon-load-txt" class="num"></span></div>'
+            '<div class="mn-foot">'
+            '<button id="btn-mon-stop" class="btn btn-danger" type="button">'
+            '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none">'
+            '<rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>停止盯障</button>'
+            '<span class="alt-note">提前结束并生成报告。</span>'
+            '<button id="btn-mon-home" class="mn-back" type="button">'
+            '← 返回主页（盯障进行中，返回后可回到本页）</button></div>'
+            '<div id="mon-live-err" class="g-err"></div></main>\n'
+            # ── 盯障 · 结束报告页 (v1.22.0, 设计稿第 3 节 1:1) ──
+            '<main id="view-mon-report" class="mrp" style="display:none">'
+            '<div class="mrp-conc">'
+            '<span id="mon-verdict-badge" class="g-badge"></span>'
+            '<span><div id="mon-conclusion" class="mrp-line"></div>'
+            '<div id="mon-advice" class="mrp-sug"></div></span>'
+            '<span id="mon-early-tag" class="mrp-tag num" style="display:none">'
+            '</span></div>'
+            '<iframe id="mon-frame" title="盯障报告" src=""></iframe>'
+            '<div class="mrp-actions">'
+            '<button id="btn-mon-folder" class="btn btn-primary" type="button">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round" stroke-linejoin="round">'
+            '<path d="M3.5 7A1.5 1.5 0 0 1 5 5.5h4l2 2h8A1.5 1.5 0 0 1 20.5 9v8'
+            'a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 17Z"/></svg>'
+            '打开报告文件夹</button>'
+            '<button id="btn-mon-home2" class="btn btn-line" type="button">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round" stroke-linejoin="round">'
+            '<path d="M14 6.5 8.5 12l5.5 5.5"/></svg>返回主页</button></div>'
+            '<div id="mon-files" class="mrp-files num"></div>'
+            '</main>\n'
             "<script>" + _GUI_JS + "</script>\n</body>\n</html>\n")
 
 
@@ -26041,6 +26693,8 @@ def _gui_meta():
              for k, p in SCENE_MENU_KEYS.items()]
             + [{"id": "site", "label": "现场检测",
                 "desc": "客户信息 + 机房 6 项 → 一页报告/PDF", "modules": 0}]
+            + [{"id": "monitor", "label": "持续盯障",
+                "desc": "定时监测外网, 抓偶发掉线/抖动", "modules": 0}]
         ),
         "module_desc": module_desc,
         "status_colors": {st: STATUS_COLORS[sk]
@@ -26184,8 +26838,19 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
                 except Exception as e:
                     return self._send(400, {"ok": False, "err": str(e)})
             if p == "/api/shutdown":
+                # v1.22.0 (Task 3): 盯障 running 纳入拦截口径 — 非 force
+                # 409 (防丢当轮报告/孤儿 ping); force 放行, 放行前尽力
+                # monitor.stop()。诊断 running 的既有口径不变。
                 force = bool((data or {}).get("force"))
-                if not self.session.is_running() or force:
+                mon_busy = (self.monitor is not None
+                            and self.monitor.is_running())
+                if ((not self.session.is_running() and not mon_busy)
+                        or force):
+                    if force and mon_busy:
+                        try:
+                            self.monitor.stop()
+                        except Exception:
+                            pass
                     self.shutdown_evt.set()
                     return self._send(200, {"ok": True})
                 return self._send(409, {"ok": False, "reason": "running"})
@@ -26349,6 +27014,10 @@ def _run_gui(install=True, pip_mirror=None, shutdown_evt=None):
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            monitor.stop()      # v1.22.0: 先停盯障 (清孤儿 ping -t) 再关服务
+        except Exception:
+            pass
         try:
             srv.shutdown()
             srv.server_close()
