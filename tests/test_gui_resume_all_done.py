@@ -236,7 +236,11 @@ class TestAllDoneNoResumePoint(_AllDoneCase):
                 t.join(10)
             try:
                 with open(self.resume_path, encoding="utf-8") as f:
-                    json.load(f)
+                    doc = json.load(f)
+                # 光是合法 JSON 不够 —— 内容也不能串味: 落盘的应是两条载荷之一
+                keys = sorted((doc.get("completed") or {}).keys())
+                if keys not in (["gateway"], ["gateway", "wifi"]):
+                    bad.append("内容串味: %s" % keys)
             except Exception as e:
                 bad.append(repr(e))
         self.assertEqual(bad, [],

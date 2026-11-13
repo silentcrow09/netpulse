@@ -24914,13 +24914,38 @@ def _gui_resume_clean(data):
     return out
 
 
+def _gui_resume_cleanup_stale_tmp(path):
+    """清掉陈旧的续跑点临时文件。
+
+    落盘是「写 tmp → os.replace」两步, 进程被强杀/断电落在两步之间就会留下
+    一个 tmp 文件。tmp 名带进程号, 同名会被下一次写覆盖 —— 但跨进程残留的
+    旧 tmp 不会自动消失, 这里顺手清掉超过 1 天的 (1 天 = 跨天再清, 不误伤
+    正在写的那个)。
+    """
+    try:
+        folder = os.path.dirname(path) or "."
+        prefix = os.path.basename(path) + ".tmp"
+        now = time.time()
+        for name in os.listdir(folder):
+            if not name.startswith(prefix):
+                continue
+            f = os.path.join(folder, name)
+            try:
+                if (now - os.path.getmtime(f)) > 86400:
+                    os.remove(f)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def _gui_resume_save(payload):
     """把续跑点原子写入磁盘。返回 (True, None) 或 (False, 错误文案)。
 
     原子写: 先写同目录临时文件再 os.replace —— 进程被杀/断电不会留半截文件
     (半截 JSON 读回来是「损坏」, 白白丢掉已测完的成果)。
 
-    v1.24.0 终审复核: 写互斥 + tmp 名带进程/线程号 —— 两条落盘路径 (worker
+    v1.24.0 终审复核: 写互斥 + tmp 名带进程号 —— 两条落盘路径 (worker
     收尾 / 关窗信标) 并发时不会再互相串接内容。
     """
     if not isinstance(payload, dict) or not payload:
@@ -24930,8 +24955,9 @@ def _gui_resume_save(payload):
         os.makedirs(os.path.dirname(path), exist_ok=True)
     except Exception as e:
         return False, "续跑点目录不可写（%s）" % e
-    tmp = "%s.tmp.%d.%d" % (path, os.getpid(), threading.get_ident())
+    tmp = "%s.tmp.%d" % (path, os.getpid())
     try:
+        _gui_resume_cleanup_stale_tmp(path)
         with _GUI_RESUME_WRITE_LOCK:
             with open(tmp, "w", encoding="utf-8") as f:
                 # default=str: 模块结果里可能有非 JSON 原生类型 (dataclass 等),
@@ -24978,12 +25004,14 @@ def _gui_resume_load():
         if not os.path.exists(path):
             return None, None
         if (time.time() - os.path.getmtime(path)) > _GUI_RESUME_MAX_AGE:
-            # 删前复核文件没被换过: 写点用 os.replace 原子替换, 若此刻恰好有
-            # 并发写点, 删的必须还是那个过期点, 免得把刚写好的新点删了。
+            # 删前复核文件没被换过 + 删除纳入写互斥: 写点用 os.replace 原子
+            # 替换, 若此刻恰好有并发写点, 删的必须还是那个过期点, 免得把刚
+            # 写好的新点删了。
             try:
-                st = os.stat(path)
-                if (time.time() - st.st_mtime) > _GUI_RESUME_MAX_AGE:
-                    os.remove(path)
+                with _GUI_RESUME_WRITE_LOCK:
+                    st = os.stat(path)
+                    if (time.time() - st.st_mtime) > _GUI_RESUME_MAX_AGE:
+                        os.remove(path)
             except Exception:
                 pass
             return None, None
@@ -25006,8 +25034,9 @@ def _gui_resume_load():
         # 有并发写点 (写点用 os.replace 原子替换), 会把刚写好的新点删掉 ——
         # 复核读也堵不住 (复核与 remove 之间仍有几微秒窗口)。清理交给:
         #   ① 下一次落盘时覆盖 (os.replace 同一路径);
-        #   ② 7 天过期自动清理;
-        #   ③ 用户点「重新开始」显式丢弃。
+        #   ② 7 天过期自动清理。
+        #   (「用户点重新开始」那条路对陈旧的全测完点不可达 —— 按钮在横幅里,
+        #    而全测完点不渲染横幅。)
         # 横幅与「接着跑」入口按「没有可续的」处理 (返回 None + 说明文案)。
         return None, "上次的诊断已经全测完了，没有要接着跑的项目"
     return clean, None
@@ -25017,9 +25046,12 @@ def _gui_resume_discard():
     """删掉续跑点 (用户选「重新开始」/ 续跑跑完后调用)。返回是否删掉了。"""
     path = _gui_resume_path()
     try:
-        if os.path.exists(path):
-            os.remove(path)
-            return True
+        # 删除也纳入写互斥 (v1.24.0 终审复核): 删的瞬间若有在途落盘, 会把刚
+        # 删掉的点写回来 —— 落盘与删除必须互斥。
+        with _GUI_RESUME_WRITE_LOCK:
+            if os.path.exists(path):
+                os.remove(path)
+                return True
     except Exception:
         pass
     return False
