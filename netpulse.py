@@ -24649,6 +24649,7 @@ def _GUI_RESET_FOR_TEST():
     _GuiHandler.session = None
     _GuiHandler.token = None
     _GuiHandler.shutdown_evt = None
+    _GuiHandler.monitor = None   # v1.22.0: 盯障 GUI 会话 (_GUI_ACT_LOCK 无状态不清)
     del _GUI_BROWSER_PROC[:]   # Task 6: 浏览器子进程句柄 (防测试间泄漏)
     with _GUI_NET_LOCK:        # 顶栏联网状态探测数据源 (v1.21.0 收尾)
         _GUI_NET["ok"] = None
@@ -24753,9 +24754,14 @@ class _GuiSession:
 
     # -- 诊断编排 (与终端 _run_scene 同一管线) --
     def _begin(self, profile, keys):
-        with self._lock:
+        # v1.22.0: 查忙 + 置 running 全程持 _GUI_ACT_LOCK — 三类活动
+        # (诊断/现场检测/盯障) 的跨类型互斥铁律, 锁外查锁内置位就会
+        # 双查双过。self._lock 是 RLock, _gui_net_busy 回查自身可重入。
+        with _GUI_ACT_LOCK, self._lock:
             if self._phase == "running":
                 return False, "已有诊断在进行中"
+            if _gui_net_busy():          # v1.22.0: 跨类型互斥 (盯障等)
+                return False, "已有网络活动在进行中"
             self._phase = "running"
             self._profile = profile
             self._keys = list(keys)
@@ -24942,6 +24948,361 @@ class _GuiSession:
         path = os.path.join(base_dir, "%s_%s%s" % (ts, title, ext))
         err = export_report(path, report=report)
         return (None, err) if err else (path, None)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# GUI 盯障会话 (v1.22.0): MonitorSession 只读复用, 终端管线零修改
+# (收口规则: run_monitor_mode / MonitorSession 不动)。
+# 互斥铁律: 诊断/现场检测/盯障三类活动的 start 路径必须在 _GUI_ACT_LOCK 内
+# 完成「查忙 + 置 running」—— 锁外查、锁内置位时, 两个入口能同时过闸。
+# ────────────────────────────────────────────────────────────────────────────
+
+_GUI_ACT_LOCK = threading.Lock()
+
+
+def _gui_net_busy():
+    """任一网络活动 (诊断/现场检测/盯障) 进行中。
+
+    调用方自身的单类判重由各 start 入口先行 (running 状态先查先拒),
+    这里只补「其他类型」; _GuiSession._lock 是 RLock, _begin 持锁回查
+    自身 is_running 可重入, 不会死锁。
+    """
+    h = _GuiHandler
+    s = h.session
+    m = h.monitor
+    if s is not None and s.is_running():
+        return True
+    if m is not None and m.is_running():
+        return True
+    return False
+
+
+class _GuiMonitor:
+    """盯障 GUI 会话: MonitorSession 只读复用 + 节流快照 + 编排线程。
+
+    phase: idle → running → done / error
+    编排 (daemon 线程): 等 duration 或停止事件 (1s 粒度) → session.stop()
+    → build_result(early_terminated=停止请求) → save_monitor_report
+    (返回 None = 落盘失败 → phase=error)。与终端 run_monitor_mode 主循环
+    同序; 快照/曲线/事件预览是只读通道, 重算一律节流 (计数器随
+    progress_payload["counters"] 可观测)。
+    """
+
+    MIN_DURATION_S = 30             # 时长钳位下限 (同 run_monitor_mode)
+    MAX_DURATION_S = 86400          # 时长钳位上限 24h (同 run_monitor_mode)
+    CURVE_WINDOW_S = 600            # 曲线/事件预览窗口 (最近 10 分钟)
+    CURVE_MAX_POINTS = 200          # 每流降采样上限
+    PROGRESS_MIN_INTERVAL_S = 2.0   # progress_payload 重算最小间隔
+    CURVE_MIN_INTERVAL_S = 5.0      # curve_payload 重算最小间隔
+    EVENT_MIN_INTERVAL_S = 5.0      # 事件预览重算最小间隔 (与曲线同档)
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._phase = "idle"
+        self._duration = 0            # 钳位后的有效时长
+        self._ext_target = None
+        self._load = False
+        self._started_at = None
+        self._ended_at = None
+        self._stop_requested = False
+        self._early = False
+        self._error = None
+        self._paths = None            # {"html": ..., "json": ...}
+        self._session = None          # MonitorSession (复用, 零修改)
+        self._stop_evt = threading.Event()
+        self._thread = None
+        # 节流时间戳 + 缓存 + 可观测计数器 (progress_payload["counters"] 下发)
+        self._ts_prog = 0.0
+        self._ts_curve = 0.0
+        self._ts_evt = 0.0
+        self._prog_cache = None
+        self._curve_cache = None
+        self._evt_cache = None
+        self._counters = {"polls": 0, "progress_computes": 0,
+                          "curve_computes": 0, "event_computes": 0}
+
+    # -- 生命周期 --
+    def start(self, duration_s, ext_target=None, load=False):
+        """启动盯障。返回 (ok, err|None, effective_s)。
+
+        全程持 _GUI_ACT_LOCK: 查忙 + 置 running 原子 (跨类型互斥铁律)。
+        时长钳位 [30, 86400] (与终端同界); None 默认 600, 非法值报错,
+        0 走下限 30。session.start() 按 truthiness 判 (同 run_monitor_mode),
+        失败回滚 phase 并补一次 stop() 清孤儿 ping 进程。
+        """
+        with _GUI_ACT_LOCK:
+            if self.is_running():
+                return False, "已有盯障在进行中", None
+            if _gui_net_busy():
+                return False, "已有网络活动在进行中", None
+            try:
+                effective = 600 if duration_s is None else int(duration_s)
+                effective = max(self.MIN_DURATION_S,
+                                min(self.MAX_DURATION_S, effective))
+            except (TypeError, ValueError):
+                return False, "盯障时长不合法", None
+            with self._lock:
+                self._phase = "running"     # 先置位 (互斥原子性), 失败回滚
+            try:
+                session = MonitorSession(effective, ext_target or None,
+                                         load_url=(MonitorSession.MONITOR_LOAD_URL
+                                                   if load else None))
+                started = session.start()   # truthiness, 同 run_monitor_mode
+            except Exception as e:
+                # 构造/启动崩溃也要回滚: phase 卡死在 running 会永久挡住
+                # 后续盯障 (编排线程尚不存在, 无人收尾翻态)
+                with self._lock:
+                    self._phase = "idle"
+                return False, "盯障启动失败: %s: %s" % (type(e).__name__, e), None
+            if not started:
+                with self._lock:
+                    self._phase = "idle"    # 回滚
+                try:
+                    session.stop()          # 孤儿 ping 清理 (同 run_monitor_mode)
+                except Exception:
+                    pass
+                return False, "外网 ping 启动失败, 无法开始盯障", None
+            with self._lock:
+                self._duration = effective
+                self._ext_target = ext_target or None
+                self._load = bool(load)
+                self._started_at = time.time()
+                self._ended_at = None
+                self._stop_requested = False
+                self._early = False
+                self._error = None
+                self._paths = None
+                self._session = session
+                self._stop_evt.clear()
+                self._ts_prog = self._ts_curve = self._ts_evt = 0.0
+                self._prog_cache = self._curve_cache = self._evt_cache = None
+                thread = threading.Thread(target=self._orchestrate,
+                                          daemon=True, name="np-gui-monitor")
+                self._thread = thread
+            thread.start()
+            return True, None, effective
+
+    def stop(self):
+        """提前结束 (幂等): 置停止事件 + 直接停采集 — 编排线程 ≤1s 内
+        感知收尾 (MonitorSession.stop 自身幂等)。非 running 忽略。"""
+        with self._lock:
+            if self._phase != "running":
+                return
+            self._stop_requested = True
+            self._stop_evt.set()
+            session = self._session
+        if session is not None:
+            try:
+                session.stop()
+            except Exception:
+                pass
+
+    def is_running(self):
+        with self._lock:
+            return self._phase == "running"
+
+    # -- 编排 --
+    def _orchestrate(self):
+        """编排线程: 等 duration 或停止事件 (1s 粒度) → 收尾落盘。
+
+        与终端 run_monitor_mode 收尾同序: stop → build_result →
+        save_monitor_report; 落盘失败 (None) 或任何异常 → phase=error,
+        error 文本进 snapshot 供前端展示。
+        """
+        try:
+            with self._lock:
+                session, planned = self._session, self._duration
+            stop_evt = self._stop_evt
+            waited = 0.0
+            while waited < planned and not stop_evt.wait(1.0):
+                waited += 1.0
+            with self._lock:
+                early = self._stop_requested
+                self._early = early
+            session.stop()
+            res = session.build_result(early_terminated=early)
+            paths = save_monitor_report(res)
+            with self._lock:
+                self._ended_at = time.time()
+                if paths:
+                    self._paths = {"html": paths[0], "json": paths[1]}
+                    self._phase = "done"
+                else:
+                    self._phase = "error"
+                    self._error = "盯障报告落盘失败"
+        except Exception as e:
+            with self._lock:
+                self._ended_at = time.time()
+                self._phase = "error"
+                self._error = "%s: %s" % (type(e).__name__, e)
+
+    # -- 只读快照 (HTTP 线程; 每次都便宜, 重算型载荷走独立节流通道) --
+    def _elapsed_s(self):
+        """已进行秒数 (完成/出错后冻结在结束时刻)。持有 _lock 调用。"""
+        if not self._started_at:
+            return 0
+        return int((self._ended_at or time.time()) - self._started_at)
+
+    def snapshot(self):
+        """轮询快照: 只读字段, 无重算。键形与 _GuiSession.snapshot 对齐
+        (site 恒 None; 无 verdict — 报告页数据走 /api/monitor/report 内嵌)。"""
+        with self._lock:
+            return {
+                "phase": self._phase,
+                "effective_s": self._duration,
+                "elapsed_s": self._elapsed_s(),
+                "stop_requested": self._stop_requested,
+                "early": self._early,
+                "has_report": self._paths is not None,
+                "report_paths": dict(self._paths) if self._paths else None,
+                "site": None,
+                "error": self._error,
+            }
+
+    # -- 重算型载荷 (节流通道) --
+    def progress_payload(self):
+        """进度载荷 (页面 1s 轮询): ≥2s 节流重算; counters 每次都取现值
+        (载荷主体命中缓存复用, 节流效果仍可观测)。"""
+        with self._lock:
+            self._counters["polls"] += 1
+            now = time.time()
+            if self._prog_cache is None \
+                    or now - self._ts_prog >= self.PROGRESS_MIN_INTERVAL_S:
+                self._ts_prog = now
+                self._counters["progress_computes"] += 1
+                self._prog_cache = self._compute_progress(now)
+            out = dict(self._prog_cache)
+            out["counters"] = dict(self._counters)
+            return out
+
+    def _compute_progress(self, now):
+        """进度载荷重算 (持有 _lock): 10s 窗口连通计数 (与 progress_line
+        同窗) + 全程丢包率 + 事件预览 (独立 ≥5s 节流)。session 缺席
+        (未启动) 返回空壳。"""
+        payload = {
+            "phase": self._phase,
+            "elapsed_s": self._elapsed_s(),
+            "duration_s": self._duration,
+            "connect": {"gw": {"ok": 0, "loss10": 0},
+                        "ext": {"ok": 0, "loss10": 0},
+                        "dns_ok": False, "tcp_ok": False},
+            "loss_pct": {"gw": None, "ext": None},
+            "events_preview": {k: 0 for k in ("outage", "dns_fail",
+                                              "jitter_burst", "latency_spike")},
+            "load": self._load,
+        }
+        session = self._session
+        if session is None:
+            return payload
+        snap = session.snapshot()
+        win0 = now - 10.0
+        for key in ("gw", "ext"):
+            stream = [s for s in snap["%s_stream" % key] if s[1] >= win0]
+            payload["connect"][key] = {
+                "ok": sum(1 for s in stream if s[0] == "ok"),
+                "loss10": sum(1 for s in stream if s[0] == "loss")}
+        payload["loss_pct"]["gw"] = self._loss_pct(snap["gw_stream"])
+        payload["loss_pct"]["ext"] = self._loss_pct(snap["ext_stream"])
+        if snap["dns"]:                    # 末样本判连通 (与 progress_line 同口径)
+            payload["connect"]["dns_ok"] = snap["dns"][-1][1] is not None
+        if snap["tcp"]:
+            payload["connect"]["tcp_ok"] = snap["tcp"][-1][1] is not None
+        payload["events_preview"] = self._compute_events(now, snap)
+        return payload
+
+    @staticmethod
+    def _loss_pct(stream):
+        """全程丢包率 (会话口径); 无样本返回 None (前端显示 —)。"""
+        n = len(stream)
+        if not n:
+            return None
+        return round(sum(1 for s in stream if s[0] == "loss") / n * 100, 1)
+
+    def _compute_events(self, now, snap):
+        """事件预览重算 (持有 _lock, ≥5s 节流): 流条目过滤到最近
+        CURVE_WINDOW_S 喂 _detect_monitor_events (与落盘判定同一实现),
+        按 type 计数; 异常吞掉置空 (预览失败不拖垮轮询, 全历史精确判定
+        只在结束时 build_result 跑)。"""
+        if self._evt_cache is not None \
+                and now - self._ts_evt < self.EVENT_MIN_INTERVAL_S:
+            return self._evt_cache
+        self._ts_evt = now
+        self._counters["event_computes"] += 1
+        win0 = now - self.CURVE_WINDOW_S
+        win_snap = {
+            "gw_stream": [s for s in snap["gw_stream"] if s[1] >= win0],
+            "ext_stream": [s for s in snap["ext_stream"] if s[1] >= win0],
+            "tcp": [s for s in snap["tcp"] if s[0] >= win0],
+            "dns": [s for s in snap["dns"] if s[0] >= win0],
+        }
+        counts = {k: 0 for k in ("outage", "dns_fail", "jitter_burst",
+                                 "latency_spike")}
+        try:
+            for ev in _detect_monitor_events(win_snap, win0, now):
+                t = ev.get("type")
+                if t in counts:
+                    counts[t] += 1
+        except Exception:
+            pass                    # 预览是辅助信息: 失败置空, 不逐级上报
+        self._evt_cache = counts
+        return counts
+
+    def curve_payload(self):
+        """延迟曲线载荷: ≥5s 节流; 窗口 600s; 每流 ≤200 点; 丢包点保留
+        (ms=None, 前端画红点)。"""
+        with self._lock:
+            now = time.time()
+            if self._curve_cache is None \
+                    or now - self._ts_curve >= self.CURVE_MIN_INTERVAL_S:
+                self._ts_curve = now
+                self._counters["curve_computes"] += 1
+                self._curve_cache = self._compute_curve(now)
+            return self._curve_cache
+
+    def _compute_curve(self, now):
+        """曲线重算 (持有 _lock): 窗口过滤 + 桶降采样。"""
+        out = {"window_s": self.CURVE_WINDOW_S, "gw": [], "ext": []}
+        if self._session is None:
+            return out
+        snap = self._session.snapshot()
+        win0 = now - self.CURVE_WINDOW_S
+        for key in ("gw", "ext"):
+            pts = [(s[1], s[2]) for s in snap["%s_stream" % key]
+                   if s[1] >= win0]      # (t, ms); loss 本身 ms=None
+            out[key] = self._downsample(pts, win0)
+        return out
+
+    def _downsample(self, pts, win0):
+        """桶降采样 ≤CURVE_MAX_POINTS: 含丢包的桶保留首个丢包点
+        (均值会抹平丢包信号), 纯 ok 桶取 ms 均值。"""
+        n = len(pts)
+        if n <= self.CURVE_MAX_POINTS:
+            return [[round(t - win0, 1), v] for t, v in pts]
+        bucket = -(-n // self.CURVE_MAX_POINTS)          # ceil 整除
+        out = []
+        for i in range(0, n, bucket):
+            chunk = pts[i:i + bucket]
+            loss = next((p for p in chunk if p[1] is None), None)
+            if loss is not None:
+                out.append([round(loss[0] - win0, 1), None])
+            else:
+                avg = sum(v for _, v in chunk) / len(chunk)
+                out.append([round(chunk[0][0] - win0, 1), round(avg, 1)])
+        return out
+
+    # -- 报告 --
+    def report_html(self):
+        """内嵌报告页 (/api/monitor/report): 读落盘 HTML 的 bytes;
+        无报告或文件不可读返回 None。"""
+        with self._lock:
+            paths = self._paths
+        if not paths:
+            return None
+        try:
+            with open(paths["html"], "rb") as f:
+                return f.read()
+        except OSError:
+            return None
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -25666,6 +26027,7 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
     session = None
     token = None
     shutdown_evt = None
+    monitor = None    # v1.22.0: _GuiMonitor 实例 (_run_gui 注入, Task 2 路由消费)
 
     def log_message(self, fmt, *args):     # GUI 模式终端不刷 HTTP 日志
         pass
