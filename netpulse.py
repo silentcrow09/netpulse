@@ -24940,11 +24940,14 @@ def _gui_resume_save(payload):
 
 
 def _gui_resume_load():
-    """读续跑点。返回 (payload, None) 或 (None, 错误文案)。
+    """读续跑点。返回 (payload, None) 或 (None, 说明文案)。
 
     - 文件不存在 → (None, None)   —— 没有续跑点, 不是错误
     - 文件损坏 / 结构非法 → (None, 提示文案) —— 当作没有续跑点, 不崩溃
     - 超过 7 天 → 删文件, (None, None)
+    - 点里的项目**全测完了** → 删文件, (None, 说明文案) —— 没有可续的
+      (spec F4「全都测完的轮次不写点」; 说明文案给「接着跑」入口用,
+      让用户知道为什么续不了, 而不是看见一个死按钮)
     """
     path = _gui_resume_path()
     try:
@@ -24963,6 +24966,17 @@ def _gui_resume_load():
     clean = _gui_resume_clean(data)
     if clean is None:
         return None, "续跑点内容无效, 已忽略"
+    # v1.24.0 复核: 「全测完」的点没有可续的 —— 当作没有 (spec F4「全都测完
+    # 的轮次不写点」)。顺手清掉这个垃圾文件, 免得主页横幅写成「上次诊断没跑完
+    # · 实检 N/N 项」自相矛盾 (verify S4.5)。
+    keys = clean.get("keys") or []
+    done = clean.get("completed") or {}
+    if keys and all(k in done for k in keys):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None, "上次的诊断已经全测完了，没有要接着跑的项目"
     return clean, None
 
 
@@ -25365,14 +25379,14 @@ class _GuiSession:
         if not remaining:
             # 全都测过了 (停止请求刚好落在最后一个模块之后, 或磁盘上的点已经
             # 跑完) → **不跑空轮次**: 空轮次会「诊断未产生数据」, 还会把这一
-            # 轮已经出的报告弄丢 (_begin 会清 _report)。有报告就收尾, 没报告
-            # 就照实说没有可跑的。
+            # 轮已经出的报告弄丢 (_begin 会清 _report)。明确告诉用户「没得
+            # 跑」, 别把人送进一个空进度页 (v1.24.0 复核)。
             with self._lock:
                 has_report = self._report is not None
                 self._phase = "done" if has_report else "idle"
                 if not has_report:
                     self._error = "这一轮的项目已经全测完了, 不用接着跑"
-            return True, None
+            return False, "上次的诊断已经全测完了，没有要接着跑的项目"
         ok, err = self._begin(profile, keys, resume_ctx=point)
         if not ok:
             return False, err
@@ -25442,11 +25456,24 @@ class _GuiSession:
                 return None
             if not self._partial:
                 return None
+            # v1.24.0 复核: 最后一个模块刚测完、报告还没建好时关窗 → 这一轮
+            # 其实全测完了, 没有可续的 → 不写点 (spec F4「全都测完的轮次不写
+            # 点」)。写了的话磁盘上会留下「全测完」的点, 主页横幅就变成
+            # 「上次诊断没跑完 · 实检 N/N 项」自相矛盾 (verify S4.5)。
+            ran = sum(1 for k in self._keys if self._module_status.get(k))
+            all_done = bool(self._keys) and ran >= len(self._keys)
             resume_ctx = self._resume_ctx
             # 已耗时也写进续跑点 (终审审查 #12): 不然续跑合并后的总耗时
             # 少算这一段, 报告里「检测耗时」会偏小。
             elapsed = int((time.time() - self._started_at) * 1000) \
                 if self._started_at else 0
+        if all_done:
+            # 续跑轮次: 来源点也全测完了 → 一并清掉 (没有可续的了);
+            # 普通新一轮: 磁盘上的旧点**保留** (spec F4「普通新一轮跑完不删旧
+            # 点」—— 删了等于把上一轮已测完的成果抹掉)。
+            if resume_ctx:
+                _gui_resume_discard()
+            return None
         err = self._save_resume_point({"duration_ms": elapsed}, resume_ctx)
         with self._lock:
             self._resume_error = err or ""
@@ -26593,6 +26620,12 @@ _GUI_JS = r"""(function () {
     var box = $("#g-resume");
     if (!box) return;
     if (!r || !r.done) {
+      box.style.display = "none";
+      return;
+    }
+    // v1.24.0 复核: 全测完的点没有可续的 —— 横幅不出现 (verify S4.5:
+    // 主页横幅不该出现「没跑完 · 实测 N/N 项」自相矛盾)
+    if (r.done >= r.total) {
       box.style.display = "none";
       return;
     }
