@@ -136,8 +136,11 @@ class TestGuiPage(unittest.TestCase):
     def test_beforeunload_punctuation_uniform(self):
         # P7b (一致性回修): beforeunload 两条确认文案标点统一全角逗号
         # (盯障文案为任务书钦定原文; 诊断文案向其对齐, 中文 UI 规范)。
-        self.assertIn("诊断仍在进行，关闭窗口将终止本次诊断", self.page)
-        self.assertNotIn("诊断仍在进行, 关闭窗口将终止本次诊断", self.page)
+        # v1.24.0: 诊断文案改为「关窗会保留已测完的 N 项, 下次可以接着跑」
+        # (spec F5 —— 关窗不再等于白跑, 提示要说清保住多少项)。
+        self.assertIn("诊断仍在进行，关闭窗口会保留已测完的 ", self.page)
+        self.assertNotIn("诊断仍在进行, 关闭窗口会保留已测完的 ", self.page)
+        self.assertIn("项，下次可以接着跑", self.page)
         self.assertIn("盯障进行中，关闭窗口将终止本次盯障且丢失未生成的报告",
                       self.page)
 

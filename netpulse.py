@@ -24707,6 +24707,7 @@ def _gui_net_watch(shutdown_evt=None):
 
 def _GUI_RESET_FOR_TEST():
     """测试隔离: 清 GUI 区段模块级状态。Task 4/6 在此追加 handler 清理项。"""
+    global _GUI_RESUME_PATH
     _GUI_SHUTDOWN.clear()
     _GuiHandler.session = None
     _GuiHandler.token = None
@@ -24716,6 +24717,16 @@ def _GUI_RESET_FOR_TEST():
     with _GUI_NET_LOCK:        # 顶栏联网状态探测数据源 (v1.21.0 收尾)
         _GUI_NET["ok"] = None
         _GUI_NET["ts"] = 0.0
+    # v1.24.0: 续跑点路径改到临时目录 —— 测试绝不碰开发机真实的
+    # %LOCALAPPDATA%\NetPulse\resume.json (本机留过续跑点就会让
+    # /api/scenarios 的载荷带上它, 测试结果随机器状态漂)。
+    _GUI_RESUME_PATH = os.path.join(tempfile.gettempdir(),
+                                    "netpulse_test_resume.json")
+    try:
+        if os.path.exists(_GUI_RESUME_PATH):
+            os.remove(_GUI_RESUME_PATH)
+    except Exception:
+        pass
 
 
 def _gui_verdict(report):
@@ -24856,10 +24867,13 @@ def _gui_apply_run_config(d, keys):
 
 _GUI_RESUME_FILE = "resume.json"
 _GUI_RESUME_MAX_AGE = 7 * 24 * 3600      # 续跑点最多留 7 天 (过期自动清理)
+_GUI_RESUME_PATH = None                 # 测试隔离用 (见 _GUI_RESET_FOR_TEST)
 
 
 def _gui_resume_path():
-    """续跑点路径: %LOCALAPPDATA%\\NetPulse\\resume.json"""
+    """续跑点路径: %LOCALAPPDATA%\\NetPulse\\resume.json (测试可覆盖)"""
+    if _GUI_RESUME_PATH:
+        return _GUI_RESUME_PATH
     base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
     return os.path.join(base, "NetPulse", _GUI_RESUME_FILE)
 
@@ -25091,6 +25105,7 @@ class _GuiSession:
         self._partial = {}            # key -> {"status", "result"} 已完成项目
         self._resume_ctx = None       # 续跑上下文 (复用的结果 + 上次时间)
         self._label_suffix = ""       # 续跑轮次的标题后缀 「（续跑）」
+        self._note = ""               # 报告级备注 (续跑说明)
 
     # -- 进度回调 (诊断线程调用, 见 run_diagnostics progress_cb 契约) --
     def on_progress(self, ev):
@@ -25138,6 +25153,10 @@ class _GuiSession:
                 "cancelled": self._phase == "cancelled",
                 "remaining": max(0, remaining),
                 "reused": reused,
+                # 现场检测不支持续跑 (spec F6) —— 页面据此不显示「继续跑」入口
+                "can_resume": (self._phase == "cancelled"
+                               and self._profile != "site"),
+                "note": self._note,
             }
 
     def is_running(self):
@@ -25270,15 +25289,17 @@ class _GuiSession:
             rf = profile if profile in DIAGNOSE_PROFILES else None
             diagnosis = _enrich_diagnosis_evidence(
                 diagnose(results, rule_filter=rf), results, run.get("evidence"))
+            note = _gui_resume_note(resume_ctx)
             report = build_report(
                 rule_filter=rf,
                 diagnosis=diagnosis.to_dict() if diagnosis else None,
                 run=run,
-                note=_gui_resume_note(resume_ctx))
+                note=note)
             with self._lock:
                 self._run = run
                 self._report = report
                 self._verdict = _gui_verdict(report) if report else None
+                self._note = note
                 self._phase = ("cancelled" if stopped else "done") if report else "error"
                 if not report:
                     self._error = "报告构建失败"
@@ -25369,6 +25390,20 @@ class _GuiSession:
         }
         ok, err = _gui_resume_save(payload)
         return None if ok else err
+
+    def save_resume_point_now(self):
+        """把当前已测完的项目落盘 (关窗时调用)。
+
+        在跑的那一项算「没测完」—— 下次续跑时重跑它。诊断没在跑、或还没测出
+        任何结果 → 不写 (没有可留的东西)。返回错误文案 (None = 成功)。
+        """
+        with self._lock:
+            if self._phase not in ("running", "stopping"):
+                return None
+            if not self._partial:
+                return None
+            resume_ctx = self._resume_ctx
+        return self._save_resume_point({}, resume_ctx)
 
     # -- 现场检测 (与终端 run_site_visit :23538 同口径) --
     def start_site(self, customer, tested_at=None, plan="",
@@ -26020,6 +26055,13 @@ input,select{ font-family:inherit; }
 #g-lastrep{ margin-left:auto; }
 .g-fullrow{ display:flex; align-items:center; gap:16px; margin-top:22px; padding-top:20px;
             border-top:1px solid var(--rule); }
+/* v1.24.0: 主页续跑横幅 (跨重启后出现 —— 上次那轮没跑完) */
+.g-resume{ display:flex; align-items:center; gap:14px; margin-top:18px; padding:14px 18px;
+           background:#fffdf5; border:1px solid #e0c98a; border-left:3px solid var(--amber);
+           border-radius:10px; }
+.g-resume .rt{ font-size:14px; font-weight:700; }
+.g-resume .rd{ font-size:12.5px; color:var(--dim); margin-top:2px; }
+.g-resume .ops{ margin-left:auto; display:flex; align-items:center; gap:10px; }
 
 /* ── 按钮族 (设计稿 .btn / .btn-primary / .btn-line-navy) ── */
 .g-btn{ display:inline-flex; align-items:center; gap:8px; border-radius:7px; font-size:13px;
@@ -26075,6 +26117,30 @@ input,select{ font-family:inherit; }
 #btn-back{ margin-top:18px; }
 .g-hint{ margin-top:22px; padding-top:14px; border-top:1px solid var(--rule); text-align:center;
          font-size:12.5px; color:var(--mute); }
+
+/* ── 停止 / 收尾 / 已停止 (v1.24.0 · 设计稿第 1/2/3 节 1:1) ──
+   停止按钮口径同盯障页的 btn-danger (白底红字红框), 琥珀色左边线表示
+   「这是用户自己的操作, 不是故障」。 */
+.g-stop{ display:inline-flex; align-items:center; gap:7px; border-radius:7px; font-size:13px;
+         font-weight:700; padding:8px 16px; letter-spacing:.3px; margin-left:18px;
+         background:#fff; border:1px solid var(--red); color:var(--red); }
+.g-stop svg{ width:14px; height:14px; }
+.g-stop:hover{ background:#fdf3f2; }
+.g-stop[disabled]{ background:#fff; border-color:var(--mute); color:var(--mute);
+                   font-weight:600; cursor:default; }
+.g-stopbar{ display:flex; align-items:center; gap:14px; margin-top:20px; padding:14px 20px;
+            background:var(--soft); border:1px solid var(--rule); border-left:3px solid var(--amber);
+            border-radius:10px; }
+.g-stopbar .sp{ width:20px; height:20px; flex:none; border-radius:50%; border:2.5px solid #d9e2ee;
+                 border-top-color:var(--navy-2); animation:gspin 1s linear infinite; }
+.g-stopbar b{ font-size:13.5px; font-weight:700; }
+.g-stopbar .sd{ display:block; font-size:12.5px; color:var(--dim); margin-top:2px; }
+.g-donebar{ display:flex; align-items:center; gap:16px; margin-bottom:20px; padding:16px 22px;
+            background:var(--soft); border:1px solid var(--rule); border-left:3px solid var(--amber);
+            border-radius:10px; }
+.g-donebar .st{ font-size:17px; font-weight:700; }
+.g-donebar .sd{ font-size:12.5px; color:var(--dim); margin-top:2px; }
+.g-donebar .ops{ margin-left:auto; display:flex; align-items:center; gap:10px; }
 
 /* ── 报告页 (设计稿第 4 节): 结论条 + 导出条 + 内嵌报告 ── */
 .g-verdict{ display:flex; align-items:center; gap:24px; background:var(--soft);
@@ -26363,7 +26429,11 @@ _GUI_JS = r"""(function () {
     monCurve: Q("/api/monitor/curve"),
     monReport: Q("/api/monitor/report"),
     monStart: Q("/api/monitor/start"),
-    monStop: Q("/api/monitor/stop")
+    monStop: Q("/api/monitor/stop"),
+    // v1.24.0 诊断取消 / 续跑
+    runStop: Q("/api/run/stop"),
+    runResume: Q("/api/run/resume"),
+    resumeDiscard: Q("/api/resume/discard")
   };
   // 场景卡图标 (内联 SVG 常量, 复制自 design_ref/gui/gui_design_v1.html 第 1 节;
   // 键 = DIAGNOSE_PROFILES profile id + site / full)。纯常量模板、不含变量插值,
@@ -26439,6 +26509,24 @@ _GUI_JS = r"""(function () {
     $("#hostname").textContent = meta.hostname || "";
     $("#ver").textContent = meta.version || "";
     $("#full-count").textContent = "全部 " + meta.full_count + " 项, 含压测, 客户网络慎用";
+    renderResumeBanner(meta.resume);
+  }
+
+  // ── 主页续跑横幅 (v1.24.0): 跨重启后出现, 问一句「接着跑吗」 ──
+  function renderResumeBanner(r) {
+    var box = $("#g-resume");
+    if (!box) return;
+    if (!r || !r.done) {
+      box.style.display = "none";
+      return;
+    }
+    var bits = [];
+    if (r.label) bits.push(r.label);
+    bits.push("实检 " + r.done + "/" + r.total + " 项");
+    if (r.when) bits.push(r.when);
+    bits.push("已完成的项目都还在");
+    $("#g-resume-d").textContent = bits.join(" · ");
+    box.style.display = "";
   }
 
   function startRun(profile) {
@@ -26653,7 +26741,8 @@ _GUI_JS = r"""(function () {
   // runbar 优先级 monRun → diagRun → monDone → monErr (F1 回修): monDone
   // 是粘滞终态 (下次盯障前一直在), 不得压过诊断进行中的入口。
   function updateHomeState(d) {
-    state.diagRunning = d.phase === "running";
+    // v1.24.0: stopping (收尾中) 也算在跑 —— 互斥不放宽
+    state.diagRunning = d.phase === "running" || d.phase === "stopping";
     applyHomeState();
   }
   function applyHomeState() {
@@ -26695,10 +26784,19 @@ _GUI_JS = r"""(function () {
     state.data = d;
     // 终审 #6: error 终态收起「正在测试」卡 (spinner 不再空转), 错误文案照旧;
     // 其余阶段恢复显示 (下一次运行回到 running 时自动回来)
-    $(".g-cur").style.display = (d.phase === "error") ? "none" : "";
+    // v1.24.0: cancelled 终态同样收起 (已停止, 没有在跑的模块了)
+    $(".g-cur").style.display =
+      (d.phase === "error" || d.phase === "cancelled") ? "none" : "";
     // 刷新/重开页面时已有进行中的诊断 → 直接回进度页 (brief 注释既定意图);
     // 用户主动返回主页后不再拉回 (state.leftProgress), 否则「返回主页」会失效
-    if (d.phase === "running" && state.view === "home" && !state.leftProgress) show("progress");
+    // v1.24.0: stopping (收尾中) 同样要拉回进度页 —— 否则刷新页面会停在
+    // 主页, 用户看不到「正在收尾, 稍后出报告」, 以为停了却没报告
+    // cancelled (已停止) 也回进度页: 设计稿变体 A 的「已停止」结论条
+    // (继续跑 / 查看报告) 就在进度页原地, 落回主页那个入口就没了
+    if ((d.phase === "running" || d.phase === "stopping" || d.phase === "cancelled")
+        && state.view === "home" && !state.leftProgress) show("progress");
+    // v1.24.0: 停止按钮 + 收尾条 + 已停止条
+    renderStopUi(d);
     $("#p-done").textContent = d.done + "/" + d.total;
     $("#p-bar").style.width = (d.total ? Math.round(d.done * 100 / d.total) : 0) + "%";
     $("#p-elapsed").textContent = fmtMs(d.elapsed_ms);
@@ -26732,6 +26830,18 @@ _GUI_JS = r"""(function () {
       showSiteCheck();
       return;
     }
+    if (d.phase === "cancelled") {
+      // v1.24.0: 已停止 —— 停在进度页 (设计稿变体 A), 用户选「继续跑」或
+      // 「查看报告」; 现场流程不支持续跑, 回现场页说明原因。
+      stopPoll();
+      if (state.siteFlow) {
+        state.siteFlow = false;
+        show("site");
+        showSiteWizard();
+        $("#site-err").textContent = d.error || "现场检测已停止";
+      }
+      return;
+    }
     if (d.phase === "done") { stopPoll(); openReport(); return; }
     if (d.phase === "error") {
       stopPoll();
@@ -26752,13 +26862,72 @@ _GUI_JS = r"""(function () {
     var m = Math.floor(s / 60); s = s % 60;
     return (m ? m + " 分 " : "") + (s < 10 ? "0" + s : s) + " 秒";
   }
+  // ── v1.24.0: 停止按钮 / 收尾提示条 / 已停止结论条 (设计稿第 1/2/3 节) ──
+  function renderStopUi(d) {
+    var stopBtn = $("#btn-stop");
+    if (stopBtn) {
+      var canStop = !!d.can_stop;
+      stopBtn.style.display = canStop ? "" : "none";
+      stopBtn.disabled = !!d.stop_requested;
+      var t = $("#btn-stop-t");
+      if (t) t.textContent = d.stop_requested ? "正在收尾…" : "停止";
+    }
+    var sb = $("#p-stopbar");
+    if (sb) sb.style.display = (d.phase === "stopping") ? "" : "none";
+    var db = $("#p-donebar");
+    if (!db) return;
+    if (d.phase !== "cancelled") { db.style.display = "none"; return; }
+    $("#p-done-t").textContent = "已停止 · 实检 " + d.done + "/" + d.total + " 项";
+    $("#p-done-d").textContent = d.can_resume
+      ? ("剩下的 " + d.remaining + " 项没测。报告已生成，可以先看结果，或者接着跑。")
+      : (d.error || "现场检测不支持续跑，请重新检测");
+    var rb = $("#btn-resume-go");
+    if (rb) {
+      rb.style.display = d.can_resume ? "" : "none";
+      // 设计稿文案表: 「继续跑剩下的 12 项」—— 项数要带 (用户先知道还要跑几项)
+      if (d.can_resume) rb.textContent = "继续跑剩下的 " + d.remaining + " 项";
+    }
+    var pb = $("#btn-partial-report");
+    if (pb) pb.style.display = d.has_report ? "" : "none";
+    db.style.display = "";
+  }
+  // ── v1.24.0: 停止 / 接着跑 / 重新开始 ──
+  function stopRun() {
+    if (!confirm("确认停止本轮诊断？已完成的项目会保留，之后可以接着跑。")) return;
+    post(API.runStop, {}).then(function (r) {
+      if (!(r && r.ok)) {
+        $("#p-err").textContent = (r && r.err) || "停止失败";
+      }
+    });
+  }
+  function resumeRun() {
+    post(API.runResume, {}).then(function (r) {
+      if (r && r.ok) {
+        $("#g-resume-err").style.display = "none";
+        show("progress");
+        pollOnce();
+      } else {
+        var box = $("#g-resume-err");
+        box.textContent = (r && r.err) || "接着跑失败";
+        box.style.display = "";
+      }
+    });
+  }
+  function discardResume() {
+    post(API.resumeDiscard, {}).then(function () {
+      $("#g-resume").style.display = "none";
+      $("#g-resume-err").style.display = "none";
+    });
+  }
   function pollOnce() {
     get(API.progress).then(function (d) {
       renderProgress(d);
       updateHomeState(d);
       // 唯一轮询路径: running 续 1s; 现场流程 siteStart 已 ok 但服务端 phase
       // 尚未翻转的瞬时 idle 也续 (否则现场诊断会停在无轮询的死态)
-      if ((d.phase === "running" || (state.siteFlow && d.phase === "idle")) && !state.pollTimer) {
+      // v1.24.0: stopping (收尾中) 也要续 —— 等当前模块跑完就出报告
+      if ((d.phase === "running" || d.phase === "stopping"
+           || (state.siteFlow && d.phase === "idle")) && !state.pollTimer) {
         state.pollTimer = setInterval(pollOnce, 1000);
       }
     });
@@ -26803,7 +26972,10 @@ _GUI_JS = r"""(function () {
       (d.files || []).forEach(function (f) { $("#rep-files").appendChild(el("li", null, f)); });
       // 结论条只用快照既有字段; 分数/等级留在内嵌报告里, GUI 不自算 (口径统一)
       $("#ver-line").textContent = "诊断完成" + (d.label ? " · " + d.label : "");
-      $("#ver-sub").textContent = "实检 " + d.done + "/" + d.total + " 项 · 用时 " + fmtMs(d.elapsed_ms);
+      var sub = "实检 " + d.done + "/" + d.total + " 项 · 用时 " + fmtMs(d.elapsed_ms);
+      // v1.24.0: 续跑轮次把「哪些数据来自上一次」写在副行 (复用不隐瞒)
+      if (d.note) sub += " · " + d.note;
+      $("#ver-sub").textContent = sub;
       renderVerdict(d.verdict);
     });
     show("report");
@@ -27195,7 +27367,9 @@ _GUI_JS = r"""(function () {
       ev.preventDefault();
       ev.returnValue = mon
         ? "盯障进行中，关闭窗口将终止本次盯障且丢失未生成的报告"
-        : "诊断仍在进行，关闭窗口将终止本次诊断";
+        : "诊断仍在进行，关闭窗口会保留已测完的 "
+          + ((state.data && state.data.done) || 0)
+          + " 项，下次可以接着跑";
       return ev.returnValue;
     }
   });
@@ -27235,6 +27409,12 @@ _GUI_JS = r"""(function () {
       state.leftProgress = true;
       show("home"); pollOnce();
     });
+    // v1.24.0: 停止 / 接着跑 / 查看部分报告 / 主页横幅两个按钮
+    $("#btn-stop").addEventListener("click", stopRun);
+    $("#btn-resume-go").addEventListener("click", resumeRun);
+    $("#btn-partial-report").addEventListener("click", openReport);
+    $("#btn-resume").addEventListener("click", resumeRun);
+    $("#btn-resume-new").addEventListener("click", discardResume);
     $("#btn-home2").addEventListener("click", function () { show("home"); });
     ["html", "pdf", "json"].forEach(function (k) {
       var b = $("#exp-" + k);
@@ -27381,6 +27561,15 @@ def _gui_page():
             '<div class="g-sub">点一张卡片就开始测，测完直接出报告。</div>'
             '<button id="g-runbar" class="g-runbar" type="button" style="display:none">'
             '诊断进行中 · 点击查看进度</button>'
+            # v1.24.0: 续跑横幅 (跨重启后出现 —— 上次那轮没跑完)
+            '<div id="g-resume" class="g-resume" style="display:none">'
+            '<span><div class="rt">上次诊断没跑完</div>'
+            '<div class="rd" id="g-resume-d"></div></span>'
+            '<span class="ops">'
+            '<button id="btn-resume" class="g-btn" type="button">接着跑</button>'
+            '<button id="btn-resume-new" class="g-btn2" type="button">重新开始</button>'
+            '</span></div>'
+            '<div id="g-resume-err" class="g-err" style="display:none"></div>'
             '<div id="cards" class="g-cards"></div>'
             '<div class="g-fullrow">'
             '<button id="btn-full" class="g-btn2" type="button">'
@@ -27395,12 +27584,31 @@ def _gui_page():
             '<button id="g-lastrep" class="g-link" type="button" style="display:none">'
             '查看上次报告</button></div>'
             "</main>\n"
-            # ── 进度页 (设计稿第 3 节) ──
+            # ── 进度页 (设计稿第 3 节 + v1.24.0 停止/收尾/已停止) ──
             '<main id="view-progress" class="g-view-prog" style="display:none">'
             '<div class="g-prog"><span id="p-done" class="g-big num"></span>'
             '<div class="g-time"><div class="lab">已耗时</div>'
-            '<div id="p-elapsed" class="g-dim num"></div></div></div>'
+            '<div id="p-elapsed" class="g-dim num"></div></div>'
+            # v1.24.0 变体 A: 停止按钮在右上角, 与「已耗时」同一行
+            '<button id="btn-stop" class="g-stop" type="button" style="display:none">'
+            '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none">'
+            '<rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>'
+            '<span id="btn-stop-t">停止</span></button></div>'
             '<div class="g-bar"><i id="p-bar"></i></div>'
+            # 收尾中 (已请求停止, 等当前模块跑完)
+            '<div id="p-stopbar" class="g-stopbar" style="display:none">'
+            '<span class="sp"></span><span>'
+            '<b>已停止调度，等当前项目跑完就出报告</b>'
+            '<span class="sd">手头这项目最长要 3 分钟，跑完就出结果，剩下的不再测。</span>'
+            '</span></div>'
+            # 已停止 (部分报告已出)
+            '<div id="p-donebar" class="g-donebar" style="display:none">'
+            '<span><div class="st" id="p-done-t">已停止</div>'
+            '<div class="sd" id="p-done-d"></div></span>'
+            '<span class="ops">'
+            '<button id="btn-resume-go" class="g-btn" type="button">继续跑剩下的</button>'
+            '<button id="btn-partial-report" class="g-btn2" type="button">查看报告</button>'
+            '</span></div>'
             '<div class="g-cur"><span class="g-spin"></span>'
             '<span><span class="lab">正在测试</span><b id="p-cur-t"></b></span></div>'
             '<div id="p-lights" class="g-lights"></div>'
@@ -27685,6 +27893,9 @@ def _gui_meta():
                           for st, sk in STATUS_KEY.items()},
         # 终审 F4: 报告页结论条等级徽章色, 同一载荷下发 (页面 JS 不内嵌色表)
         "grade_colors": dict(GRADE_COLORS),
+        # v1.24.0: 主页续跑横幅数据 —— 有没有「上次没跑完」的轮次。
+        # 点开页面读一次续跑点; 文件不存在/损坏都当没有 (不报错、不打断主页)。
+        "resume": _gui_resume_summary(_gui_resume_load()[0]),
         "site_items": [{"key": it["key"], "cat": it["cat"],
                         "label": it["label"], "options": list(it["options"])}
                        for it in SITE_CHECK_ITEMS],
@@ -27733,6 +27944,16 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
             pass
 
     def _reject(self):
+        # v1.24.0: 先把请求体读掉再回 403 —— 不读就关连接, 客户端会收到
+        # RST (Windows: WinError 10053 连接被中止), 表现为「请求失败」而不是
+        # 「403 无权限」, 排查时分不清是权限问题还是网络问题。
+        # 上限 64KB: 免得被超大 Content-Length 撑内存。
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if 0 < n <= 65536:
+                self.rfile.read(n)
+        except Exception:
+            pass
         self._send(403, {"error": "forbidden"})
 
     def _body(self):
@@ -27837,6 +28058,27 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
                     ok, err = self.session.start(profile)
                 return self._send(200 if ok else 400,
                                   {"ok": ok, "err": err})
+            if p == "/api/run/stop":
+                # v1.24.0: 请求停止本轮诊断 (软取消 —— 不再启动新模块, 手头
+                # 那项跑完就收尾)。幂等口径: 在跑/已在收尾 → 200; 没在跑 → 400。
+                snap = self.session.snapshot()
+                if not snap.get("can_stop"):
+                    return self._send(400,
+                                      {"ok": False, "err": "当前没有进行中的诊断"})
+                if snap.get("stop_requested"):
+                    return self._send(200, {"ok": True})   # 已在收尾, 幂等
+                ok = self.session.stop()
+                return self._send(200 if ok else 400,
+                                  {"ok": ok,
+                                   "err": None if ok else "停止失败"})
+            if p == "/api/run/resume":
+                # v1.24.0: 从落盘的续跑点接着跑 (只跑没测过的那几项)。
+                ok, err = self.session.start_resume()
+                return self._send(200 if ok else 400, {"ok": ok, "err": err})
+            if p == "/api/resume/discard":
+                # v1.24.0: 丢弃续跑点 (主页横幅的「重新开始」)
+                _gui_resume_discard()
+                return self._send(200, {"ok": True})
             if p == "/api/export":
                 kind = str((data or {}).get("kind") or "")
                 path, err = self.session.export(kind)
@@ -27862,6 +28104,12 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
                             self.monitor.stop()
                         except Exception:
                             pass
+                    # v1.24.0: 诊断在跑时关窗 → 先把已测完的项目落盘
+                    # (在跑的那项算没测完, 下次重跑), 别让成果白费。
+                    try:
+                        self.session.save_resume_point_now()
+                    except Exception:
+                        pass
                     self.shutdown_evt.set()
                     return self._send(200, {"ok": True})
                 return self._send(409, {"ok": False, "reason": "running"})
