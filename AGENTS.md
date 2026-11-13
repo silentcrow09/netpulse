@@ -462,7 +462,7 @@
 
 ```bash
 for f in tests/test_*.py; do python "$f"; done
-#   单元/回归套件 (v1.15.2: 41 文件): diagnosis/诊断矩阵/丢包口径/
+#   单元/回归套件 (v1.24.0: 61 文件): diagnosis/诊断矩阵/丢包口径/
 #   XSS 转义 (含测速报告族 href 属性注入回归)/抓包离线分析/pcap 分析与取证/
 #   **抓包生产管线端到端 (v1.14.14 新增, 最重要的一条)**/控制台编码兜底 (v1.14.14)/
 #   **JSON Schema ↔ 导出一致性 (v1.14.14 新增)**/probes/redaction/场景菜单/
@@ -470,6 +470,7 @@ for f in tests/test_*.py; do python "$f"; done
 #   全量口径与 tcpcc 多目标轮转 (v1.10.0)/自动检查更新 (v1.12.0)/
 #   现场检测模式 (v1.13.0)/一页版问题区回退 (v1.13.1)/现场模式自动 PDF (v1.14.0)/
 #   **异常上报 (v1.17.0 新增: 协议/脱敏/限流/探针保栈/端到端)**/
+#   **诊断中途取消/续跑 (v1.24.0 新增: 取消闸三处 + 续跑点 + 部分报告 + 页面分支)**/
 #   v1.14.14 已删 tests/test_parsers.py: 那 29 个用例测的 4 个解析器
 #   (parse_ipconfig / parse_route_print / parse_arp_a / parse_netsh_wlan_interfaces)
 #   **生产代码一次都没调用** —— ARPAnalyzer/RouteAnalyzer/WifiAnalyzer 都是各自
