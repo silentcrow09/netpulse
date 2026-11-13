@@ -24928,7 +24928,17 @@ def _gui_resume_save(payload):
             # default=str: 模块结果里可能有非 JSON 原生类型 (dataclass 等),
             # 落盘时退化成字符串; 读回只用于续跑合并, 不影响当轮报告。
             json.dump(payload, f, ensure_ascii=False, default=str)
-        os.replace(tmp, path)
+        # v1.24.0 终审复核: Windows 上读方持有 resume.json 句柄时, os.replace
+        # 会 WinError 5 (拒绝访问) —— 退避重试几次, 别让这一轮的成果因为
+        # 几毫秒的占用没存下来 (os.replace 本身是原子的, 失败只是目标被占用)。
+        for attempt in range(4):
+            try:
+                os.replace(tmp, path)
+                return True, None
+            except PermissionError:
+                if attempt == 3:
+                    raise
+                time.sleep(0.06 * (attempt + 1))
         return True, None
     except Exception as e:
         try:
@@ -24972,17 +24982,15 @@ def _gui_resume_load():
     keys = clean.get("keys") or []
     done = clean.get("completed") or {}
     if keys and all(k in done for k in keys):
-        # 删前复核: 读文件与删文件之间可能恰好有并发写入 (os.replace 是原子
-        # 替换) —— 删的必须还是这个「全测完」的点, 免得把刚写好的新点删了。
-        try:
-            with open(path, encoding="utf-8") as f:
-                again = _gui_resume_clean(json.load(f))
-            akeys = (again or {}).get("keys") or []
-            adone = (again or {}).get("completed") or {}
-            if akeys and all(k in adone for k in akeys):
-                os.remove(path)
-        except Exception:
-            pass
+        # 「全测完」的点没有可续的 —— 当作没有 (spec F4「全都测完的轮次不写点」)。
+        #
+        # v1.24.0 终审复核: 这里**不删文件**。读路径带删除副作用, 删的瞬间若恰好
+        # 有并发写点 (写点用 os.replace 原子替换), 会把刚写好的新点删掉 ——
+        # 复核读也堵不住 (复核与 remove 之间仍有几微秒窗口)。清理交给:
+        #   ① 下一次落盘时覆盖 (os.replace 同一路径);
+        #   ② 7 天过期自动清理;
+        #   ③ 用户点「重新开始」显式丢弃。
+        # 横幅与「接着跑」入口按「没有可续的」处理 (返回 None + 说明文案)。
         return None, "上次的诊断已经全测完了，没有要接着跑的项目"
     return clean, None
 

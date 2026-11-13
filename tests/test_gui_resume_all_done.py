@@ -144,7 +144,7 @@ class TestAllDoneNoResumePoint(_AllDoneCase):
         self.assertFalse(os.path.exists(self.resume_path),
                          "续跑轮次全测完 → 来源点也没有可续的了, 该删")
 
-    # ── A5 读点: 全测完的点当作没有 ──
+    # ── A5 读点: 全测完的点当作没有 (读路径零副作用, 不删文件) ──
     def test_all_done_point_ignored_on_load(self):
         self._write_point(_point(["gateway", "dns"],
                                   {"gateway": _done("gateway"),
@@ -153,8 +153,54 @@ class TestAllDoneNoResumePoint(_AllDoneCase):
         self.assertIsNone(pt, "全测完的点没有可续的 → 当作没有")
         self.assertIn("全测完", err or "",
                       "要说明为什么续不了 (「接着跑」入口照实说, 不给死按钮)")
-        self.assertFalse(os.path.exists(self.resume_path),
-                         "顺手把这个垃圾点清掉 (别留着下回又说「没跑完」)")
+        # 读路径**不删文件** —— 删的瞬间若恰好有并发写点 (os.replace 原子替换),
+        # 会把刚写好的新点删掉。清理交给「下一次落盘覆盖 / 7 天过期 / 重新开始」。
+        self.assertTrue(os.path.exists(self.resume_path),
+                        "读点不删文件 (读路径带删除副作用会误删并发写的新点)")
+
+    # ── A12 读点过程中并发写的新点不被删 (锁住「读路径不删」这条) ──
+    def test_concurrent_write_during_load_survives(self):
+        self._write_point(_point(["gateway", "dns"],
+                                  {"gateway": _done("gateway"),
+                                   "dns": _done("dns")}))
+        new_payload = _point(["wifi", "tcpstats"], {"wifi": _done("wifi")})
+        real_clean = np._gui_resume_clean
+        state = {"n": 0}
+
+        def _clean(data):
+            # 注入并发写点: 读完、判定之前, 另一线程写了个新点 (os.replace 原子替换)
+            state["n"] += 1
+            if state["n"] == 1:
+                np._gui_resume_save(new_payload)
+            return real_clean(data)
+
+        with mock.patch.object(np, "_gui_resume_clean", side_effect=_clean):
+            np._gui_resume_load()
+        pt2, err2 = np._gui_resume_load()
+        self.assertIsNone(err2, err2)
+        self.assertIsNotNone(pt2, "并发写的新点被读点删掉了 (回归!)")
+        self.assertEqual(sorted(pt2["completed"]), ["wifi"],
+                         "并发写的新点内容要原样还在")
+
+    # ── A13 Windows: os.replace 撞上占用 → 退避重试后成功 ──
+    def test_save_retries_when_target_is_locked(self):
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def _replace(src, dst):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(5, "拒绝访问")
+            return real_replace(src, dst)
+
+        payload = _point(["gateway", "dns"], {"gateway": _done("gateway")})
+        with mock.patch.object(np.os, "replace", side_effect=_replace):
+            ok, err = np._gui_resume_save(payload)
+        self.assertTrue(ok, "目标被占用时应退避重试, 而不是直接判失败: %s" % err)
+        self.assertEqual(calls["n"], 3, "应重试到成功为止")
+        pt, _ = np._gui_resume_load()
+        self.assertIsNotNone(pt)
+        self.assertEqual(sorted(pt["completed"]), ["gateway"])
 
     # ── A6 读点: 没测完的点照常读 ──
     def test_partial_point_still_loads(self):
