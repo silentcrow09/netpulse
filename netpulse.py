@@ -25821,6 +25821,8 @@ iframe#mon-frame{ width:100%; height:calc(100vh - 300px); border:0; margin-top:1
              align-items:center; justify-content:center; }
 .grp-name{ font-size:15.5px; font-weight:700; letter-spacing:.2px; }
 .grp-sub{ font-size:12px; color:var(--mute); margin-left:2px; }
+/* 组级「全选/清空」(spec F2, 设计稿未画): 推到组头右缘, 复用 .txtbtn 文字按钮 */
+.grp-ops{ margin-left:auto; display:flex; align-items:center; gap:8px; }
 .mrows{ display:grid; grid-template-columns:1fr 1fr; column-gap:28px; align-items:start;
         margin-top:8px; }
 .mrow{ display:flex; align-items:center; gap:10px; padding:7px 12px; border-radius:8px;
@@ -25981,15 +25983,33 @@ _GUI_JS = r"""(function () {
     Object.keys(byCat).forEach(function (letter) {
       var info = cats[letter] || {};
       var grp = el("div", "grp");
+      grp.dataset.cat = letter;   // 组级「全选/清空」的限定作用域 (spec F2)
       var head = el("div", "grp-head");
       head.appendChild(el("span", "cat-letter", letter));
       head.appendChild(el("span", "grp-name", info.name || letter));
       head.appendChild(el("span", "grp-sub", info.desc || ""));
+      // 组头尾部组级「全选 / 清空」(spec F2 明文; 顶部全选=全 24 项,
+      // 无法一键只操作某一组)。动态渲染, 点击走 #mp-groups 委托。
+      var ops = el("span", "grp-ops");
+      var gAll = el("button", "txtbtn", "全选");
+      gAll.type = "button";
+      gAll.dataset.cat = letter;
+      gAll.dataset.act = "all";
+      ops.appendChild(gAll);
+      ops.appendChild(el("span", "tsep", "·"));
+      var gNone = el("button", "txtbtn", "清空");
+      gNone.type = "button";
+      gNone.dataset.cat = letter;
+      gNone.dataset.act = "none";
+      ops.appendChild(gNone);
+      head.appendChild(ops);
       grp.appendChild(head);
       var rows = el("div", "mrows");
       byCat[letter].forEach(function (it) {
         var row = document.createElement("label");
-        row.className = "mrow";
+        // tcpcc 初次渲染即整行红调 (设计稿静态 class="mrow stress"),
+        // 交互后由 mpSyncRow 维持同款拼装
+        row.className = "mrow" + (it.key === "tcpcc" ? " stress" : "");
         var ck = document.createElement("input");
         ck.type = "checkbox";
         ck.className = "ck";
@@ -26067,6 +26087,8 @@ _GUI_JS = r"""(function () {
     if (sub) sub.style.display = on ? "" : "none";
   }
   function updateMpCount() {
+    // 改选组合即清旧错 (上次启动失败文案不残留; 进面板清由入口绑定负责)
+    $("#mp-err").textContent = "";
     var n = mpSelectedKeys().length;
     $("#mp-count").textContent = String(n);
     $("#mp-run-n").textContent = "(" + n + ")";
@@ -26092,6 +26114,18 @@ _GUI_JS = r"""(function () {
       mpSyncRow(c);
       mpSyncSub(c.dataset.k, c.checked);
     });
+    updateMpCount();
+  }
+  function mpSetGroup(letter, on) {
+    // spec F2 组级「全选/清空」: 只作用于该组 .ck (data-cat 限定作用域),
+    // 逐行同步/子项联动/计数与顶部 mpSetAll 同款
+    document.querySelectorAll(
+      '#view-modules .grp[data-cat="' + letter + '"] .ck')
+      .forEach(function (c) {
+        c.checked = on;
+        mpSyncRow(c);
+        mpSyncSub(c.dataset.k, on);
+      });
     updateMpCount();
   }
   function runModules() {
@@ -26736,7 +26770,10 @@ _GUI_JS = r"""(function () {
     $("#btn-site-finish").addEventListener("click", finishSite);
     $("#btn-site-back").addEventListener("click", function () { show("home"); });
     // ── 模块勾选面板 (v1.23.0) ──
-    $("#g-modpanel").addEventListener("click", function () { show("modules"); });
+    $("#g-modpanel").addEventListener("click", function () {
+      $("#mp-err").textContent = "";   // 进面板清旧错, 不带上次启动失败的文案
+      show("modules");
+    });
     $("#btn-mp-back").addEventListener("click", function () { show("home"); });
     $("#mp-all").addEventListener("click", function () { mpSetAll(true); });
     $("#mp-none").addEventListener("click", function () { mpSetAll(false); });
@@ -26750,6 +26787,13 @@ _GUI_JS = r"""(function () {
       updateMpCount();
     });
     $("#mp-groups").addEventListener("click", function (ev) {
+      // 组级「全选/清空」(动态渲染, 事件委托; closest 只匹配按钮,
+      // 不会误中携带 data-cat 的组容器本身)
+      var btn = ev.target.closest("button[data-cat]");
+      if (btn) {
+        mpSetGroup(btn.dataset.cat, btn.dataset.act === "all");
+        return;
+      }
       var sw = ev.target.closest("#mp-ookla-sw");
       if (!sw) return;
       mpOokla = !mpOokla;

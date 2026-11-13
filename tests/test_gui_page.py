@@ -22,7 +22,7 @@
      连通率外网口径 四项锚点
   P9 v1.23.0 模块勾选面板: 次级入口 g-modpanel + #view-modules 三分组 +
      tcpcc 红字警示 + DOM 确认弹层 (非 window.confirm) + 条件子项显隐 +
-     Ookla 真布尔直发
+     Ookla 真布尔直发 + 每组全选/清空 (spec F2) + 旧错清理/请求体锚点
 """
 import os
 import sys
@@ -227,6 +227,16 @@ class TestGuiPage(unittest.TestCase):
         self.assertTrue(0 <= i0 < i1, "applyHomeState 定位失败")
         self.assertIn("updateMpRunBtn();", js[i0:i1],
                       "主页状态合成必须联动面板运行按钮禁用")
+        # 旧错误文案不残留: 进面板与改选组合都要清 #mp-err (审查 F1 波小项)
+        i_gm = js.find('$("#g-modpanel").addEventListener')
+        self.assertTrue(i_gm > 0, "入口绑定缺失")
+        self.assertIn('$("#mp-err").textContent = "";',
+                      js[i_gm:i_gm + 200], "进面板必须清旧错误文案")
+        i0 = js.find("function updateMpCount")
+        i1 = js.find("function updateMpRunBtn")
+        self.assertTrue(0 <= i0 < i1, "updateMpCount 定位失败")
+        self.assertIn('$("#mp-err").textContent = "";', js[i0:i1],
+                      "改选组合必须清旧错误文案 (updateMpCount 单点)")
 
     def test_modules_tcpcc_warning(self):
         # tcpcc 行红字压测警示 (设计稿第 2 节原文), 且运行前特判弹确认
@@ -235,6 +245,11 @@ class TestGuiPage(unittest.TestCase):
         self.assertIn("压测：短时建立大量连接，勿对客户网络使用", p,
                       "tcpcc 红字警示缺失")
         self.assertIn('indexOf("tcpcc")', js, "运行前必须特判 tcpcc")
+        # 审查 F2: 初次渲染整行即带 stress 红调 (设计稿静态 class="mrow stress"),
+        # 不得等交互后 mpSyncRow 才补
+        self.assertIn(
+            'row.className = "mrow" + (it.key === "tcpcc" ? " stress" : "");',
+            js, "初次渲染 tcpcc 行必须自带 stress 红调")
 
     def test_modules_confirm_modal_dom(self):
         # 确认弹层必须是 DOM 遮罩实现 (遮罩+居中卡片+确认/返回), 非 window.confirm
@@ -263,6 +278,52 @@ class TestGuiPage(unittest.TestCase):
         self.assertIn("mpOokla = !mpOokla;", js, "开关切换缺失")
         self.assertIn("body.use_speedtest_net = mpOokla;", js,
                       "use_speedtest_net 必须发真布尔, 不得发字符串")
+        # 审查 F1 波小项: 请求体组装锚点——可选字段只在对应模块勾选中才发
+        # (留空不发, 未勾选不发); 运行按钮禁用判定锚点 (诊断+盯障双忙源)
+        i0 = js.find("function mpRun")
+        i1 = js.find("── 主页状态合成")
+        self.assertTrue(0 <= i0 < i1, "mpRun 定位失败")
+        run_body = js[i0:i1]
+        for guard in ('if (keys.indexOf("port") >= 0)',
+                      'if (keys.indexOf("iperf3") >= 0)',
+                      'if (keys.indexOf("speedtest") >= 0)'):
+            self.assertIn(guard, run_body,
+                          "可选字段必须按勾选守卫: %s" % guard)
+        i0 = js.find("function updateMpRunBtn")
+        i1 = js.find("function mpSetAll")
+        self.assertTrue(0 <= i0 < i1, "updateMpRunBtn 定位失败")
+        btn_body = js[i0:i1]
+        self.assertIn('state.monPhase === "running"', btn_body,
+                      "盯障运行中必须参与禁用判定")
+        self.assertIn("disabled = !mpSelectedKeys().length || busy", btn_body,
+                      "运行按钮禁用判定锚点缺失")
+
+    def test_modules_group_ops(self):
+        # spec F2 明文「每组全选/清空」——顶部全选=全 24 项, 无法一键只操作
+        # 一组 (范围重审裁定: 设计稿没画不能豁免 spec)。组头尾部组级文字
+        # 按钮, 复用 mpSetAll 同款逐行同步, 计数联动照旧。
+        p = self.page
+        js = p.split("<script>")[1]
+        self.assertIn("function mpSetGroup", js, "组级全选/清空函数缺失")
+        self.assertIn("grp.dataset.cat = letter", js, "组容器未携带分类字母")
+        self.assertIn('el("button", "txtbtn", "全选")', js, "组级全选按钮缺失")
+        self.assertIn('el("button", "txtbtn", "清空")', js, "组级清空按钮缺失")
+        # mpSetGroup 主体: 只作用于该组 .ck (data-cat 限定) + 行同步 + 子项联动 + 计数
+        i0 = js.find("function mpSetGroup")
+        i1 = js.find("function runModules")
+        self.assertTrue(0 <= i0 < i1, "mpSetGroup 定位失败")
+        body = js[i0:i1]
+        self.assertIn('.grp[data-cat="', body,
+                      "mpSetGroup 未按组限定作用域")
+        self.assertIn("mpSyncRow(c);", body, "组级操作必须同步行高亮")
+        self.assertIn("mpSyncSub(c.dataset.k, on);", body,
+                      "组级操作必须联动条件子项显隐")
+        self.assertIn("updateMpCount();", body, "组级操作必须联动计数")
+        # 组级按钮动态渲染, 事件必须走 #mp-groups 点击委托
+        self.assertIn('ev.target.closest("button[data-cat]")', js,
+                      "组级按钮点击委托缺失")
+        self.assertIn("mpSetGroup(btn.dataset.cat", js,
+                      "委托必须把组字母传给 mpSetGroup")
 
 
 if __name__ == "__main__":
