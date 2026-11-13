@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetPulse 模块勾选高级面板 · 设计稿 v1（GUI 二期第 2 项）</title>
+<style>
+  /* ════════════════════════════════════════════════════════════
+     NetPulse 模块勾选高级面板（GUI 二期第 2 项）· 静态设计稿（无可运行代码）
+     设计语言继承 gui_design_v1.html / monitor_design_v1.html：
+     藏蓝主色 + 克制严重度色 + hairline 细线 + 小号大写字距标签
+     + tabular-nums + soft 浅底卡；全部系统字体，零外部资源
+     模块中文名与三分类分组 = netpulse.py MODULE_REGISTRY /
+     MODULE_CATEGORIES 真实口径（24 项：a 基础信息 6 / b 宽带测速 5 /
+     c 故障诊断 13）
+     ════════════════════════════════════════════════════════════ */
+  :root{
+    --navy:#0a3b6e; --navy-2:#2a5485; --red:#b3261e; --amber:#ad6e10; --green:#1e6e44;
+    --text:#1a2230; --dim:#5b6472; --mute:#98a2ad; --rule:#d8dde5; --soft:#f6f7f9;
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ background:#dfe3e9; }
+  body{ font-family:"Inter","Microsoft YaHei","PingFang SC",sans-serif; color:var(--text);
+        font-size:14px; line-height:1.65; padding:46px 40px 110px; -webkit-font-smoothing:antialiased; }
+  .wrap{ max-width:1240px; margin:0 auto; }
+  .num{ font-variant-numeric:tabular-nums; font-feature-settings:"tnum"; }
+
+  /* ── 文档头 ── */
+  h1{ font-size:26px; font-weight:800; letter-spacing:.4px; color:var(--text); }
+  h1 .brandtag{ display:inline-block; background:var(--navy); color:#fff; font-size:15px; font-weight:800;
+                border-radius:8px; padding:3px 10px; letter-spacing:1px; vertical-align:3px; margin-right:12px; }
+  .meta{ font-size:12.5px; color:var(--mute); margin-top:8px; letter-spacing:.3px; }
+  .meta b{ color:var(--dim); }
+  .lead{ font-size:13.5px; color:var(--dim); margin-top:14px; max-width:980px; }
+  .lead b{ color:var(--text); }
+
+  /* ── 节 ── */
+  .sec{ margin-top:60px; }
+  .sec-head{ display:flex; align-items:baseline; gap:14px; border-bottom:2px solid var(--navy);
+             padding-bottom:10px; margin-bottom:12px; }
+  .sec-head .no{ font-size:13px; font-weight:800; color:var(--navy); letter-spacing:2.5px; white-space:nowrap; }
+  .sec-head .t{ font-size:20px; font-weight:800; letter-spacing:.5px; color:var(--text); }
+  .sec-head .pill{ font-size:11.5px; font-weight:700; letter-spacing:1.5px; padding:2px 12px;
+                   border-radius:999px; white-space:nowrap; }
+  .pill.navy{ background:var(--navy); color:#fff; }
+  .pill.ghost{ background:#fff; color:var(--navy-2); border:1px solid var(--navy-2); }
+  .sec-head .r{ margin-left:auto; font-size:12px; color:var(--mute); white-space:nowrap; }
+  .sec-desc{ font-size:13px; color:var(--dim); max-width:980px; margin:2px 2px 0; }
+
+  /* ── 设计注释（窗口下方说明） ── */
+  .notes{ font-size:12.5px; color:var(--dim); margin:10px auto 0; width:1160px; max-width:100%; }
+  .notes li{ margin-left:20px; margin-top:3px; }
+  .notes b{ color:var(--text); }
+  .notes .k{ color:var(--navy); font-weight:700; }
+  .notes .warn{ color:var(--red); font-weight:700; }
+
+  /* ── 假窗口框（与既有两稿同款） ── */
+  .win{ width:1160px; max-width:100%; margin:18px auto 8px; background:#fff; border:1px solid #c6ccd4;
+        border-radius:10px; overflow:hidden; box-shadow:0 26px 52px -30px rgba(13,35,60,.38); }
+  .win-title{ height:40px; background:#eef1f5; border-bottom:1px solid #e0e4ea; display:flex;
+              align-items:center; padding:0 14px; position:relative; }
+  .win-title .dots{ display:inline-flex; gap:6px; }
+  .win-title .dots i{ width:10px; height:10px; border-radius:50%; background:#c3cad3; }
+  .win-title .wt{ position:absolute; left:0; right:0; text-align:center; font-size:12.5px;
+                  color:var(--dim); font-weight:600; letter-spacing:.5px; pointer-events:none; }
+  .win-btns{ margin-left:auto; display:flex; align-items:center; gap:18px; color:#7b8593; font-size:13px; line-height:1; }
+  .win-btns .x{ font-size:14px; color:#5b6472; }
+
+  /* ═══ 第 0 节 · 总览 ═══ */
+  .flow{ display:flex; align-items:stretch; margin:18px 0 6px; }
+  .fstep{ flex:1; background:#fff; border:1px solid var(--rule); border-radius:10px; padding:14px 18px 12px; }
+  .fstep .h{ font-size:14px; font-weight:700; color:var(--navy); }
+  .fstep .h small{ font-size:11px; color:var(--mute); font-weight:600; letter-spacing:1px; margin-left:6px; }
+  .fstep .d{ font-size:12px; color:var(--dim); margin-top:4px; line-height:1.6; }
+  .farrow{ width:38px; display:flex; align-items:center; justify-content:center;
+           color:var(--mute); font-size:20px; }
+  .tbl{ background:#fff; border:1px solid var(--rule); border-radius:10px; overflow:hidden; margin-top:16px; }
+  table.list{ width:100%; border-collapse:collapse; }
+  table.list th{ background:var(--soft); text-align:left; font-size:12px; letter-spacing:1.5px;
+                 color:var(--dim); font-weight:700; padding:10px 16px; border-bottom:1px solid var(--rule); white-space:nowrap; }
+  table.list td{ padding:11px 16px; border-bottom:1px solid var(--soft); font-size:13px; color:var(--text); vertical-align:top; }
+  table.list tr:last-child td{ border-bottom:none; }
+  table.list td.dim{ color:var(--dim); }
+  table.list .secno{ color:var(--navy); font-weight:700; white-space:nowrap; }
+  .pill-add{ display:inline-block; background:#eaf4ee; color:var(--green); font-size:11px; font-weight:700;
+             letter-spacing:1.5px; padding:1px 11px; border-radius:999px; }
+  .pill-sel{ display:inline-block; background:#eef3f9; color:var(--navy); font-size:11px; font-weight:700;
+             letter-spacing:1.5px; padding:1px 11px; border-radius:999px; }
+  .pill-reuse{ display:inline-block; background:var(--soft); color:var(--dim); font-size:11px; font-weight:700;
+               letter-spacing:1.5px; padding:1px 11px; border-radius:999px; }
+  .unchanged{ background:var(--soft); border:1px solid var(--rule); border-radius:10px;
+              padding:14px 18px; font-size:13px; color:var(--dim); margin-top:16px; line-height:1.8; }
+  .unchanged b{ color:var(--text); }
+  .unchanged .lab{ font-size:12px; letter-spacing:2px; color:var(--mute); font-weight:700; display:block; margin-bottom:2px; }
+  code{ font-family:Consolas,"Courier New",monospace; font-size:12px; background:#eef1f5;
+        border:1px solid var(--rule); border-radius:4px; padding:0 6px; color:var(--navy); }
+
+  /* ═══ 窗口内通用：应用顶栏 / 主页元素（与 gui_design_v1 方案A 同款） ═══ */
+  .app-top{ height:58px; display:flex; align-items:center; gap:12px; padding:0 24px; border-bottom:1px solid var(--rule); }
+  .badge{ width:34px; height:34px; border-radius:9px; background:var(--navy); color:#fff; font-size:14px;
+          font-weight:800; letter-spacing:.5px; display:flex; align-items:center; justify-content:center; }
+  .brand-name{ font-size:17px; font-weight:800; color:var(--navy); letter-spacing:.3px; }
+  .ver-chip{ font-size:11px; font-weight:600; letter-spacing:.5px; color:var(--mute);
+             border:1px solid var(--rule); border-radius:999px; padding:2px 11px; }
+  .top-right{ margin-left:auto; display:flex; align-items:center; gap:12px; }
+  .net-dot{ width:11px; height:11px; border-radius:50%; background:var(--green);
+            box-shadow:0 0 0 3px #1e6e4422; }
+  .host-chip{ display:flex; align-items:center; gap:8px; background:var(--soft); border:1px solid var(--rule);
+              border-radius:999px; padding:5px 15px; font-size:12.5px; font-weight:600; color:var(--dim); }
+  .host-chip svg{ width:13px; height:13px; color:var(--mute); }
+  .app-main{ padding:28px 36px 28px; }
+  .app-h{ font-size:26px; font-weight:800; letter-spacing:.3px; }
+  .app-sub{ font-size:13px; color:var(--dim); margin-top:5px; }
+
+  /* ── 场景卡（仅变体 B 整卡网格示意用，与 gui_design_v1 方案A 同款） ── */
+  .scene-grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-top:22px; }
+  .scene{ background:var(--soft); border:1px solid var(--rule); border-radius:12px;
+          padding:20px 20px 18px; min-height:158px; display:flex; flex-direction:column; }
+  .scene .ic{ width:46px; height:46px; border-radius:11px; background:#fff; border:1px solid var(--rule);
+              display:flex; align-items:center; justify-content:center; color:var(--navy); margin-bottom:14px; }
+  .scene .ic svg{ width:24px; height:24px; }
+  .scene .nm{ font-size:16.5px; font-weight:700; letter-spacing:.2px; }
+  .scene .ds{ font-size:12.5px; color:var(--dim); margin-top:6px; line-height:1.6; }
+  .scene .go{ margin-top:auto; padding-top:12px; font-size:11.5px; font-weight:700; letter-spacing:1px; color:var(--mute); }
+  .scene.hot{ background:var(--navy); border-color:var(--navy); }
+  .scene.hot .ic{ background:rgba(255,255,255,.13); border-color:rgba(255,255,255,.28); color:#fff; }
+  .scene.hot .nm{ color:#fff; }
+  .scene.hot .ds{ color:#c7d7e8; }
+  .scene.hot .go{ color:#8fb3d6; }
+  .alt-row{ display:flex; align-items:center; gap:16px; margin-top:22px; padding-top:20px; border-top:1px solid var(--rule); }
+  .btn{ display:inline-flex; align-items:center; gap:8px; border-radius:7px; font-size:13px; font-weight:600;
+        padding:9px 18px; letter-spacing:.3px; }
+  .btn svg{ width:15px; height:15px; }
+  .btn-primary{ background:var(--navy); border:1px solid var(--navy); color:#fff; }
+  .btn-line-navy{ background:#fff; border:1px solid var(--navy-2); color:var(--navy); }
+  .btn-line{ background:#fff; border:1px solid var(--rule); color:var(--text); }
+  .btn-solid-red{ background:var(--red); border:1px solid var(--red); color:#fff; font-weight:700; }
+  .alt-note{ font-size:12.5px; color:var(--mute); }
+  .backlink{ font-size:12.5px; color:var(--mute); }
+
+  /* ── 变体 A 专用：上接卡提示带 ── */
+  .hint-cap{ font-size:11.5px; letter-spacing:1.5px; color:var(--mute); font-weight:700; margin-top:20px; }
+  .hint-chips{ display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+  .hchip{ border:1px dashed var(--rule); background:var(--soft); color:var(--dim); font-size:12px;
+          padding:4px 12px; border-radius:8px; }
+
+  /* ── 变体小节头 + 优劣注 ── */
+  .v-head{ display:flex; align-items:center; gap:12px; margin:34px auto 2px; width:1160px; max-width:100%;
+           font-size:16px; font-weight:800; letter-spacing:.3px; }
+  .v-head .pill{ font-size:11.5px; font-weight:700; letter-spacing:1.5px; padding:2px 12px; border-radius:999px; white-space:nowrap; }
+  .v-lead{ font-size:12.5px; color:var(--mute); margin:2px auto 0; width:1160px; max-width:100%; }
+  .v-note{ font-size:12.5px; color:var(--dim); margin:10px auto 0; width:1160px; max-width:100%; }
+  .v-note b{ color:var(--text); }
+
+  /* ── 「新增」就地标注（淡黄虚线框 + 标记） ── */
+  .anno{ position:relative; outline:2px dashed #e2c258; outline-offset:6px; border-radius:12px; }
+  .anno .anno-tag{ position:absolute; top:-11px; left:16px; z-index:2; background:#fbf3d9; border:1px solid #e2c258;
+                   color:#8a6d1a; font-size:11px; font-weight:700; letter-spacing:1px;
+                   padding:0 9px; border-radius:999px; line-height:19px; white-space:nowrap; }
+
+  /* ═══ 第 2 节 · 高级模块组合面板 ═══ */
+  .mp{ padding:26px 36px 26px; }
+  .mp-h{ font-size:21px; font-weight:800; letter-spacing:.3px; }
+  .mp-sub{ font-size:13px; color:var(--dim); margin-top:4px; }
+  .mp-ops{ display:flex; align-items:center; gap:16px; margin:18px 0 16px; padding:10px 16px;
+           background:var(--soft); border:1px solid var(--rule); border-radius:10px; }
+  .sel-count{ font-size:13px; color:var(--dim); }
+  .sel-count b{ font-size:17px; font-weight:800; color:var(--navy); margin:0 2px; }
+  .sel-count .sl{ color:var(--mute); margin:0 5px 0 3px; font-style:normal; }
+  .sel-count .tot{ color:var(--mute); }
+  .ops-btns{ margin-left:auto; display:flex; align-items:center; gap:12px; }
+  .txtbtn{ font-size:13px; color:var(--navy-2); font-weight:600; }
+  .tsep{ color:#c3cad3; }
+  .grp{ border:1px solid var(--rule); border-radius:12px; padding:14px 20px 14px; background:#fff; }
+  .grp + .grp{ margin-top:14px; }
+  .grp-head{ display:flex; align-items:center; gap:10px; padding-bottom:10px; border-bottom:1px solid var(--soft); }
+  .cat-letter{ width:22px; height:22px; flex:none; border-radius:7px; background:var(--navy); color:#fff;
+               font-size:12.5px; font-weight:800; display:inline-flex; align-items:center; justify-content:center; }
+  .grp-name{ font-size:15.5px; font-weight:700; letter-spacing:.2px; }
+  .grp-sub{ font-size:12px; color:var(--mute); margin-left:2px; }
+  .mrows{ display:grid; grid-template-columns:1fr 1fr; column-gap:28px; align-items:start; margin-top:8px; }
+  .mrow{ display:flex; align-items:center; gap:10px; padding:7px 12px; border-radius:8px; }
+  .ck{ width:17px; height:17px; flex:none; border-radius:5px; border:1.5px solid var(--mute); background:#fff;
+       display:inline-flex; align-items:center; justify-content:center; }
+  .ck svg{ width:11px; height:11px; }
+  .mname{ font-size:13.5px; }
+  .mrow.on .ck{ background:var(--navy); border-color:var(--navy); }
+  .mrow.on .mname{ color:var(--navy); font-weight:700; }
+  .mrow.stress{ background:#fbeeec; }
+  .mrow.stress .mname{ color:var(--red); font-weight:700; }
+  .mrow.stress.on .ck{ background:var(--navy); border-color:var(--navy); }
+  .mwarn{ margin-left:auto; font-size:11.5px; color:var(--red); font-weight:600; padding-left:10px; }
+  .sub{ margin:2px 0 8px 41px; background:var(--soft); border:1px solid var(--rule); border-radius:9px;
+        padding:9px 14px 11px; }
+  .slab{ font-size:12.5px; color:var(--dim); font-weight:600; display:flex; align-items:center; gap:10px; }
+  .sub .input{ height:32px; font-size:12.5px; border-radius:6px; padding:0 11px; }
+  .input{ width:100%; border:1px solid var(--rule); font-family:inherit; color:var(--text); background:#fff; }
+  input::placeholder{ color:#a8b2bd; }
+  .switch{ width:42px; height:24px; border-radius:999px; background:#c9d1da; position:relative; flex:none; }
+  .switch i{ position:absolute; top:3px; left:3px; width:18px; height:18px; border-radius:50%; background:#fff;
+             box-shadow:0 1px 3px rgba(0,0,0,.25); }
+  .swstate{ font-size:12px; font-weight:700; color:var(--dim); }
+  .mp-foot{ margin-top:18px; padding-top:16px; border-top:1px solid var(--rule); display:flex; align-items:center; gap:14px; }
+  .mp-back{ margin-left:auto; font-size:12.5px; color:var(--mute); }
+
+  /* ═══ 第 3 节 · 运行确认弹层 ═══ */
+  .winbody{ position:relative; background:#fff; }
+  .overlay{ position:absolute; inset:0; background:rgba(13,30,50,.44); display:flex;
+            align-items:center; justify-content:center; z-index:5; }
+  .modal{ width:470px; max-width:calc(100% - 60px); background:#fff; border-radius:14px;
+          box-shadow:0 30px 70px -18px rgba(10,25,45,.55); padding:22px 26px 24px; }
+  .modal-head{ display:flex; align-items:center; gap:13px; }
+  .warn-ic{ width:38px; height:38px; flex:none; border-radius:50%; background:#fbeeec; color:var(--red);
+            display:flex; align-items:center; justify-content:center; }
+  .warn-ic svg{ width:19px; height:19px; }
+  .modal-t{ font-size:16.5px; font-weight:800; letter-spacing:.3px; }
+  .modal-body{ font-size:13.5px; color:var(--text); line-height:1.75; margin-top:14px; }
+  .modal-body b{ color:var(--red); }
+  .modal-btns{ display:flex; justify-content:flex-end; gap:12px; margin-top:20px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1><span class="brandtag">NP</span>NetPulse 模块勾选高级面板 · 设计稿</h1>
+<div class="meta">v1 · 2026-11-13 · <b>GUI 二期第 2 项「模块勾选高级面板」</b> · 入口两变体选型 + 面板视图 + 压测确认弹层 · 设计语言继承 <code>gui_design_v1.html</code> / <code>monitor_design_v1.html</code> · 模块中文名与分组取自 <code>MODULE_REGISTRY</code> / <code>MODULE_CATEGORIES</code> 真实口径 · 静态选型稿（无可运行代码），选型确认后另出 <b>spec.md + verify.md</b> 再实施</div>
+<p class="lead">技术形态一句话：<b>主页新增「高级模块组合」入口 → 面板里按分类勾选 24 个模块的任意组合 → 点「运行所选」，进入与现在完全相同的诊断进度页和报告页（只是模块清单换成所选组合）</b>。测速系独占模块自动排队串行、压测模块（TCP 并发）运行前弹确认，调度全部由内核处理，GUI 不另造调度逻辑；终端模块菜单与 <code>--list</code> 照旧。</p>
+
+<!-- ══════════════════ 第 0 节 · 总览 ══════════════════ -->
+<div class="sec" id="sec0">
+  <div class="sec-head">
+    <span class="no">00</span><span class="t">总览</span>
+    <span class="r">技术形态 · 新增内容清单 · 不变项</span>
+  </div>
+  <p class="sec-desc">高级面板解决的是「<b>完整诊断太全、单场景卡不全</b>」之间的空档：想测哪几项就勾哪几项，其余一切照旧。勾完点「运行所选」，后面的进度页、报告页、评分口径与单独运行完全同源，不会因为组合方式不同而出现两套结果。</p>
+
+  <div class="flow">
+    <div class="fstep">
+      <div class="h">① 主页入口<small>第 1 节 · 变体 A / B 选型其一</small></div>
+      <div class="d">变体 A：完整诊断旁文字入口；变体 B：第 8 张场景卡。</div>
+    </div>
+    <div class="farrow">→</div>
+    <div class="fstep">
+      <div class="h">② 高级模块组合面板<small>第 2 节</small></div>
+      <div class="d">三分类 × 24 模块勾选；已选计数实时联动，条件选项就地展开。</div>
+    </div>
+    <div class="farrow">→</div>
+    <div class="fstep">
+      <div class="h">③ 运行确认弹层<small>第 3 节 · 仅压测时</small></div>
+      <div class="d">所选含「TCP 并发」时红字确认；普通组合不弹，直接开跑。</div>
+    </div>
+    <div class="farrow">→</div>
+    <div class="fstep">
+      <div class="h">④ 进度页 → 报告页<small>复用一期既有页面</small></div>
+      <div class="d">模块清单 = 所选组合；独占模块内核自动排队串行，不新增口径。</div>
+    </div>
+  </div>
+
+  <div class="tbl">
+    <table class="list">
+      <tr><th style="width:26%">界面</th><th style="width:20%">入口</th><th>说明</th><th style="width:8%">类型</th><th style="width:14%">对应节号</th></tr>
+      <tr>
+        <td>主页入口「高级模块组合」</td>
+        <td class="dim">主界面</td>
+        <td class="dim">变体 A：完整诊断行旁新增次级文字入口；变体 B：第 8 张场景卡（网格第三行）——二选一</td>
+        <td><span class="pill-sel">选型</span></td>
+        <td class="secno">第 1 节</td>
+      </tr>
+      <tr>
+        <td>高级模块组合面板</td>
+        <td class="dim">主页入口</td>
+        <td class="dim">三分类（a 基础信息 6 项 / b 宽带测速 5 项 / c 故障诊断 13 项）勾选；已选计数 + 全选 / 清空 / 反选；勾「测速」「iperf3 吞吐」「MTU 检测」时条件选项就地展开</td>
+        <td><span class="pill-add">新增</span></td>
+        <td class="secno">第 2 节</td>
+      </tr>
+      <tr>
+        <td>运行确认弹层</td>
+        <td class="dim">所选含「TCP 并发」点「运行所选」</td>
+        <td class="dim">红字压测提示 + 确认运行 / 返回；其余组合不弹</td>
+        <td><span class="pill-add">新增</span></td>
+        <td class="secno">第 3 节</td>
+      </tr>
+      <tr>
+        <td>诊断进度页 / 报告页</td>
+        <td class="dim">点「运行所选」后</td>
+        <td class="dim">完全复用一期既有页面，仅模块清单变为所选组合；进度、报告、评分口径零改动</td>
+        <td><span class="pill-reuse">复用</span></td>
+        <td class="secno">一期第 3 / 4 节</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="unchanged">
+    <span class="lab">不变项</span>
+    <b>终端模块菜单</b>与 <code>--list</code> 照旧可用；<b>既有七张场景卡</b>（六张一期卡 + 二期第 1 项「持续盯障」）内容与顺序不变（变体 B 仅追加第 8 张卡）；
+    诊断进度页、报告页与评分口径全部复用；模块注册表 <code>MODULE_REGISTRY</code> 不改，面板只是换一种「挑模块」的方式。
+  </div>
+</div>
+
+<!-- ══════════════════ 第 1 节 · 入口两变体 ══════════════════ -->
+<div class="sec" id="sec1">
+  <div class="sec-head">
+    <span class="no">01</span><span class="t">入口两变体</span>
+    <span class="pill ghost">选型 · 二选一</span>
+    <span class="r">同一入口的两种放法 · 变体 A 推荐 / 变体 B 备选</span>
+  </div>
+  <p class="sec-desc">入口只解决「从主页怎么进面板」。两案都不改现有卡片的内容与顺序：选 A 主页保持七张卡，选 B 主页变八张。</p>
+
+  <div class="v-head">变体 A · 「完整诊断」旁次级文字入口 <span class="pill navy">推荐</span></div>
+  <p class="v-lead">示意主页底部区域：上部七张场景卡不动，在「完整诊断」次级行旁挂一个文字入口。</p>
+
+  <div class="win">
+    <div class="win-title">
+      <span class="dots"><i></i><i></i><i></i></span>
+      <span class="wt">NetPulse 网络诊断</span>
+      <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+    </div>
+    <div class="app-top">
+      <span class="badge">NP</span>
+      <span class="brand-name">NetPulse</span>
+      <span class="ver-chip num">v1.22.0-dev</span>
+      <span class="top-right">
+        <span class="net-dot" title="网络正常"></span>
+        <span class="host-chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="13" rx="2"/><path d="M8 21h8M12 18v3"/></svg>DESKTOP-3F8K2</span>
+      </span>
+    </div>
+    <div class="app-main">
+      <div class="app-h">今天网络哪里不舒服？</div>
+      <div class="app-sub">点一张卡片就开始测，测完直接出报告。</div>
+      <div class="hint-cap">上接 · 现有七张场景卡（同现状，不变）</div>
+      <div class="hint-chips">
+        <span class="hchip">网络很慢</span>
+        <span class="hchip">经常断网</span>
+        <span class="hchip">网页打不开</span>
+        <span class="hchip">游戏卡顿</span>
+        <span class="hchip">WiFi 信号差</span>
+        <span class="hchip">现场检测（上门）</span>
+        <span class="hchip">持续盯障</span>
+      </div>
+      <div class="alt-row">
+        <span class="btn btn-line-navy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/><path d="M7 13h6M7 16h4"/></svg>完整诊断（24 项全查）</span>
+        <span class="anno"><span class="anno-tag">新增</span><span class="txtbtn" style="padding:9px 10px;">高级模块组合 ›</span></span>
+        <span class="alt-note">大约 5–10 分钟，出完整报告。</span>
+      </div>
+    </div>
+  </div>
+  <p class="v-note"><b>优：</b>低调，不挤卡片网格，主页保持七张卡的节奏；<b>劣：</b>文字入口弱，进阶用户发现性低。</p>
+
+  <div class="v-head">变体 B · 第 8 张场景卡「模块组合」 <span class="pill ghost">备选</span></div>
+  <p class="v-lead">示意完整主页：网格第三行追加一张卡，样式与其它卡一致，说明文案区分进阶用途。</p>
+
+  <div class="win">
+    <div class="win-title">
+      <span class="dots"><i></i><i></i><i></i></span>
+      <span class="wt">NetPulse 网络诊断</span>
+      <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+    </div>
+    <div class="app-top">
+      <span class="badge">NP</span>
+      <span class="brand-name">NetPulse</span>
+      <span class="ver-chip num">v1.22.0-dev</span>
+      <span class="top-right">
+        <span class="net-dot" title="网络正常"></span>
+        <span class="host-chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="13" rx="2"/><path d="M8 21h8M12 18v3"/></svg>DESKTOP-3F8K2</span>
+      </span>
+    </div>
+    <div class="app-main">
+      <div class="app-h">今天网络哪里不舒服？</div>
+      <div class="app-sub">点一张卡片就开始测，测完直接出报告。</div>
+      <div class="scene-grid">
+        <div class="scene">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 16a8 8 0 1 1 14 0"/><path d="M12 16 8.6 11.4"/><circle cx="12" cy="16" r="1.5"/></svg></span>
+          <span class="nm">网络很慢</span>
+          <span class="ds">刷视频转圈、下载龟速时选这个。</span>
+          <span class="go">点击开始 →</span>
+        </div>
+        <div class="scene">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12.5h4l2.5-5.5 3.5 10 2.5-4.5h6.5"/></svg></span>
+          <span class="nm">经常断网</span>
+          <span class="ds">时好时坏，玩着玩着说断就断。</span>
+          <span class="go">点击开始 →</span>
+        </div>
+        <div class="scene">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/><path d="M10 12.5l4 4M14 12.5l-4 4"/></svg></span>
+          <span class="nm">网页打不开</span>
+          <span class="ds">个别网站转半天出不来，别的都正常。</span>
+          <span class="go">点击开始 →</span>
+        </div>
+        <div class="scene">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="7.5" width="19" height="9.5" rx="4.75"/><path d="M8 10.2v4M6 12.2h4"/><circle cx="15.6" cy="11" r="1" fill="currentColor" stroke="none"/><circle cx="18" cy="13.4" r="1" fill="currentColor" stroke="none"/></svg></span>
+          <span class="nm">游戏卡顿</span>
+          <span class="ds">延迟高、时不时卡一下、团战掉帧。</span>
+          <span class="go">点击开始 →</span>
+        </div>
+        <div class="scene">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 10.2a11.5 11.5 0 0 1 15 0" opacity=".22"/><path d="M7.3 13.2a7.5 7.5 0 0 1 9.4 0" opacity=".45"/><path d="M10 16.1a3.6 3.6 0 0 1 4 0"/><circle cx="12" cy="18.7" r="1.2" fill="currentColor" stroke="none"/></svg></span>
+          <span class="nm">WiFi 信号差</span>
+          <span class="ds">隔堵墙就没信号，离路由器远掉速。</span>
+          <span class="go">点击开始 →</span>
+        </div>
+        <div class="scene hot">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-13a2 2 0 0 0-2-2h-2"/><rect x="9" y="2.5" width="6" height="4" rx="1"/><path d="M8.8 13.5l2.3 2.3 4.3-4.6"/></svg></span>
+          <span class="nm">现场检测（上门）</span>
+          <span class="ds">给客户做全屋体检，出一份客户能看懂的报告。</span>
+          <span class="go">点击开始 →</span>
+        </div>
+        <div class="scene">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13.5" r="7.5"/><path d="M12 10v3.5l2.5 2"/><path d="M9.5 3.5h5"/><path d="M12 3.5v2.5"/></svg></span>
+          <span class="nm">持续盯障</span>
+          <span class="ds">守一段时间抓偶发断线和高负载下的问题，结束自动出报告。</span>
+          <span class="go">点击开始 →</span>
+        </div>
+        <div class="anno">
+          <span class="anno-tag">新增 · 第 8 张</span>
+          <div class="scene">
+            <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3.5" width="16" height="17" rx="2.2"/><path d="M8.2 9.6l1.5 1.5 2.8-3"/><path d="M14.8 10.1h1.4"/><path d="M8.2 15.2l1.5 1.5 2.8-3"/><path d="M14.8 15.7h1.4"/></svg></span>
+            <span class="nm">模块组合</span>
+            <span class="ds">按分类勾选任意模块，自由组合诊断。</span>
+            <span class="go">点击开始 →</span>
+          </div>
+        </div>
+      </div>
+      <div class="alt-row">
+        <span class="btn btn-line-navy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/><path d="M7 13h6M7 16h4"/></svg>完整诊断（24 项全查）</span>
+        <span class="alt-note">大约 5–10 分钟，出完整报告。</span>
+      </div>
+    </div>
+  </div>
+  <p class="v-note"><b>优：</b>发现性高，卡片能承载一句说明文案；<b>劣：</b>主页卡片变多，对小白有噪音。</p>
+
+  <ul class="notes">
+    <li><b>两案互斥二选一</b>；选 A 主页七卡不动，选 B 仅追加第 8 张卡、现有七张卡内容与顺序都不改。</li>
+    <li>两案都通向同一个面板（第 2 节）；「完整诊断（24 项全查）」入口照旧，两者互不影响。</li>
+    <li>变体 A 的文字入口与「完整诊断」同行同级（次级行），不升级为按钮，避免和六张场景卡抢注意力。</li>
+  </ul>
+</div>
+
+<!-- ══════════════════ 第 2 节 · 高级模块组合面板 ══════════════════ -->
+<div class="sec" id="sec2">
+  <div class="sec-head">
+    <span class="no">02</span><span class="t">高级模块组合面板</span>
+    <span class="pill navy">本稿核心</span>
+    <span class="r">新增页面 · 已勾选 5 项的状态示意 · 分组与命名取真实注册表</span>
+  </div>
+  <p class="sec-desc">按分类勾选要测的模块，自由组合。示例状态：勾了<b>链路速率 / 多出口 / 测速 / iperf3 吞吐 / MTU 检测</b>共 5 项，计数与底部按钮数字随之联动；三个条件选项（Ookla 对照、iperf3 服务器、MTU 探测目标）随勾选就地展开。</p>
+
+  <div class="win">
+    <div class="win-title">
+      <span class="dots"><i></i><i></i><i></i></span>
+      <span class="wt">NetPulse 网络诊断</span>
+      <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+    </div>
+    <div class="app-top">
+      <span class="badge">NP</span>
+      <span class="brand-name">NetPulse</span>
+      <span class="ver-chip num">v1.22.0-dev</span>
+      <span class="top-right">
+        <span class="net-dot" title="网络正常"></span>
+        <span class="host-chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="13" rx="2"/><path d="M8 21h8M12 18v3"/></svg>DESKTOP-3F8K2</span>
+      </span>
+    </div>
+    <div class="mp">
+      <div class="mp-h">高级模块组合</div>
+      <div class="mp-sub">按分类勾选要测的模块，自由组合；结果与单独运行同口径。</div>
+
+      <div class="mp-ops">
+        <span class="sel-count num">已选<b>5</b><i class="sl">/</i><span class="tot num">24</span></span>
+        <span class="ops-btns">
+          <span class="txtbtn">全选</span><span class="tsep">·</span>
+          <span class="txtbtn">清空</span><span class="tsep">·</span>
+          <span class="txtbtn">反选</span>
+        </span>
+      </div>
+
+      <div class="grp">
+        <div class="grp-head">
+          <span class="cat-letter">a</span>
+          <span class="grp-name">基础信息</span>
+          <span class="grp-sub">环境快照 · 看清网络状态</span>
+        </div>
+        <div class="mrows">
+          <div class="mrow on"><span class="ck"><svg viewBox="0 0 12 12" fill="none"><path d="M2.5 6.3l2.3 2.3 4.7-5.2" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="mname">链路速率</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">DHCP 检测</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">LAN 设备扫描</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">WiFi 分析</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">IPv6 检测</span></div>
+          <div class="mrow on"><span class="ck"><svg viewBox="0 0 12 12" fill="none"><path d="M2.5 6.3l2.3 2.3 4.7-5.2" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="mname">多出口</span></div>
+        </div>
+      </div>
+
+      <div class="grp">
+        <div class="grp-head">
+          <span class="cat-letter">b</span>
+          <span class="grp-name">宽带测速</span>
+          <span class="grp-sub">带宽达标验证 · 装维核心高频</span>
+        </div>
+        <div class="mrows">
+          <div class="munit">
+            <div class="mrow on"><span class="ck"><svg viewBox="0 0 12 12" fill="none"><path d="M2.5 6.3l2.3 2.3 4.7-5.2" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="mname">测速</span></div>
+            <div class="sub">
+              <div class="slab"><span>Ookla 官方对照</span><span class="switch"><i></i></span><span class="swstate">关（默认）</span></div>
+            </div>
+          </div>
+          <div class="mrow"><span class="ck"></span><span class="mname">Bufferbloat</span></div>
+          <div class="munit">
+            <div class="mrow on"><span class="ck"><svg viewBox="0 0 12 12" fill="none"><path d="M2.5 6.3l2.3 2.3 4.7-5.2" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="mname">iperf3 吞吐</span></div>
+            <div class="sub">
+              <div class="slab"><span>iperf3 服务器</span></div>
+              <input class="input" type="text" placeholder="留空则按未检测处理">
+            </div>
+          </div>
+          <div class="mrow stress"><span class="ck"></span><span class="mname">TCP 并发</span><span class="mwarn">压测：短时建立大量连接，勿对客户网络使用</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">环回测速</span></div>
+        </div>
+      </div>
+
+      <div class="grp">
+        <div class="grp-head">
+          <span class="cat-letter">c</span>
+          <span class="grp-name">故障诊断</span>
+          <span class="grp-sub">定位故障根源</span>
+        </div>
+        <div class="mrows">
+          <div class="mrow"><span class="ck"></span><span class="mname">网关检测</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">外网检测</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">DNS 诊断</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">网页体检</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">ARP 分析</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">环路检测</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">TCP 连接</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">端口探测</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">路由表</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">TCP 传输质量</span></div>
+          <div class="munit">
+            <div class="mrow on"><span class="ck"><svg viewBox="0 0 12 12" fill="none"><path d="M2.5 6.3l2.3 2.3 4.7-5.2" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="mname">MTU 检测</span></div>
+            <div class="sub">
+              <div class="slab"><span>探测目标（可选）</span></div>
+              <input class="input" type="text" placeholder="默认自动，可填 host:port 或范围">
+            </div>
+          </div>
+          <div class="mrow"><span class="ck"></span><span class="mname">代理检测</span></div>
+          <div class="mrow"><span class="ck"></span><span class="mname">NAT 类型</span></div>
+        </div>
+      </div>
+
+      <div class="mp-foot">
+        <span class="btn btn-primary"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5.8v12.4c0 .9 1 1.4 1.7.9l9.6-6.2c.7-.4.7-1.4 0-1.8L9.7 4.9c-.7-.5-1.7 0-1.7.9Z"/></svg>运行所选 <span class="num">(5)</span></span>
+        <span class="alt-note">独占模块（测速系）自动排队串行，不互相干扰。</span>
+        <span class="mp-back">← 返回主页</span>
+      </div>
+    </div>
+  </div>
+  <ul class="notes">
+    <li><b>分组与顺序 = <code>MODULE_CATEGORIES</code> 真实口径</b>：a 基础信息 6 项 / b 宽带测速 5 项 / c 故障诊断 13 项，共 24 项；字母 chip 与终端菜单的分类快捷字母一致；模块中文名与 <code>--list</code> 输出一字不差（「端口探测」在故障诊断组）。</li>
+    <li><b>条件选项就地展开</b>：勾「测速」→ Ookla 官方对照小开关（默认关）；勾「iperf3 吞吐」→ 服务器输入（留空则按未检测处理）；勾「MTU 检测」→ 探测目标输入（默认自动）。取消勾选即收起。</li>
+    <li><b>已选计数实时联动</b>：顶部「已选 5 / 24」与底部「运行所选 (5)」同源；全选 / 清空 / 反选只作用于本面板，不影响其它入口。</li>
+    <li><span class="warn">TCP 并发是全页唯一的红色行</span>：压测风险在勾选阶段就讲清楚（整行红调 + 红字警示），真要运行时再弹第 3 节的确认层，两道提醒各管一步。</li>
+    <li>点「运行所选」进一期既有进度页 / 报告页；测速系五项（测速 / Bufferbloat / iperf3 吞吐 / TCP 并发 / 环回测速）由内核自动排队串行独占，普通模块先行并发。</li>
+  </ul>
+</div>
+
+<!-- ══════════════════ 第 3 节 · 运行确认弹层 ══════════════════ -->
+<div class="sec" id="sec3">
+  <div class="sec-head">
+    <span class="no">03</span><span class="t">运行确认弹层</span>
+    <span class="r">新增 · 仅当所选含压测模块（TCP 并发）时出现</span>
+  </div>
+  <p class="sec-desc">场景：在第 2 节基础上追加勾选「TCP 并发」（已选变 6 项），点「运行所选」→ 弹居中确认层。红字讲清后果，确认才开跑；普通组合不经过这一步。</p>
+
+  <div class="win">
+    <div class="win-title">
+      <span class="dots"><i></i><i></i><i></i></span>
+      <span class="wt">NetPulse 网络诊断</span>
+      <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+    </div>
+    <div class="winbody">
+      <div class="app-top">
+        <span class="badge">NP</span>
+        <span class="brand-name">NetPulse</span>
+        <span class="ver-chip num">v1.22.0-dev</span>
+        <span class="top-right">
+          <span class="net-dot" title="网络正常"></span>
+          <span class="host-chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="13" rx="2"/><path d="M8 21h8M12 18v3"/></svg>DESKTOP-3F8K2</span>
+        </span>
+      </div>
+      <div class="mp">
+        <div class="mp-h">高级模块组合</div>
+        <div class="mp-sub">按分类勾选要测的模块，自由组合；结果与单独运行同口径。</div>
+
+        <div class="mp-ops">
+          <span class="sel-count num">已选<b>6</b><i class="sl">/</i><span class="tot num">24</span></span>
+          <span class="ops-btns">
+            <span class="txtbtn">全选</span><span class="tsep">·</span>
+            <span class="txtbtn">清空</span><span class="tsep">·</span>
+            <span class="txtbtn">反选</span>
+          </span>
+        </div>
+
+        <div class="grp">
+          <div class="grp-head">
+            <span class="cat-letter">b</span>
+            <span class="grp-name">宽带测速</span>
+            <span class="grp-sub">带宽达标验证 · 装维核心高频</span>
+          </div>
+          <div class="mrows">
+            <div class="munit">
+              <div class="mrow on"><span class="ck"><svg viewBox="0 0 12 12" fill="none"><path d="M2.5 6.3l2.3 2.3 4.7-5.2" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="mname">测速</span></div>
+              <div class="sub">
+                <div class="slab"><span>Ookla 官方对照</span><span class="switch"><i></i></span><span class="swstate">关（默认）</span></div>
+              </div>
+            </div>
+            <div class="mrow"><span class="ck"></span><span class="mname">Bufferbloat</span></div>
+            <div class="munit">
+              <div class="mrow on"><span class="ck"><svg viewBox="0 0 12 12" fill="none"><path d="M2.5 6.3l2.3 2.3 4.7-5.2" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="mname">iperf3 吞吐</span></div>
+              <div class="sub">
+                <div class="slab"><span>iperf3 服务器</span></div>
+                <input class="input" type="text" placeholder="留空则按未检测处理">
+              </div>
+            </div>
+            <div class="mrow stress on"><span class="ck"><svg viewBox="0 0 12 12" fill="none"><path d="M2.5 6.3l2.3 2.3 4.7-5.2" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="mname">TCP 并发</span><span class="mwarn">压测：短时建立大量连接，勿对客户网络使用</span></div>
+            <div class="mrow"><span class="ck"></span><span class="mname">环回测速</span></div>
+          </div>
+        </div>
+
+        <div class="mp-foot">
+          <span class="btn btn-primary"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5.8v12.4c0 .9 1 1.4 1.7.9l9.6-6.2c.7-.4.7-1.4 0-1.8L9.7 4.9c-.7-.5-1.7 0-1.7.9Z"/></svg>运行所选 <span class="num">(6)</span></span>
+          <span class="alt-note">独占模块（测速系）自动排队串行，不互相干扰。</span>
+          <span class="mp-back">← 返回主页</span>
+        </div>
+      </div>
+
+      <div class="overlay">
+        <div class="modal">
+          <div class="modal-head">
+            <span class="warn-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4.2 21 19.5H3Z"/><path d="M12 10v4.2"/><circle cx="12" cy="16.9" r=".9" fill="currentColor" stroke="none"/></svg></span>
+            <span class="modal-t">运行确认</span>
+          </div>
+          <div class="modal-body">包含压测模块 <b>TCP 并发</b>：将短时建立大量连接。确认对当前网络运行？</div>
+          <div class="modal-btns">
+            <span class="btn btn-line">返回</span>
+            <span class="btn btn-solid-red">确认运行</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <ul class="notes">
+    <li><b>只在所选含压测模块时弹层</b>（当前注册表压测级仅 <code>tcpcc</code> TCP 并发一项）；普通组合点「运行所选」直接进进度页，不多一步。</li>
+    <li><b>「确认运行」红色实心</b>：动作带网络风险，按钮颜色与风险等级对齐；「返回」灰色描边，误触也好退。</li>
+    <li>示例状态与第 2 节衔接：同一份勾选（5 项）+ 追加「TCP 并发」= 6 项，计数与按钮数字同步为 6；确认后仍按既有调度跑（普通模块并发、测速系串行独占）。</li>
+  </ul>
+</div>
+
+</div>
+</body>
+</html>
