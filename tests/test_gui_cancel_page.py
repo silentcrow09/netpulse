@@ -58,9 +58,16 @@ class TestGuiCancelPage(unittest.TestCase):
         self.assertIn(
             '"已停止 · 实检 " + d.done + "/" + d.total + " 项"', p,
             "已停止结论条标题带实检项数")
-        self.assertIn(
-            '"剩下的 " + d.remaining + " 项没测。报告已生成，可以先看结果，'
-            '或者接着跑。"', p, "已停止结论条副行文案与设计稿一致")
+        self.assertIn('"剩下的 " + d.remaining', p)
+        self.assertIn('" 项没测。报告已生成，可以先看结果，或者接着跑。"', p,
+                      "已停止结论条副行文案与设计稿一致")
+
+    # ── P3b 落盘失败要提示 (spec 风险表) ──
+    def test_resume_save_failure_copy(self):
+        p = self._js()
+        self.assertIn("if (d.resume_error)", p,
+                      "已停止条必须区分「续跑点没存下来」这一支")
+        self.assertIn("这次没法接着跑", p)
 
     # ── P4 继续跑按钮带项数 ──
     def test_resume_button_shows_count(self):
@@ -82,6 +89,29 @@ class TestGuiCancelPage(unittest.TestCase):
         self.assertIn(">接着跑<", p)
         self.assertIn(">重新开始<", p)
         self.assertIn("已完成的项目都还在", p)
+
+    # ── P7 收尾期关窗: beacon 必须发 force=true (终审审查 #2) ──
+    def test_unload_beacon_counts_stopping_as_busy(self):
+        p = self._js()
+        i = p.find('window.addEventListener("unload"')
+        self.assertTrue(i > 0, "找不到 unload 处理")
+        seg = p[i:i + 900]
+        self.assertIn('state.data.phase === "stopping"', seg,
+                      "收尾中也要算忙 → beacon 发 force=true, 否则服务端回 409")
+        j = p.find('window.addEventListener("beforeunload"')
+        self.assertTrue(j > 0)
+        seg2 = p[j:j + 700]
+        self.assertIn('state.data.phase === "stopping"', seg2,
+                      "收尾中关窗也要提示用户")
+
+    # ── P8 续跑失败要在进度页看得见 (终审审查 #4) ──
+    def test_resume_failure_shows_on_progress_page(self):
+        p = self._js()
+        i = p.find("function resumeRun()")
+        self.assertTrue(i > 0)
+        seg = p[i:i + 800]
+        self.assertIn('$("#p-err")', seg,
+                      "续跑失败要写到进度页的错误位 (只写主页那个等于没提示)")
 
     # ── 页面动态数据仍只用 textContent (v1.21.0 铁律不被本次改动破坏) ──
     def test_no_innerhtml_assignment(self):

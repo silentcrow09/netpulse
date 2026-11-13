@@ -57,8 +57,24 @@ class TestCancelGate(unittest.TestCase):
         # (*args, **kwargs)), 拿不到内层签名 → 走源码级断言。
         src = open(os.path.join(ROOT, "netpulse.py"), encoding="utf-8").read()
         self.assertIn("cancel_evt=None):", src)
-        # 不传就是 None (默认路径行为与旧版一致, 见 P6)
-        self.assertNotIn("cancel_evt=evt)", src.split("def run_diagnostics")[1][:600])
+        # 终端调用点一个都不许传 cancel_evt (传了就等于改了终端行为,
+        # 见 verify.md S5.4)。GUI 会话层是唯一该传的地方。
+        import re
+        head, sep, gui = src.partition("class _GuiSession")
+        self.assertTrue(sep, "找不到 GUI 会话类")
+        self.assertIn("cancel_evt=self._cancel_evt", gui)
+        def_at = head.find("def run_diagnostics(")
+        self.assertTrue(def_at > 0, "找不到 run_diagnostics 定义")
+        body = head[def_at:]
+        body = body[body.find("):") + 2:]          # 跳过函数签名本身
+        hits = 0
+        for m in re.finditer(r"run_diagnostics\(", body):
+            chunk = body[m.start():m.start() + 300]
+            hits += 1
+            self.assertNotIn(
+                "cancel_evt", chunk,
+                "终端调用点传了 cancel_evt: %s" % chunk[:100].replace("\n", " "))
+        self.assertGreater(hits, 0, "没扫到任何 run_diagnostics 调用点")
 
     # ── P2/P3 取消后: 未启动的不产生结果, 已完成的保住 ──
     def test_cancelled_modules_have_no_result(self):
@@ -114,6 +130,25 @@ class TestCancelGate(unittest.TestCase):
 
         self._run(parallel=True, progress_cb=_cb, cancel_evt=evt)
         self.assertEqual([s for s in started if s[0] == "start"], [("start", "gateway")])
+
+    # ── P5b 独占段 (测速类模块) 的取消闸 ──
+    # 独占段是第二道闸: 普通模块并发跑完后, 测速类逐个串行跑。已请求停止
+    # 时不能启动测速 (一跑就是几分钟, spec F1 的核心价值就在这)。
+    def test_exclusive_phase_gate_blocks_speedtest(self):
+        evt = threading.Event()
+        started = []
+
+        def _cb(e):
+            started.append((e["event"], e["key"]))
+            if e.get("event") == "done":
+                evt.set()
+
+        run = self._run(keys=["gateway", "speedtest"], parallel=True,
+                        progress_cb=_cb, cancel_evt=evt)
+        self.assertNotIn(("start", "speedtest"), started,
+                         "已请求停止 → 独占段不得启动测速类模块")
+        self.assertNotIn("speedtest", run["results"])
+        self.assertIn("gateway", run["results"])
 
     # ── P6 默认行为不变 ──
     def test_no_cancel_runs_everything(self):

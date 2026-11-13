@@ -21707,9 +21707,12 @@ def render_report_html_customer(report):
     ran = len(((report.get("tech") or {}).get("raw_results") or {}))
     if isinstance(sel, int) and isinstance(tot, int) and tot > 0:
         if ran and ran < sel:
+            # 分母用**本次请求的项数**(sel), 不用全库(tot) —— 否则 chip 写
+            # 「6/24 项」而副行说「6 项未检测」, 读者按 24-6 会算出 18, 自相矛盾。
             hero_meta.append(
-                (f"检测范围 <b>{ran}/{tot}</b> 项",
-                 f"本轮提前结束, {sel - ran} 项未检测"))
+                (f"检测范围 <b>{ran}/{sel}</b> 项",
+                 f"本轮提前结束, 请求的 {sel} 项里有 {sel - ran} 项没测"
+                 + (f" (全库共 {tot} 项)" if sel < tot else "")))
         elif sel < tot:
             # 部分检测: title 里说清未覆盖多少项, 避免只看到分数就下结论
             hero_meta.append(
@@ -24918,7 +24921,7 @@ def _gui_resume_save(payload):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
     except Exception as e:
-        return False, "续跑点目录不可写: %s" % e
+        return False, "续跑点目录不可写（%s）" % e
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -24933,7 +24936,7 @@ def _gui_resume_save(payload):
                 os.remove(tmp)
         except Exception:
             pass
-        return False, "续跑点保存失败: %s" % e
+        return False, "续跑点保存失败（%s）" % e
 
 
 def _gui_resume_load():
@@ -25106,6 +25109,12 @@ class _GuiSession:
         self._resume_ctx = None       # 续跑上下文 (复用的结果 + 上次时间)
         self._label_suffix = ""       # 续跑轮次的标题后缀 「（续跑）」
         self._note = ""               # 报告级备注 (续跑说明)
+        # v1.24.0: 续跑点落盘失败的提示文案 (spec 风险表: 落盘失败要提示,
+        # 但不影响当轮报告与导出)。空串 = 没失败。
+        self._resume_error = ""
+        # 磁盘上是否真有可续的续跑点 (落盘成功 = True)。用来判「继续跑」入口
+        # 给不给 —— 一项都没测完就停时没有点, 给个假入口点了只会报错。
+        self._resume_saved = False
 
     # -- 进度回调 (诊断线程调用, 见 run_diagnostics progress_cb 契约) --
     def on_progress(self, ev):
@@ -25153,9 +25162,17 @@ class _GuiSession:
                 "cancelled": self._phase == "cancelled",
                 "remaining": max(0, remaining),
                 "reused": reused,
-                # 现场检测不支持续跑 (spec F6) —— 页面据此不显示「继续跑」入口
+                # 能不能接着跑 —— 五个条件缺一不可 (终审审查 #3/#4):
+                #   ① 本轮是「已停止」; ② 不是现场检测 (spec F6 不支持续跑);
+                #   ③ 续跑点确实落盘成功 (失败/没东西可存 → 不能续);
+                #   ④ 还有没测的项 (全测完了 → 「继续跑剩下的 0 项」是死入口);
+                #   ⑤ 没落盘失败。
                 "can_resume": (self._phase == "cancelled"
-                               and self._profile != "site"),
+                               and self._profile != "site"
+                               and not self._resume_error
+                               and remaining > 0
+                               and self._resume_saved),
+                "resume_error": self._resume_error,
                 "note": self._note,
             }
 
@@ -25199,6 +25216,8 @@ class _GuiSession:
             self._stop_requested = False
             self._partial = {}
             self._resume_ctx = resume_ctx
+            self._resume_error = ""
+            self._resume_saved = False
             self._label_suffix = "（续跑）" if resume_ctx else ""
             if resume_ctx:
                 # 续跑: 上次已测完的项目先把状态铺上 (网格里显示原状态色),
@@ -25305,9 +25324,23 @@ class _GuiSession:
                     self._error = "报告构建失败"
             if stopped:
                 # 提前结束 → 把已测完的项目落盘 (关窗、退出都不丢, 见 spec F4)
-                self._save_resume_point(run, resume_ctx)
-            else:
-                # 正常跑完 (含续跑跑完) → 清掉续跑点 (主页别再提示「上次没跑完」)
+                # v1.24.0 终审: 全部请求的模块都跑完了 (停止请求刚好落在最后
+                # 一个模块之后) → **没有可续的**, 别写续跑点。否则主页横幅会写
+                # 「上次诊断没跑完 · 实测 24/24 项」自相矛盾, 点「接着跑」也只会
+                # 报「没有可接着跑的诊断」。
+                ran = sum(1 for k in self._keys if self._module_status.get(k))
+                if ran >= len(self._keys) and self._keys:
+                    _gui_resume_discard()
+                else:
+                    err = self._save_resume_point(run, resume_ctx)
+                    with self._lock:
+                        # 落盘失败要提示 (spec 风险表), 但**不影响**当轮报告与
+                        # 导出 —— 报告已经建好, 这里只补一句说明。
+                        self._resume_error = err or ""
+            elif resume_ctx:
+                # 续跑轮次正常跑完 → 清掉续跑点 (主页别再提示「上次没跑完」)。
+                # 普通新轮次**不删**旧点 (spec 风险表: 开始新一轮不立即删除旧点,
+                # 新一轮停止时才覆盖) —— 删了等于把上一轮已测完的成果抹掉。
                 _gui_resume_discard()
         except Exception as e:
             with self._lock:
@@ -25330,15 +25363,15 @@ class _GuiSession:
         if profile not in DIAGNOSE_PROFILES and profile != "full":
             profile = None
         if not remaining:
-            # 全都测过了 (极少见: 停止请求刚好落在最后一个模块之后) →
-            # 不再跑, 直接用已存的结果出报告。
-            ok, err = self._begin(profile, keys, resume_ctx=point)
-            if not ok:
-                return False, err
-            self._thread = threading.Thread(
-                target=self._run_diag, args=([], install, pip_mirror, point),
-                daemon=True, name="np-gui-resume")
-            self._thread.start()
+            # 全都测过了 (停止请求刚好落在最后一个模块之后, 或磁盘上的点已经
+            # 跑完) → **不跑空轮次**: 空轮次会「诊断未产生数据」, 还会把这一
+            # 轮已经出的报告弄丢 (_begin 会清 _report)。有报告就收尾, 没报告
+            # 就照实说没有可跑的。
+            with self._lock:
+                has_report = self._report is not None
+                self._phase = "done" if has_report else "idle"
+                if not has_report:
+                    self._error = "这一轮的项目已经全测完了, 不用接着跑"
             return True, None
         ok, err = self._begin(profile, keys, resume_ctx=point)
         if not ok:
@@ -25368,6 +25401,11 @@ class _GuiSession:
                 completed[k] = {"status": item.get("status"),
                                 "result": item.get("result")}
         if not partial:
+            # 这一轮没测出新的东西 → 不覆盖磁盘上的点 (上一轮的成果留着),
+            # 但「能不能接着跑」取决于磁盘上是否真有可续的点 (上一轮留的点
+            # 仍然可以接着跑 —— 终审审查 #4)。
+            with self._lock:
+                self._resume_saved = os.path.exists(_gui_resume_path())
             return None
         results = {k: v["result"] for k, v in partial.items()
                    if isinstance(v.get("result"), dict)}
@@ -25389,6 +25427,8 @@ class _GuiSession:
                                  or len(MODULE_MAP)),
         }
         ok, err = _gui_resume_save(payload)
+        with self._lock:
+            self._resume_saved = bool(ok)
         return None if ok else err
 
     def save_resume_point_now(self):
@@ -25403,7 +25443,14 @@ class _GuiSession:
             if not self._partial:
                 return None
             resume_ctx = self._resume_ctx
-        return self._save_resume_point({}, resume_ctx)
+            # 已耗时也写进续跑点 (终审审查 #12): 不然续跑合并后的总耗时
+            # 少算这一段, 报告里「检测耗时」会偏小。
+            elapsed = int((time.time() - self._started_at) * 1000) \
+                if self._started_at else 0
+        err = self._save_resume_point({"duration_ms": elapsed}, resume_ctx)
+        with self._lock:
+            self._resume_error = err or ""
+        return err
 
     # -- 现场检测 (与终端 run_site_visit :23538 同口径) --
     def start_site(self, customer, tested_at=None, plan="",
@@ -25440,6 +25487,15 @@ class _GuiSession:
             with self._lock:
                 stopped = self._stop_requested
             if not (run.get("results") or {}):
+                if stopped:
+                    # v1.24.0: 停得太早 (一项都没测完) → 不是「诊断失败」,
+                    # 是「用户叫停了」。诚实说清现场流程不支持续跑, 别把
+                    # RuntimeError 抛给用户看 (同 _run_diag 的处理口径)。
+                    with self._lock:
+                        self._phase = "cancelled"
+                        self._error = ("现场检测已停止, 现场流程不支持续跑, "
+                                       "请重新检测")
+                    return
                 raise RuntimeError("诊断未产生数据")
             # 决议 (Task 2 审查, 同 _run_diag): module_status 以最终 run dict
             # 为准整体同步 — done 事件带归一化前原值 (site 集含 loopback,
@@ -25460,6 +25516,26 @@ class _GuiSession:
                     self._error = "现场检测已停止, 现场流程不支持续跑, 请重新检测"
                 else:
                     self._phase = "site_ready"     # 等机房勾选 (页面切核对步)
+            if stopped:
+                # spec F6: 停止后照样出部分报告 (可导出) —— 现场流程不比普通
+                # 诊断差这一口。已经测出来的东西不该白扔, 报告里写明提前结束。
+                try:
+                    site_results = run.get("results") or {}
+                    diagnosis = _enrich_diagnosis_evidence(
+                        diagnose(site_results, rule_filter=None), site_results,
+                        run.get("evidence"))
+                    report = build_report(
+                        diagnosis=diagnosis.to_dict() if diagnosis else None,
+                        meta_manual=dict(self._site or {}) or None,
+                        run=run,
+                        note="现场检测已停止, 本轮提前结束 (只测了一部分)")
+                    with self._lock:
+                        self._report = report
+                        self._verdict = (_gui_verdict(report)
+                                         if report else None)
+                except Exception:
+                    # 部分报告出不来也不影响「已停止」这个事实 (页面照实说)
+                    pass
         except Exception as e:
             with self._lock:
                 self._phase = "error"
@@ -26878,9 +26954,24 @@ _GUI_JS = r"""(function () {
     if (!db) return;
     if (d.phase !== "cancelled") { db.style.display = "none"; return; }
     $("#p-done-t").textContent = "已停止 · 实检 " + d.done + "/" + d.total + " 项";
-    $("#p-done-d").textContent = d.can_resume
-      ? ("剩下的 " + d.remaining + " 项没测。报告已生成，可以先看结果，或者接着跑。")
-      : (d.error || "现场检测不支持续跑，请重新检测");
+    // 已停止的说法分四种 (终审审查 #3/#4/#7):
+    //   ① 续跑点没存下来 → 说清为什么, 别让用户以为还能接着跑;
+    //   ② 还能接着跑 → 给「继续跑剩下的 N 项」;
+    //   ③ 服务端给了原因 (现场检测不支持续跑 / 一项都没测完) → 照实说;
+    //   ④ 剩下的都测完了 (停止请求落在最后一个模块之后) → 不给死入口。
+    if (d.resume_error) {
+      $("#p-done-d").textContent = "剩下的 " + d.remaining + " 项没测。"
+        + d.resume_error + "，这次没法接着跑；报告已生成，可以先看结果。";
+    } else if (d.can_resume) {
+      $("#p-done-d").textContent = "剩下的 " + d.remaining
+        + " 项没测。报告已生成，可以先看结果，或者接着跑。";
+    } else if (d.error) {
+      $("#p-done-d").textContent = d.error;
+    } else if (d.remaining === 0) {
+      $("#p-done-d").textContent = "这一轮的项目其实都测完了，报告已生成。";
+    } else {
+      $("#p-done-d").textContent = "剩下的 " + d.remaining + " 项没测。报告已生成。";
+    }
     var rb = $("#btn-resume-go");
     if (rb) {
       rb.style.display = d.can_resume ? "" : "none";
@@ -26904,11 +26995,16 @@ _GUI_JS = r"""(function () {
     post(API.runResume, {}).then(function (r) {
       if (r && r.ok) {
         $("#g-resume-err").style.display = "none";
+        $("#p-err").textContent = "";
         show("progress");
         pollOnce();
       } else {
+        var msg = (r && r.err) || "接着跑失败";
+        // 进度页上也要看得见 (主页横幅那条在 #g-resume-err, 进度页这条在
+        // #p-err —— 终审审查 #4: 只写主页那个, 用户在进度页只看到按钮像坏了)
+        $("#p-err").textContent = msg;
         var box = $("#g-resume-err");
-        box.textContent = (r && r.err) || "接着跑失败";
+        box.textContent = msg;
         box.style.display = "";
       }
     });
@@ -27361,7 +27457,10 @@ _GUI_JS = r"""(function () {
 
   // ── 关窗生命周期: 空闲直接退出; 诊断/盯障进行中先确认 (v1.22.0 纳入盯障) ──
   window.addEventListener("beforeunload", function (ev) {
-    var diag = state.data && state.data.phase === "running";
+    // v1.24.0: 收尾中 (stopping) 也要提示 —— 那时诊断还在跑, 关窗同样会
+    // 丢掉正在收尾的这一轮。
+    var diag = state.data && (state.data.phase === "running"
+                               || state.data.phase === "stopping");
     var mon = state.monPhase === "running";
     if (diag || mon) {
       ev.preventDefault();
@@ -27376,7 +27475,11 @@ _GUI_JS = r"""(function () {
   window.addEventListener("unload", function () {
     // beacon 语义不变: 忙 = 任一活动进行中 → force 关停 (服务端放行前
     // 尽力 monitor.stop(), 不留孤儿 ping)
-    var busy = (state.data && state.data.phase === "running")
+    // v1.24.0: 收尾中 (stopping) 也算忙 —— 不然 beacon 发的是 force=false,
+    // 服务端因「诊断还在跑」回 409: 既不落盘也不退出, 程序在后台常驻,
+    // 已测完的成果就白测了。
+    var busy = (state.data && (state.data.phase === "running"
+                                || state.data.phase === "stopping"))
       || state.monPhase === "running";
     if (navigator.sendBeacon) {
       navigator.sendBeacon(API.shutdown, JSON.stringify({ force: !!busy }));

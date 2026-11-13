@@ -5,6 +5,7 @@
   S1 stop(): 只在 running 时受理, 幂等; 收尾期间仍算「在跑」(互斥不放宽)
   S2 取消后: phase=cancelled, 部分报告已出, 未跑的模块留在网格里(状态 None)
   S3 取消后: 续跑点落盘 (已完成的项目都在)
+  S3b 落盘失败: 提示「续跑点保存失败」, 但当轮报告照常出, 不给假入口
   S4 正常跑完: phase=done, 旧续跑点被清掉
   S5 start_resume(): 没有续跑点 → 拒绝; 有 → 只跑剩下的, 合并出完整报告
   S6 续跑合并 (_gui_merge_runs): keys 取全集, results/status 取并集,
@@ -82,7 +83,10 @@ class TestGuiSessionCancel(_SessionCase):
             self.assertTrue(ok)
             started.wait(5)
             self.assertTrue(s.stop())         # running → 受理
-            self.assertTrue(s.stop() or True)  # 幂等: 再点一次不报错
+            # 幂等: 再点一次不报错, 也不重复受理
+            snap_mid = s.snapshot()
+            self.assertTrue(snap_mid["stop_requested"])
+            self.assertEqual(snap_mid["phase"], "stopping")
             self.assertFalse(s.stop())         # 已进入 stopping → 不再受理
             release.set()
             self._wait(s)
@@ -174,8 +178,94 @@ class TestGuiSessionCancel(_SessionCase):
         self.assertEqual(sorted(pt["completed"]), ["gateway"])
         self.assertEqual(pt["keys"], ["gateway", "dns"])
 
-    # ── S4 正常跑完清掉旧续跑点 ──
-    def test_normal_run_discards_resume_point(self):
+    # ── S4c 一项都没测完就停: 不给假的「继续跑」入口 (终审审查 #4) ──
+    def test_no_resume_entry_when_nothing_measured(self):
+        s = np._GuiSession()
+
+        def _fake(keys, **kw):
+            s.stop()                 # 一项都没测完就点停止
+            return _run_dict(keys, {}, {})
+
+        with mock.patch.object(np, "run_diagnostics", side_effect=_fake):
+            s.start(keys=["gateway", "dns"])
+            self._wait(s)
+        snap = s.snapshot()
+        self.assertEqual(snap["phase"], "cancelled")
+        self.assertIn("还没测出任何结果", snap.get("error") or "")
+        self.assertFalse(snap["can_resume"],
+                         "没有续跑点 → 不给「继续跑」入口 (点了只会报错)")
+        self.assertFalse(os.path.exists(self.resume_path),
+                         "一项都没测完 → 不该写续跑点")
+
+    # ── S4d 停止落在最后一个模块之后: 全测完了, 不给死入口 (终审审查 #3) ──
+    def test_no_resume_entry_when_everything_done(self):
+        s = np._GuiSession()
+
+        def _fake(keys, **kw):
+            cb = kw.get("progress_cb")
+            results, status = {}, {}
+            for k in keys:
+                results[k] = {"fake": k}
+                status[k] = "完成"
+                if cb:
+                    cb({"event": "start", "key": k})
+                    cb({"event": "done", "key": k, "status": "完成",
+                        "result": results[k]})
+            s.stop()                 # 全跑完之后才点停止
+            return _run_dict(keys, results, status)
+
+        with mock.patch.object(np, "run_diagnostics", side_effect=_fake):
+            s.start(keys=["gateway", "dns"])
+            self._wait(s)
+        snap = s.snapshot()
+        self.assertEqual(snap["phase"], "cancelled")
+        self.assertEqual(snap["remaining"], 0)
+        self.assertFalse(snap["can_resume"],
+                         "全测完了 → 不给「继续跑剩下的 0 项」这种死入口")
+        self.assertFalse(os.path.exists(self.resume_path),
+                         "全测完了 → 没有可续的, 不写续跑点 (主页横幅不该"
+                         "写「没跑完 · 实测 2/2 项」)")
+
+    # ── S4b 落盘失败: 要提示, 但报告与导出照常 (spec 风险表) ──
+    def test_resume_save_failure_is_reported_but_report_intact(self):
+        s = np._GuiSession()
+
+        def _fake(keys, **kw):
+            cb = kw.get("progress_cb")
+            evt = kw.get("cancel_evt")
+            results, status = {}, {}
+            for k in keys:
+                if evt is not None and evt.is_set():
+                    break
+                if cb:
+                    cb({"event": "start", "key": k})
+                results[k] = {"fake": k}
+                status[k] = "完成"
+                if cb:
+                    cb({"event": "done", "key": k, "status": "完成",
+                        "result": results[k]})
+                if k == "gateway":
+                    s.stop()
+            return _run_dict(keys, results, status)
+
+        with mock.patch.object(np, "run_diagnostics", side_effect=_fake), \
+                mock.patch.object(np, "_gui_resume_save",
+                                  return_value=(False, "续跑点保存失败（磁盘满）")):
+            s.start(keys=["gateway", "dns"])
+            self._wait(s)
+        snap = s.snapshot()
+        self.assertEqual(snap["phase"], "cancelled")
+        self.assertTrue(snap["has_report"], "落盘失败不该影响当轮报告")
+        self.assertIn("续跑点保存失败", snap["resume_error"],
+                      "落盘失败必须提示给用户 (spec 风险表)")
+        self.assertFalse(snap["can_resume"],
+                         "续跑点没存下来 → 不给假的「继续跑」入口")
+        self.assertFalse(os.path.exists(self.resume_path))
+
+    # ── S4 正常跑完: 旧续跑点该不该删 ──
+    # 口径 (spec 风险表): 「开始新一轮不立即删除旧点, 新一轮停止时覆盖」。
+    # 所以**普通新一轮**跑完不动旧点; 只有**续跑轮次**跑完才清掉 (F3)。
+    def test_normal_run_keeps_old_resume_point(self):
         np._gui_resume_save({"schema": 1, "keys": ["gateway"],
                              "completed": {"gateway": {"status": "完成",
                                                        "result": {"a": 1}}}})
@@ -195,8 +285,36 @@ class TestGuiSessionCancel(_SessionCase):
             s.start(keys=["gateway"])
             self._wait(s)
         self.assertEqual(s.snapshot()["phase"], "done")
+        self.assertTrue(os.path.exists(self.resume_path),
+                        "普通新一轮跑完不该删旧续跑点 (spec 风险表)")
+
+    def test_finished_resume_discards_resume_point(self):
+        s = np._GuiSession()
+        point = {"schema": 1, "saved_at": "2026-11-13T15:30:00",
+                 "saved_at_ts": time.time(), "profile": "slow",
+                 "label": "网络很慢", "keys": ["gateway", "dns"],
+                 "completed": {"gateway": {"status": "完成",
+                                           "result": {"fake": "gateway"}}},
+                 "duration_ms": 1234, "total_modules": 2}
+        with open(self.resume_path, "w", encoding="utf-8") as f:
+            json.dump(point, f, ensure_ascii=False)
+
+        def _fake(keys, **kw):
+            cb = kw.get("progress_cb")
+            for k in keys:
+                if cb:
+                    cb({"event": "start", "key": k})
+                    cb({"event": "done", "key": k, "status": "完成",
+                        "result": {"fake": k}})
+            return _run_dict(keys)
+
+        with mock.patch.object(np, "run_diagnostics", side_effect=_fake):
+            ok, err = s.start_resume()
+            self.assertTrue(ok, err)
+            self._wait(s)
+        self.assertEqual(s.snapshot()["phase"], "done")
         self.assertFalse(os.path.exists(self.resume_path),
-                         "正常跑完不该留着续跑点 (主页会误提示)")
+                         "续跑跑完后续跑点要删掉 (主页别再提示「上次没跑完」)")
 
 
 class TestGuiSessionResume(_SessionCase):

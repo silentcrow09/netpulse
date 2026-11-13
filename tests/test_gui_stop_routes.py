@@ -233,13 +233,41 @@ class TestGuiStopRoutes(unittest.TestCase):
                          token=self.token, body={"force": True})
             self.assertEqual(st, 200)
             # 落盘发生在关窗请求里 —— 必须在诊断线程收尾**之前**断言:
-            # 线程正常跑完会按设计清掉续跑点 (那一轮已经完整, 不需要续跑了);
             # 真机关窗时进程随即退出, 线程被强杀, 续跑点留着。
+            # (普通新一轮跑完按 spec 也不删旧点, 只有续跑轮次跑完才删。)
             self.assertTrue(os.path.exists(self.resume_path),
                             "关窗前应把已测完的项目落盘")
             with open(self.resume_path, encoding="utf-8") as f:
                 pt = json.load(f)
             self.assertIn("gateway", pt["completed"])
+        finally:
+            release.set()
+            t = self.session._thread
+            if t is not None:
+                t.join(5)
+
+    def test_shutdown_during_stopping_saves_and_exits(self):
+        """收尾 (stopping) 阶段关窗 → 照样落盘 + 退出 (终审审查 #2)。
+
+        页面 unload 的 beacon 在 stopping 时也要发 force=true —— 否则服务端
+        因「诊断还在跑」回 409: 既不落盘也不退出, 程序在后台常驻, 已测完的
+        成果白测了。
+        """
+        release = threading.Event()
+        self._start_running(release)
+        self.session.on_progress({"event": "done", "key": "gateway",
+                                   "status": "完成", "result": {"fake": 1}})
+        try:
+            st, _ = _req(self.port, "POST", "/api/run/stop",
+                         token=self.token, body={})
+            self.assertEqual(st, 200)
+            self.assertEqual(self.session.snapshot()["phase"], "stopping")
+            st, raw = _req(self.port, "POST", "/api/shutdown",
+                           token=self.token, body={"force": True})
+            self.assertEqual(st, 200, "收尾期关窗必须放行 (不能 409 卡住)")
+            self.assertTrue(os.path.exists(self.resume_path),
+                            "收尾期关窗也要把已测完的项目落盘")
+            self.assertTrue(self.evt.is_set(), "关窗请求要真的让程序退出")
         finally:
             release.set()
             t = self.session._thread
