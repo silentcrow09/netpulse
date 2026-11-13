@@ -25557,6 +25557,10 @@ input,select{ font-family:inherit; }
 .g-btn2:hover{ background:#eef3f9; }
 .g-link{ background:none; border:none; color:var(--mute); font-size:12.5px; font-weight:600; padding:0; }
 .g-link:hover{ color:var(--navy); }
+/* v1.23.0: 次级文字入口 (变体 A, 设计稿 .txtbtn 定位) —— navy 文字比 g-link
+   (mute) 高半级、比 g-btn2 按钮低一级, hover 下划线, 不与场景卡抢注意力 */
+.g-link2{ background:none; border:none; color:var(--navy); font-size:13px; font-weight:600; padding:0; }
+.g-link2:hover{ text-decoration:underline; }
 .g-dim{ font-size:12.5px; color:var(--mute); }
 .g-err{ color:var(--red); font-size:12.5px; margin-top:12px; min-height:1.2em; }
 
@@ -25789,6 +25793,75 @@ iframe#g-frame{ width:100%; height:calc(100vh - 120px); border:0; margin-top:16p
 .mrp-actions{ display:flex; gap:10px; margin-top:18px; }
 .mrp-files{ margin-top:10px; font-size:12px; color:var(--mute); }
 iframe#mon-frame{ width:100%; height:calc(100vh - 300px); border:0; margin-top:16px; }
+
+/* ── 模块勾选面板 (v1.23.0, design_ref/gui/modules_design_v1.html 第 2/3 节 1:1) ──
+   复选框用原生 input.appearance:none 重绘成设计稿 .ck 方块 (选中 navy 底 +
+   纯 CSS 对勾), 不引外部资源; Ookla 开关复用盯障配置页 .switch/.swstate;
+   遮罩用 fixed (设计稿是假窗内 absolute, 真页面无窗体)。 */
+.mp{ padding:26px 36px 26px; }
+.mp-h{ font-size:21px; font-weight:800; letter-spacing:.3px; }
+.mp-sub{ font-size:13px; color:var(--dim); margin-top:4px; }
+.mp-ops{ display:flex; align-items:center; gap:16px; margin:18px 0 16px; padding:10px 16px;
+         background:var(--soft); border:1px solid var(--rule); border-radius:10px; }
+.sel-count{ font-size:13px; color:var(--dim); }
+.sel-count b{ font-size:17px; font-weight:800; color:var(--navy); margin:0 2px; }
+.sel-count .sl{ color:var(--mute); margin:0 5px 0 3px; font-style:normal; }
+.sel-count .tot{ color:var(--mute); }
+.ops-btns{ margin-left:auto; display:flex; align-items:center; gap:12px; }
+.txtbtn{ background:none; border:none; padding:0; font-size:13px; color:var(--navy-2);
+         font-weight:600; }
+.txtbtn:hover{ color:var(--navy); }
+.tsep{ color:#c3cad3; }
+.grp{ border:1px solid var(--rule); border-radius:12px; padding:14px 20px 14px; background:#fff; }
+.grp + .grp{ margin-top:14px; }
+.grp-head{ display:flex; align-items:center; gap:10px; padding-bottom:10px;
+           border-bottom:1px solid var(--soft); }
+.cat-letter{ width:22px; height:22px; flex:none; border-radius:7px; background:var(--navy);
+             color:#fff; font-size:12.5px; font-weight:800; display:inline-flex;
+             align-items:center; justify-content:center; }
+.grp-name{ font-size:15.5px; font-weight:700; letter-spacing:.2px; }
+.grp-sub{ font-size:12px; color:var(--mute); margin-left:2px; }
+.mrows{ display:grid; grid-template-columns:1fr 1fr; column-gap:28px; align-items:start;
+        margin-top:8px; }
+.mrow{ display:flex; align-items:center; gap:10px; padding:7px 12px; border-radius:8px;
+       cursor:pointer; }
+.ck{ width:17px; height:17px; flex:none; border-radius:5px; border:1.5px solid var(--mute);
+     background:#fff; appearance:none; -webkit-appearance:none; margin:0; padding:0;
+     cursor:pointer; display:inline-flex; align-items:center; justify-content:center; }
+.ck::after{ content:""; display:none; width:5px; height:9px; border-right:2px solid #fff;
+            border-bottom:2px solid #fff; transform:rotate(45deg); margin-top:-2px; }
+.ck:checked{ background:var(--navy); border-color:var(--navy); }
+.ck:checked::after{ display:block; }
+.mname{ font-size:13.5px; }
+.mrow.on .mname{ color:var(--navy); font-weight:700; }
+.mrow.stress{ background:#fbeeec; }
+.mrow.stress .mname{ color:var(--red); font-weight:700; }
+.mwarn{ margin-left:auto; font-size:11.5px; color:var(--red); font-weight:600; padding-left:10px; }
+.sub{ margin:2px 0 8px 41px; background:var(--soft); border:1px solid var(--rule);
+      border-radius:9px; padding:9px 14px 11px; }
+.slab{ font-size:12.5px; color:var(--dim); font-weight:600; display:flex; align-items:center;
+       gap:10px; }
+.sub .input{ height:32px; font-size:12.5px; border-radius:6px; padding:0 11px; }
+.sub .swstate{ font-size:12px; }
+.mp-foot{ margin-top:18px; padding-top:16px; border-top:1px solid var(--rule); display:flex;
+         align-items:center; gap:14px; }
+.mp-back{ margin-left:auto; font-size:12.5px; color:var(--mute); background:none;
+          border:none; padding:0; }
+.mp-back:hover{ color:var(--navy); }
+.btn-solid-red{ background:var(--red); border:1px solid var(--red); color:#fff; font-weight:700; }
+.btn-solid-red:hover{ background:#9c1f18; border-color:#9c1f18; }
+.overlay{ position:fixed; inset:0; background:rgba(13,30,50,.44); display:flex;
+          align-items:center; justify-content:center; z-index:50; }
+.modal{ width:470px; max-width:calc(100% - 60px); background:#fff; border-radius:14px;
+        box-shadow:0 30px 70px -18px rgba(10,25,45,.55); padding:22px 26px 24px; }
+.modal-head{ display:flex; align-items:center; gap:13px; }
+.warn-ic{ width:38px; height:38px; flex:none; border-radius:50%; background:#fbeeec;
+          color:var(--red); display:flex; align-items:center; justify-content:center; }
+.warn-ic svg{ width:19px; height:19px; }
+.modal-t{ font-size:16.5px; font-weight:800; letter-spacing:.3px; }
+.modal-body{ font-size:13.5px; color:var(--text); line-height:1.75; margin-top:14px; }
+.modal-body b{ color:var(--red); }
+.modal-btns{ display:flex; justify-content:flex-end; gap:12px; margin-top:20px; }
 """
 
 _GUI_JS = r"""(function () {
@@ -25831,6 +25904,7 @@ _GUI_JS = r"""(function () {
                 // v1.22.0 盯障: phase 随 monPoll 刷新 (关窗守卫/主页状态用)
                 diagRunning: false, monPhase: null, monTimer: null,
                 monLast: null, monLoad: false, monMins: 30, curMs: {} };
+  var mpOokla = false;   // v1.23.0 面板 Ookla 官方对照开关 (默认关, 真布尔直发)
 
   function $(s) { return document.querySelector(s); }
   function el(tag, cls, text) {
@@ -25846,11 +25920,11 @@ _GUI_JS = r"""(function () {
   }
   function get(url) { return fetch(url).then(function (r) { return r.json(); }); }
 
-  // ── 视图切换: 七个 section, display 控制 ──
+  // ── 视图切换: 八个 section, display 控制 ──
   function show(view) {
     state.view = view;
     ["home", "progress", "report", "site",
-     "mon-config", "mon-live", "mon-report"].forEach(function (v) {
+     "modules", "mon-config", "mon-live", "mon-report"].forEach(function (v) {
       var n = $("#view-" + v);
       if (n) n.style.display = (v === view) ? "" : "none";
     });
@@ -25890,6 +25964,170 @@ _GUI_JS = r"""(function () {
     post(API.run, { profile: profile }).then(function (r) {
       if (r && r.ok) { show("progress"); pollOnce(); }
       else if (r && r.reason === "running") { show("progress"); pollOnce(); }
+    });
+  }
+
+  // ── 模块勾选面板 (v1.23.0, design_ref/gui/modules_design_v1.html 第 2/3 节):
+  // 目录/分类来自 /api/scenarios 的 module_catalog + module_cats (服务端唯一
+  // 来源, 页面不内嵌清单); 条件子项就地展开; tcpcc 压测走 DOM 弹层确认。
+  function renderModules(meta) {
+    var box = $("#mp-groups");
+    box.textContent = "";
+    var cats = meta.module_cats || {};
+    var byCat = {};
+    (meta.module_catalog || []).forEach(function (it) {
+      (byCat[it.cat] = byCat[it.cat] || []).push(it);
+    });
+    Object.keys(byCat).forEach(function (letter) {
+      var info = cats[letter] || {};
+      var grp = el("div", "grp");
+      var head = el("div", "grp-head");
+      head.appendChild(el("span", "cat-letter", letter));
+      head.appendChild(el("span", "grp-name", info.name || letter));
+      head.appendChild(el("span", "grp-sub", info.desc || ""));
+      grp.appendChild(head);
+      var rows = el("div", "mrows");
+      byCat[letter].forEach(function (it) {
+        var row = document.createElement("label");
+        row.className = "mrow";
+        var ck = document.createElement("input");
+        ck.type = "checkbox";
+        ck.className = "ck";
+        ck.dataset.k = it.key;
+        row.appendChild(ck);
+        row.appendChild(el("span", "mname", it.name));
+        if (it.key === "tcpcc") {
+          row.appendChild(el("span", "mwarn",
+            "压测：短时建立大量连接，勿对客户网络使用"));
+        }
+        if (it.key === "speedtest" || it.key === "iperf3" || it.key === "port") {
+          var unit = el("div", "munit");
+          unit.appendChild(row);
+          unit.appendChild(mpBuildSub(it.key));
+          rows.appendChild(unit);
+        } else {
+          rows.appendChild(row);
+        }
+      });
+      grp.appendChild(rows);
+      box.appendChild(grp);
+    });
+    $("#mp-total").textContent = String((meta.module_catalog || []).length);
+    updateMpCount();
+  }
+  // 条件子项 (设计稿 .sub): 勾选展开、取消收起; 输入值保留, 仅勾选才随请求发送
+  function mpBuildSub(key) {
+    var sub = el("div", "sub");
+    sub.dataset.k = key;
+    sub.style.display = "none";
+    if (key === "speedtest") {
+      var slab = el("div", "slab");
+      slab.appendChild(el("span", null, "Ookla 官方对照"));
+      var sw = el("button", "switch");
+      sw.type = "button";
+      sw.id = "mp-ookla-sw";
+      sw.setAttribute("aria-pressed", "false");
+      sw.appendChild(el("i"));
+      slab.appendChild(sw);
+      var st = el("span", "swstate", "关（默认）");
+      st.id = "mp-ookla-state";
+      slab.appendChild(st);
+      sub.appendChild(slab);
+    } else {
+      var lab = el("div", "slab");
+      lab.appendChild(el("span", null,
+        key === "iperf3" ? "iperf3 服务器" : "探测目标（可选）"));
+      sub.appendChild(lab);
+      var inp = document.createElement("input");
+      inp.type = "text";
+      inp.className = "input";
+      inp.id = key === "iperf3" ? "mp-iperf3-server" : "mp-port-targets";
+      inp.placeholder = key === "iperf3"
+        ? "留空则按未检测处理"
+        : "如 223.5.5.5:53，多个逗号分隔";
+      sub.appendChild(inp);
+    }
+    return sub;
+  }
+  function mpSelectedKeys() {
+    // DOM 顺序 = 分类分组渲染顺序 = MODULE_REGISTRY 注册顺序, 直接作为请求体顺序
+    var keys = [];
+    document.querySelectorAll("#view-modules .ck").forEach(function (c) {
+      if (c.checked) keys.push(c.dataset.k);
+    });
+    return keys;
+  }
+  function mpSyncRow(c) {
+    var row = c.closest(".mrow");
+    if (row) row.className = "mrow" + (c.checked ? " on" : "")
+      + (c.dataset.k === "tcpcc" ? " stress" : "");
+  }
+  function mpSyncSub(key, on) {
+    var sub = document.querySelector('#view-modules .sub[data-k="' + key + '"]');
+    if (sub) sub.style.display = on ? "" : "none";
+  }
+  function updateMpCount() {
+    var n = mpSelectedKeys().length;
+    $("#mp-count").textContent = String(n);
+    $("#mp-run-n").textContent = "(" + n + ")";
+    updateMpRunBtn();
+  }
+  function updateMpRunBtn() {
+    // 运行中互斥 (面板运行 = 诊断 running, 复用 updateHomeState 合成的既有状态):
+    // 诊断或盯障进行中一律禁用, 与主页场景卡同拍
+    var busy = state.diagRunning || state.monPhase === "running";
+    $("#btn-mp-run").disabled = !mpSelectedKeys().length || busy;
+  }
+  function mpSetAll(on) {
+    document.querySelectorAll("#view-modules .ck").forEach(function (c) {
+      c.checked = on;
+      mpSyncRow(c);
+      mpSyncSub(c.dataset.k, on);
+    });
+    updateMpCount();
+  }
+  function mpInvert() {
+    document.querySelectorAll("#view-modules .ck").forEach(function (c) {
+      c.checked = !c.checked;
+      mpSyncRow(c);
+      mpSyncSub(c.dataset.k, c.checked);
+    });
+    updateMpCount();
+  }
+  function runModules() {
+    var keys = mpSelectedKeys();
+    if (!keys.length) return;
+    $("#mp-err").textContent = "";
+    if (keys.indexOf("tcpcc") >= 0) {
+      $("#mp-overlay").style.display = "";   // 压测确认弹层 (DOM 实现)
+      return;
+    }
+    mpRun(keys);
+  }
+  function mpRun(keys) {
+    // 可选内联配置只发勾选中的模块且非空 (留空 = 既有「未检测/未提供目标」语义);
+    // use_speedtest_net 必须是真布尔 —— 服务端 bool() 直写, 发字符串恒为真
+    var body = { keys: keys };
+    if (keys.indexOf("port") >= 0) {
+      var pt = $("#mp-port-targets").value.trim();
+      if (pt) body.port_targets = pt;
+    }
+    if (keys.indexOf("iperf3") >= 0) {
+      var srv = $("#mp-iperf3-server").value.trim();
+      if (srv) body.iperf3_server = srv;
+    }
+    if (keys.indexOf("speedtest") >= 0) {
+      body.use_speedtest_net = mpOokla;
+    }
+    post(API.run, body).then(function (r) {
+      if (r && r.ok) { show("progress"); pollOnce(); }
+      else if (r && r.reason) {   // 409: 忙分诊, 就地显示不跳页
+        $("#mp-err").textContent = r.reason === "running"
+          ? "已有诊断进行中，等它跑完再试"
+          : "已有其他任务进行中，请稍后再试";
+      } else {
+        $("#mp-err").textContent = (r && r.err) || "启动失败";
+      }
     });
   }
 
@@ -25936,6 +26174,7 @@ _GUI_JS = r"""(function () {
     }
     $("#g-lastrep").style.display =
       (state.data && state.data.has_report) ? "" : "none";
+    updateMpRunBtn();   // v1.23.0: 面板运行按钮与主页卡同拍禁用 (运行中互斥)
   }
 
   // ── 进度页轮询 (1s) ──
@@ -26496,6 +26735,37 @@ _GUI_JS = r"""(function () {
     });
     $("#btn-site-finish").addEventListener("click", finishSite);
     $("#btn-site-back").addEventListener("click", function () { show("home"); });
+    // ── 模块勾选面板 (v1.23.0) ──
+    $("#g-modpanel").addEventListener("click", function () { show("modules"); });
+    $("#btn-mp-back").addEventListener("click", function () { show("home"); });
+    $("#mp-all").addEventListener("click", function () { mpSetAll(true); });
+    $("#mp-none").addEventListener("click", function () { mpSetAll(false); });
+    $("#mp-inv").addEventListener("click", mpInvert);
+    // 组内行事件委托: 复选 change 同步行高亮 + 条件子项显隐 + 计数; Ookla 开关走 click
+    $("#mp-groups").addEventListener("change", function (ev) {
+      var c = ev.target;
+      if (c.type !== "checkbox") return;
+      mpSyncRow(c);
+      mpSyncSub(c.dataset.k, c.checked);
+      updateMpCount();
+    });
+    $("#mp-groups").addEventListener("click", function (ev) {
+      var sw = ev.target.closest("#mp-ookla-sw");
+      if (!sw) return;
+      mpOokla = !mpOokla;
+      sw.className = "switch" + (mpOokla ? " on" : "");
+      sw.setAttribute("aria-pressed", mpOokla ? "true" : "false");
+      $("#mp-ookla-state").textContent = mpOokla ? "开" : "关（默认）";
+    });
+    $("#btn-mp-run").addEventListener("click", runModules);
+    $("#btn-mp-cancel").addEventListener("click", function () {
+      $("#mp-overlay").style.display = "none";
+    });
+    $("#btn-mp-confirm").addEventListener("click", function () {
+      $("#mp-overlay").style.display = "none";
+      var keys = mpSelectedKeys();
+      if (keys.length) mpRun(keys);
+    });
     // ── 盯障三视图 (v1.22.0) ──
     document.querySelectorAll("#mon-chips .chip").forEach(function (c) {
       c.addEventListener("click", function () {
@@ -26554,6 +26824,7 @@ _GUI_JS = r"""(function () {
       COLORS = meta.status_colors || {};
       GRADES = meta.grade_colors || {};
       renderHome(meta);
+      renderModules(meta);   // v1.23.0: 模块面板目录 (catalog/cats 同载荷)
       pollOnce();     // 若已有进行中的诊断 (刷新场景), 直接回进度页
     });
   });
@@ -26594,6 +26865,9 @@ def _gui_page():
             'stroke-linecap="round" stroke-linejoin="round">'
             '<rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/>'
             '<path d="M7 13h6M7 16h4"/></svg>完整诊断</button>'
+            # v1.23.0 变体 A: 次级文字入口, 与完整诊断同行同级 (设计稿第 1 节选型)
+            '<button id="g-modpanel" class="g-link2" type="button">'
+            '高级模块组合 ›</button>'
             '<span id="full-count" class="g-dim"></span>'
             '<button id="g-lastrep" class="g-link" type="button" style="display:none">'
             '查看上次报告</button></div>'
@@ -26792,6 +27066,50 @@ def _gui_page():
             '<path d="M14 6.5 8.5 12l5.5 5.5"/></svg>返回主页</button></div>'
             '<div id="mon-files" class="mrp-files num"></div>'
             '</main>\n'
+            # ── 模块勾选面板 (v1.23.0, 设计稿第 2 节 1:1) ──
+            # 分组行由 JS 按 module_catalog/module_cats 渲染, 页面只留骨架
+            '<main id="view-modules" class="mp" style="display:none">'
+            '<div class="mp-h">高级模块组合</div>'
+            '<div class="mp-sub">按分类勾选要测的模块，自由组合；'
+            '结果与单独运行同口径。</div>'
+            '<div class="mp-ops">'
+            '<span class="sel-count num">已选<b id="mp-count">0</b>'
+            '<i class="sl">/</i><span class="tot num" id="mp-total">0</span></span>'
+            '<span class="ops-btns">'
+            '<button id="mp-all" class="txtbtn" type="button">全选</button>'
+            '<span class="tsep">·</span>'
+            '<button id="mp-none" class="txtbtn" type="button">清空</button>'
+            '<span class="tsep">·</span>'
+            '<button id="mp-inv" class="txtbtn" type="button">反选</button>'
+            '</span></div>'
+            '<div id="mp-groups"></div>'
+            '<div id="mp-err" class="g-err"></div>'
+            '<div class="mp-foot">'
+            '<button id="btn-mp-run" class="btn btn-primary" type="button" disabled>'
+            '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none">'
+            '<path d="M8 5.8v12.4c0 .9 1 1.4 1.7.9l9.6-6.2c.7-.4.7-1.4 0-1.8'
+            'L9.7 4.9c-.7-.5-1.7 0-1.7.9Z"/></svg>'
+            '运行所选 <span class="num" id="mp-run-n">(0)</span></button>'
+            '<span class="alt-note">独占模块（测速系）自动排队串行，不互相干扰。</span>'
+            '<button id="btn-mp-back" class="mp-back" type="button">← 返回主页</button>'
+            '</div></main>\n'
+            # ── 压测运行确认弹层 (v1.23.0, 设计稿第 3 节 1:1; DOM 实现,
+            #    非 window.confirm —— 遮罩 fixed 盖全屏, 居中卡片) ──
+            '<div id="mp-overlay" class="overlay" style="display:none">'
+            '<div class="modal">'
+            '<div class="modal-head">'
+            '<span class="warn-ic">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            'stroke-linecap="round" stroke-linejoin="round">'
+            '<path d="M12 4.2 21 19.5H3Z"/><path d="M12 10v4.2"/>'
+            '<circle cx="12" cy="16.9" r=".9" fill="currentColor" stroke="none"/></svg></span>'
+            '<span class="modal-t">运行确认</span></div>'
+            '<div class="modal-body">包含压测模块 <b>TCP 并发</b>：'
+            '将短时建立大量连接。确认对当前网络运行？</div>'
+            '<div class="modal-btns">'
+            '<button id="btn-mp-cancel" class="btn btn-line" type="button">返回</button>'
+            '<button id="btn-mp-confirm" class="btn btn-solid-red" type="button">确认运行</button>'
+            '</div></div></div>\n'
             "<script>" + _GUI_JS + "</script>\n</body>\n</html>\n")
 
 
@@ -26833,6 +27151,13 @@ def _gui_meta():
             for ci, (_cname, ckeys, _cdesc) in enumerate(MODULE_CATEGORIES)
             for k in ckeys
         ],
+        # v1.23.0 Task 2: 面板组头分类名+副题 ({"a":{"name","desc"}}),
+        # 数据同源 MODULE_CATEGORIES 第 1/3 元组 —— Task 1 只发了目录三元组,
+        # 组头文案此前无处可取, 页面不内嵌清单 (F4 红线同口径)
+        "module_cats": {
+            MODULE_CATEGORY_LETTERS[ci]: {"name": cname, "desc": cdesc}
+            for ci, (cname, _ckeys, cdesc) in enumerate(MODULE_CATEGORIES)
+        },
         "status_colors": {st: STATUS_COLORS[sk]
                           for st, sk in STATUS_KEY.items()},
         # 终审 F4: 报告页结论条等级徽章色, 同一载荷下发 (页面 JS 不内嵌色表)

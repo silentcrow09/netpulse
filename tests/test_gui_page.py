@@ -20,6 +20,9 @@
   P8 v1.22.0 终审修复波: 自定义分钟放行 0/负数交服务端钳位 + 钳位回显
      配置页/实时页双写; 负载倒计时 / DNS-TCP 等待灰 / runbar 错误入口 /
      连通率外网口径 四项锚点
+  P9 v1.23.0 模块勾选面板: 次级入口 g-modpanel + #view-modules 三分组 +
+     tcpcc 红字警示 + DOM 确认弹层 (非 window.confirm) + 条件子项显隐 +
+     Ookla 真布尔直发
 """
 import os
 import sys
@@ -194,6 +197,72 @@ class TestGuiPage(unittest.TestCase):
                       "#5 点击必须回实时页看错误信息")
         self.assertIn('<small class="v-scope">外网</small>', self.page,
                       "#6 连通率外网口径标注缺失")
+
+    # ── P9: v1.23.0 模块勾选面板 (次级入口 + #view-modules + 确认弹层) ──
+
+    def test_modules_entry_and_view_anchors(self):
+        # 变体 A 次级文字入口 → show("modules"); 面板视图骨架齐全;
+        # 目录/分类消费 /api/scenarios 载荷 (服务端唯一来源, 页面不内嵌清单)
+        p = self.page
+        js = p.split("<script>")[1]
+        self.assertIn('id="g-modpanel"', p, "主页次级入口缺失")
+        self.assertIn('class="g-link2"', p, "次级入口样式类缺失")
+        self.assertIn("高级模块组合 ›", p)
+        self.assertIn('show("modules")', js, "入口必须跳面板视图")
+        self.assertIn('"modules", "mon-config"', js,
+                      "show() 视图清单未纳入 modules")
+        self.assertIn('id="view-modules"', p, "面板视图缺失")
+        for anchor in ("mp-count", "mp-total", "mp-all", "mp-none", "mp-inv",
+                       "mp-groups", "mp-err", "btn-mp-run", "mp-run-n",
+                       "btn-mp-back"):
+            self.assertIn(anchor, p, "面板锚点缺失: %s" % anchor)
+        meta = np._gui_meta()
+        self.assertEqual(len(meta["module_catalog"]), 24)
+        self.assertEqual(set(meta["module_cats"]), {"a", "b", "c"})
+        self.assertIn("module_catalog", js, "页面未消费 module_catalog")
+        self.assertIn("module_cats", js, "页面未消费 module_cats")
+        # 运行中互斥: 面板运行按钮跟随 diagRunning/monRun 禁用 (复用既有状态)
+        i0 = js.find("function applyHomeState")
+        i1 = js.find("function renderProgress")
+        self.assertTrue(0 <= i0 < i1, "applyHomeState 定位失败")
+        self.assertIn("updateMpRunBtn();", js[i0:i1],
+                      "主页状态合成必须联动面板运行按钮禁用")
+
+    def test_modules_tcpcc_warning(self):
+        # tcpcc 行红字压测警示 (设计稿第 2 节原文), 且运行前特判弹确认
+        p = self.page
+        js = p.split("<script>")[1]
+        self.assertIn("压测：短时建立大量连接，勿对客户网络使用", p,
+                      "tcpcc 红字警示缺失")
+        self.assertIn('indexOf("tcpcc")', js, "运行前必须特判 tcpcc")
+
+    def test_modules_confirm_modal_dom(self):
+        # 确认弹层必须是 DOM 遮罩实现 (遮罩+居中卡片+确认/返回), 非 window.confirm
+        p = self.page
+        js = p.split("<script>")[1]
+        self.assertIn('id="mp-overlay"', p, "DOM 遮罩缺失")
+        self.assertIn('id="btn-mp-confirm"', p, "确认按钮缺失")
+        self.assertIn('id="btn-mp-cancel"', p, "返回按钮缺失")
+        self.assertIn("运行确认", p, "弹层标题缺失")
+        i0 = js.find("function runModules")
+        i1 = js.find("function mpRun")
+        self.assertTrue(0 <= i0 < i1, "runModules/mpRun 定位失败")
+        self.assertNotIn("confirm(", js[i0:i1],
+                         "面板运行不得使用 window.confirm")
+
+    def test_modules_conditional_subs(self):
+        # 条件子项: speedtest→Ookla 开关(默认关) / iperf3→服务器输入 /
+        # port→目标输入; 勾选显示、取消收起 (静态机制断言)
+        p = self.page
+        js = p.split("<script>")[1]
+        self.assertIn("function mpSyncSub", js, "条件子项显隐机制缺失")
+        self.assertIn("留空则按未检测处理", p, "iperf3 输入占位缺失")
+        self.assertIn("如 223.5.5.5:53，多个逗号分隔", p, "port 输入占位缺失")
+        # Ookla 开关默认关; use_speedtest_net 必须发真布尔 (服务端 bool() 直写)
+        self.assertIn("var mpOokla = false;", js, "Ookla 开关必须默认关")
+        self.assertIn("mpOokla = !mpOokla;", js, "开关切换缺失")
+        self.assertIn("body.use_speedtest_net = mpOokla;", js,
+                      "use_speedtest_net 必须发真布尔, 不得发字符串")
 
 
 if __name__ == "__main__":

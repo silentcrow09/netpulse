@@ -49,6 +49,10 @@ v1.23.0 模块勾选面板 (Task 1: 服务端 keys 形态 + module_catalog + 配
       不消费; 合法 → PORT_PROBE_CONFIG["targets"] 逐段写入
   P22 iperf3_server / use_speedtest_net 注入: 非法 iperf3 → 400 不写
       (CLI 同口径); 留空不消费; 仅对应模块在 keys 里才写
+
+v1.23.0 模块勾选面板 (Task 2: 页面资产):
+  P20b module_cats: 分类名/副题 {"a":{"name","desc"}} 与 MODULE_CATEGORIES
+      同源 (Task 1 只发了 module_catalog 三元组, 组头文案本任务补下发)
 """
 import json
 import os
@@ -730,6 +734,18 @@ class TestKeysRun(unittest.TestCase):
         for letter, (name, keys, _desc) in zip(
                 np.MODULE_CATEGORY_LETTERS, np.MODULE_CATEGORIES):
             self.assertEqual(by[letter], keys)
+
+    # -- P20b: module_cats 分类名/副题同源 (Task 2 面板组头数据源) --
+    def test_module_cats(self):
+        st, raw = _req(self.port, "GET",
+                       "/api/scenarios?t=" + self.token)
+        self.assertEqual(st, 200)
+        cats = json.loads(raw)["module_cats"]
+        self.assertEqual(set(cats), {"a", "b", "c"})
+        for letter, (name, _keys, desc) in zip(
+                np.MODULE_CATEGORY_LETTERS, np.MODULE_CATEGORIES):
+            self.assertEqual(cats[letter]["name"], name)
+            self.assertEqual(cats[letter]["desc"], desc)
 
     # -- P21: port_targets 注入 --
     def test_port_targets_injection(self):
