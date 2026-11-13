@@ -26,6 +26,14 @@ v1.22.0 盯障路由 (Task 2):
 v1.22.0 页面资产 (Task 3):
   P13 /api/shutdown 守卫: 盯障 running + 非 force → 409 (防丢当轮报告);
       force 放行且先尽力 monitor.stop(); 诊断 running 的既有 409 保持
+
+v1.22.0 终审修复波:
+  P14 /api/site/start 忙分诊: 盯障 running → 409 {"reason":"busy"}
+      (终审 #2, 交叉组合原零覆盖); 诊断 running 同属忙 → 409; 真实输入
+      错误 (客户名空) 维持 400 err; 预检与 _begin 原子复查竞态窗口
+      (忙错误标记) 兜底同样 409
+  P15 site_ready → POST /api/monitor/start: 现场检测收尾等待机房勾选时
+      网络已空闲, 盯障 start 允许 (终审 #7, 按现状语义断言)
 """
 import json
 import os
@@ -359,6 +367,57 @@ class TestGuiServer(unittest.TestCase):
             self.assertEqual(rec["args"][0], 30)
             mon.stop()
             mon._thread.join(timeout=5)
+
+    def test_site_start_busy_409(self):
+        # P14 (终审 #2): 忙类拒绝从 400 修正为 409 {"ok":False,"reason":
+        # "busy"} — 盯障 running → POST /api/site/start 是终审点名的
+        # 交叉组合, 此前零覆盖; 真实输入错误 (客户名空) 维持 400。
+        tok = "?t=" + self.token
+        cust = {"customer": "张三 · 测试小区"}
+        np._GuiHandler.monitor._phase = "running"   # 直摆忙 (同 P10 手法)
+        st, raw = _req(self.port, "POST", "/api/site/start" + tok, body=cust)
+        self.assertEqual(st, 409)
+        self.assertEqual(json.loads(raw), {"ok": False, "reason": "busy"})
+        # 诊断 running 同属忙类 → 409 busy
+        np._GuiHandler.monitor._phase = "idle"
+        self.session._phase = "running"
+        st, raw = _req(self.port, "POST", "/api/site/start" + tok, body=cust)
+        self.assertEqual(st, 409)
+        self.assertEqual(json.loads(raw)["reason"], "busy")
+        # 真实输入错误: 网络空闲 + 客户名空 → 400 err (非 busy)
+        self.session._phase = "idle"
+        st, raw = _req(self.port, "POST", "/api/site/start" + tok,
+                       body={"customer": "   "})
+        self.assertEqual(st, 400)
+        d = json.loads(raw)
+        self.assertFalse(d["ok"])
+        self.assertIn("客户名称", d["err"])
+        # 竞态窗口: 预检 (False) 与 _begin 原子复查 (True) 之间被抢跑 →
+        # 忙错误按标记 (_GUI_BUSY_MSG) 识别 → 兜底同样 409
+        with mock.patch.object(np, "_gui_net_busy",
+                               side_effect=[False, True]):
+            st, raw = _req(self.port, "POST", "/api/site/start" + tok,
+                           body=cust)
+        self.assertEqual(st, 409)
+        self.assertEqual(json.loads(raw), {"ok": False, "reason": "busy"})
+
+    def test_site_ready_allows_monitor_start(self):
+        # P15 (终审 #7): 现场检测走到机房核对 (site_ready) 后诊断已收尾,
+        # 网络空闲 → 盯障 start 允许 (按现状语义断言 200, minutes×60 回显)。
+        fake = _fake_monitor_session()
+        rec, p_ms, p_save = _patch_monitor_session(fake,
+                                                   save_result=("x", "y"))
+        tok = "?t=" + self.token
+        self.session._phase = "site_ready"
+        with p_ms, p_save:
+            st, raw = _req(self.port, "POST", "/api/monitor/start" + tok,
+                           body={"minutes": 10})
+            self.assertEqual(st, 200)
+            d = json.loads(raw)
+            self.assertTrue(d["ok"])
+            self.assertEqual(d["effective_s"], 600)
+            np._GuiHandler.monitor.stop()
+            np._GuiHandler.monitor._thread.join(timeout=5)
 
     def test_minor_stop_before_commit_kept(self):
         # P12a (审查 Minor ①): phase 置位到 _session 提交之间到达的 stop

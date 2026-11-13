@@ -17,6 +17,9 @@
      (ICONS.monitor + /api/scenarios 下发 monitor 条目, 与终端菜单同语义)
   P7 F1 回修: runbar 三态优先级 monRun → diagRun → monDone (盯障完成的
      粘滞终态不得覆盖诊断进行中入口); beforeunload 两条文案标点统一全角
+  P8 v1.22.0 终审修复波: 自定义分钟放行 0/负数交服务端钳位 + 钳位回显
+     配置页/实时页双写; 负载倒计时 / DNS-TCP 等待灰 / runbar 错误入口 /
+     连通率外网口径 四项锚点
 """
 import os
 import sys
@@ -153,6 +156,44 @@ class TestGuiPage(unittest.TestCase):
         self.assertEqual(_html_guard_violations(
             'box.insertAdjacentHTML("afterbegin", ICON);'), [],
             "全大写常量标识符注入被误拦")
+
+    def test_monitor_minutes_pass_through_and_clamp_echo(self):
+        # 终审修复 #1: 自定义分钟不再前端拒收 0/负数 (n<=0 拦截删除),
+        # 任意整数放行交服务端钳位 (0→30 / 2000→86400, P11 已锁); 非整数
+        # 仍前端拦截; 钳位回显写配置页 + 实时页 (#mon-clamp) 两处 ——
+        # 跳转后两处都可见, 不再「返回配置页才看得到」。
+        js = self.page.split("<script>")[1]
+        i0 = js.find("function monMinutes()")
+        i1 = js.find("function startMon()")
+        self.assertTrue(0 <= i0 < i1, "monMinutes 函数定位失败")
+        body = js[i0:i1]
+        self.assertNotIn("n <= 0", body,
+                         "0/负数不得在前端拦截 (须放行交服务端钳位)")
+        self.assertIn("Math.floor(n) !== n", body, "非整数仍须前端拦截")
+        self.assertIn('id="mon-clamp"', self.page, "实时页钳位回显锚点缺失")
+        self.assertIn('$("#mon-clamp")', js, "实时页钳位回显写入缺失")
+        self.assertIn("执行（最短 30 秒，最长 24 小时）", js, "钳位回显文案缺失")
+
+    def test_monitor_fixwave_live_anchors(self):
+        # 终审修复 #3/#4/#5/#6 页面锚点:
+        #   #3 负载提示倒计时 (等待倒计时 → 负载窗进行中);
+        #   #4 DNS/TCP 无样本等待灰 (qSt 判 null → "wait" + 「等待数据」);
+        #   #5 盯障 error 态主页 runbar 入口 (不静默隐藏, 点击回实时页);
+        #   #6 连通率「外网」口径小字标注。
+        js = self.page.split("<script>")[1]
+        self.assertIn("后开始（15 秒下载）", js, "#3 倒计时文案缺失")
+        self.assertIn("下载负载进行中", js, "#3 负载窗进行中文案缺失")
+        self.assertIn("function qSt(", js, "#4 无样本判据 helper 缺失")
+        self.assertIn('"等待数据"', js, "#4 等待态副文案缺失")
+        self.assertIn("盯障启动失败 · 点击查看", js, "#5 runbar 错误入口缺失")
+        i_done = js.find('bar.textContent = "盯障完成 · 点击查看报告";')
+        i_err = js.find('bar.textContent = "盯障启动失败 · 点击查看";')
+        self.assertTrue(0 <= i_done < i_err, "#5 错误分支必须在 monDone 之后")
+        self.assertIn('} else if (state.monPhase === "error") {\n'
+                      '        show("mon-live");', js,
+                      "#5 点击必须回实时页看错误信息")
+        self.assertIn('<small class="v-scope">外网</small>', self.page,
+                      "#6 连通率外网口径标注缺失")
 
 
 if __name__ == "__main__":

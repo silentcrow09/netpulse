@@ -211,6 +211,9 @@ class TestGuiMonitor(unittest.TestCase):
                 self.assertEqual(sorted(p1["connect"][k]), ["loss10", "ok"])
             self.assertIn("dns_ok", p1["connect"])
             self.assertIn("tcp_ok", p1["connect"])
+            # 终审 #4: 无样本 → None (前端显示等待灰), 不再 False 误判红
+            self.assertIsNone(p1["connect"]["dns_ok"])
+            self.assertIsNone(p1["connect"]["tcp_ok"])
             for k in ("outage", "dns_fail", "jitter_burst", "latency_spike"):
                 self.assertIn(k, p1["events_preview"])
             self.assertFalse(p1["load"])

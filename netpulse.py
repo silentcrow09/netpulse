@@ -24761,7 +24761,7 @@ class _GuiSession:
             if self._phase == "running":
                 return False, "已有诊断在进行中"
             if _gui_net_busy():          # v1.22.0: 跨类型互斥 (盯障等)
-                return False, "已有网络活动在进行中"
+                return False, _GUI_BUSY_MSG
             self._phase = "running"
             self._profile = profile
             self._keys = list(keys)
@@ -24959,6 +24959,11 @@ class _GuiSession:
 
 _GUI_ACT_LOCK = threading.Lock()
 
+# v1.22.0 终审修复波: 跨类型忙拒绝的统一文案 (可识别标记)。/api/site/start
+# 路由据此把「预检通过但 _begin 原子复查拒绝」的竞态窗口忙拒映射成 409
+# (而非被统一错误通道映射成 400, 与真实输入错误不可区分)。
+_GUI_BUSY_MSG = "已有网络活动在进行中"
+
 
 def _gui_net_busy():
     """任一网络活动 (诊断/现场检测/盯障) 进行中。
@@ -25037,7 +25042,7 @@ class _GuiMonitor:
             if self.is_running():
                 return False, "已有盯障在进行中", None
             if _gui_net_busy():
-                return False, "已有网络活动在进行中", None
+                return False, _GUI_BUSY_MSG, None
             try:
                 effective = 600 if duration_s is None else int(duration_s)
                 effective = max(self.MIN_DURATION_S,
@@ -25222,7 +25227,7 @@ class _GuiMonitor:
             "duration_s": self._duration,
             "connect": {"gw": {"ok": 0, "loss10": 0},
                         "ext": {"ok": 0, "loss10": 0},
-                        "dns_ok": False, "tcp_ok": False},
+                        "dns_ok": None, "tcp_ok": None},
             "loss_pct": {"gw": None, "ext": None},
             "events_preview": {k: 0 for k in ("outage", "dns_fail",
                                               "jitter_burst", "latency_spike")},
@@ -25632,6 +25637,10 @@ iframe#g-frame{ width:100%; height:calc(100vh - 120px); border:0; margin-top:16p
 .mn-conn{ padding-bottom:4px; }
 .mn-conn .lab{ font-size:11px; letter-spacing:2px; color:var(--mute); font-weight:700; }
 .mn-conn .v{ font-size:21px; font-weight:700; margin-top:2px; }
+/* 终审 #6: 连通率是 100−外网丢包率, 补小字标注防误读为全网口径 */
+.mn-conn .v-scope{ font-size:11px; color:var(--mute); }
+/* 终审 S1.3: 盯障钳位回显在实时页大数字区的就地副本 (配置页 msg 同文案) */
+.mn-clamp{ font-size:12px; font-weight:700; color:var(--green); padding-bottom:6px; }
 .mn-meta{ margin-left:auto; text-align:right; font-size:12px; color:var(--dim); padding-bottom:6px; }
 .badge-run{ margin-left:0; margin-bottom:6px; display:inline-flex; align-items:center; gap:8px;
             background:var(--navy-2); color:#fff; font-size:13px; font-weight:700; letter-spacing:1.5px;
@@ -25806,9 +25815,10 @@ _GUI_JS = r"""(function () {
   // 轮询各自刷新 state, 统一在这里落 DOM ——
   //   诊断 running → 全部卡禁用 + 运行条「诊断进行中」;
   //   盯障 running → 除盯障卡外全部禁用 + 运行条「盯障进行中」(点回实时页);
-  //   盯障 done   → 运行条「盯障完成」(点开报告)。
-  // runbar 优先级 monRun → diagRun → monDone (F1 回修): monDone 是粘滞
-  // 终态 (下次盯障前一直在), 不得压过诊断进行中的入口。
+  //   盯障 done   → 运行条「盯障完成」(点开报告);
+  //   盯障 error  → 运行条「盯障启动失败」(终审 #5, 点开实时页看错误)。
+  // runbar 优先级 monRun → diagRun → monDone → monErr (F1 回修): monDone
+  // 是粘滞终态 (下次盯障前一直在), 不得压过诊断进行中的入口。
   function updateHomeState(d) {
     state.diagRunning = d.phase === "running";
     applyHomeState();
@@ -25817,6 +25827,7 @@ _GUI_JS = r"""(function () {
     var diagRun = !!state.diagRunning;
     var monRun = state.monPhase === "running";
     var monDone = state.monPhase === "done";
+    var monErr = state.monPhase === "error";
     document.querySelectorAll("#cards .g-card").forEach(function (c) {
       if (monRun) {
         c.disabled = c.dataset.p !== "monitor";
@@ -25834,6 +25845,10 @@ _GUI_JS = r"""(function () {
     } else if (monDone) {
       bar.style.display = "";
       bar.textContent = "盯障完成 · 点击查看报告";
+    } else if (monErr) {
+      // 终审 #5: 启动失败不再静默隐藏 — 主页给入口, 点开实时页看错误信息
+      bar.style.display = "";
+      bar.textContent = "盯障启动失败 · 点击查看";
     } else {
       bar.style.display = "none";
     }
@@ -26060,7 +26075,9 @@ _GUI_JS = r"""(function () {
     var raw = $("#mon-min-custom").value.trim();
     if (!raw) return state.monMins;
     var n = Number(raw);
-    if (!isFinite(n) || n <= 0 || Math.floor(n) !== n) return null;
+    // 终审 S1.3: 只拦非整数, 0/负数/超大值一律放行交服务端钳位
+    // (服务端 0→30 / 2000→86400, P11 已锁), 前端不再拒收
+    if (!isFinite(n) || Math.floor(n) !== n) return null;
     return n;
   }
 
@@ -26077,12 +26094,16 @@ _GUI_JS = r"""(function () {
         state.monPhase = "running";
         $("#mon-live-err").textContent = "";
         if (r.effective_s !== mins * 60) {
-          // 钳位回显 (就地留在配置页, 返回时可见; 实时页计时按真实值走)
-          msg.style.color = "var(--green)";
-          msg.textContent = "已按 " + fmtDur(r.effective_s) +
+          // 钳位回显 (终审 S1.3): 配置页与实时页各写一份 —— 回显只写在
+          // 跳转后的配置页要「返回」才可见, 实时页大数字旁就地可见
+          var t = "已按 " + fmtDur(r.effective_s) +
             " 执行（最短 30 秒，最长 24 小时）";
+          msg.style.color = "var(--green)";
+          msg.textContent = t;
+          $("#mon-clamp").textContent = t;
         } else {
           msg.textContent = "";
+          $("#mon-clamp").textContent = "";
         }
         show("mon-live");
         startMonPoll();
@@ -26152,10 +26173,15 @@ _GUI_JS = r"""(function () {
     renderQuad(d);
     renderMonEvents(d);
     var bar = $("#mon-loadbar");
-    if (d.load) {
+    // 终审 #3: 静态文案改 elapsed_s 驱动倒计时 (设计稿第 2 节视觉基准) —
+    // 等待期倒计时 → 15s 负载窗进行中 → 结束后隐藏
+    if (d.load && d.elapsed_s < 60) {
       bar.style.display = "";
       $("#mon-load-txt").textContent =
-        "主动负载已开启（开始 60 秒后施加 15 秒下载负载）";
+        "主动负载将在 " + mmss(60 - d.elapsed_s) + " 后开始（15 秒下载）";
+    } else if (d.load && d.elapsed_s < 75) {
+      bar.style.display = "";
+      $("#mon-load-txt").textContent = "下载负载进行中";
     } else {
       bar.style.display = "none";
     }
@@ -26190,6 +26216,10 @@ _GUI_JS = r"""(function () {
   function msTxt(v) {
     return (v === null || v === undefined) ? "—" : v + "ms";
   }
+  function qSt(v) {
+    // 终审 #4: 无样本 (null) → 等待灰 (与 gw/ext 等待态同款), 不误判红
+    return (v === null || v === undefined) ? "wait" : (v ? "ok" : "err");
+  }
   function renderQuad(d) {
     var grid = $("#mon-quad");
     grid.textContent = "";
@@ -26206,10 +26236,12 @@ _GUI_JS = r"""(function () {
       extData ? (ext.ok > 0 ? "ok" : "err") : "wait",
       "当前 " + msTxt(state.curMs.ext) + " · 丢包 " +
       (extData ? String(ext.loss10 || 0) : "—")));
-    grid.appendChild(qCell("DNS", c.dns_ok ? "ok" : "err",
-      "失败 " + (ev.dns_fail || 0)));
-    grid.appendChild(qCell("TCP", c.tcp_ok ? "ok" : "err",
-      c.tcp_ok ? "正常" : "失败 · 未恢复"));
+    grid.appendChild(qCell("DNS", qSt(c.dns_ok),
+      (c.dns_ok === null || c.dns_ok === undefined)
+        ? "等待数据" : ("失败 " + (ev.dns_fail || 0))));
+    grid.appendChild(qCell("TCP", qSt(c.tcp_ok),
+      (c.tcp_ok === null || c.tcp_ok === undefined)
+        ? "等待数据" : (c.tcp_ok ? "正常" : "失败 · 未恢复")));
   }
 
   // 事件计数四卡 (前台粗略提示, 0 值灰色弱化)
@@ -26423,6 +26455,8 @@ _GUI_JS = r"""(function () {
         show("progress"); pollOnce();
       } else if (state.monPhase === "done") {
         openMonReport();
+      } else if (state.monPhase === "error") {
+        show("mon-live");          // 终审 #5: 查看启动失败的错误信息
       } else {
         show("progress"); pollOnce();
       }
@@ -26603,8 +26637,10 @@ def _gui_page():
             '<div class="mn-top">'
             '<span class="mn-num num"><span id="mon-elapsed">00:00</span>'
             '<small class="num" id="mon-total">/ 00:00</small></span>'
+            '<span id="mon-clamp" class="mn-clamp"></span>'
             '<span class="mn-conn"><span class="lab">连通率</span>'
-            '<div id="mon-conn" class="v num">—</div></span>'
+            '<div id="mon-conn" class="v num">—</div>'
+            '<small class="v-scope">外网</small></span>'
             '<span id="mon-meta" class="mn-meta num"></span>'
             '<span class="badge-run"><i></i>监测中</span></div>'
             '<div class="pbar"><i id="mon-pbar"></i></div>'
@@ -26866,9 +26902,17 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
                 return self._send(409, {"ok": False, "reason": "running"})
             if p == "/api/site/start":
                 d = data or {}
+                # v1.22.0 终审 #2: 忙类拒绝 409 (原被统一映射 400, 前端
+                # 无法与输入错误区分); 真实输入错误 (客户名空) 维持 400。
+                # 判据一: 路由先查 _gui_net_busy 分诊; 判据二: 预检与
+                # _begin 原子复查之间被抢跑时, 按忙错误标记兜底识别。
+                if _gui_net_busy():
+                    return self._send(409, {"ok": False, "reason": "busy"})
                 ok, err = self.session.start_site(
                     d.get("customer"), tested_at=d.get("tested_at"),
                     plan=d.get("plan"))
+                if not ok and err == _GUI_BUSY_MSG:
+                    return self._send(409, {"ok": False, "reason": "busy"})
                 return self._send(200 if ok else 400, {"ok": ok, "err": err})
             if p == "/api/site/finish":
                 d = data or {}
