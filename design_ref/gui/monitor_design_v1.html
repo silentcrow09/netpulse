@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetPulse 盯障实时窗口 · 设计稿 v1（GUI 二期第 1 项）</title>
+<style>
+  /* ════════════════════════════════════════════════════════════
+     NetPulse 盯障实时窗口（GUI 二期第 1 项）· 静态设计稿（无可运行代码）
+     设计语言继承 gui_design_v1.html：藏蓝主色 + 克制严重度色
+     + hairline 细线 + 小号大写字距标签 + tabular-nums + soft 浅底卡
+     全部系统字体，零外部资源（无 CDN / 无图片 / 无外链）
+     ════════════════════════════════════════════════════════════ */
+  :root{
+    --navy:#0a3b6e; --navy-2:#2a5485; --red:#b3261e; --amber:#ad6e10; --green:#1e6e44;
+    --text:#1a2230; --dim:#5b6472; --mute:#98a2ad; --rule:#d8dde5; --soft:#f6f7f9;
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ background:#dfe3e9; }
+  body{ font-family:"Inter","Microsoft YaHei","PingFang SC",sans-serif; color:var(--text);
+        font-size:14px; line-height:1.65; padding:46px 40px 110px; -webkit-font-smoothing:antialiased; }
+  .wrap{ max-width:1240px; margin:0 auto; }
+  .num{ font-variant-numeric:tabular-nums; font-feature-settings:"tnum"; }
+
+  /* ── 文档头 ── */
+  h1{ font-size:26px; font-weight:800; letter-spacing:.4px; color:var(--text); }
+  h1 .brandtag{ display:inline-block; background:var(--navy); color:#fff; font-size:15px; font-weight:800;
+                border-radius:8px; padding:3px 10px; letter-spacing:1px; vertical-align:3px; margin-right:12px; }
+  .meta{ font-size:12.5px; color:var(--mute); margin-top:8px; letter-spacing:.3px; }
+  .meta b{ color:var(--dim); }
+  .lead{ font-size:13.5px; color:var(--dim); margin-top:14px; max-width:980px; }
+  .lead b{ color:var(--text); }
+
+  /* ── 节 ── */
+  .sec{ margin-top:60px; }
+  .sec-head{ display:flex; align-items:baseline; gap:14px; border-bottom:2px solid var(--navy);
+             padding-bottom:10px; margin-bottom:12px; }
+  .sec-head .no{ font-size:13px; font-weight:800; color:var(--navy); letter-spacing:2.5px; white-space:nowrap; }
+  .sec-head .t{ font-size:20px; font-weight:800; letter-spacing:.5px; color:var(--text); }
+  .sec-head .pill{ font-size:11.5px; font-weight:700; letter-spacing:1.5px; padding:2px 12px;
+                   border-radius:999px; white-space:nowrap; }
+  .pill.navy{ background:var(--navy); color:#fff; }
+  .sec-head .r{ margin-left:auto; font-size:12px; color:var(--mute); white-space:nowrap; }
+  .sec-desc{ font-size:13px; color:var(--dim); max-width:980px; margin:2px 2px 0; }
+
+  /* ── 设计注释（窗口下方说明） ── */
+  .notes{ font-size:12.5px; color:var(--dim); margin:10px auto 0; width:1160px; max-width:100%; }
+  .notes li{ margin-left:20px; margin-top:3px; }
+  .notes b{ color:var(--text); }
+  .notes .k{ color:var(--navy); font-weight:700; }
+
+  /* ── 假窗口框（与 gui_design_v1 同款） ── */
+  .win{ width:1160px; max-width:100%; margin:18px auto 8px; background:#fff; border:1px solid #c6ccd4;
+        border-radius:10px; overflow:hidden; box-shadow:0 26px 52px -30px rgba(13,35,60,.38); }
+  .win-title{ height:40px; background:#eef1f5; border-bottom:1px solid #e0e4ea; display:flex;
+              align-items:center; padding:0 14px; position:relative; }
+  .win-title .dots{ display:inline-flex; gap:6px; }
+  .win-title .dots i{ width:10px; height:10px; border-radius:50%; background:#c3cad3; }
+  .win-title .wt{ position:absolute; left:0; right:0; text-align:center; font-size:12.5px;
+                  color:var(--dim); font-weight:600; letter-spacing:.5px; pointer-events:none; }
+  .win-btns{ margin-left:auto; display:flex; align-items:center; gap:18px; color:#7b8593; font-size:13px; line-height:1; }
+  .win-btns .x{ font-size:14px; color:#5b6472; }
+
+  /* ═══ 第 0 节 · 总览 ═══ */
+  .flow{ display:flex; align-items:stretch; margin:18px 0 6px; }
+  .fstep{ flex:1; background:#fff; border:1px solid var(--rule); border-radius:10px; padding:14px 18px 12px; }
+  .fstep .h{ font-size:14px; font-weight:700; color:var(--navy); }
+  .fstep .h small{ font-size:11px; color:var(--mute); font-weight:600; letter-spacing:1px; margin-left:6px; }
+  .fstep .d{ font-size:12px; color:var(--dim); margin-top:4px; line-height:1.6; }
+  .farrow{ width:42px; display:flex; align-items:center; justify-content:center;
+           color:var(--mute); font-size:20px; }
+  .tbl{ background:#fff; border:1px solid var(--rule); border-radius:10px; overflow:hidden; margin-top:16px; }
+  table.list{ width:100%; border-collapse:collapse; }
+  table.list th{ background:var(--soft); text-align:left; font-size:12px; letter-spacing:1.5px;
+                 color:var(--dim); font-weight:700; padding:10px 16px; border-bottom:1px solid var(--rule); white-space:nowrap; }
+  table.list td{ padding:11px 16px; border-bottom:1px solid var(--soft); font-size:13px; color:var(--text); vertical-align:top; }
+  table.list tr:last-child td{ border-bottom:none; }
+  table.list td.dim{ color:var(--dim); }
+  table.list .secno{ color:var(--navy); font-weight:700; white-space:nowrap; }
+  .pill-add{ display:inline-block; background:#eaf4ee; color:var(--green); font-size:11px; font-weight:700;
+             letter-spacing:1.5px; padding:1px 11px; border-radius:999px; }
+  .unchanged{ background:var(--soft); border:1px solid var(--rule); border-radius:10px;
+              padding:14px 18px; font-size:13px; color:var(--dim); margin-top:16px; line-height:1.8; }
+  .unchanged b{ color:var(--text); }
+  .unchanged .lab{ font-size:12px; letter-spacing:2px; color:var(--mute); font-weight:700; display:block; margin-bottom:2px; }
+  code{ font-family:Consolas,"Courier New",monospace; font-size:12px; background:#eef1f5;
+        border:1px solid var(--rule); border-radius:4px; padding:0 6px; color:var(--navy); }
+
+  /* ═══ 通用按钮 / 表单元素（与 gui_design_v1 同款） ═══ */
+  .btn{ display:inline-flex; align-items:center; gap:8px; border-radius:7px; font-size:13px; font-weight:600;
+        padding:9px 18px; letter-spacing:.3px; }
+  .btn svg{ width:15px; height:15px; }
+  .btn-primary{ background:var(--navy); border:1px solid var(--navy); color:#fff; }
+  .btn-line{ background:#fff; border:1px solid var(--rule); color:var(--text); }
+  .btn-danger{ background:#fff; border:1px solid var(--red); color:var(--red); font-weight:700; }
+  .alt-note{ font-size:12.5px; color:var(--mute); }
+  .backlink{ font-size:12.5px; color:var(--mute); }
+  .fcard{ border:1px solid var(--rule); border-radius:12px; padding:22px 26px 24px; background:#fff; }
+  .field{ margin-bottom:18px; }
+  .field:last-of-type{ margin-bottom:20px; }
+  .flabel{ font-size:13px; font-weight:600; margin-bottom:7px; }
+  .input{ width:100%; height:38px; border:1px solid var(--rule); border-radius:7px; padding:0 13px;
+          font-size:13.5px; font-family:inherit; color:var(--text); background:#fff; }
+  input::placeholder{ color:#a8b2bd; }
+  .fhint{ font-size:11.5px; color:var(--mute); margin-top:6px; }
+  .form-foot{ display:flex; align-items:center; gap:14px; margin-top:4px; }
+  .g-badge{ background:var(--green); color:#fff; font-size:13px; font-weight:700; letter-spacing:1.5px;
+            padding:5px 15px; border-radius:6px; white-space:nowrap; }
+  .pbar{ height:10px; background:#eef1f5; border:1px solid var(--rule); border-radius:999px;
+         margin-top:16px; position:relative; overflow:hidden; }
+  .pbar i{ position:absolute; top:0; bottom:0; left:0; width:42%; background:var(--navy-2); border-radius:999px; }
+
+  /* ═══ 场景卡（仅第 1 节入口示意用，与 gui_design_v1 方案A 同款） ═══ */
+  .entry-strip{ width:1160px; max-width:100%; margin:18px auto 0; }
+  .entry-cap{ font-size:11.5px; letter-spacing:1.5px; color:var(--mute); font-weight:700; margin-bottom:8px; }
+  .scene{ background:var(--soft); border:1px solid var(--rule); border-radius:12px;
+          padding:18px 18px 16px; display:flex; flex-direction:column; }
+  .entry-strip .scene{ width:340px; }
+  .scene .ic{ width:44px; height:44px; border-radius:11px; background:#fff; border:1px solid var(--rule);
+              display:flex; align-items:center; justify-content:center; color:var(--navy); margin-bottom:12px; }
+  .scene .ic svg{ width:23px; height:23px; }
+  .scene .nm{ font-size:16px; font-weight:700; letter-spacing:.2px; }
+  .scene .ds{ font-size:12.5px; color:var(--dim); margin-top:5px; line-height:1.6; }
+  .scene .go{ margin-top:10px; font-size:11.5px; font-weight:700; letter-spacing:1px; color:var(--mute); }
+
+  /* ═══ 第 1 节 · 配置页 ═══ */
+  .cfg{ padding:30px 36px 28px; }
+  .cfg .fcard{ max-width:780px; margin:0 auto; }
+  .cfg-h{ font-size:21px; font-weight:800; letter-spacing:.3px; }
+  .cfg-sub{ font-size:13px; color:var(--dim); margin-top:4px; padding-bottom:16px; border-bottom:1px solid var(--soft); margin-bottom:18px; }
+  .chips{ display:flex; align-items:stretch; gap:10px; flex-wrap:wrap; }
+  .chip{ border:1px solid var(--rule); background:#fff; border-radius:8px; padding:4px 16px; height:52px;
+         display:flex; flex-direction:column; justify-content:center; text-align:center; }
+  .chip b{ display:block; font-size:14px; font-weight:700; letter-spacing:.2px; line-height:1.45; }
+  .chip small{ display:block; font-size:10.5px; color:var(--mute); margin-top:1px; letter-spacing:.5px; line-height:1.3; }
+  .chip.on{ background:var(--navy); border-color:var(--navy); }
+  .chip.on b{ color:#fff; }
+  .chip.on small{ color:#b9cde2; }
+  .chip-ct{ display:flex; align-items:center; gap:7px; border:1px solid var(--rule); border-radius:8px;
+            background:#fff; padding:0 14px; height:52px; }
+  .chip-ct input{ border:none; outline:none; width:86px; height:50px; font-family:inherit; font-size:14px;
+                  color:var(--text); background:transparent; }
+  .chip-ct .suf{ font-size:12px; color:var(--mute); }
+  .swrow{ display:flex; align-items:center; gap:12px; height:38px; }
+  .switch{ width:42px; height:24px; border-radius:999px; background:#c9d1da; position:relative; flex:none; }
+  .switch i{ position:absolute; top:3px; left:3px; width:18px; height:18px; border-radius:50%; background:#fff;
+             box-shadow:0 1px 3px rgba(0,0,0,.25); }
+  .swstate{ font-size:13px; font-weight:700; color:var(--dim); }
+
+  /* ═══ 第 2 节 · 盯障实时页 ═══ */
+  .mn{ padding:28px 36px 24px; }
+  .mn-top{ display:flex; align-items:flex-end; gap:28px; padding-bottom:18px; border-bottom:1px solid var(--rule); }
+  .mn-num{ font-size:44px; font-weight:800; letter-spacing:-1px; line-height:1; color:var(--navy); }
+  .mn-num small{ font-size:17px; font-weight:700; color:var(--mute); letter-spacing:0; margin-left:6px; }
+  .mn-conn{ padding-bottom:4px; }
+  .mn-conn .lab{ font-size:11px; letter-spacing:2px; color:var(--mute); font-weight:700; }
+  .mn-conn .v{ font-size:21px; font-weight:700; margin-top:2px; }
+  .mn-meta{ margin-left:auto; text-align:right; font-size:12px; color:var(--dim); padding-bottom:6px; }
+  .badge-run{ margin-left:0; margin-bottom:6px; display:inline-flex; align-items:center; gap:8px;
+              background:var(--navy-2); color:#fff; font-size:13px; font-weight:700; letter-spacing:1.5px;
+              padding:6px 16px; border-radius:999px; }
+  .badge-run i{ width:8px; height:8px; border-radius:50%; background:#fff; animation:blink 1.6s ease-out infinite; }
+  @keyframes blink{ 0%{ opacity:1; } 50%{ opacity:.35; } 100%{ opacity:1; } }
+  .quad{ display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:20px; }
+  .qcell{ background:var(--soft); border:1px solid var(--rule); border-radius:10px; padding:12px 16px 11px; }
+  .q-top{ display:flex; align-items:center; gap:9px; }
+  .qdot{ width:10px; height:10px; border-radius:50%; flex:none; }
+  .qdot.ok{ background:var(--green); }
+  .qdot.err{ background:var(--red); }
+  .qname{ font-size:14.5px; font-weight:700; }
+  .qmark{ font-size:13px; font-weight:800; margin-left:2px; }
+  .qmark.ok{ color:var(--green); }
+  .qmark.err{ color:var(--red); }
+  .qsub{ font-size:12px; color:var(--dim); margin-top:5px; }
+  .qsub b{ font-weight:700; }
+  .qsub .warn{ color:var(--amber); font-weight:700; }
+  .qsub .bad{ color:var(--red); font-weight:700; }
+  .chart-card{ border:1px solid var(--rule); border-radius:12px; background:#fff; padding:14px 20px 10px; margin-top:16px; }
+  .cap-row{ display:flex; align-items:baseline; }
+  .cap-row .lab{ font-size:11px; letter-spacing:2.5px; color:var(--mute); font-weight:700; }
+  .cap-row .r{ margin-left:auto; font-size:11.5px; color:var(--mute); }
+  .chart-holder{ width:840px; max-width:100%; margin:4px auto 0; }
+  .chart-svg{ display:block; }
+  .chart-svg text{ font-family:inherit; }
+  .chart-svg .t{ font-size:11px; fill:var(--mute); }
+  .chart-svg .t.dim{ fill:var(--dim); }
+  .chart-svg .t.red{ fill:var(--red); font-weight:700; }
+  .chart-svg .t.end{ text-anchor:end; }
+  .chart-svg .t.mid{ text-anchor:middle; }
+  .chart-svg .ax{ stroke:var(--rule); stroke-width:1; }
+  .chart-svg .ax.base{ stroke:#d3d9e1; }
+  .chart-svg .ln{ fill:none; stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
+  .chart-svg .ln.gw{ stroke:var(--navy); }
+  .chart-svg .ln.wan{ stroke:var(--amber); }
+  .chart-svg .lgw.gw{ fill:var(--navy); }
+  .chart-svg .lgw.wan{ fill:var(--amber); }
+  .chart-svg .loss{ fill:#fff; stroke:var(--red); stroke-width:2; }
+  .chart-svg .bracket{ stroke:var(--red); stroke-width:1; opacity:.55; }
+  .chart-svg .chipbg{ fill:var(--soft); stroke:var(--rule); }
+  .ev-grid{ display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:10px; }
+  .evcard{ background:#fff; border:1px solid var(--rule); border-radius:10px; padding:12px 16px 10px; }
+  .ev-num{ font-size:24px; font-weight:800; line-height:1.15; }
+  .ev-num .u{ font-size:12px; font-weight:600; color:var(--mute); margin-left:2px; letter-spacing:0; }
+  .ev-num.red{ color:var(--red); }
+  .ev-num.amber{ color:var(--amber); }
+  .ev-num.dim{ color:var(--dim); }
+  .ev-lab{ font-size:12px; color:var(--dim); margin-top:2px; letter-spacing:.5px; }
+  .loadbar{ margin-top:16px; display:flex; align-items:center; gap:12px;
+            background:#faf5ea; border:1px solid #e8dcc2; border-left:3px solid var(--amber);
+            border-radius:10px; padding:10px 18px; font-size:12.5px; color:var(--dim); }
+  .loadbar svg{ width:16px; height:16px; flex:none; color:var(--amber); }
+  .loadbar b{ color:var(--text); }
+  .mn-foot{ margin-top:20px; padding-top:16px; border-top:1px solid var(--rule); display:flex; align-items:center; gap:14px; }
+  .mn-back{ margin-left:auto; font-size:12.5px; color:var(--mute); }
+
+  /* ═══ 第 3 节 · 盯障结束报告页 ═══ */
+  .mrp{ padding:28px 36px 30px; }
+  .mrp-conc{ display:flex; align-items:center; gap:20px; background:var(--soft); border:1px solid var(--rule);
+             border-radius:12px; padding:18px 24px; }
+  .mrp-line{ font-size:15px; font-weight:700; }
+  .mrp-sug{ font-size:12.5px; color:var(--dim); margin-top:4px; }
+  .mrp-tag{ margin-left:auto; align-self:flex-start; flex:none; font-size:11px; color:var(--mute);
+            border:1px solid var(--rule); background:#fff; border-radius:999px; padding:3px 12px;
+            letter-spacing:.5px; white-space:nowrap; }
+  .mst-grid{ display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:18px; }
+  .mst{ background:var(--soft); border:1px solid var(--rule); border-radius:10px; padding:12px 16px 11px; }
+  .mst-num{ font-size:22px; font-weight:800; line-height:1.2; }
+  .mst-num .u{ font-size:12px; font-weight:600; color:var(--mute); margin-left:2px; letter-spacing:0; }
+  .mst-num.red{ color:var(--red); }
+  .mst-num.amber{ color:var(--amber); }
+  .mst-num.dim{ color:var(--dim); }
+  .mst-sub{ font-size:11.5px; color:var(--mute); margin-top:2px; }
+  .mch-grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:10px; }
+  .mch{ border:2px dashed #b6c0cd; border-radius:12px; background:#fbfcfd; padding:12px 12px 10px; text-align:center; }
+  .mch .t{ display:inline-block; font-size:11.5px; font-weight:700; color:var(--dim);
+           background:#fff; border:1px solid var(--rule); border-radius:999px; padding:3px 14px; }
+  .mch svg{ display:block; margin:8px auto 2px; }
+  .mch svg text{ font-family:inherit; }
+  .mch svg .t{ font-size:9.5px; fill:var(--mute); }
+  .mch svg .ax{ stroke:var(--rule); stroke-width:1; }
+  .mch svg .ln{ fill:none; stroke-width:1.8; stroke-linejoin:round; stroke-linecap:round; }
+  .mch svg .loss{ fill:#fff; stroke:var(--red); stroke-width:1.8; }
+  .mrp-actions{ display:flex; gap:10px; margin-top:18px; }
+  .mrp-files{ margin-top:10px; font-size:12px; color:var(--mute); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1><span class="brandtag">NP</span>NetPulse 盯障实时窗口 · 设计稿</h1>
+<div class="meta">v1 · 2026-11-13 · <b>GUI 二期第 1 项「持续盯障」</b> · 三个界面全部新增 · 设计语言继承 <code>gui_design_v1.html</code> · 静态选型稿（无可运行代码），选型确认后另出 <b>spec.md + verify.md</b> 再实施</div>
+<p class="lead">技术形态一句话：<b>主页新增第 7 张场景卡「持续盯障」→ 进配置页选时长与目标 → 实时盯障页看延迟双曲线与事件计数 → 到时（或手动停止）后窗口内嵌盯障报告并可导出三件套</b>；终端 <code>--monitor</code> 盯障照旧，两边互不影响。窗口沿用一期的 Edge 应用模式壳，本稿只画窗口内容区。</p>
+
+<!-- ══════════════════ 第 0 节 · 总览 ══════════════════ -->
+<div class="sec" id="sec0">
+  <div class="sec-head">
+    <span class="no">00</span><span class="t">总览</span>
+    <span class="r">技术形态 · 新增内容清单 · 不变项</span>
+  </div>
+  <p class="sec-desc">持续盯障解决的是「<b>偶发问题抓不到</b>」：快诊断是跑一次快照，盯障是守一段时间。第 7 张卡与现有六张卡同款，点卡片进配置页；盯障进行中可以离开实时页（后台继续），结束后在本窗口直接看报告。三节界面与下方清单一一对应。</p>
+
+  <div class="flow">
+    <div class="fstep">
+      <div class="h">① 主页第 7 张卡<small>新增入口 · 同款场景卡</small></div>
+      <div class="d">「持续盯障」与现有六张卡并排，点卡片进配置页。</div>
+    </div>
+    <div class="farrow">→</div>
+    <div class="fstep">
+      <div class="h">② 配置页<small>第 1 节</small></div>
+      <div class="d">选盯多久（三档预设 / 自定义分钟）、外网目标、要不要主动负载。</div>
+    </div>
+    <div class="farrow">→</div>
+    <div class="fstep">
+      <div class="h">③ 实时盯障页<small>第 2 节</small></div>
+      <div class="d">大计时 + 连通率 + 四路状态 + 延迟双曲线 + 事件计数；可随时停止。</div>
+    </div>
+    <div class="farrow">→</div>
+    <div class="fstep">
+      <div class="h">④ 结束报告<small>第 3 节</small></div>
+      <div class="d">到时或手动停止后，窗口内嵌盯障报告，导出 csv / json / html 三件套。</div>
+    </div>
+  </div>
+
+  <div class="tbl">
+    <table class="list">
+      <tr><th style="width:26%">界面</th><th style="width:20%">入口</th><th>说明</th><th style="width:8%">类型</th><th style="width:14%">对应节号</th></tr>
+      <tr>
+        <td>主页第 7 张卡「持续盯障」</td>
+        <td class="dim">主界面卡片新增</td>
+        <td class="dim">与六张现有卡同款样式，点卡片进入配置页</td>
+        <td><span class="pill-add">新增</span></td>
+        <td class="secno">第 1 节（入口示意）</td>
+      </tr>
+      <tr>
+        <td>持续盯障 · 配置页</td>
+        <td class="dim">主页第 7 张卡</td>
+        <td class="dim">单卡片表单：时长（10 分钟 / 30 分钟 / 1 小时 / 自定义）、外网目标、主动负载开关</td>
+        <td><span class="pill-add">新增</span></td>
+        <td class="secno">第 1 节</td>
+      </tr>
+      <tr>
+        <td>持续盯障 · 实时页</td>
+        <td class="dim">配置页点「开始盯障」</td>
+        <td class="dim">大计时 + 连通率 + 网关/外网/DNS/TCP 四路状态 + 延迟双曲线 + 事件计数；可提前停止</td>
+        <td><span class="pill-add">新增</span></td>
+        <td class="secno">第 2 节</td>
+      </tr>
+      <tr>
+        <td>盯障结束报告页</td>
+        <td class="dim">到时自动 / 手动停止</td>
+        <td class="dim">结论徽章 + 统计小卡 + 三图缩略（内嵌现有盯障报告图表）+ 三件套导出</td>
+        <td><span class="pill-add">新增</span></td>
+        <td class="secno">第 3 节</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="unchanged">
+    <span class="lab">不变项</span>
+    <b>终端盯障</b>（<code>--monitor</code>）照旧可用，GUI 与终端互不影响、可同时使用；<b>抓包取证</b>（<code>--capture</code>）不在 GUI 二期范围。
+    所有结论仍由现有盯障引擎与报告渲染产出，GUI 只做「配置 + 实时展示 + 报告壳」，不新增口径。
+  </div>
+</div>
+
+<!-- ══════════════════ 第 1 节 · 配置页 ══════════════════ -->
+<div class="sec" id="sec1">
+  <div class="sec-head">
+    <span class="no">01</span><span class="t">配置页「开始一次盯障」</span>
+    <span class="r">新增页面 · 单卡片表单，步骤感从简</span>
+  </div>
+  <p class="sec-desc">只回答三个问题：盯多久、盯哪个外网目标、要不要主动负载。其余全部给默认值，改完点「开始盯障」就走。</p>
+
+  <div class="entry-strip">
+    <div class="entry-cap">新增入口 · 主界面第 7 张场景卡（与现有六张卡同款样式，此处单独示意）</div>
+    <div class="scene">
+      <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13.5" r="7.5"/><path d="M12 10v3.5l2.5 2"/><path d="M9.5 3.5h5"/><path d="M12 3.5v2.5"/></svg></span>
+      <span class="nm">持续盯障</span>
+      <span class="ds">守一段时间抓偶发断线和高负载下的问题，结束自动出报告。</span>
+      <span class="go">点击开始 →</span>
+    </div>
+  </div>
+
+  <div class="win">
+    <div class="win-title">
+      <span class="dots"><i></i><i></i><i></i></span>
+      <span class="wt">NetPulse 网络诊断</span>
+      <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+    </div>
+    <div class="cfg">
+      <div class="fcard">
+        <div class="cfg-h">持续盯障</div>
+        <div class="cfg-sub">持续监测网关 / 外网的延迟与丢包，抓偶发断线和抖动，结束后自动生成报告。</div>
+
+        <div class="field">
+          <div class="flabel">盯多久</div>
+          <div class="chips">
+            <span class="chip"><b class="num">10 分钟</b><small>快速摸底</small></span>
+            <span class="chip on"><b class="num">30 分钟</b><small>常用</small></span>
+            <span class="chip"><b class="num">1 小时</b><small>长时观察</small></span>
+            <span class="chip-ct"><input class="num" type="text" placeholder="自定义"><span class="suf">分钟</span></span>
+          </div>
+          <div class="fhint">到时自动结束并出报告；填了自定义分钟数就按自定义来。</div>
+        </div>
+
+        <div class="field">
+          <div class="flabel">外网目标</div>
+          <input class="input" type="text" placeholder="默认 223.5.5.5，可改域名或 IP">
+          <div class="fhint">网关不用填、始终会盯；这里只改外网一路，留空用默认。</div>
+        </div>
+
+        <div class="field">
+          <div class="flabel">主动负载</div>
+          <div class="swrow">
+            <span class="switch"><i></i></span>
+            <span class="swstate">关（默认）</span>
+          </div>
+          <div class="fhint">打开后：开始盯障 60 秒后开始 15 秒下载负载，用于逼出高负载下的问题。</div>
+        </div>
+
+        <div class="form-foot">
+          <span class="btn btn-primary"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5.8v12.4c0 .9 1 1.4 1.7.9l9.6-6.2c.7-.4.7-1.4 0-1.8L9.7 4.9c-.7-.5-1.7 0-1.7.9Z"/></svg>开始盯障</span>
+          <span class="alt-note">盯满所选时长自动出报告，中途可随时停止。</span>
+          <span class="backlink" style="margin-left:auto;">← 返回主页</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <ul class="notes">
+    <li><b>单卡片表单，步骤感从简</b>：选时长 →（可选）改目标 → 开始，三步以内；不显示步骤条。</li>
+    <li>预设时长三档（选中态藏青高亮）；外网目标留空用默认 223.5.5.5；<b>网关一路始终自动盯</b>，不用配置。</li>
+    <li><b>主动负载默认关</b>：打开后 60 秒等待 + 15 秒下载负载，专抓「高负载才出现」的问题；开启后实时页会出现对应的负载提示条（见第 2 节）。</li>
+    <li>入口为主界面第 7 张场景卡（窗口上方示意），样式与现有六卡一致，不新增卡片语言。</li>
+  </ul>
+</div>
+
+<!-- ══════════════════ 第 2 节 · 盯障实时页（运行中） ══════════════════ -->
+<div class="sec" id="sec2">
+  <div class="sec-head">
+    <span class="no">02</span><span class="t">盯障实时页（运行中）</span>
+    <span class="pill navy">本稿核心</span>
+    <span class="r">新增页面 · 运行态示意 · 示例数据自洽</span>
+  </div>
+  <p class="sec-desc">点「开始盯障」后进入。大数字回答「盯了多久 / 还有多久」，双曲线回答「哪条路、什么时候出的问题」，事件计数给粗略提示。示例：盯障 12 分 36 秒，中段出现过一次约 42 秒的外网中断。</p>
+
+  <div class="win">
+    <div class="win-title">
+      <span class="dots"><i></i><i></i><i></i></span>
+      <span class="wt">NetPulse 网络诊断</span>
+      <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+    </div>
+    <div class="mn">
+      <div class="mn-top">
+        <span class="mn-num num">12:36<small class="num">/ 30:00</small></span>
+        <span class="mn-conn"><span class="lab">连通率</span><div class="v num">99.2%</div></span>
+        <span class="mn-meta num">网关 192.168.1.1 · 外网 223.5.5.5</span>
+        <span class="badge-run"><i></i>监测中</span>
+      </div>
+      <div class="pbar"><i></i></div>
+
+      <div class="quad">
+        <div class="qcell">
+          <div class="q-top"><span class="qdot ok"></span><span class="qname">网关<span class="qmark ok">✓</span></span></div>
+          <div class="qsub num">当前 3.2ms · 丢包 <b>0</b></div>
+        </div>
+        <div class="qcell">
+          <div class="q-top"><span class="qdot ok"></span><span class="qname">外网<span class="qmark ok">✓</span></span></div>
+          <div class="qsub num">当前 14ms · 丢包 <span class="warn">2</span></div>
+        </div>
+        <div class="qcell">
+          <div class="q-top"><span class="qdot ok"></span><span class="qname">DNS<span class="qmark ok">✓</span></span></div>
+          <div class="qsub num">当前 8ms · 失败 <b>0</b></div>
+        </div>
+        <div class="qcell">
+          <div class="q-top"><span class="qdot err"></span><span class="qname">TCP<span class="qmark err">✗</span></span></div>
+          <div class="qsub num"><span class="bad">失败 2 次 · 未恢复</span></div>
+        </div>
+      </div>
+
+      <div class="chart-card">
+        <div class="cap-row">
+          <span class="lab">延迟曲线</span>
+          <span class="r num">每 15 秒一个采样点 · 曲线实时右移</span>
+        </div>
+        <div class="chart-holder">
+          <svg class="chart-svg" width="840" height="240" viewBox="0 0 840 240">
+            <!-- 网格线（hairline）与刻度 -->
+            <line class="ax" x1="50" y1="34" x2="830" y2="34"/>
+            <line class="ax" x1="50" y1="104.4" x2="830" y2="104.4"/>
+            <line class="ax" x1="50" y1="174.8" x2="830" y2="174.8"/>
+            <line class="ax base" x1="50" y1="210" x2="830" y2="210"/>
+            <text class="t end" x="44" y="38">500</text>
+            <text class="t end" x="44" y="108">300</text>
+            <text class="t end" x="44" y="178">100</text>
+            <text class="t end" x="44" y="214">0</text>
+            <text class="t end" x="44" y="20">ms</text>
+            <text class="t" x="50" y="231">10 分钟前</text>
+            <text class="t mid" x="440" y="231">5 分钟前</text>
+            <text class="t end" x="830" y="231">现在</text>
+            <!-- 中断标注 -->
+            <text class="t red mid" x="380" y="17">中断 1 次 · 约 42 秒</text>
+            <line class="bracket" x1="290" y1="24" x2="470" y2="24"/>
+            <line class="bracket" x1="290" y1="21" x2="290" y2="27"/>
+            <line class="bracket" x1="470" y1="21" x2="470" y2="27"/>
+            <!-- 图例（左上，与红色标注同一基线） -->
+            <rect class="lgw gw" x="56" y="8" width="14" height="10" rx="2"/>
+            <text class="t dim" x="76" y="17">网关</text>
+            <rect class="lgw wan" x="124" y="8" width="14" height="10" rx="2"/>
+            <text class="t dim" x="144" y="17">外网</text>
+            <!-- 范围标签（右上） -->
+            <rect class="chipbg" x="726" y="8" width="104" height="18" rx="9"/>
+            <text class="t dim mid" x="778" y="20.5">最近 10 分钟</text>
+            <!-- 网关（藏青，毫秒级贴底属正常） -->
+            <polyline class="ln gw" points="50,209.3 70,209.2 90,209.3 110,209.2 130,209.2 150,209.1 170,209.3 190,209.0 210,209.2 230,209.1 250,209.2 270,208.9 290,209.2 310,209.2 330,209.0 350,209.1 370,208.8 390,209.0 410,208.9 430,205.6 450,208.6 470,209.0 490,209.2 510,209.0 530,209.2 550,209.1 570,209.2 590,208.9 610,209.1 630,209.0 650,209.2 670,209.2 690,209.0 710,208.9 730,209.1 750,209.0 770,209.2 790,209.1 810,209.2 830,209.1"/>
+            <!-- 外网（琥珀，中段故障：跳高 + 缺两个点） -->
+            <polyline class="ln wan" points="50,205.8 70,205.1 90,206.1 110,204.7 130,205.4 150,204.4 170,205.8 190,203.7 210,205.4 230,205.4 250,204.0 270,205.1 290,196.6 310,167.8 330,100.9"/>
+            <polyline class="ln wan" points="370,62.2 390,72.7"/>
+            <polyline class="ln wan" points="430,48.1 450,146.6 470,201.6 490,204.4 510,205.4 530,204.7 550,205.8 570,204.4 590,206.1 610,195.2 630,168.5 650,196.6 670,204.7 690,204.0 710,205.1 730,179.0 750,205.4 770,204.7 790,205.8 810,204.4 830,205.1"/>
+            <!-- 丢包点（红圈 = 该采样点丢失） -->
+            <circle class="loss" cx="350" cy="81.5" r="4.5"/>
+            <circle class="loss" cx="410" cy="60.4" r="4.5"/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="cap-row" style="margin-top:16px;">
+        <span class="lab">事件计数</span>
+        <span class="r">完整事件以结束报告为准</span>
+      </div>
+      <div class="ev-grid">
+        <div class="evcard"><div class="ev-num red num">1<span class="u">次</span></div><div class="ev-lab">中断</div></div>
+        <div class="evcard"><div class="ev-num amber num">2<span class="u">次</span></div><div class="ev-lab">高延迟</div></div>
+        <div class="evcard"><div class="ev-num amber num">1<span class="u">次</span></div><div class="ev-lab">抖动</div></div>
+        <div class="evcard"><div class="ev-num dim num">0<span class="u">次</span></div><div class="ev-lab">DNS 失败</div></div>
+      </div>
+
+      <div class="loadbar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10"/><path d="M8 10.5l4 4 4-4"/><path d="M5 18.5h14"/></svg>
+        <span class="num">主动负载将在 <b>00:42</b> 后开始（15 秒下载）</span>
+      </div>
+
+      <div class="mn-foot">
+        <span class="btn btn-danger"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>停止盯障</span>
+        <span class="alt-note">提前结束并生成报告。</span>
+        <span class="mn-back">← 返回主页（盯障进行中，返回后可回到本页）</span>
+      </div>
+    </div>
+  </div>
+  <ul class="notes">
+    <li><b>顶部大数字</b>回答「盯了多久 / 还有多久」（tabular-nums，进度条同步 42%）；「连通率」为当前累计口径；「监测中」蓝徽章带呼吸点，表示实时页在前台运行。</li>
+    <li><b>四路状态一行四格</b>：✓ 绿 / ✗ 红，每格带丢包 / 失败计数。示例数据自洽——外网丢包 2 = 曲线中两个红圈；TCP 失败 2 次未恢复显示红色；网关 / DNS 全程正常 → 一次中断即可判断「问题在外网侧」。</li>
+    <li><b>双曲线</b>：藏青 = 网关、琥珀 = 外网。网关是毫秒级，贴着 0 轴属正常；外网中段一次约 42 秒故障段（延迟冲高到 300ms+ + 两个采样点丢失画红圈），红色标注与事件计数「中断 1」对应；后续一次约 120ms 的短促升高 = 高延迟的第 2 次，单点突刺 = 抖动 1 次。</li>
+    <li><b>事件计数只是前台粗略提示</b>（0 值灰色弱化），完整事件清单以结束报告为准；负载提示条仅在配置页打开主动负载时出现，时间数字为示意。</li>
+    <li>「停止盯障」红色描边不抢主色：提前结束也生成报告；返回主页后盯障在后台继续，可随时回到本页。</li>
+  </ul>
+</div>
+
+<!-- ══════════════════ 第 3 节 · 盯障结束报告页 ══════════════════ -->
+<div class="sec" id="sec3">
+  <div class="sec-head">
+    <span class="no">03</span><span class="t">盯障结束报告页</span>
+    <span class="r">新增页面 · 示意「提前终止」场景，与第 2 节计时衔接</span>
+  </div>
+  <p class="sec-desc">到时自动结束或手动停止都进这一页。结论徽章 + 统计小卡 + 三个图表缩略 + 导出；下方示意「盯了 12 分 36 秒手动停止」的场景。</p>
+
+  <div class="win">
+    <div class="win-title">
+      <span class="dots"><i></i><i></i><i></i></span>
+      <span class="wt">NetPulse 网络诊断</span>
+      <span class="win-btns"><span>─</span><span>□</span><span class="x">✕</span></span>
+    </div>
+    <div class="mrp">
+      <div class="mrp-conc">
+        <span class="g-badge">网络稳定</span>
+        <span>
+          <div class="mrp-line">整体稳定：12 分 36 秒内出现 1 次约 42 秒的外网中断，已自动恢复，其余时间延迟正常。</div>
+          <div class="mrp-sug">建议：中断时段网关一路正常，问题在外网侧；如再复现，直接报这个时间点。</div>
+        </span>
+        <span class="mrp-tag num">提前终止 · 实际 12:36 / 计划 30:00</span>
+      </div>
+
+      <div class="mst-grid">
+        <div class="mst"><div class="mst-num red num">1<span class="u">次</span></div><div class="mst-sub">中断 · 最长 42 秒</div></div>
+        <div class="mst"><div class="mst-num amber num">0.8<span class="u">%</span></div><div class="mst-sub">丢包率 · 外网一路，集中在中断段</div></div>
+        <div class="mst"><div class="mst-num dim num">0<span class="u">次</span></div><div class="mst-sub">DNS 失败 · 全程正常</div></div>
+        <div class="mst"><div class="mst-num dim num">1.2<span class="u">%</span></div><div class="mst-sub">TCP 重传率 · 正常范围</div></div>
+      </div>
+
+      <div class="cap-row" style="margin-top:18px;">
+        <span class="lab">图表缩略</span>
+        <span class="r">三个图均为占位示意 · 复用现有盯障报告 canvas 图表渲染</span>
+      </div>
+      <div class="mch-grid">
+        <div class="mch">
+          <span class="t">延迟双曲线</span>
+          <svg width="320" height="110" viewBox="0 0 320 110">
+            <line class="ax" x1="10" y1="26" x2="308" y2="26"/>
+            <line class="ax" x1="10" y1="88" x2="308" y2="88"/>
+            <circle cx="16" cy="10" r="3" fill="#0a3b6e"/><text class="t" x="24" y="13.5">网关</text>
+            <circle cx="66" cy="10" r="3" fill="#ad6e10"/><text class="t" x="74" y="13.5">外网</text>
+            <polyline class="ln" stroke="#0a3b6e" points="12,81 38,81 64,80 90,81 116,82 142,81 168,82 194,81 220,82 246,81 272,82 298,81 308,81"/>
+            <polyline class="ln" stroke="#ad6e10" points="12,78 38,78 64,77 90,79 116,44 142,30 168,52 194,76 220,77 246,76 272,78 298,77 308,77"/>
+          </svg>
+        </div>
+        <div class="mch">
+          <span class="t">连通率</span>
+          <svg width="320" height="110" viewBox="0 0 320 110">
+            <line class="ax" x1="10" y1="22" x2="308" y2="22"/>
+            <line class="ax" x1="10" y1="94" x2="308" y2="94"/>
+            <text class="t" x="10" y="16">100%</text>
+            <polygon points="12,22 130,22 130,84 188,84 188,22 308,22 308,94 12,94" fill="rgba(30,110,68,.08)"/>
+            <polyline class="ln" stroke="#1e6e44" points="12,22 130,22 130,84 188,84 188,22 308,22"/>
+            <circle class="loss" cx="159" cy="84" r="3.5"/>
+          </svg>
+        </div>
+        <div class="mch">
+          <span class="t">TCP 重传</span>
+          <svg width="320" height="110" viewBox="0 0 320 110">
+            <line class="ax" x1="10" y1="92" x2="308" y2="92"/>
+            <rect x="14" y="87" width="12" height="5" rx="2" fill="#cbd4dd"/>
+            <rect x="34" y="86" width="12" height="6" rx="2" fill="#cbd4dd"/>
+            <rect x="54" y="88" width="12" height="4" rx="2" fill="#cbd4dd"/>
+            <rect x="74" y="85" width="12" height="7" rx="2" fill="#cbd4dd"/>
+            <rect x="94" y="87" width="12" height="5" rx="2" fill="#cbd4dd"/>
+            <rect x="114" y="50" width="12" height="42" rx="2" fill="#ad6e10"/>
+            <rect x="134" y="34" width="12" height="58" rx="2" fill="#b3261e"/>
+            <rect x="154" y="86" width="12" height="6" rx="2" fill="#cbd4dd"/>
+            <rect x="174" y="87" width="12" height="5" rx="2" fill="#cbd4dd"/>
+            <rect x="194" y="85" width="12" height="7" rx="2" fill="#cbd4dd"/>
+            <rect x="214" y="88" width="12" height="4" rx="2" fill="#cbd4dd"/>
+            <rect x="234" y="62" width="12" height="30" rx="2" fill="#ad6e10"/>
+            <rect x="254" y="87" width="12" height="5" rx="2" fill="#cbd4dd"/>
+            <rect x="274" y="86" width="12" height="6" rx="2" fill="#cbd4dd"/>
+            <rect x="294" y="88" width="12" height="4" rx="2" fill="#cbd4dd"/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="mrp-actions">
+        <span class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 7A1.5 1.5 0 0 1 5 5.5h4l2 2h8A1.5 1.5 0 0 1 20.5 9v8a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 17Z"/></svg>打开报告文件夹</span>
+        <span class="btn btn-line"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 6.5 8.5 12l5.5 5.5"/></svg>返回主页</span>
+      </div>
+      <div class="mrp-files num">已生成盯障三件套（reports 文件夹）：<code>monitor_20261113_093000.csv</code> · <code>monitor_20261113_093000.json</code> · <code>monitor_20261113_093000.html</code></div>
+    </div>
+  </div>
+  <ul class="notes">
+    <li><b>「提前终止」灰标</b>：到时自然结束没有这枚标；本稿示意「盯了 12:36 手动停止」，与第 2 节实时页的大数字衔接（同一个 12:36）。</li>
+    <li><b>统计与实时页事件衔接</b>：中断 1 次（最长 42 秒）即曲线中段的故障段，红 / 琥珀 / 灰的用色口径与实时页一致；TCP 重传率来自 TCP 探测，正常范围不强调颜色。</li>
+    <li><b>三个图表是占位缩略</b>：实装直接内嵌现有盯障报告的 canvas 图表渲染，GUI 不重画图、不另造口径。</li>
+    <li><b>三件套</b>文件名 = monitor_盯障开始时间（csv 原始数据 / json 明细 / html 报告），存报告文件夹；「打开报告文件夹」复用现有打开逻辑。</li>
+  </ul>
+</div>
+
+</div>
+</body>
+</html>
