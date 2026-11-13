@@ -25028,7 +25028,9 @@ class _GuiMonitor:
         全程持 _GUI_ACT_LOCK: 查忙 + 置 running 原子 (跨类型互斥铁律)。
         时长钳位 [30, 86400] (与终端同界); None 默认 600, 非法值报错,
         0 走下限 30。session.start() 按 truthiness 判 (同 run_monitor_mode),
-        失败回滚 phase 并补一次 stop() 清孤儿 ping 进程。
+        失败回滚 phase 并补一次 stop() 清孤儿 ping 进程。提交窗口内
+        (置 running 到 _session 落定之间) 到达的 stop 不丢 —— 编排线程
+        首个 wait 立即返回, 按提前结束收尾。
         """
         with _GUI_ACT_LOCK:
             if self.is_running():
@@ -25039,9 +25041,17 @@ class _GuiMonitor:
                 effective = 600 if duration_s is None else int(duration_s)
                 effective = max(self.MIN_DURATION_S,
                                 min(self.MAX_DURATION_S, effective))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # v1.22.0 (审查 Minor ③): int(∞) 抛 OverflowError, 与
+                # 类型/取值错误同按「时长不合法」拒, 不炸穿调用方
                 return False, "盯障时长不合法", None
             with self._lock:
+                # v1.22.0 (审查 Minor ①): 窗口起点先清上一轮残留
+                # (_stop_requested 编排完成后不清零, 不在这里清, 下一轮
+                # 会被残留标志秒停); 此刻起到提交之间到达的 stop 由提交
+                # 块甄别保留。
+                self._stop_requested = False
+                self._stop_evt.clear()
                 self._phase = "running"     # 先置位 (互斥原子性), 失败回滚
             try:
                 session = MonitorSession(effective, ext_target or None,
@@ -25063,23 +25073,41 @@ class _GuiMonitor:
                     pass
                 return False, "外网 ping 启动失败, 无法开始盯障", None
             with self._lock:
+                pending_stop = self._stop_requested   # Minor ①: 窗口内到达?
                 self._duration = effective
                 self._ext_target = ext_target or None
                 self._load = bool(load)
                 self._started_at = time.time()
                 self._ended_at = None
-                self._stop_requested = False
                 self._early = False
                 self._error = None
                 self._paths = None
                 self._session = session
-                self._stop_evt.clear()
+                if not pending_stop:
+                    # 常规开轮: 清残留; 若窗口内有 stop 到达则保留标志与
+                    # 事件 —— 编排线程首个 wait 立即返回, 按用户提前结束
+                    # 收尾, 不会把停止请求抹掉后跑满全程 (Minor ①)。
+                    self._stop_requested = False
+                    self._stop_evt.clear()
                 self._ts_prog = self._ts_curve = self._ts_evt = 0.0
                 self._prog_cache = self._curve_cache = self._evt_cache = None
                 thread = threading.Thread(target=self._orchestrate,
                                           daemon=True, name="np-gui-monitor")
                 self._thread = thread
-            thread.start()
+            try:
+                thread.start()
+            except Exception as e:
+                # v1.22.0 (审查 Minor ②): 编排线程起不来 (线程耗尽
+                # RuntimeError 等) 也必须回滚 —— 否则 phase 永久卡
+                # running 挡死后续盯障; 采集已在跑, 补 stop 清孤儿 ping
+                # (与构造/启动失败同款)。
+                with self._lock:
+                    self._phase = "idle"
+                try:
+                    session.stop()
+                except Exception:
+                    pass
+                return False, "盯障启动失败: %s: %s" % (type(e).__name__, e), None
             return True, None, effective
 
     def stop(self):
@@ -25257,7 +25285,12 @@ class _GuiMonitor:
                 self._ts_curve = now
                 self._counters["curve_computes"] += 1
                 self._curve_cache = self._compute_curve(now)
-            return self._curve_cache
+            # v1.22.0 (审查 Minor ④): 返回副本 —— 消费方对载荷的改写
+            # (append/换值) 不得污染节流缓存
+            cache = self._curve_cache
+            return {"window_s": cache["window_s"],
+                    "gw": [list(pt) for pt in cache["gw"]],
+                    "ext": [list(pt) for pt in cache["ext"]]}
 
     def _compute_curve(self, now):
         """曲线重算 (持有 _lock): 窗口过滤 + 桶降采样。"""
@@ -26102,6 +26135,18 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
                     return self._send(404, {"error": "尚无报告"})
                 return self._send(200, html.encode("utf-8"),
                                   "text/html; charset=utf-8")
+            if p == "/api/monitor/progress":
+                # v1.22.0: 盯障实时页轮询通道 (服务端 ≥2s 节流, 载荷含 counters)
+                return self._send(200, self.monitor.progress_payload())
+            if p == "/api/monitor/curve":
+                # 延迟双曲线 (服务端 ≥5s 节流, 窗口 600s, 丢包点 ms=None)
+                return self._send(200, self.monitor.curve_payload())
+            if p == "/api/monitor/report":
+                # 盯障报告内嵌 (编排落盘后可读); report_html 已返回 bytes
+                html = self.monitor.report_html()
+                if not html:
+                    return self._send(404, {"error": "尚无报告"})
+                return self._send(200, html, "text/html; charset=utf-8")
             return self._send(404, {"error": "not found"})
         except Exception as e:
             try:
@@ -26120,6 +26165,10 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
                 profile = str((data or {}).get("profile") or "")
                 if self.session.is_running():
                     return self._send(409, {"ok": False, "reason": "running"})
+                if self.monitor is not None and self.monitor.is_running():
+                    # v1.22.0: 盯障进行中, 诊断入口同样 409 (互斥第二道
+                    # 防线在 _begin: _GUI_ACT_LOCK 内原子复查)
+                    return self._send(409, {"ok": False, "reason": "busy"})
                 ok, err = self.session.start(profile)
                 return self._send(200 if ok else 400,
                                   {"ok": ok, "err": err})
@@ -26151,6 +26200,40 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
                 ok, err = self.session.finalize_site(
                     d.get("checks") or {}, note=d.get("note") or "")
                 return self._send(200 if ok else 400, {"ok": ok, "err": err})
+            if p == "/api/monitor/start":
+                # v1.22.0: 忙检放 _GUI_ACT_LOCK 内, 只做 409/400 状态码
+                # 分诊; 真正的「查忙+置位」原子闸在 monitor.start() 内
+                # (自持同锁复查 — 锁不可重入, 路由层不能持锁调它)。
+                # minutes×60 秒 (与终端菜单同语义), 缺省 600s = 10 分钟。
+                d = data or {}
+                try:
+                    minutes = d.get("minutes")
+                    duration_s = 600 if minutes is None else int(minutes) * 60
+                except (TypeError, ValueError, OverflowError):
+                    return self._send(400,
+                                      {"ok": False, "err": "盯障时长不合法"})
+                with _GUI_ACT_LOCK:
+                    busy = _gui_net_busy()
+                if busy:
+                    return self._send(409, {"ok": False, "reason": "busy"})
+                ok, err, eff = self.monitor.start(
+                    duration_s, ext_target=d.get("target") or None,
+                    load=bool(d.get("load")))
+                if ok:
+                    return self._send(200, {"ok": True, "effective_s": eff})
+                if _gui_net_busy():
+                    # 查忙与 start 之间被其他活动抢跑: start 的原子复查
+                    # 已拒 → 按忙回 409 而非 400
+                    return self._send(409, {"ok": False, "reason": "busy"})
+                return self._send(400, {"ok": False, "err": err})
+            if p == "/api/monitor/stop":
+                # 幂等口径: running (含已请求停止、编排收尾中) → 200;
+                # 已结束/未开始 → 400。_GuiMonitor.stop 自身幂等。
+                if not self.monitor.is_running():
+                    return self._send(400,
+                                      {"ok": False, "err": "当前没有进行中的盯障"})
+                self.monitor.stop()
+                return self._send(200, {"ok": True})
             return self._send(404, {"error": "not found"})
         except Exception as e:
             try:
@@ -26159,17 +26242,23 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
                 pass
 
 
-def _start_gui_server(session=None, shutdown_evt=None):
-    """起本地 GUI 服务: 仅绑 127.0.0.1 随机端口, 返回 (server, port, token)。"""
+def _start_gui_server(session=None, shutdown_evt=None, monitor=None):
+    """起本地 GUI 服务: 仅绑 127.0.0.1 随机端口, 返回 (server, port, token)。
+
+    monitor 缺省自建 (v1.22.0): 与 session 同款注入 _GuiHandler 类属性,
+    /api/monitor/* 路由由此可达。
+    """
     import secrets
     session = session if session is not None else _GuiSession()
     shutdown_evt = shutdown_evt if shutdown_evt is not None else threading.Event()
+    monitor = monitor if monitor is not None else _GuiMonitor()
     token = secrets.token_urlsafe(24)
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _GuiHandler)
     srv.daemon_threads = True
     _GuiHandler.session = session
     _GuiHandler.token = token
     _GuiHandler.shutdown_evt = shutdown_evt
+    _GuiHandler.monitor = monitor
     threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.2},
                      daemon=True, name="np-gui-http").start()
     return srv, srv.server_address[1], token
@@ -26235,9 +26324,10 @@ def _run_gui(install=True, pip_mirror=None, shutdown_evt=None):
     问询 —— 会话卡死在隐藏控制台里没人能答。
     """
     session = _GuiSession()
+    monitor = _GuiMonitor()     # v1.22.0: 盯障会话随 GUI 生命周期创建
     shutdown_evt = shutdown_evt if shutdown_evt is not None else threading.Event()
     try:
-        srv, port, token = _start_gui_server(session, shutdown_evt)
+        srv, port, token = _start_gui_server(session, shutdown_evt, monitor)
     except OSError as e:
         print(_c("  ✗ 图形界面服务启动失败 (%s)。" % e, C_RED))
         return

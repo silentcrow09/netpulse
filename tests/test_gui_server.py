@@ -10,13 +10,28 @@
   P5 POST /api/shutdown 触发事件
   P6 GET /api/netstatus → {"ok": ...} (顶栏联网状态数据源, 锁内读 _GUI_NET)
   P7 _gui_conn_check 三态 (通/不通/OSError→False) + _gui_net_watch 单轮写状态
+
+v1.22.0 盯障路由 (Task 2):
+  P8 五条 /api/monitor/* 新路由全部过 token 闸 (无 token → 403)
+  P9 start→progress→curve→report→stop 全链: minutes×60 回显 / 载荷键 /
+     无报告 404 / 重复 stop 幂等 200 / 收尾后 stop 400 / 报告内嵌 bytes
+  P10 双向互斥 409: 诊断 running → 盯障 start 409; 盯障 running →
+      /api/run 409 (同类 running 也走同一忙闸)
+  P11 minutes 钳位与非法输入: 0 → effective_s=30; 非法值 400 且不构造
+      MonitorSession; int(∞) OverflowError 同样 400
+  P12 Task 1 审查 4 条 Minor 回归: ①提交窗口内 stop 不丢 ②编排线程
+      start 失败回滚 idle+清孤儿 ③int OverflowError 并入时长不合法
+      ④curve_payload 返回缓存副本
 """
 import json
 import os
 import socket
 import sys
 import http.client
+import shutil
+import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -38,6 +53,47 @@ def _req(port, method, path, token=None, body=None, headers=None):
     raw = r.read()
     conn.close()
     return r.status, raw
+
+
+def _fake_monitor_session(dur=600):
+    """MonitorSession 实例替身 (与 tests/test_gui_monitor.py 同款契约):
+    可控 snapshot/stop/build_result; start 显式声明成功语义。"""
+    s = mock.Mock()
+    s.duration_s = dur
+    s.snapshot.return_value = {"gw_stream": [], "ext_stream": [],
+                               "tcp": [], "dns": []}
+    s.build_result.return_value = {"verdict": "stable"}
+    s.start.return_value = True
+    return s
+
+
+def _patch_monitor_session(fake, save_result=None):
+    """MonitorSession 类替身三件套 (沿用 test_gui_monitor.py::_patch_ms)。
+
+    关键坑: 类替身必须复制真实 MonitorSession 全部大写常量 ——
+    _detect_monitor_events 以模块级 MonitorSession.GAP_S 引用, 缺常量的
+    Mock 替身会让事件预览静默吞成空计数。save_result 传可调用对象时
+    按 side_effect 生效 (P9 的落盘替身要真写 tmp 文件)。
+    """
+    rec = {}
+    real = np.MonitorSession
+
+    def _factory(*args, **kw):
+        rec["args"] = args
+        rec["kw"] = kw
+        return fake
+
+    for attr in dir(real):
+        if attr.isupper():
+            setattr(_factory, attr, getattr(real, attr))
+    p_ms = mock.patch.object(np, "MonitorSession", _factory)
+    save_mock = mock.Mock()
+    if callable(save_result):
+        save_mock.side_effect = save_result
+    else:
+        save_mock.return_value = save_result
+    p_save = mock.patch.object(np, "save_monitor_report", save_mock)
+    return rec, p_ms, p_save
 
 
 class TestGuiServer(unittest.TestCase):
@@ -140,6 +196,232 @@ class TestGuiServer(unittest.TestCase):
         st, raw = _req(self.port, "POST", "/api/run?t=" + self.token,
                        body={"profile": "slow"})
         self.assertEqual(st, 409)
+
+    # -- v1.22.0 盯障路由 (P8–P12) --
+
+    def test_monitor_routes_token_gate(self):
+        # P8: 五条新路由全部过 token 闸 (无 token → 403)
+        for method, path in (("GET", "/api/monitor/progress"),
+                             ("GET", "/api/monitor/curve"),
+                             ("GET", "/api/monitor/report"),
+                             ("POST", "/api/monitor/start"),
+                             ("POST", "/api/monitor/stop")):
+            st, _ = _req(self.port, method, path, token=None)
+            self.assertEqual(st, 403, path)
+
+    def test_monitor_full_chain(self):
+        # P9: start→progress→curve→report→stop 全链。minutes×60 回显;
+        # build_result 用事件闸拦住编排收尾, 依次验证「无报告 404 →
+        # 重复 stop 幂等 200 → 放行落盘 → 报告 200 → 结束后 stop 400」。
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        html_path = os.path.join(tmp, "mon.html")
+        json_path = os.path.join(tmp, "mon.json")
+        fake = _fake_monitor_session()
+        gate = threading.Event()
+        fake.build_result.side_effect = lambda **kw: (
+            gate.wait(5), {"verdict": "stable"})[1]
+
+        def _fake_save(res):
+            with open(html_path, "wb") as f:
+                f.write("<html><body>盯障报告OK</body></html>".encode("utf-8"))
+            return (html_path, json_path)
+
+        rec, p_ms, p_save = _patch_monitor_session(fake,
+                                                    save_result=_fake_save)
+        mon = np._GuiHandler.monitor        # setUp 注入的同一实例
+        tok = "?t=" + self.token
+        with p_ms, p_save:
+            st, _ = _req(self.port, "GET", "/api/monitor/report" + tok)
+            self.assertEqual(st, 404)               # 起步无报告
+            st, raw = _req(self.port, "POST",
+                           "/api/monitor/start" + tok,
+                           body={"minutes": 10, "target": "1.2.3.4",
+                                 "load": False})
+            self.assertEqual(st, 200)
+            d = json.loads(raw)
+            self.assertTrue(d["ok"])
+            self.assertEqual(d["effective_s"], 600)      # minutes×60
+            self.assertEqual(rec["args"], (600, "1.2.3.4"))
+            self.assertEqual(rec["kw"], {"load_url": None})
+            st, raw = _req(self.port, "GET", "/api/monitor/progress" + tok)
+            self.assertEqual(st, 200)
+            d = json.loads(raw)
+            self.assertEqual(d["phase"], "running")
+            self.assertEqual(d["duration_s"], 600)
+            for k in ("elapsed_s", "connect", "loss_pct", "events_preview",
+                      "load", "counters"):
+                self.assertIn(k, d)
+            for k in ("polls", "progress_computes", "curve_computes",
+                      "event_computes"):
+                self.assertIn(k, d["counters"])
+            st, raw = _req(self.port, "GET", "/api/monitor/curve" + tok)
+            self.assertEqual(st, 200)
+            d = json.loads(raw)
+            self.assertEqual(d["window_s"], 600)
+            self.assertIn("gw", d)
+            self.assertIn("ext", d)
+            st, _ = _req(self.port, "GET", "/api/monitor/report" + tok)
+            self.assertEqual(st, 404)               # 编排被闸住, 未落盘
+            st, raw = _req(self.port, "POST", "/api/monitor/stop" + tok)
+            self.assertEqual(st, 200)
+            self.assertTrue(json.loads(raw)["ok"])
+            st, raw = _req(self.port, "POST", "/api/monitor/stop" + tok)
+            # 幂等: build_result 仍被闸着, phase 还是 running → 再 stop 也 200
+            self.assertEqual(st, 200)
+            gate.set()
+            for _ in range(100):
+                if mon.snapshot()["phase"] in ("done", "error"):
+                    break
+                time.sleep(0.1)
+            self.assertEqual(mon.snapshot()["phase"], "done")
+            fake.build_result.assert_called_once_with(early_terminated=True)
+            st, raw = _req(self.port, "GET", "/api/monitor/report" + tok)
+            self.assertEqual(st, 200)
+            self.assertIn("盯障报告OK".encode("utf-8"), raw)
+            st, raw = _req(self.port, "POST", "/api/monitor/stop" + tok)
+            self.assertEqual(st, 400)               # 已结束 → 未在跑
+            self.assertFalse(json.loads(raw)["ok"])
+
+    def test_monitor_busy_409_both_ways(self):
+        # P10: 双向互斥 409 (忙检在 _GUI_ACT_LOCK 内查)
+        tok = "?t=" + self.token
+        self.session._phase = "running"     # 直接摆忙 (同 test_run_conflict_409)
+        st, raw = _req(self.port, "POST", "/api/monitor/start" + tok,
+                       body={"minutes": 10})
+        self.assertEqual(st, 409)
+        self.assertEqual(json.loads(raw), {"ok": False, "reason": "busy"})
+        self.session._phase = "idle"
+        np._GuiHandler.monitor._phase = "running"
+        st, raw = _req(self.port, "POST", "/api/monitor/start" + tok,
+                       body={"minutes": 10})
+        self.assertEqual(st, 409)           # 同类 running → 同一忙闸
+        st, raw = _req(self.port, "POST", "/api/run" + tok,
+                       body={"profile": "slow"})
+        self.assertEqual(st, 409)
+        self.assertEqual(json.loads(raw)["reason"], "busy")
+
+    def test_monitor_minutes_clamp_and_invalid(self):
+        # P11: 非法输入 400 且不构造 MonitorSession; minutes=0 钳到下限
+        # 30 并回显; int(∞) OverflowError 同样 400 (审查 Minor ③ 路由侧)。
+        mon = np._GuiHandler.monitor
+        fake = _fake_monitor_session()
+        rec, p_ms, p_save = _patch_monitor_session(fake,
+                                                   save_result=("x", "y"))
+        tok = "?t=" + self.token
+        with p_ms, p_save:
+            st, raw = _req(self.port, "POST", "/api/monitor/start" + tok,
+                           body={"minutes": "abc"})
+            self.assertEqual(st, 400)
+            self.assertIn("err", json.loads(raw))
+            self.assertNotIn("args", rec)           # 未构造 MonitorSession
+            st, _ = _req(self.port, "POST", "/api/monitor/start" + tok,
+                         body={"minutes": float("inf")})   # JSON Infinity
+            self.assertEqual(st, 400)
+            st, raw = _req(self.port, "POST", "/api/monitor/start" + tok,
+                           body={"minutes": 0})
+            self.assertEqual(st, 200)
+            d = json.loads(raw)
+            self.assertTrue(d["ok"])
+            self.assertEqual(d["effective_s"], 30)  # 钳位回显
+            self.assertEqual(rec["args"][0], 30)
+            mon.stop()
+            mon._thread.join(timeout=5)
+
+    def test_minor_stop_before_commit_kept(self):
+        # P12a (审查 Minor ①): phase 置位到 _session 提交之间到达的 stop
+        # 曾被提交块 clear 抹掉 → 用户点了停止却跑满全程。修复后窗口起点
+        # 清上一轮残留、提交块甄别保留: 编排线程首个 wait 即返回。
+        m = np._GuiMonitor()
+        fake = _fake_monitor_session()
+        # 落盘替身须返回真值路径 (None = 落盘失败 → phase=error, 既有语义)
+        rec, p_ms, p_save = _patch_monitor_session(fake,
+                                                   save_result=("x", "y"))
+        in_window = threading.Event()
+        release = threading.Event()
+
+        def _blocking_start():
+            in_window.set()
+            release.wait(5)
+            return True
+
+        fake.start.side_effect = _blocking_start
+        box = {}
+
+        def _do_start():
+            box["res"] = m.start(600)
+
+        with p_ms, p_save:
+            w = threading.Thread(target=_do_start, daemon=True)
+            w.start()
+            self.assertTrue(in_window.wait(5), "未进入 session.start 窗口")
+            self.assertEqual(m.snapshot()["phase"], "running")  # 已置位未提交
+            m.stop()                    # 窗口内到达的 stop
+            release.set()
+            w.join(timeout=5)
+            ok, err, _ = box["res"]
+            self.assertTrue(ok, err)
+            m._thread.join(timeout=5)   # 若 stop 被抹, 这里会白等满 600s
+        snap = m.snapshot()
+        self.assertEqual(snap["phase"], "done")
+        self.assertTrue(snap["early"])
+        self.assertTrue(snap["stop_requested"])
+        fake.build_result.assert_called_once_with(early_terminated=True)
+
+    def test_minor_thread_start_failure_rollback(self):
+        # P12b (审查 Minor ②): 编排线程起不来 (线程耗尽 RuntimeError) 时
+        # phase 必须回滚 idle (否则永久卡 running 挡死后续盯障), 且补
+        # stop() 清已在跑的采集 (孤儿 ping)。
+        m = np._GuiMonitor()
+        fake = _fake_monitor_session()
+        rec, p_ms, p_save = _patch_monitor_session(fake)
+
+        def _boom_thread(*args, **kw):
+            t = mock.Mock()
+            t.start.side_effect = RuntimeError("cannot start new thread")
+            return t
+
+        with p_ms, p_save, mock.patch.object(np.threading, "Thread",
+                                             _boom_thread):
+            ok, err, eff = m.start(600)
+        self.assertFalse(ok)
+        self.assertIn("盯障启动失败", err)
+        self.assertIn("RuntimeError", err)
+        self.assertIsNone(eff)
+        self.assertEqual(m.snapshot()["phase"], "idle")   # 回滚, 不卡 running
+        self.assertTrue(fake.stop.called)                 # 孤儿采集清理
+        self.assertFalse(fake.build_result.called)        # 无编排收尾
+
+    def test_minor_duration_overflow(self):
+        # P12c (审查 Minor ③): int(∞) 抛 OverflowError, 与类型/取值错误
+        # 同按「时长不合法」拒, 不再炸穿 start()。
+        m = np._GuiMonitor()
+        fake = _fake_monitor_session()
+        rec, p_ms, p_save = _patch_monitor_session(fake)
+        with p_ms, p_save:
+            ok, err, eff = m.start(float("inf"))
+        self.assertFalse(ok)
+        self.assertIn("不合法", err)
+        self.assertIsNone(eff)
+        self.assertEqual(m.snapshot()["phase"], "idle")
+        self.assertNotIn("args", rec)
+
+    def test_minor_curve_payload_copy(self):
+        # P12d (审查 Minor ④): curve_payload 返回缓存副本, 消费方改写
+        # (append/换值) 不污染节流缓存 (第二次调用走缓存命中路径)。
+        m = np._GuiMonitor()
+        fake = _fake_monitor_session()
+        rec, p_ms, p_save = _patch_monitor_session(fake)
+        with p_ms, p_save:
+            m.start(600)
+            c1 = m.curve_payload()
+            c1["gw"].append([999, 1.0])     # 消费方改写「副本」
+            c1["window_s"] = 0
+            c2 = m.curve_payload()          # 5s 内 → 缓存命中
+            m.stop()
+            m._thread.join(timeout=5)
+        self.assertEqual(c2["window_s"], 600)
+        self.assertNotIn([999, 1.0], c2["gw"])
 
     def test_netstatus_api(self):
         # P6: 探测线程之外, 测试直接在锁内摆状态 → API 原样透传
