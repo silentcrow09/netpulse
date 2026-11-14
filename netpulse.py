@@ -2631,16 +2631,13 @@ def diagnose(results_dict, rule_filter=None):
 # 后续 C4 实现 netpulse diagnose <profile> 子命令.
 
 DIAGNOSE_PROFILES = {
-    # 网速慢/卡顿: 链路 + 干扰 + 测速 + 缓冲膨胀 + TCP 质量 + DNS
-    # (v1.7.0: 补 tcpstats — tcp_loss_burst 规则需要重传率数据)
-    "slow": ["gateway", "wifi", "speedtest", "bufferbloat", "tcp", "dns",
-             "tcpstats"],
+    # 网页打开慢 (v1.26.0): 合并原「网络很慢」+「网页打不开」两场景, 模块集取
+    # 两场景全并集 (11 项, Simon 拍板「全并集」); 诊断类在前, 测速类 (独占)
+    # 排最后, 独占模块自动排队串行。
+    "web": ["gateway", "external", "dns", "wifi", "web", "tcp", "tcpstats",
+            "mtu", "route", "speedtest", "bufferbloat"],
     # 频繁断网: 链路 + 外网 + DNS + TCP + 环路检测 (monitor 是 CLI 模式不是模块)
     "disconnect": ["gateway", "external", "dns", "tcp", "loop"],
-    # 网页打不开/慢: 网关 + 外网 + DNS + TCP + HTTP + TCP 质量 + MTU + 路由
-    # (v1.6.1: 补 gateway/external — dns_failure / wan_interruption / gateway_loss
-    #  三条 web 规则都依赖网关或外网数据, 缺采集会让 web 场景永远零根因)
-    "web": ["gateway", "external", "dns", "tcp", "web", "tcpstats", "mtu", "route"],
     # 游戏卡顿/延迟高: 网关 + 抖动/丢包 + NAT + Bufferbloat + MTU + TCP
     "gaming": ["gateway", "tcp", "nattype", "bufferbloat", "mtu", "tcpstats"],
     # WiFi 不稳/信号弱: WiFi + 网关 + LAN
@@ -2650,15 +2647,14 @@ DIAGNOSE_PROFILES = {
 # 场景 profile → 参与根因评估的规则 id (PR-B · v1.6.0)
 # 只评估该场景相关规则, 避免无关根因 (如 gaming 场景报 "WiFi 信号弱" 噪音)。
 # 规则集取舍:
-#   - slow 含 wifi_weak: 装维现场 "网慢" 多数先看 WiFi 信号 (决策点 7.4 默认含)
+#   - web (v1.26.0 合并场景) 含 wifi_weak: 原「网络很慢」并入, "网慢" 多数
+#     先看 WiFi 信号 (决策点 7.4); 7 条 = 原 slow ∪ 原 web, 不新增规则
 #   - gaming 必不含 wifi_weak: 游戏卡顿报 WiFi 弱 = 噪音 (用户拍板)
 #   - disconnect/web 聚焦连通性规则 (WAN 中断 / 网关丢包 / DNS)
 PROFILE_RULES = {
-    "slow": ["bufferbloat", "gateway_loss", "dns_failure", "wifi_weak",
-             "tcp_loss_burst"],
+    "web": ["bufferbloat", "gateway_loss", "dns_failure", "wifi_weak",
+            "tcp_loss_burst", "wan_interruption", "mtu_blackhole"],
     "disconnect": ["wan_interruption", "gateway_loss", "dns_failure"],
-    "web": ["dns_failure", "wan_interruption", "gateway_loss",
-            "mtu_blackhole", "tcp_loss_burst"],
     "gaming": ["gateway_loss", "bufferbloat", "nat_restricted",
                "mtu_blackhole", "tcp_loss_burst"],
     "wifi": ["wifi_weak", "gateway_loss"],
@@ -2671,20 +2667,20 @@ PROFILE_RULE_EXCLUDES = {
 }
 
 # 场景中文标签 (PR-A · v1.6.0 主菜单 / 完成屏 / 报告文件名用)
+# v1.26.0: 「网络很慢」+「网页打不开」合并为「网页打开慢」(Simon 拟名),
+# 全入口 (GUI 卡片 / 终端菜单 / 报告文件名) 同源生效。
 SCENE_LABELS = {
-    "slow": "网络很慢",
+    "web": "网页打开慢",
     "disconnect": "经常断网",
-    "web": "网页打不开",
     "gaming": "游戏卡顿",
     "wifi": "WiFi 信号差",
 }
 # 主菜单数字键 → profile id
 SCENE_MENU_KEYS = {
-    "1": "slow",
+    "1": "web",
     "2": "disconnect",
-    "3": "web",
-    "4": "gaming",
-    "5": "wifi",
+    "3": "gaming",
+    "4": "wifi",
 }
 
 
@@ -3723,7 +3719,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.25.0"
+APP_VERSION = "1.26.0"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -24323,19 +24319,20 @@ def _menu_banner_lines(notice=None, subtitle="网络诊断（场景模式）"):
 
 # 场景菜单卡片副行 (批次 2): 一句话讲清场景测什么。
 # 文案严格对齐 DIAGNOSE_PROFILES 各场景实际包含的模块, 不新增能力承诺。
+# v1.26.0: web 副行 = 合并场景 (原 slow ∪ web) 的全量能力罗列。
 SCENE_MENU_DESC = {
-    "slow": "测速 + 缓冲膨胀 + TCP 质量 + WiFi + DNS",
+    "web": "测速 + 缓冲膨胀 + DNS + 网页体验 + WiFi + MTU/路由 + TCP 质量",
     "disconnect": "外网连通 + 网关丢包 + DNS + 环路",
-    "web": "DNS + HTTP 体验 + MTU/路由 + TCP 质量",
     "gaming": "延迟抖动 + NAT 类型 + 缓冲膨胀 + MTU",
     "wifi": "WiFi 信号 + 信道干扰 + 网关 + 局域网",
 }
 
 # 工具区菜单项 (键, 名称, 副行)
+# v1.26.0: 场景腾出的键位顺次重排 5/6/7/A, 不留空洞 (原 6/7/9/A)。
 _SCENE_TOOL_ITEMS = (
-    ("6", "现场检测", "客户信息 + 机房 6 项 → 一页报告/PDF"),
-    ("7", "持续盯障", "定时监测外网, 抓偶发掉线/抖动"),
-    ("9", "高级选项", "模块级单测 / 工程师功能"),
+    ("5", "现场检测", "客户信息 + 机房 6 项 → 一页报告/PDF"),
+    ("6", "持续盯障", "定时监测外网, 抓偶发掉线/抖动"),
+    ("7", "高级选项", "模块级单测 / 工程师功能"),
     ("A", "管理员模式", "抓包取证、Npcap 安装需要"),
 )
 
@@ -24375,8 +24372,9 @@ def _menu_item_lines(show_desc=True):
 def _scene_menu(install=False, pip_mirror=None):
     """场景层首页 (PR-A · v1.6.0): 中文场景标签 + 数字回车。
 
-    返回 False = 退出程序 ([0] 退出 / [9] 高级页里退出 / Ctrl+C)。
+    返回 False = 退出程序 ([0] 退出 / [7] 高级页里退出 / Ctrl+C)。
     v1.9.7 PR-3: [A] 一键以管理员身份重启。
+    v1.26.0: 场景 4 行 (1-4), 工具区键位重排 5/6/7/A (原 6/7/9/A)。
     控制台现代化批次 2: 闭环框横幅 (权限/本机网络进框, 公网联网后补行)
     + 双分区菜单 (副行按 DIAGNOSE_PROFILES 校准, 窄终端自动收起)。
     """
@@ -24399,7 +24397,7 @@ def _scene_menu(install=False, pip_mirror=None):
               + _c("    ", C_GRAY) + _c("[0]", C_CYAN) + _c(" 退出", C_GRAY))
         print(_c("─" * min(_term_width() - 2, 76), C_GRAY))
         try:
-            choice = input(_c("  选择 [0-9AC] » ", C_GREEN)).strip().lower()
+            choice = input(_c("  选择 [0-7AC] » ", C_GREEN)).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return False
@@ -24419,15 +24417,15 @@ def _scene_menu(install=False, pip_mirror=None):
                 list(sys.argv[1:]),
                 reason="抓包取证、Npcap 安装等功能需要管理员权限")
             continue
-        if choice == "9":
+        if choice == "7":
             # 高级页 (原模块清单菜单) 里退出 → 整个程序退出
             if not _module_menu(install=install, pip_mirror=pip_mirror):
                 return False
             continue
-        if choice == "6":
+        if choice == "5":
             run_site_visit(install=install, pip_mirror=pip_mirror)
             continue
-        if choice == "7":
+        if choice == "6":
             _run_scene_monitor(install=install, pip_mirror=pip_mirror)
             continue
         if choice in SCENE_MENU_KEYS:
@@ -24445,7 +24443,8 @@ def interactive_menu(install=False, pip_mirror=None):
     """交互式场景菜单 (cmd 窗口, v1.6.0)。
 
     无参数启动 → 场景层 (中文场景标签 + 数字回车);
-    [9] 高级选项 = 原模块清单菜单 (工程师用), 行为与 v1.5.x 一致。
+    [7] 高级选项 = 原模块清单菜单 (工程师用), 行为与 v1.5.x 一致。
+    v1.26.0: 场景合并为 4 个, 工具键位 5/6/7/A。
 
     install: 是否允许在交互过程中自动安装缺失依赖
              (与 CLI --install 联动)。
@@ -24515,7 +24514,7 @@ def _module_menu_lines():
 
 
 def _module_menu(install=False, pip_mirror=None):
-    """原模块清单菜单 (v1.6.0 起为场景层 [9] 高级选项)。
+    """原模块清单菜单 (v1.6.0 起为场景层 [7] 高级选项)。
 
     行为与 v1.5.x 一致 (模块编号 / 分类 / 0 全部 / m 盯障 / e 导出 / q 退出);
     返回语义 (v1.9.3): r = 返回场景层主菜单 → True; q / Ctrl+C / EOF → False
@@ -26606,18 +26605,18 @@ body{ font-family:"Inter","Microsoft YaHei","PingFang SC",sans-serif; color:var(
 button{ font-family:inherit; cursor:pointer; }
 input,select{ font-family:inherit; }
 
-/* ── 顶栏 (设计稿 .app-top) ── */
-.g-top{ height:58px; display:flex; align-items:center; gap:12px; padding:0 24px;
+/* ── 顶栏 (设计稿 .app-top; v1.26.0 紧凑化 58→52) ── */
+.g-top{ height:52px; display:flex; align-items:center; gap:12px; padding:0 24px;
         border-bottom:1px solid var(--rule); }
-.g-mark{ width:34px; height:34px; border-radius:9px; background:var(--navy); color:#fff;
-         font-size:14px; font-weight:800; letter-spacing:.5px;
+.g-mark{ width:30px; height:30px; border-radius:8px; background:var(--navy); color:#fff;
+         font-size:13px; font-weight:800; letter-spacing:.5px;
          display:flex; align-items:center; justify-content:center; }
-.g-brand{ font-size:17px; font-weight:800; color:var(--navy); letter-spacing:.3px; }
+.g-brand{ font-size:16px; font-weight:800; color:var(--navy); letter-spacing:.3px; }
 .g-ver{ font-size:11px; font-weight:600; letter-spacing:.5px; color:var(--mute);
         border:1px solid var(--rule); border-radius:999px; padding:2px 11px; }
 .g-spring{ margin-left:auto; }
 .g-host{ display:flex; align-items:center; gap:8px; background:var(--soft);
-         border:1px solid var(--rule); border-radius:999px; padding:5px 15px;
+         border:1px solid var(--rule); border-radius:999px; padding:4px 13px;
          font-size:12.5px; font-weight:600; color:var(--dim); }
 .g-host svg{ width:13px; height:13px; color:var(--mute); flex:none; }
 /* 顶栏联网状态圆点 (v1.21.0 收尾): 颜色由 JS 按探测结果赋 style,
@@ -26625,28 +26624,28 @@ input,select{ font-family:inherit; }
 .g-dot{ width:11px; height:11px; flex:none; border-radius:50%; background:var(--mute); }
 .g-netword{ font-size:10px; color:var(--dim); }
 
-/* ── 各视图容器 padding (对齐设计稿各节) ── */
-.g-view-home{ padding:32px 36px 30px; }
+/* ── 各视图容器 padding (v1.26.0: 主页收紧 32/36/30→22/32/20, 其余不动) ── */
+.g-view-home{ padding:22px 32px 20px; }
 .g-view-prog{ padding:30px 36px 26px; }
 .g-rep{ padding:26px 32px 30px; }
 .g-view-site{ padding:26px 36px 30px; }
 
-/* ── 主页 (设计稿第 1 节 方案A) ── */
-.g-h1{ font-size:26px; font-weight:800; letter-spacing:.3px; }
-.g-sub{ font-size:13px; color:var(--dim); margin-top:5px; }
-.g-cards{ display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-top:24px; }
+/* ── 主页 (v1.26.0 方案A紧凑化: 设计稿 02 节数值 1:1) ── */
+.g-h1{ font-size:22px; font-weight:800; letter-spacing:.3px; }
+.g-sub{ font-size:12.5px; color:var(--dim); margin-top:3px; }
+.g-cards{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:14px; }
 .g-card{ background:var(--soft); border:1px solid var(--rule); border-radius:12px;
-         padding:20px 20px 18px; min-height:158px; display:flex; flex-direction:column;
+         padding:13px 16px 12px; min-height:140px; display:flex; flex-direction:column;
          text-align:left; color:var(--text); }
 .g-card:hover{ border-color:var(--navy-2); }
-.g-card-ic{ width:46px; height:46px; border-radius:11px; background:#fff;
+.g-card-ic{ width:32px; height:32px; border-radius:9px; background:#fff;
             border:1px solid var(--rule); display:flex; align-items:center;
-            justify-content:center; color:var(--navy); margin-bottom:14px; }
-.g-card-ic svg{ width:24px; height:24px; }
-.g-card-t{ font-size:16.5px; font-weight:700; letter-spacing:.2px; }
-.g-card-d{ font-size:12.5px; color:var(--dim); margin-top:6px; line-height:1.6; }
-.g-card-go{ margin-top:auto; padding-top:12px; font-size:11.5px; font-weight:700;
-            letter-spacing:1px; color:var(--mute); }
+            justify-content:center; color:var(--navy); margin-bottom:8px; }
+.g-card-ic svg{ width:18px; height:18px; }
+.g-card-t{ font-size:15px; font-weight:700; letter-spacing:.2px; }
+.g-card-d{ font-size:12px; color:var(--dim); margin-top:4px; line-height:1.55; }
+.g-card-go{ margin-top:auto; padding-top:8px; font-size:11px; font-weight:700;
+            letter-spacing:.5px; color:var(--mute); }
 .g-card.site{ background:var(--navy); border-color:var(--navy); }
 .g-card.site:hover{ border-color:var(--navy-2); }
 .g-card.site .g-card-ic{ background:rgba(255,255,255,.13); border-color:rgba(255,255,255,.28); color:#fff; }
@@ -26657,16 +26656,16 @@ input,select{ font-family:inherit; }
 .g-card:disabled{ opacity:.45; cursor:default; }
 .g-card:disabled:hover{ border-color:var(--rule); }
 .g-card.site:disabled:hover{ border-color:var(--navy); }
-.g-runbar{ display:flex; align-items:center; gap:10px; width:100%; margin-top:18px;
+.g-runbar{ display:flex; align-items:center; gap:10px; width:100%; margin-top:14px;
            background:#eef3f9; border:1px solid var(--navy-2); border-radius:10px;
            padding:11px 18px; font-size:13px; font-weight:700; color:var(--navy);
            text-align:left; }
 .g-runbar:hover{ background:#e3ebf4; }
 #g-lastrep{ margin-left:auto; }
-.g-fullrow{ display:flex; align-items:center; gap:16px; margin-top:22px; padding-top:20px;
+.g-fullrow{ display:flex; align-items:center; gap:16px; margin-top:14px; padding-top:14px;
             border-top:1px solid var(--rule); }
 /* v1.24.0: 主页续跑横幅 (跨重启后出现 —— 上次那轮没跑完) */
-.g-resume{ display:flex; align-items:center; gap:14px; margin-top:18px; padding:14px 18px;
+.g-resume{ display:flex; align-items:center; gap:14px; margin-top:14px; padding:14px 18px;
            background:#fffdf5; border:1px solid #e0c98a; border-left:3px solid var(--amber);
            border-radius:10px; }
 .g-resume .rt{ font-size:14px; font-weight:700; }
@@ -26787,8 +26786,10 @@ input,select{ font-family:inherit; }
 .g-steps>i.on b{ background:var(--navy); border-color:var(--navy); color:#fff; }
 .g-steps>i.on{ color:var(--text); font-weight:700; }
 .g-steps .ln{ flex:1; height:1.5px; background:var(--rule); margin:0 14px; min-width:30px; }
+/* v1.26.0: 表单限宽 720→760 并整体居中 (原靠左, 宽窗下右侧大片留白);
+   步骤条本就是 #site-wizard(g-form) 的首个子元素, 随盒居中。 */
 .g-form{ border:1px solid var(--rule); border-radius:12px; padding:20px 24px 22px;
-         background:#fff; max-width:720px; }
+         background:#fff; max-width:760px; margin:0 auto; }
 .g-field{ margin-bottom:16px; }
 .g-flabel{ font-size:13px; font-weight:600; margin-bottom:6px; }
 .g-flabel .req{ color:var(--red); margin-left:3px; font-weight:700; }
@@ -26798,7 +26799,7 @@ input,select{ font-family:inherit; }
 .g-fhint{ font-size:11.5px; color:var(--mute); margin-top:5px; }
 .g-form-foot{ display:flex; align-items:center; gap:14px; margin-top:4px; }
 .g-form-foot .g-link{ margin-left:auto; }
-#site-check{ max-width:720px; }
+#site-check{ max-width:760px; margin:0 auto; }
 .g-h2{ font-size:16px; font-weight:800; margin-bottom:12px; }
 #site-items{ border:1px solid var(--rule); border-radius:12px; padding:4px 20px; background:#fff; }
 .g-siteit{ display:flex; align-items:center; justify-content:space-between; gap:12px;
@@ -27223,14 +27224,21 @@ _GUI_JS = r"""(function () {
   // 键 = DIAGNOSE_PROFILES profile id + site / full)。纯常量模板、不含变量插值,
   // 属于 textContent 规则允许的例外; 动态数据 (label/desc) 一律 textContent。
   var ICONS = {
-    slow: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 16a8 8 0 1 1 14 0"/><path d="M12 16 8.6 11.4"/><circle cx="12" cy="16" r="1.5"/></svg>',
+    // v1.26.0: 合并场景「网页打开慢」用仪表 (慢) 图标 —— 标题语义落点是「慢」,
+    // 不用「网页+×」(失败); 原 slow 图标升格为 web 场景图标, 原 web 图标退役。
+    web: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 16a8 8 0 1 1 14 0"/><path d="M12 16 8.6 11.4"/><circle cx="12" cy="16" r="1.5"/></svg>',
     disconnect: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12.5h4l2.5-5.5 3.5 10 2.5-4.5h6.5"/></svg>',
-    web: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/><path d="M10 12.5l4 4M14 12.5l-4 4"/></svg>',
     gaming: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="7.5" width="19" height="9.5" rx="4.75"/><path d="M8 10.2v4M6 12.2h4"/><circle cx="15.6" cy="11" r="1" fill="currentColor" stroke="none"/><circle cx="18" cy="13.4" r="1" fill="currentColor" stroke="none"/></svg>',
     wifi: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 10.2a11.5 11.5 0 0 1 15 0" opacity=".22"/><path d="M7.3 13.2a7.5 7.5 0 0 1 9.4 0" opacity=".45"/><path d="M10 16.1a3.6 3.6 0 0 1 4 0"/><circle cx="12" cy="18.7" r="1.2" fill="currentColor" stroke="none"/></svg>',
     site: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-13a2 2 0 0 0-2-2h-2"/><rect x="9" y="2.5" width="6" height="4" rx="1"/><path d="M8.8 13.5l2.3 2.3 4.3-4.6"/></svg>',
     full: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/><path d="M7 13h6M7 16h4"/></svg>',
     monitor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13.5" r="7.5"/><path d="M12 10v3.5l2.5 2"/><path d="M9.5 3.5h5"/><path d="M12 3.5v2.5"/></svg>'
+  };
+  // v1.26.0: 卡片规模副行 (site/monitor 无模块数, 给等价规模提示;
+  // 场景卡用 /api/scenarios 下发的 modules 数 —— 数据唯一来源服务端)
+  var CARD_GO_TEXT = {
+    site: "向导式 · 机房 6 项核对",
+    monitor: "后台运行 · 随时可停"
   };
   var COLORS = {};          // {状态中文: 颜色} — 来自 /api/scenarios, 唯一来源服务端
   var GRADES = {};          // {等级: 颜色} — 同一载荷 grade_colors, 结论条徽章用
@@ -27279,7 +27287,10 @@ _GUI_JS = r"""(function () {
       c.appendChild(ic);
       c.appendChild(el("span", "g-card-t", s.label));
       c.appendChild(el("span", "g-card-d", s.desc));
-      c.appendChild(el("span", "g-card-go", "点击开始 →"));
+      // v1.26.0: 副行 = 模块规模 (数据来自下发的 modules 字段);
+      // site/monitor 无模块数, 给等价规模提示。
+      c.appendChild(el("span", "g-card-go",
+        CARD_GO_TEXT[s.id] || (s.modules + " 项模块")));
       if (s.id === "site") {
         c.addEventListener("click", function () { show("site"); });
       } else if (s.id === "monitor") {
@@ -29653,7 +29664,7 @@ def _gui_launch_browser(url):
     if browser:
         try:
             proc = subprocess.Popen([browser, "--app=" + url,
-                                     "--window-size=1280,860"])
+                                     "--window-size=1180,720"])
             _GUI_BROWSER_PROC.append(proc)      # 保留句柄防 GC
             return "app"
         except OSError:

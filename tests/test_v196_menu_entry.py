@@ -141,9 +141,9 @@ class TestSceneMonitorPassthrough(unittest.TestCase):
         m_prompt.assert_called_once_with(
             resume_tail=["--monitor", "600", "--capture"])
 
-    def test_scene_menu_7_routes_to_monitor(self):
-        # 场景层 [7] → _run_scene_monitor (接线检查)
-        with mock.patch("builtins.input", side_effect=["7", "0"]), \
+    def test_scene_menu_6_routes_to_monitor(self):
+        # 场景层 [6] → _run_scene_monitor (v1.26.0 键位重排: 原 [7])
+        with mock.patch("builtins.input", side_effect=["6", "0"]), \
              mock.patch.object(np, "_menu_clear"), \
              mock.patch("netpulse._run_scene_monitor") as m_mon:
             np._scene_menu()

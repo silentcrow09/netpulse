@@ -81,12 +81,13 @@ class TestPRB(unittest.TestCase):
         self.assertNotIn("wifi_weak", ids)
         self.assertEqual(d.rules_evaluated, 7)  # 8 条 - 排除 1 条
 
-    def test_slow_includes_wifi_weak(self):
+    def test_web_includes_wifi_weak(self):
+        # v1.26.0: 原 slow 场景并入 web; web 规则集含 wifi_weak (原 slow 口径)
         results = _mk_results(bufferbloat=True, wifi=True)
-        d = np.diagnose(results, rule_filter="slow")
+        d = np.diagnose(results, rule_filter="web")
         ids = {rc.id for rc in d.root_causes}
-        self.assertIn("wifi_weak", ids, "slow 场景默认含 wifi 弱")
-        self.assertEqual(d.rules_evaluated, 5)
+        self.assertIn("wifi_weak", ids, "web (合并场景) 默认含 wifi 弱")
+        self.assertEqual(d.rules_evaluated, 7)
 
     def test_no_hit_falls_back_to_all_rules(self):
         # wifi 场景规则集不含 bufferbloat, 但证据里只有 bufferbloat
@@ -172,11 +173,11 @@ class TestPRC(unittest.TestCase):
                 "keys": ["gateway"], "duration_ms": 1, "total_modules": 23}
             with mock.patch.object(np, "export_report",
                                    return_value=None) as m_exp:
-                path, err = np._export_scene_report("slow", "网络很慢")
+                path, err = np._export_scene_report("web", "网页打开慢")
         self.assertIsNone(err)
         self.assertIn("Desktop", path)
-        self.assertIn("网络很慢.html", path)
-        m_exp.assert_called_once_with(path, rule_filter="slow", report=None)
+        self.assertIn("网页打开慢.html", path)
+        m_exp.assert_called_once_with(path, rule_filter="web", report=None)
         import shutil
         shutil.rmtree(fake_home, ignore_errors=True)
         np.LAST_RUN = None
@@ -187,7 +188,8 @@ class TestPRC(unittest.TestCase):
             self.assertFalse(np._scene_menu())
 
     def test_scene_menu_advance_then_exit(self):
-        with mock.patch("builtins.input", side_effect=["9", "q"]), \
+        # v1.26.0: 高级选项键位 9 → 7
+        with mock.patch("builtins.input", side_effect=["7", "q"]), \
              mock.patch.object(np, "_menu_clear", return_value=None), \
              mock.patch.object(np, "_module_menu", return_value=False):
             self.assertFalse(np._scene_menu())
@@ -233,13 +235,13 @@ class TestPRA(unittest.TestCase):
                  mock.patch.object(np, "_export_scene_report",
                                    return_value=("x.html", None)) as m_exp, \
                  mock.patch("builtins.input", return_value="") as m_in:
-                np._run_scene("slow")
+                np._run_scene("web")
         m_rd.assert_called_once()
         call_kw = m_rd.call_args.kwargs
         self.assertEqual(call_kw.get("parallel"), True)
         m_diag.assert_called_once()
         # diagnose(results_dict, rule_filter=profile) — rule_filter 是关键字参数
-        self.assertEqual(m_diag.call_args[1].get("rule_filter"), "slow")
+        self.assertEqual(m_diag.call_args[1].get("rule_filter"), "web")
         # 诊断只评一次: build_report 复用同一份 diagnosis (审查 #8)
         m_br.assert_called_once()
         self.assertEqual(m_br.call_args[1].get("diagnosis"),
@@ -295,7 +297,7 @@ class TestV161(unittest.TestCase):
         with mock.patch.object(np, "run_diagnostics",
                                side_effect=KeyboardInterrupt), \
              mock.patch("builtins.input", return_value="") as m_in:
-            np._run_scene("slow")  # 不应抛异常
+            np._run_scene("web")  # 不应抛异常
         self.assertTrue(m_in.called)
 
     def test_scene_report_filename_has_time(self):
@@ -313,7 +315,7 @@ class TestV161(unittest.TestCase):
             with mock.patch.object(np, "_desktop_netpulse_dir",
                                    return_value=tmp), \
                  mock.patch.object(np, "export_report", return_value=None):
-                p1, err1 = np._export_scene_report("slow", "网络很慢")
+                p1, err1 = np._export_scene_report("web", "网页打开慢")
         finally:
             np.LAST_RUN = saved
             shutil.rmtree(tmp, ignore_errors=True)

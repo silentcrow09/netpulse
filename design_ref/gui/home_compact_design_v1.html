@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetPulse GUI 首页紧凑化 · 设计稿 v1（选型用）</title>
+<style>
+  /* ════════════════════════════════════════════════════════════
+     NetPulse GUI 首页紧凑化 · 静态选型稿（无可运行代码）
+     现状数值来自 2026-11-14 真实运行页 1280×860 实测。
+     图标与实现 ICONS 常量同源（symbol+use 内嵌）。
+     全部系统字体，零外部资源；框内排版 1:1 真实字号。
+     ════════════════════════════════════════════════════════════ */
+  :root{
+    --navy:#0a3b6e; --navy-2:#2a5485; --red:#b3261e; --amber:#ad6e10; --green:#1e6e44;
+    --text:#1a2230; --dim:#5b6472; --mute:#98a2ad; --rule:#d8dde5; --soft:#f6f7f9;
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ background:#dfe3e9; }
+  body{ font-family:"Inter","Microsoft YaHei","PingFang SC",sans-serif; color:var(--text);
+        font-size:14px; line-height:1.65; padding:46px 40px 110px; -webkit-font-smoothing:antialiased; }
+  .wrap{ max-width:1360px; margin:0 auto; }
+  .num{ font-variant-numeric:tabular-nums; font-feature-settings:"tnum"; }
+
+  /* ── 图标（与实现 ICONS 同源的线条语言） ── */
+  .ic{ fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round;
+       stroke-linejoin:round; display:block; }
+  .g-card-ic .ic{ width:24px; height:24px; }
+  .a-ic .ic{ width:18px; height:18px; }
+  .b-ic .ic{ width:20px; height:20px; }
+  .g-btn2 .ic{ width:15px; height:15px; }
+
+  /* ── 文档头 ── */
+  h1{ font-size:26px; font-weight:800; letter-spacing:.4px; }
+  h1 .brandtag{ display:inline-block; background:var(--navy); color:#fff; font-size:15px; font-weight:800;
+                border-radius:8px; padding:3px 10px; letter-spacing:1px; vertical-align:3px; margin-right:12px; }
+  .meta{ font-size:12.5px; color:var(--mute); margin-top:8px; letter-spacing:.3px; }
+  .meta b{ color:var(--dim); }
+  .lead{ font-size:13.5px; color:var(--dim); margin-top:14px; max-width:1000px; }
+  .lead b{ color:var(--text); }
+
+  /* ── 节 ── */
+  .sec{ margin-top:58px; }
+  .sec-head{ display:flex; align-items:baseline; gap:14px; border-bottom:2px solid var(--navy);
+             padding-bottom:10px; margin-bottom:12px; }
+  .sec-head .no{ font-size:13px; font-weight:800; color:var(--navy); letter-spacing:2.5px; white-space:nowrap; }
+  .sec-head .t{ font-size:20px; font-weight:800; letter-spacing:.5px; }
+  .sec-head .pill{ font-size:11.5px; font-weight:700; letter-spacing:1.5px; padding:2px 12px;
+                   border-radius:999px; white-space:nowrap; }
+  .pill.navy{ background:var(--navy); color:#fff; }
+  .pill.ghost{ background:#fff; color:var(--navy-2); border:1px solid var(--navy-2); }
+  .pill.amber{ background:#fff; color:var(--amber); border:1px solid var(--amber); }
+  .sec-head .r{ margin-left:auto; font-size:12px; color:var(--mute); white-space:nowrap; }
+  .sec-desc{ font-size:13px; color:var(--dim); max-width:1000px; margin:2px 2px 0; }
+
+  /* ── 设计注释 ── */
+  .notes{ font-size:12.5px; color:var(--dim); margin:10px auto 0; width:1240px; max-width:100%; }
+  .notes li{ margin-left:20px; margin-top:3px; }
+  .notes b{ color:var(--text); }
+  .notes .k{ color:var(--navy); font-weight:700; }
+  .notes .a{ color:var(--amber); font-weight:700; }
+
+  /* ── 假窗口框 ── */
+  .win{ margin:18px auto 8px; background:#fff; border:1px solid #c6ccd4;
+        border-radius:10px; overflow:hidden; box-shadow:0 26px 52px -30px rgba(13,35,60,.38); }
+  .win.s1280{ width:1280px; }
+  .win.s1180{ width:1180px; }
+  .win-title{ height:40px; background:#eef1f5; border-bottom:1px solid #e0e4ea; display:flex;
+              align-items:center; padding:0 14px; position:relative; }
+  .win-title .dots{ display:inline-flex; gap:6px; }
+  .win-title .dots i{ width:10px; height:10px; border-radius:50%; background:#c3cad3; }
+  .win-title .wt{ position:absolute; left:0; right:0; text-align:center; font-size:12.5px;
+                  color:var(--dim); font-weight:600; }
+  .win-title .sz{ margin-left:auto; font-size:11px; color:var(--mute); font-weight:700; letter-spacing:.5px; }
+
+  /* ── 标注（就地标出变更点） ── */
+  .mark{ position:absolute; z-index:5; font-size:10.5px; font-weight:800; letter-spacing:1px;
+         color:#8a6a00; background:#fff7d6; border:1px dashed #d9b13c; border-radius:4px;
+         padding:1px 7px; pointer-events:none; }
+  .mark.new{ color:#0c5a34; background:#e5f5ec; border-color:#3c9d6e; }
+  .chg{ outline:1.5px dashed #d9b13c; outline-offset:2px; }
+
+  /* ════════ 页面本体（1:1 还原 / 提案） ════════ */
+  .pv{ position:relative; }
+  .g-top{ height:58px; display:flex; align-items:center; gap:12px; padding:0 24px;
+          border-bottom:1px solid var(--rule); }
+  .g-mark{ width:34px; height:34px; border-radius:9px; background:var(--navy); color:#fff;
+           font-size:14px; font-weight:800; letter-spacing:.5px;
+           display:flex; align-items:center; justify-content:center; }
+  .g-brand{ font-size:17px; font-weight:800; color:var(--navy); letter-spacing:.3px; }
+  .g-ver{ font-size:11px; font-weight:600; letter-spacing:.5px; color:var(--mute);
+          border:1px solid var(--rule); border-radius:999px; padding:2px 11px; }
+  .g-spring{ margin-left:auto; }
+  .g-host{ display:flex; align-items:center; gap:8px; background:var(--soft);
+           border:1px solid var(--rule); border-radius:999px; padding:5px 15px;
+           font-size:12.5px; font-weight:600; color:var(--dim); }
+  .g-dot{ width:11px; height:11px; flex:none; border-radius:50%; background:#1e6e44; }
+  .g-netword{ font-size:10px; color:var(--dim); }
+
+  /* 现状主页（实测值原样） */
+  .cur-home{ padding:32px 36px 30px; }
+  .g-h1{ font-size:26px; font-weight:800; letter-spacing:.3px; }
+  .g-sub{ font-size:13px; color:var(--dim); margin-top:5px; }
+  .g-cards{ display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-top:24px; }
+  .g-card{ background:var(--soft); border:1px solid var(--rule); border-radius:12px;
+           padding:20px 20px 18px; min-height:158px; display:flex; flex-direction:column;
+           text-align:left; color:var(--text); position:relative; border:none; cursor:default; }
+  .g-card-ic{ width:46px; height:46px; border-radius:11px; background:#fff;
+              border:1px solid var(--rule); display:flex; align-items:center;
+              justify-content:center; color:var(--navy); margin-bottom:14px; }
+  .g-card-t{ font-size:16.5px; font-weight:700; letter-spacing:.2px; }
+  .g-card-d{ font-size:12.5px; color:var(--dim); margin-top:6px; line-height:1.6; }
+  .g-card-go{ margin-top:auto; padding-top:12px; font-size:11.5px; font-weight:700;
+              letter-spacing:1px; color:var(--mute); }
+  .g-card.site{ background:var(--navy); border-color:var(--navy); }
+  .g-card.site .g-card-ic{ background:rgba(255,255,255,.13); border-color:rgba(255,255,255,.28); color:#fff; }
+  .g-card.site .g-card-t{ color:#fff; }
+  .g-card.site .g-card-d{ color:#c7d7e8; }
+  .g-card.site .g-card-go{ color:#8fb3d6; }
+  .g-fullrow{ display:flex; align-items:center; gap:16px; margin-top:22px; padding-top:20px;
+              border-top:1px solid var(--rule); }
+  .g-btn2{ display:inline-flex; align-items:center; gap:8px; border-radius:7px; font-size:13px;
+           font-weight:600; padding:9px 18px; letter-spacing:.3px; cursor:default;
+           background:#fff; border:1px solid var(--navy-2); color:var(--navy); }
+  .g-link2{ background:none; border:none; color:var(--navy); font-size:13px; font-weight:600; padding:0; cursor:default; }
+  .g-dim{ font-size:12.5px; color:var(--mute); }
+  .g-link{ background:none; border:none; color:var(--mute); font-size:12.5px; font-weight:600; padding:0; cursor:default; }
+  .g-fullrow .g-link{ margin-left:auto; }
+
+  /* ════════ 方案 A：上下布局收紧 ════════ */
+  .a-home{ padding:22px 32px 20px; }
+  .a .g-top{ height:52px; }
+  .a .g-mark{ width:30px; height:30px; border-radius:8px; font-size:13px; }
+  .a .g-brand{ font-size:16px; }
+  .a .g-host{ padding:4px 13px; }
+  .a-h1{ font-size:22px; font-weight:800; letter-spacing:.3px; position:relative; }
+  .a-sub{ font-size:12.5px; color:var(--dim); margin-top:3px; }
+  .a-cards{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:14px;
+            position:relative; }
+  .a-card{ background:var(--soft); border:1px solid var(--rule); border-radius:11px;
+           padding:13px 16px 12px; min-height:140px; display:flex; flex-direction:column;
+           text-align:left; color:var(--text); position:relative; border:none; cursor:default; }
+  .a-ic{ width:32px; height:32px; border-radius:9px; background:#fff;
+         border:1px solid var(--rule); display:flex; align-items:center;
+         justify-content:center; color:var(--navy); margin-bottom:8px; }
+  .a-t{ font-size:15px; font-weight:700; letter-spacing:.2px; }
+  .a-d{ font-size:12px; color:var(--dim); margin-top:4px; line-height:1.55; }
+  .a-go{ margin-top:auto; padding-top:8px; font-size:11px; font-weight:700;
+         letter-spacing:.5px; color:var(--mute); }
+  .a-go b{ color:var(--navy-2); }
+  .a-card.site{ background:var(--navy); border-color:var(--navy); }
+  .a-card.site .a-ic{ background:rgba(255,255,255,.13); border-color:rgba(255,255,255,.28); color:#fff; }
+  .a-card.site .a-t{ color:#fff; }
+  .a-card.site .a-d{ color:#c7d7e8; }
+  .a-card.site .a-go{ color:#8fb3d6; }
+  .a-fullrow{ display:flex; align-items:center; gap:14px; margin-top:14px; padding-top:14px;
+              border-top:1px solid var(--rule); position:relative; }
+
+  /* ════════ 方案 B：图标左置横排 ════════ */
+  .b-home{ padding:22px 32px 20px; }
+  .b .g-top{ height:52px; }
+  .b .g-mark{ width:30px; height:30px; border-radius:8px; font-size:13px; }
+  .b .g-brand{ font-size:16px; }
+  .b .g-host{ padding:4px 13px; }
+  .b-h1{ font-size:22px; font-weight:800; letter-spacing:.3px; }
+  .b-sub{ font-size:12.5px; color:var(--dim); margin-top:3px; }
+  .b-cards{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:14px; }
+  .b-card{ background:var(--soft); border:1px solid var(--rule); border-radius:11px;
+           padding:12px 14px; min-height:92px; display:flex; gap:12px; align-items:stretch;
+           text-align:left; color:var(--text); position:relative; border:none; cursor:default; }
+  .b-ic{ width:38px; height:38px; flex:none; border-radius:10px; background:#fff;
+         border:1px solid var(--rule); display:flex; align-items:center;
+         justify-content:center; color:var(--navy); align-self:flex-start; }
+  .b-body{ display:flex; flex-direction:column; min-width:0; flex:1; }
+  .b-t{ font-size:15px; font-weight:700; letter-spacing:.2px; }
+  .b-d{ font-size:12px; color:var(--dim); margin-top:2px; line-height:1.5; }
+  .b-go{ margin-top:auto; padding-top:5px; font-size:11px; font-weight:700;
+         letter-spacing:.5px; color:var(--mute); }
+  .b-go b{ color:var(--navy-2); }
+  .b-card.site{ background:var(--navy); border-color:var(--navy); }
+  .b-card.site .b-ic{ background:rgba(255,255,255,.13); border-color:rgba(255,255,255,.28); color:#fff; }
+  .b-card.site .b-t{ color:#fff; }
+  .b-card.site .b-d{ color:#c7d7e8; }
+  .b-card.site .b-go{ color:#8fb3d6; }
+  .b-fullrow{ display:flex; align-items:center; gap:14px; margin-top:14px; padding-top:14px;
+              border-top:1px solid var(--rule); }
+
+  /* ── 高度标尺 ── */
+  .ruler{ position:absolute; right:-8px; top:0; bottom:0; width:26px; display:flex;
+          flex-direction:column; align-items:flex-end; font-size:10.5px; color:var(--amber);
+          font-weight:700; }
+  .ruler span{ writing-mode:vertical-rl; letter-spacing:1px; }
+
+  /* ── 清单表 ── */
+  table.chg-tb{ border-collapse:collapse; width:100%; margin-top:14px; background:#fff;
+                border:1px solid var(--rule); font-size:12.5px; }
+  .chg-tb th{ background:var(--soft); text-align:left; font-size:11.5px; letter-spacing:1px;
+              color:var(--dim); padding:8px 12px; border-bottom:1px solid var(--rule); white-space:nowrap; }
+  .chg-tb td{ padding:8px 12px; border-bottom:1px solid var(--soft); vertical-align:top; }
+  .chg-tb td.typ{ white-space:nowrap; font-weight:800; }
+  .chg-tb .t-mod{ color:#8a6a00; }
+  .chg-tb .t-new{ color:#0c5a34; }
+  .chg-tb .t-keep{ color:var(--mute); }
+  .chg-tb code{ font-family:Consolas,"Courier New",monospace; font-size:11.5px; color:var(--navy);
+                background:var(--soft); border-radius:4px; padding:0 5px; }
+
+  /* ── 终端菜单示意 ── */
+  .term{ width:820px; margin:18px auto 8px; background:#0c1118; border:1px solid #1e2733;
+         border-radius:10px; overflow:hidden; box-shadow:0 26px 52px -30px rgba(13,35,60,.5); }
+  .term-title{ height:32px; background:#141b25; display:flex; align-items:center; padding:0 14px;
+               font-size:11.5px; color:#8b98a9; letter-spacing:.5px; }
+  .term-body{ font-family:Consolas,"Courier New",monospace; font-size:13px; line-height:1.9;
+              color:#c9d4e0; padding:14px 22px 18px; white-space:pre; }
+  .term-body .hd{ color:#ffffff; font-weight:700; }
+  .term-body .k{ color:#3ddad0; font-weight:700; }
+  .term-body .ds{ color:#6f7d8e; }
+
+  /* ── 现场检测页对齐示意 ── */
+  .site-demo{ position:relative; padding:20px 32px; }
+  .site-steps{ display:flex; align-items:center; border:1.5px dashed #d9b13c; padding:8px 12px; }
+  .site-steps i{ display:flex; align-items:center; gap:8px; font-style:normal; font-size:12.5px;
+                 font-weight:600; color:var(--mute); white-space:nowrap; }
+  .site-steps i.on{ color:var(--text); font-weight:700; }
+  .site-steps i b{ width:26px; height:26px; border-radius:50%; border:1.5px solid var(--rule);
+                   background:#fff; color:var(--mute); font-size:12px; font-weight:700;
+                   display:flex; align-items:center; justify-content:center; }
+  .site-steps i.on b{ background:var(--navy); border-color:var(--navy); color:#fff; }
+  .site-steps .ln{ flex:1; height:1.5px; background:var(--rule); margin:0 12px; min-width:24px; }
+  .site-form-w{ width:760px; margin:14px auto 0; border:1px solid var(--rule); border-radius:12px;
+                padding:16px 20px; background:#fff; }
+  .site-flabel{ font-size:12.5px; font-weight:600; margin-bottom:5px; }
+  .site-input{ height:34px; border:1px solid var(--rule); border-radius:7px; padding:0 12px;
+               font-size:13px; color:var(--mute); background:#fff; }
+  .site-foot{ margin-top:12px; display:flex; align-items:center; gap:12px; }
+</style>
+</head>
+<body>
+
+<!-- 图标符号库：与 netpulse.py ICONS 常量同源（线宽 1.8 线条语言） -->
+<svg style="display:none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <symbol id="i-slow" viewBox="0 0 24 24"><path d="M5 16a8 8 0 1 1 14 0"/><path d="M12 16 8.6 11.4"/><circle cx="12" cy="16" r="1.5"/></symbol>
+    <symbol id="i-disconnect" viewBox="0 0 24 24"><path d="M2.5 12.5h4l2.5-5.5 3.5 10 2.5-4.5h6.5"/></symbol>
+    <symbol id="i-web" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/><path d="M10 12.5l4 4M14 12.5l-4 4"/></symbol>
+    <symbol id="i-gaming" viewBox="0 0 24 24"><rect x="2.5" y="7.5" width="19" height="9.5" rx="4.75"/><path d="M8 10.2v4M6 12.2h4"/><circle cx="15.6" cy="11" r="1" fill="currentColor" stroke="none"/><circle cx="18" cy="13.4" r="1" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M4.5 10.2a11.5 11.5 0 0 1 15 0" opacity=".22"/><path d="M7.3 13.2a7.5 7.5 0 0 1 9.4 0" opacity=".45"/><path d="M10 16.1a3.6 3.6 0 0 1 4 0"/><circle cx="12" cy="18.7" r="1.2" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-site" viewBox="0 0 24 24"><path d="M9 4.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-13a2 2 0 0 0-2-2h-2"/><rect x="9" y="2.5" width="6" height="4" rx="1"/><path d="M8.8 13.5l2.3 2.3 4.3-4.6"/></symbol>
+    <symbol id="i-full" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="2.2"/><path d="M3 9h18"/><path d="M7 13h6M7 16h4"/></symbol>
+    <symbol id="i-monitor" viewBox="0 0 24 24"><circle cx="12" cy="13.5" r="7.5"/><path d="M12 10v3.5l2.5 2"/><path d="M9.5 3.5h5"/><path d="M12 3.5v2.5"/></symbol>
+  </defs>
+</svg>
+
+<div class="wrap">
+
+  <h1><span class="brandtag">NP</span>GUI 首页紧凑化 · 设计稿 v1（选型用）</h1>
+  <div class="meta">2026-11-14 · 依据真实运行页实测（1280×860 视口） · 对应 <b>docs/spec.md（v1.26.0）</b> · 待选型：<b>方案 A / 方案 B</b></div>
+  <div class="lead">现状三件事：主页总高 <b>847px</b> 顶满 860 窗口（续跑横幅一出现就滚动）；7 张卡
+  3 行排布（3+3+1，末行孤卡）；单卡 174px 偏虚高。方案：合并「网络很慢 + 网页打不开」为
+  <b>「网页打开慢」</b>（已拍板），卡片紧凑化（A/B 两版选型），窗口默认改
+  <b>1180×720</b>。金色虚线框 = <b>变更点</b>；绿色标注 = 新增元素。</div>
+
+  <!-- ═══════════ 节 1 · 现状 ═══════════ -->
+  <div class="sec">
+    <div class="sec-head"><span class="no">01</span><span class="t">现状还原（实测）</span>
+      <span class="pill amber">问题标注</span>
+      <span class="r">1280×860 · 数值为 2026-11-14 实测</span></div>
+    <div class="sec-desc">两张待合并卡片用琥珀虚线框标出；右侧标尺标注实测高度。</div>
+
+    <div class="win s1280">
+      <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>
+        <span class="wt">NetPulse 网络诊断</span><span class="sz num">1280 × 860 · 主页总高 847px</span></div>
+      <div class="pv" style="height:556px; overflow:hidden;">
+        <div class="g-top"><span class="g-mark">NP</span><span class="g-brand">NetPulse</span>
+          <span class="g-ver num">v1.25.0</span><span class="g-spring"></span>
+          <span class="g-host"><span class="g-dot"></span><span class="g-netword">已联网</span><span>DESKTOP-XXXX</span></span></div>
+        <div class="cur-home">
+          <div class="g-h1">今天网络哪里不舒服？</div>
+          <div class="g-sub">点一张卡片就开始测，测完直接出报告。</div>
+          <div class="g-cards">
+            <button class="g-card merge"><span class="mark" style="left:10px; top:-10px;">将合并</span>
+              <span class="g-card-ic"><svg class="ic"><use href="#i-slow"/></svg></span>
+              <span class="g-card-t">网络很慢</span>
+              <span class="g-card-d">测速 + 缓冲膨胀 + TCP 质量 + WiFi + DNS</span>
+              <span class="g-card-go">点击开始 →</span></button>
+            <button class="g-card"><span class="g-card-ic"><svg class="ic"><use href="#i-disconnect"/></svg></span>
+              <span class="g-card-t">经常断网</span>
+              <span class="g-card-d">外网连通 + 网关丢包 + DNS + 环路</span>
+              <span class="g-card-go">点击开始 →</span></button>
+            <button class="g-card merge"><span class="mark" style="left:10px; top:-10px;">将合并</span>
+              <span class="g-card-ic"><svg class="ic"><use href="#i-web"/></svg></span>
+              <span class="g-card-t">网页打不开</span>
+              <span class="g-card-d">DNS + HTTP 体验 + MTU/路由 + TCP 质量</span>
+              <span class="g-card-go">点击开始 →</span></button>
+            <button class="g-card"><span class="g-card-ic"><svg class="ic"><use href="#i-gaming"/></svg></span>
+              <span class="g-card-t">游戏卡顿</span>
+              <span class="g-card-d">延迟抖动 + NAT 类型 + 缓冲膨胀 + MTU</span>
+              <span class="g-card-go">点击开始 →</span></button>
+            <button class="g-card"><span class="g-card-ic"><svg class="ic"><use href="#i-wifi"/></svg></span>
+              <span class="g-card-t">WiFi 信号差</span>
+              <span class="g-card-d">WiFi 信号 + 信道干扰 + 网关 + 局域网</span>
+              <span class="g-card-go">点击开始 →</span></button>
+            <button class="g-card site"><span class="g-card-ic"><svg class="ic"><use href="#i-site"/></svg></span>
+              <span class="g-card-t">现场检测</span>
+              <span class="g-card-d">客户信息 + 机房 6 项 → 一页报告/PDF</span>
+              <span class="g-card-go">点击开始 →</span></button>
+            <button class="g-card" style="grid-column:2;"><span class="mark" style="left:10px; top:-10px;">孤行</span>
+              <span class="g-card-ic"><svg class="ic"><use href="#i-monitor"/></svg></span>
+              <span class="g-card-t">持续盯障</span>
+              <span class="g-card-d">定时监测外网, 抓偶发掉线/抖动</span>
+              <span class="g-card-go">点击开始 →</span></button>
+          </div>
+          <div class="g-fullrow"><span class="mark" style="left:0; top:-22px;">间距可收紧</span>
+            <button class="g-btn2"><svg class="ic"><use href="#i-full"/></svg>完整诊断</button>
+            <button class="g-link2">高级模块组合 ›</button>
+            <span class="g-dim num">全部 23 项, 含压测, 客户网络慎用</span>
+            <button class="g-link">查看上次报告</button></div>
+        </div>
+        <div class="ruler"><span>卡片 174px × 3 行 = 554px · 标题区 69px · 首屏 847px ↑</span></div>
+      </div>
+    </div>
+    <ul class="notes">
+      <li><b>问题 1 · 一屏放不下</b>：主页总高 847px，窗口 860px——「上次没跑完」横幅（约 +80px）一出现即滚动。</li>
+      <li><b>问题 2 · 不对称</b>：7 卡 3 行，第 7 张孤行居中，视觉重心歪。</li>
+      <li><b>问题 3 · 卡片虚高</b>：单卡实测 174px（图标 46 + 上下留白 38），副行文案一行都撑不满，下半截全是空的。</li>
+      <li><b>问题 4 · 副行无信息</b>：7 处重复「点击开始 →」；服务端已下发的模块数（7/5/8/6/4 项）没展示。</li>
+    </ul>
+  </div>
+
+  <!-- ═══════════ 节 2 · 方案 A ═══════════ -->
+  <div class="sec">
+    <div class="sec-head"><span class="no">02</span><span class="t">方案 A · 上下布局收紧（推荐）</span>
+      <span class="pill navy">选型候选</span>
+      <span class="r">1180×720 · 本稿实测主页总高 613px（<b>含横幅 ≈693 &lt; 720</b>）</span></div>
+    <div class="sec-desc">保持现有卡片骨架（图标上、文字下），压缩图标与留白；副行换成模块规模。
+    结构与现状最接近，风险最小。</div>
+
+    <div class="win s1180 a">
+      <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>
+        <span class="wt">NetPulse 网络诊断</span><span class="sz num">1180 × 720 · 默认窗口</span></div>
+      <div class="pv a-home">
+        <div class="g-top"><span class="g-mark">NP</span><span class="g-brand">NetPulse</span>
+          <span class="g-ver num">v1.26.0</span><span class="g-spring"></span>
+          <span class="g-host"><span class="g-dot"></span><span class="g-netword">已联网</span><span>DESKTOP-XXXX</span></span></div>
+        <div style="margin-top:22px;">
+          <div class="a-h1 chg"><span class="mark" style="right:0; top:-22px;">26px→22px</span>今天网络哪里不舒服？</div>
+          <div class="a-sub">点一张卡片就开始测，测完直接出报告。</div>
+          <div class="a-cards chg">
+            <span class="mark" style="left:0; top:-22px;">7卡→6卡 · 卡片 174→140px · 间距 24→14 / 16→12</span>
+            <button class="a-card"><span class="mark new" style="right:8px; bottom:6px;">副行换规模</span>
+              <span class="a-ic"><svg class="ic"><use href="#i-slow"/></svg></span>
+              <span class="a-t">网页打开慢</span>
+              <span class="a-d">测速 + 缓冲膨胀 + DNS + 网页体验 + WiFi + MTU/路由 + TCP 质量</span>
+              <span class="a-go"><b class="num">11</b> 项模块 · 约 6–10 分钟</span></button>
+            <button class="a-card"><span class="a-ic"><svg class="ic"><use href="#i-disconnect"/></svg></span>
+              <span class="a-t">经常断网</span>
+              <span class="a-d">外网连通 + 网关丢包 + DNS + 环路</span>
+              <span class="a-go"><b class="num">5</b> 项模块</span></button>
+            <button class="a-card"><span class="a-ic"><svg class="ic"><use href="#i-gaming"/></svg></span>
+              <span class="a-t">游戏卡顿</span>
+              <span class="a-d">延迟抖动 + NAT 类型 + 缓冲膨胀 + MTU</span>
+              <span class="a-go"><b class="num">6</b> 项模块</span></button>
+            <button class="a-card"><span class="a-ic"><svg class="ic"><use href="#i-wifi"/></svg></span>
+              <span class="a-t">WiFi 信号差</span>
+              <span class="a-d">WiFi 信号 + 信道干扰 + 网关 + 局域网</span>
+              <span class="a-go"><b class="num">3</b> 项模块</span></button>
+            <button class="a-card site"><span class="a-ic"><svg class="ic"><use href="#i-site"/></svg></span>
+              <span class="a-t">现场检测</span>
+              <span class="a-d">客户信息 + 机房 6 项 → 一页报告/PDF</span>
+              <span class="a-go">向导式 · 机房 6 项核对</span></button>
+            <button class="a-card"><span class="a-ic"><svg class="ic"><use href="#i-monitor"/></svg></span>
+              <span class="a-t">持续盯障</span>
+              <span class="a-d">定时监测外网, 抓偶发掉线/抖动</span>
+              <span class="a-go">后台运行 · 随时可停</span></button>
+          </div>
+          <div class="a-fullrow chg"><span class="mark" style="left:0; top:-20px;">间距 22/20→14/14</span>
+            <button class="g-btn2"><svg class="ic"><use href="#i-full"/></svg>完整诊断</button>
+            <button class="g-link2">高级模块组合 ›</button>
+            <span class="g-dim num">全部 23 项, 含压测, 客户网络慎用</span>
+            <button class="g-link">查看上次报告</button></div>
+        </div>
+      </div>
+    </div>
+    <ul class="notes">
+      <li><b>改动</b>：顶栏 58→52px；标题 26→22px；卡区上边距 24→14、卡间距 16→12；图标 46→32px；
+        卡片内边距 20/18→13/12；单卡 174→<b>140–151px</b>（合并卡副行折两行时 151）。</li>
+      <li class="a"><b>副行新文案（数据来自已下发的 modules 字段）</b>：场景卡「N 项模块」；
+        合并卡多一句耗时预告「约 6–10 分钟」（11 项里测速/缓冲膨胀占大头，按现状节奏估算，
+        实现后用真实跑一轮的时间校准）；site/monitor 卡给等价规模提示。若不想写耗时数字，
+        删掉后半句即可，版式不受影响。</li>
+      <li><b>合并卡图标</b>：建议用仪表（慢）而不是「网页+×」（失败）——标题语义落点是「慢」；
+        实现时同步改 ICONS 映射。</li>
+      <li><b>高度账（本稿实测）</b>：主页总高 <b>613px</b>（顶栏 52 + 标题区 ~99 + 两行卡 314 + 底行 ~76 + 边距）；
+        加续跑横幅 ≈ 693px &lt; 720 —— <b>横幅出现也不滚动</b>；若嫌紧，副行耗时句删除后单卡回落到 140。</li>
+    </ul>
+  </div>
+
+  <!-- ═══════════ 节 3 · 方案 B ═══════════ -->
+  <div class="sec">
+    <div class="sec-head"><span class="no">03</span><span class="t">方案 B · 图标左置横排</span>
+      <span class="pill ghost">选型候选</span>
+      <span class="r">1180×720 · 本稿实测主页总高 518px</span></div>
+    <div class="sec-desc">图标挪到左侧、文字右排，卡片压成矮排。信息密度最高、页面最矮，
+    但「卡片感」减弱、更像列表。</div>
+
+    <div class="win s1180 b">
+      <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>
+        <span class="wt">NetPulse 网络诊断</span><span class="sz num">1180 × 720 · 默认窗口</span></div>
+      <div class="pv b-home">
+        <div class="g-top"><span class="g-mark">NP</span><span class="g-brand">NetPulse</span>
+          <span class="g-ver num">v1.26.0</span><span class="g-spring"></span>
+          <span class="g-host"><span class="g-dot"></span><span class="g-netword">已联网</span><span>DESKTOP-XXXX</span></span></div>
+        <div style="margin-top:22px;">
+          <div class="b-h1">今天网络哪里不舒服？</div>
+          <div class="b-sub">点一张卡片就开始测，测完直接出报告。</div>
+          <div class="b-cards" style="margin-top:14px;">
+            <button class="b-card"><span class="b-ic"><svg class="ic"><use href="#i-slow"/></svg></span>
+              <span class="b-body"><span class="b-t">网页打开慢</span>
+                <span class="b-d">测速 + 缓冲膨胀 + DNS + 网页体验 + WiFi + MTU/路由</span>
+                <span class="b-go"><b class="num">11</b> 项模块 · 约 6–10 分钟</span></span></button>
+            <button class="b-card"><span class="b-ic"><svg class="ic"><use href="#i-disconnect"/></svg></span>
+              <span class="b-body"><span class="b-t">经常断网</span>
+                <span class="b-d">外网连通 + 网关丢包 + DNS + 环路</span>
+                <span class="b-go"><b class="num">5</b> 项模块</span></span></button>
+            <button class="b-card"><span class="b-ic"><svg class="ic"><use href="#i-gaming"/></svg></span>
+              <span class="b-body"><span class="b-t">游戏卡顿</span>
+                <span class="b-d">延迟抖动 + NAT 类型 + 缓冲膨胀 + MTU</span>
+                <span class="b-go"><b class="num">6</b> 项模块</span></span></button>
+            <button class="b-card"><span class="b-ic"><svg class="ic"><use href="#i-wifi"/></svg></span>
+              <span class="b-body"><span class="b-t">WiFi 信号差</span>
+                <span class="b-d">WiFi 信号 + 信道干扰 + 网关 + 局域网</span>
+                <span class="b-go"><b class="num">3</b> 项模块</span></span></button>
+            <button class="b-card site"><span class="b-ic"><svg class="ic"><use href="#i-site"/></svg></span>
+              <span class="b-body"><span class="b-t">现场检测</span>
+                <span class="b-d">客户信息 + 机房 6 项 → 一页报告/PDF</span>
+                <span class="b-go">向导式 · 机房 6 项核对</span></span></button>
+            <button class="b-card"><span class="b-ic"><svg class="ic"><use href="#i-monitor"/></svg></span>
+              <span class="b-body"><span class="b-t">持续盯障</span>
+                <span class="b-d">定时监测外网, 抓偶发掉线/抖动</span>
+                <span class="b-go">后台运行 · 随时可停</span></span></button>
+          </div>
+          <div class="b-fullrow">
+            <button class="g-btn2"><svg class="ic"><use href="#i-full"/></svg>完整诊断</button>
+            <button class="g-link2">高级模块组合 ›</button>
+            <span class="g-dim num">全部 23 项, 含压测, 客户网络慎用</span>
+            <button class="g-link">查看上次报告</button></div>
+        </div>
+      </div>
+    </div>
+    <ul class="notes">
+      <li><b>与方案 A 的差别</b>：单卡 92–104px（图标 38 左置 + 右侧三行），两行卡 ≈220px；
+        主页总高实测 <b>518px</b>，比 A 再省约 95px。</li>
+      <li><b>代价</b>：合并卡的 7 组文案在右栏只能排 2 行，横排卡里文字换行的节奏不如竖排舒服；
+        深色 site 卡在矮排里视觉分量偏重。</li>
+      <li>两方案的顶栏/标题区/底行/窗口尺寸/文案改动完全一致，只差卡片骨架。</li>
+    </ul>
+  </div>
+
+  <!-- ═══════════ 节 4 · 变动清单 ═══════════ -->
+  <div class="sec">
+    <div class="sec-head"><span class="no">04</span><span class="t">变动与不变清单</span>
+      <span class="pill amber">全覆盖</span></div>
+    <table class="chg-tb">
+      <tr><th>类型</th><th>位置</th><th>内容</th></tr>
+      <tr><td class="typ t-mod">变更</td><td>主页卡片</td>
+        <td>7→6 张（3×2）；「网络很慢」+「网页打不开」合并为<b>「网页打开慢」</b>，模块集并集 11 项、规则集并集 7 条</td></tr>
+      <tr><td class="typ t-mod">变更</td><td>卡片尺寸</td>
+        <td>方案 A：图标 46→32、内边距 20/18→13/12、单卡 174→140–151；方案 B：图标左置横排 92–104px（均为本稿实测）</td></tr>
+      <tr><td class="typ t-mod">变更</td><td>卡片副行</td>
+        <td>「点击开始 →」→ 模块规模（<code>N 项模块</code>，数据用已下发的 modules 字段；site/monitor 给等价提示）</td></tr>
+      <tr><td class="typ t-mod">变更</td><td>标题区/间距</td>
+        <td>顶栏 58→52；标题 26→22px；卡区上距 24→14；底行间距 22/20→14/14；主页左右 padding 36→32</td></tr>
+      <tr><td class="typ t-mod">变更</td><td>窗口默认</td>
+        <td><code>--window-size=1280,860</code> → <code>1180,720</code>（降级链不变）</td></tr>
+      <tr><td class="typ t-mod">变更</td><td>终端菜单</td>
+        <td>场景区 5→4 行；工具键位 6/7/9/A → <code>5/6/7/A</code>；场景文案同源更新（见 05 节）</td></tr>
+      <tr><td class="typ t-mod">变更</td><td>现场检测页</td>
+        <td>限宽盒 720 靠左 → <b>760 居中</b>（更正：步骤条本就在盒内，「通栏失衡」为体检误读；见 06 节）</td></tr>
+      <tr><td class="typ t-new">新增</td><td>合并卡副行</td>
+        <td>耗时预告「约 6–10 分钟」（可选项，实现后按实测校准，不想要可删）</td></tr>
+      <tr><td class="typ t-new">新增</td><td>合并卡图标</td>
+        <td>仪表图标映射（标题语义「慢」，替换原「网页+×」）</td></tr>
+      <tr><td class="typ t-keep">不变</td><td>报告页 / 进度页 / 盯障三视图 / 模块面板</td>
+        <td>结构与信息层级零变化（窗口变矮后盯障实时页 707px 仍无滚动）</td></tr>
+      <tr><td class="typ t-keep">不变</td><td>导出链</td>
+        <td>HTML/PDF/JSON 报告、现场检测四件套、golden 基线逐字节不动</td></tr>
+      <tr><td class="typ t-keep">不变</td><td>诊断口径</td>
+        <td>评分、规则实现、判级、豁免逻辑不动——只改「场景 → 模块/规则」映射表</td></tr>
+      <tr><td class="typ t-keep">不变</td><td>安全闸</td>
+        <td>textContent 规则、无 iframe、状态色服务端下发、/api/run 白名单语义</td></tr>
+    </table>
+  </div>
+
+  <!-- ═══════════ 节 5 · 终端菜单 ═══════════ -->
+  <div class="sec">
+    <div class="sec-head"><span class="no">05</span><span class="t">终端菜单改后示意</span>
+      <span class="pill ghost">同步合并</span></div>
+    <div class="sec-desc">场景区 4 行、工具区键位顺序重排（5/6/7/A，不留空洞）。文案与 GUI 同源
+    （SCENE_LABELS / SCENE_MENU_DESC）。</div>
+    <div class="term">
+      <div class="term-title">NetPulse — 交互菜单（改后）</div>
+      <div class="term-body"><span class="hd">按问题选场景</span>
+ <span class="k"> 1 </span> 网页打开慢    <span class="ds">测速 + 缓冲膨胀 + DNS + 网页体验 + WiFi + MTU/路由 + TCP 质量</span>
+ <span class="k"> 2 </span> 经常断网      <span class="ds">外网连通 + 网关丢包 + DNS + 环路</span>
+ <span class="k"> 3 </span> 游戏卡顿      <span class="ds">延迟抖动 + NAT 类型 + 缓冲膨胀 + MTU</span>
+ <span class="k"> 4 </span> WiFi 信号差   <span class="ds">WiFi 信号 + 信道干扰 + 网关 + 局域网</span>
+
+<span class="hd">工具与报告</span>
+ <span class="k"> 5 </span> 现场检测      <span class="ds">客户信息 + 机房 6 项 → 一页报告/PDF</span>
+ <span class="k"> 6 </span> 持续盯障      <span class="ds">定时监测外网, 抓偶发掉线/抖动</span>
+ <span class="k"> 7 </span> 高级选项      <span class="ds">模块级单测 / 工程师功能</span>
+ <span class="k"> A </span> 管理员模式    <span class="ds">抓包取证、Npcap 安装需要</span></div>
+    </div>
+    <ul class="notes">
+      <li>合并卡的副行是 7 组能力的全量罗列，终端宽度足够；GUI 卡片里同一句会折两行（方案 A 留了两行空间）。</li>
+      <li>旧键位 <code>9 高级选项</code> 顺位改 7；<code>8</code> 恢复为无效键（按既有无效键提示处理）。</li>
+    </ul>
+  </div>
+
+  <!-- ═══════════ 节 6 · 现场检测页 ═══════════ -->
+  <div class="sec">
+    <div class="sec-head"><span class="no">06</span><span class="t">现场检测页 · 版式对齐</span>
+      <span class="pill ghost">顺手修正</span></div>
+    <div class="sec-desc">更正：步骤条本就在表单盒内（初稿「通栏」为误读）。真实问题是
+    720px 限宽盒整体<b>靠左</b>、宽窗下右侧大片留白；改后整体居中、限宽 720→760。</div>
+    <div class="win s1180">
+      <div class="win-title"><span class="dots"><i></i><i></i><i></i></span>
+        <span class="wt">现场检测（改后）</span><span class="sz num">限宽 760 · 居中</span></div>
+      <div class="pv site-demo">
+        <div class="site-form-w chg"><span class="mark" style="right:0; top:-20px;">720 靠左 → 760 居中</span>
+          <div class="site-steps" style="border-color:var(--rule); padding:8px 0; margin-bottom:10px;">
+            <i class="on"><b>1</b>填写信息</i><span class="ln"></span>
+            <i><b>2</b>自动诊断</i><span class="ln"></span>
+            <i><b>3</b>机房核对</i><span class="ln"></span>
+            <i><b>4</b>产出报告</i></div>
+          <div class="site-flabel">客户名称 <span style="color:var(--red);">*</span></div>
+          <div class="site-input">如：张伟 · 幸福小区 3-502</div>
+          <div class="site-foot"><button class="g-btn2">开始检测</button>
+            <span class="g-dim">大约 5–10 分钟，测完进入机房核对。</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sec" style="margin-top:40px;">
+    <div class="sec-desc">选型确认后：方案数值回写 spec §2 → 实施按 docs/verify.md S1–S9 验收。</div>
+  </div>
+
+</div>
+</body>
+</html>

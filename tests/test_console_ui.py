@@ -178,13 +178,16 @@ class TestMenuItems(unittest.TestCase):
         text = N._ANSI_RE.sub("", "\n".join(N._menu_item_lines(show_desc=True)))
         self.assertIn("按问题选场景", text)
         self.assertIn("工具与报告", text)
-        for key in "12345679A":
+        # v1.26.0: 场景 1-4 + 工具 5/6/7/A (8 恢复无效键, 9 退役)
+        for key in "1234567A":
             self.assertIn(f" {key} ", text, f"菜单缺键位 {key}")
+        for gone in (" 8 ", " 9 "):
+            self.assertNotIn(gone, text, f"键位{gone.strip()}不应出现在菜单")
 
     def test_desc_toggle(self):
         wide = "\n".join(_plain(N._menu_item_lines(show_desc=True)))
         narrow = "\n".join(_plain(N._menu_item_lines(show_desc=False)))
-        desc = N.SCENE_MENU_DESC["slow"]
+        desc = N.SCENE_MENU_DESC["web"]
         self.assertIn(desc, wide)
         self.assertNotIn(desc, narrow, "窄终端应收起副行")
         for p, d in N.SCENE_MENU_DESC.items():
@@ -192,10 +195,11 @@ class TestMenuItems(unittest.TestCase):
 
     def test_desc_matches_profile_modules(self):
         """副行不得承诺场景模块之外的能力 (抽查关键词)。"""
-        pairs = {"gaming": "NAT", "wifi": "WiFi", "slow": "测速",
-                 "web": "DNS", "disconnect": "外网"}
-        for p, kw in pairs.items():
-            self.assertIn(kw, N.SCENE_MENU_DESC[p])
+        pairs = {"gaming": "NAT", "wifi": "WiFi",
+                 "web": ("测速", "DNS", "网页体验"), "disconnect": "外网"}
+        for p, kws in pairs.items():
+            for kw in (kws if isinstance(kws, tuple) else (kws,)):
+                self.assertIn(kw, N.SCENE_MENU_DESC[p])
 
     def test_no_background_fill(self):
         """菜单行不得铺底色 (实机反馈: ANSI 100 在经典 conhost 是明显灰带)。"""

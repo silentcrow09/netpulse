@@ -52,7 +52,7 @@ class TestGuiSession(unittest.TestCase):
     def setUp(self):
         np._GUI_RESET_FOR_TEST()      # 测试隔离: 清模块级单例/事件
 
-    def _patch_pipeline(self, profile="slow", fail=False):
+    def _patch_pipeline(self, profile="web", fail=False):
         keys = list(np.DIAGNOSE_PROFILES[profile])
         run = _fake_run(keys)
         # 终审 F2: health/summary 是真实 build_report 产物的既有键形态
@@ -84,7 +84,7 @@ class TestGuiSession(unittest.TestCase):
         with p, pd, pb, \
              mock.patch.object(np, "_enrich_diagnosis_evidence",
                                side_effect=lambda d, r, e: d):
-            ok, err = s.start("slow")
+            ok, err = s.start("web")
             self.assertTrue(ok)
             s._thread.join(timeout=5)
         snap = s.snapshot()
@@ -101,7 +101,7 @@ class TestGuiSession(unittest.TestCase):
         with p, pd, pb, \
              mock.patch.object(np, "_enrich_diagnosis_evidence",
                                side_effect=lambda d, r, e: d):
-            s.start("slow")
+            s.start("web")
             s._thread.join(timeout=5)
         v = s.snapshot()["verdict"]
         self.assertEqual(v["score"], 92)
@@ -123,7 +123,7 @@ class TestGuiSession(unittest.TestCase):
             return run
         p2 = mock.patch.object(np, "run_diagnostics", side_effect=_slow_rd)
         with p2, pd, pb:
-            ok, _ = s.start("slow")
+            ok, _ = s.start("web")
             self.assertTrue(ok)
             ok2, err2 = s.start("web")
             self.assertFalse(ok2)
@@ -183,7 +183,7 @@ class TestGuiSession(unittest.TestCase):
              mock.patch.object(np, "export_report", side_effect=_fake_export), \
              mock.patch.object(np, "_find_pdf_browser", return_value="C:/x/chrome.exe"), \
              mock.patch.object(np, "_html_to_pdf", side_effect=_fake_pdf):
-            s.start("slow"); s._thread.join(timeout=5)
+            s.start("web"); s._thread.join(timeout=5)
             p1, e1 = s.export("html")
             p2, e2 = s.export("json")
             p3, e3 = s.export("pdf")
@@ -204,7 +204,7 @@ class TestGuiSession(unittest.TestCase):
         s = np._GuiSession()
         with p, pd, pb, \
              mock.patch.object(np, "_enrich_diagnosis_evidence", side_effect=lambda d, r, e: d):
-            s.start("slow"); s._thread.join(timeout=5)
+            s.start("web"); s._thread.join(timeout=5)
         snap = s.snapshot()
         self.assertEqual(snap["phase"], "error")
         self.assertTrue(snap["error"])

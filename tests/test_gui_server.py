@@ -51,7 +51,7 @@ v1.23.0 模块勾选面板 (Task 1: 服务端 keys 形态 + module_catalog + 配
   P22 iperf3_server / use_speedtest_net 注入: 非法 iperf3 → 400 不写
       (CLI 同口径); 留空 → server 重置 None; use_speedtest_net 仅
       speedtest 在 keys 里才消费, 字段缺失重置 False
-  P23 每轮自决定 (终审 #1/#2): keys 开 Ookla 后 {profile:"slow"} 不带
+  P23 每轮自决定 (终审 #1/#2): keys 开 Ookla 后 {profile:"web"} 不带
       字段 → use_speedtest_net 重置 False (不跨轮残留); 非布尔
       (字符串 "false") 按缺失处理走重置, 不被 bool() 误判 True
   P24 keys 组合导出 (终审 #4): export path 文件名带「模块组合 (N 项)」
@@ -281,7 +281,7 @@ class TestGuiServer(unittest.TestCase):
     def test_run_conflict_409(self):
         self.session._phase = "running"     # 直接摆成忙
         st, raw = _req(self.port, "POST", "/api/run?t=" + self.token,
-                       body={"profile": "slow"})
+                       body={"profile": "web"})
         self.assertEqual(st, 409)
 
     # -- v1.22.0 盯障路由 (P8–P12) --
@@ -393,7 +393,7 @@ class TestGuiServer(unittest.TestCase):
                        body={"minutes": 10})
         self.assertEqual(st, 409)           # 同类 running → 同一忙闸
         st, raw = _req(self.port, "POST", "/api/run" + tok,
-                       body={"profile": "slow"})
+                       body={"profile": "web"})
         self.assertEqual(st, 409)
         self.assertEqual(json.loads(raw)["reason"], "busy")
 
@@ -731,7 +731,7 @@ class TestKeysRun(unittest.TestCase):
             {"keys": []},                        # 空
             {"keys": "dns"},                     # 非数组
             {"keys": ["dns", 123]},              # 非字符串项
-            {"keys": ["dns"], "profile": "slow"},   # 同现
+            {"keys": ["dns"], "profile": "web"},   # 同现
         ]
         for body in cases:
             st, raw = self._post(body)
@@ -871,7 +871,7 @@ class TestKeysRun(unittest.TestCase):
 
     # -- P23: 每轮自决定 — profile 形态重置 + bool 防御 (终审 #1/#2) --
     def test_ookla_not_leak_into_profile_run(self):
-        """面板开 Ookla 后, 场景卡 {profile:"slow"} 请求不带该字段 →
+        """面板开 Ookla 后, 场景卡 {profile:"web"} 请求不带该字段 →
         无条件重置 False。slow 含 speedtest, 不重置会静默沿用 True
         污染场景运行 (spec F2/S3.1「留空 = 诚实降级」)。"""
         pipes = self._patch_pipeline({})
@@ -882,7 +882,7 @@ class TestKeysRun(unittest.TestCase):
             self._wait_done()
         self.assertIs(np.SPEEDTEST_CONFIG["use_speedtest_net"], True)
         with pipes[0], pipes[1], pipes[2], pipes[3]:
-            st, raw = self._post({"profile": "slow"})
+            st, raw = self._post({"profile": "web"})
             self.assertEqual(st, 200)
             self._wait_done()
         self.assertIs(np.SPEEDTEST_CONFIG["use_speedtest_net"], False)

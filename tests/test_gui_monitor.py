@@ -295,7 +295,7 @@ class TestGuiMonitor(unittest.TestCase):
 
     def test_busy_session_rejects_monitor(self):
         s = np._GuiSession()
-        ok, err = s._begin("slow", ["dns"])    # 不起线程, 只置 running
+        ok, err = s._begin("web", ["dns"])    # 不起线程, 只置 running
         self.assertTrue(ok, err)
         np._GuiHandler.session = s
         self.assertTrue(np._gui_net_busy())
@@ -324,7 +324,7 @@ class TestGuiMonitor(unittest.TestCase):
             ok, err, _ = m.start(600)
             self.assertTrue(ok, err)
             self.assertTrue(np._gui_net_busy())
-            ok2, err2 = s.start("slow")
+            ok2, err2 = s.start("web")
         self.assertFalse(ok2)
         self.assertIn("网络活动", err2)
         self.assertEqual(s.snapshot()["phase"], "idle")

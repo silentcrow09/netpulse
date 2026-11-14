@@ -175,10 +175,10 @@ class TestExclusiveModeNotice(unittest.TestCase):
     def test_diagnose_branch_warns_monitor_ignored(self):
         buf = io.StringIO()
         with mock.patch.object(sys, "argv",
-                               ["netpulse.py", "--diagnose", "slow", "--monitor", "60"]), \
+                               ["netpulse.py", "--diagnose", "web", "--monitor", "60"]), \
              mock.patch.object(N, "run_diagnostics", return_value=None), \
              mock.patch.object(N, "LAST_RUN",
-                               {"status": {"slow": "完成"}, "results": {}}), \
+                               {"status": {"web": "完成"}, "results": {}}), \
              contextlib.redirect_stdout(buf):
             with self.assertRaises(SystemExit):
                 N.main()

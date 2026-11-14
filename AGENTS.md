@@ -118,6 +118,22 @@
 - 页面动态数据一律 `textContent`，禁止 innerHTML 插值；
 - `--cli`/`--json`/非 TTY 契约永不进 GUI。
 
+### 场景合并与主页紧凑化（v1.26.0 增补）
+
+- **场景 4 个，全入口同源**：「网页打开慢」（`web`，合并场景——原「网络很慢」
+  `slow` 已退役）、「经常断网」「游戏卡顿」「WiFi 信号差」。`DIAGNOSE_PROFILES`
+  是模块集唯一来源；`PROFILE_RULES` 是场景规则集唯一来源（web = 原 slow ∪ 原
+  web 共 7 条）。`SCENE_LABELS` / `SCENE_MENU_KEYS`（1-4）/ `SCENE_MENU_DESC`
+  / `_SCENE_TOOL_ITEMS`（5/6/7/A）是文案与键位唯一来源 —— GUI 卡片与终端菜单
+  都从这里取，**不要再造第二份**。
+- **`slow` 是非法 profile**：`/api/run {profile:"slow"}` 走白名单校验被拒；
+  旧续跑点里的 `profile:"slow"` 不崩溃（执行依据是 keys，label 是落盘时存的
+  中文文案）。
+- **主页一屏契约**：窗口默认 `--window-size=1180,720`；主页 6 卡 3×2、卡片
+  副行 = 模块规模（数据用 `/api/scenarios` 下发的 `modules` 字段）；视口
+  1180×720 下主页 `scrollHeight ≤ 720`（含续跑横幅出现时）—— 改主页排版时
+  守住这条，别把一屏契约改丢了。
+
 ### 盯障窗口（v1.22.0 增补两条）
 
 - **节流红线**：GUI 轮询的服务端重算必须节流——进度类 ≥2s、曲线/事件预览类
@@ -339,7 +355,7 @@
 
 ## 现场检测模式 (v1.13.0)
 
-- **入口**：场景菜单 `[6]` / CLI `--site`（`--customer` 预填客户名）。
+- **入口**：场景菜单 `[5]` / CLI `--site`（`--customer` 预填客户名）。
   独立顶层模式，与其他模块互斥；需交互终端（非 TTY 直接报错）。
 - **口径**：诊断走 `all_module_keys()`（排除 tcpcc 压测）且剔除 port/iperf3
   （无配置自动跳过）—— 不在客户网络里制造压测负载。

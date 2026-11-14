@@ -595,18 +595,22 @@ class TestDiagnoseMain(unittest.TestCase):
 
 
 class TestProfiles(unittest.TestCase):
-    """C3: 5 个 Profile 定义."""
+    """C3: Profile 定义 (v1.26.0 起合并为 4 个)."""
 
-    def test_5_profiles_defined(self):
-        self.assertEqual(len(N.DIAGNOSE_PROFILES), 5)
-        for name in ("slow", "disconnect", "web", "gaming", "wifi"):
+    def test_4_profiles_defined(self):
+        self.assertEqual(len(N.DIAGNOSE_PROFILES), 4)
+        for name in ("web", "disconnect", "gaming", "wifi"):
             self.assertIn(name, N.DIAGNOSE_PROFILES)
+        # v1.26.0: slow 退役 (合并进 web)
+        self.assertNotIn("slow", N.DIAGNOSE_PROFILES)
 
-    def test_slow_profile_modules(self):
-        mods = N.DIAGNOSE_PROFILES["slow"]
-        # 期望: gateway / wifi / speedtest / bufferbloat / tcp / dns
-        for m in ("gateway", "wifi", "speedtest", "bufferbloat", "tcp", "dns"):
-            self.assertIn(m, mods)
+    def test_web_merged_profile_modules(self):
+        """v1.26.0: web = 原 slow ∪ 原 web 全并集 (11 项)."""
+        mods = N.DIAGNOSE_PROFILES["web"]
+        expected = {"gateway", "external", "dns", "wifi", "web", "tcp",
+                    "tcpstats", "mtu", "route", "speedtest", "bufferbloat"}
+        self.assertEqual(set(mods), expected)
+        self.assertEqual(len(mods), 11)
 
     def test_disconnect_profile_modules(self):
         mods = N.DIAGNOSE_PROFILES["disconnect"]
@@ -642,27 +646,31 @@ class TestProfileRulesV17(unittest.TestCase):
             self.assertIn("mtu_blackhole", N.PROFILE_RULES[scene])
             self.assertIn("tcp_loss_burst", N.PROFILE_RULES[scene])
 
-    def test_slow_includes_tcp_loss_only(self):
-        """网慢场景看传输层丢包; MTU 由 diagnose 补采模块覆盖, 不占场景过滤."""
-        self.assertIn("tcp_loss_burst", N.PROFILE_RULES["slow"])
-        self.assertNotIn("mtu_blackhole", N.PROFILE_RULES["slow"])
+    def test_web_merged_includes_slow_rules(self):
+        """v1.26.0: web 规则集 = 原 slow ∪ 原 web (7 条), 含 wifi_weak 与测速系."""
+        rules = N.PROFILE_RULES["web"]
+        for rid in ("tcp_loss_burst", "wifi_weak", "bufferbloat",
+                    "mtu_blackhole", "wan_interruption", "dns_failure",
+                    "gateway_loss"):
+            self.assertIn(rid, rules)
+        self.assertEqual(len(rules), 7)
 
     def test_disconnect_excludes_new_rules(self):
         """掉线场景聚焦连通性, 不掺 MTU/重传."""
         self.assertNotIn("mtu_blackhole", N.PROFILE_RULES["disconnect"])
         self.assertNotIn("tcp_loss_burst", N.PROFILE_RULES["disconnect"])
 
-    def test_slow_diagnose_evaluates_5_rules(self):
-        """slow 场景命中过滤时 rules_evaluated = 过滤条数 (5)."""
+    def test_web_diagnose_evaluates_7_rules(self):
+        """web 场景命中过滤时 rules_evaluated = 过滤条数 (7)."""
         r = _healthy_full()
         r["wifi"] = {"overall_interference": "干扰较高", "issues": []}
-        report = N.diagnose(r, rule_filter="slow")
+        report = N.diagnose(r, rule_filter="web")
         self.assertIn("wifi_weak", [x.id for x in report.root_causes])
-        self.assertEqual(report.rules_evaluated, 5)
+        self.assertEqual(report.rules_evaluated, 7)
 
-    def test_slow_profile_collects_tcpstats(self):
-        """slow 场景补采 tcpstats 模块 (重传率判据的数据源)."""
-        self.assertIn("tcpstats", N.DIAGNOSE_PROFILES["slow"])
+    def test_web_profile_collects_tcpstats(self):
+        """web 场景补采 tcpstats 模块 (重传率判据的数据源)."""
+        self.assertIn("tcpstats", N.DIAGNOSE_PROFILES["web"])
 
 
 class TestEvidenceChainConsumption(unittest.TestCase):
