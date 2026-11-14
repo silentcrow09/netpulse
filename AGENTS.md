@@ -173,6 +173,28 @@
   总数）；既有报告 requested == ran → 输出逐字节不变。新代码一律显式传
   `build_report(run=...)`，不读全局 `LAST_RUN`。
 
+### 报告/结果页原生渲染（v1.25.0）
+
+- **报告数据唯一通道是投影**：诊断走 `_gui_report_view`（`/api/report` 下发
+  JSON，**不含** `tech.raw_results` 与模块 `raw` 大对象）；盯障走
+  `_gui_monitor_report_view`（读落盘 JSON 回放，曲线服务端降采样 ≤240 点/流，
+  丢包点 ms=null 保留）。投影按需拉取、不进轮询、不持 `_GUI_ACT_LOCK`。
+- **屏幕版数字零自算**：分数/算式行/待办/模块展开集合/扣分表全部取自投影与
+  共享口径函数（`_score_formula` / `_todo_issues_data` / `_conf_band` /
+  `SCORE_PENALTY`），JS 只画不算；模块折叠口径（首要根因 / PROBLEM_STATUSES）
+  由投影的 `expanded` 给出。状态色仍经 `/api/scenarios`（新增 `grade_badges`
+  下发 `GRADE_BADGE` 二元组），页面不内嵌色表。
+- **iframe 已废除**：页面不得出现 `<iframe`（`test_gui_page.py` 闸住）；
+  报告视图容器是 `div#g-frame` / `div#mon-frame`，动态渲染仍走
+  textContent / createElementNS（P5 闸延续）。判级三态（命中根因 / 有未完成
+  模块 / 未匹配到根因）与导出报告同口径，屏幕版不写「无故障 / 高置信度」。
+- **导出链零回归锁**：`tests/test_report_golden.py` 固定 fixture 渲染
+  customer / brief / brief_v2 三份 HTML 与 `tests/fixtures/golden/` 基线逐字节
+  比对（换行归一）——**本文件「报告渲染」节的手工 Compare-Object 流程以此测试
+  自动化**；有意变更导出渲染器时 `python tests/test_report_golden.py --bless`
+  重生成基线并人工审 diff。投影与导出的口径一致性由 `tests/test_gui_report_view.py`
+  锁住。
+
 ## 诊断汇总口径（v1.19.x）
 
 终端诊断汇总框**只给两行**：健康分 + 异常模块数量，**不列异常模块清单**
@@ -230,9 +252,10 @@
   `_module_cards_section`（模块卡，178 行）/ `_host_info_section`（本机信息）/
   `_tech_appendix_section`（技术附录）。191 行 CSS 提成模块常量
   `CSS_CUSTOMER_REPORT`（与 `CSS_BRIEF_V2` 同一惯例）。
-  **拆分零回归验证方式**（改渲染代码后照做）：用固定 LAST_RUN fixture 渲染
-  customer/brief/brief_v2 三份 HTML 落盘，改前改后 `Compare-Object` 逐行比对，
-  必须完全一致。
+  **拆分零回归验证方式**（改渲染代码后照做）：`tests/test_report_golden.py`
+  已把本流程自动化 —— 固定 fixture 渲染 customer/brief/brief_v2 三份与
+  `tests/fixtures/golden/` 基线逐字节比对，测试红即渲染器被改动；有意变更时
+  `--bless` 重生成基线并逐行审查 diff（v1.25.0 起）。
 
 ## JSON Schema 必须与导出一致 (v1.14.14)
 
@@ -491,6 +514,9 @@ for f in tests/test_*.py; do python "$f"; done
 #   **异常上报 (v1.17.0 新增: 协议/脱敏/限流/探针保栈/端到端)**/
 #   **诊断中途取消/续跑 (v1.24.0 新增: 取消闸三处 + 续跑点 + 部分报告 + 页面分支
 #   + 「全测完的轮次」不写续跑点)**/
+#   **报告渲染 golden 基线 (v1.25.0 新增: customer/brief/brief_v2 逐字节锁)**/
+#   **报告投影口径一致性 (v1.25.0 新增: 屏幕版与导出同源、投影不含 raw 载荷、
+#   盯障落盘 JSON 回放投影)**/
 #   v1.14.14 已删 tests/test_parsers.py: 那 29 个用例测的 4 个解析器
 #   (parse_ipconfig / parse_route_print / parse_arp_a / parse_netsh_wlan_interfaces)
 #   **生产代码一次都没调用** —— ARPAnalyzer/RouteAnalyzer/WifiAnalyzer 都是各自

@@ -7,6 +7,43 @@
 
 ## [Unreleased]
 
+## [1.25.0] - 2026-11-14
+
+### 新增
+
+- **报告 / 结果页原生重构**（GUI）：诊断跑完、点「查看报告」、「查看上次报告」、
+  现场检测完成——看到的报告不再是嵌在 iframe 里的独立网页（双顶栏、双导航、
+  双滚动条），而是与主界面同一页面的**原生视图**：顶栏不变，自上而下为
+  Hero（分数环 + 算式行 + 双口径说明）→ 需要关注 → 关键指标图 → 模块明细
+  （即点即展）→ 诊断结论 → 本机信息 → 技术附录（默认折叠）。
+  设计稿选型：方案 A 单列流（`design_ref/gui/report_native_design_v1.html`）。
+- **盯障报告同样原生**：盯障结束的报告页改为页面内渲染——一句话结论横幅 +
+  统计卡（网关/外网丢包、中断、抖动、DNS 失败、TCP 重传率）+ 延迟双线
+  （丢包红点 + 丢包集中段色带）+ 事件表；原来「报告套在网页里」的观感一并消灭。
+- **报告数据通道 JSON 化**（为 Windows 客户端打底）：`/api/report` 与
+  `/api/monitor/report` 改为下发投影 JSON（服务端按需组装、不轮询），
+  页面只画不算——分数/计数/待办/展开集合与导出 HTML 报告同源
+  （`_score_formula` / `_todo_issues_data` / `SCORE_PENALTY`），口径漂移由
+  `tests/test_gui_report_view.py` 锁住。
+- **导出链 golden 回归锁**：`tests/test_report_golden.py` 固定 fixture 渲染
+  customer / brief / brief_v2 三份 HTML 与基线**逐字节**比对（AGENTS.md 原
+  「改前改后 Compare-Object」手工流程的自动化）。
+
+### 修复
+
+- **「web 嵌套在 web 里」根除**：删除报告视图与盯障报告的两个 iframe
+  （`#g-frame` / `#mon-frame` 原为 iframe，直指服务端现渲的完整 HTML 文档），
+  页面资产闸新增「零 iframe」断言；`session.report_html()` 与
+  `_GuiMonitor.report_html()` 现渲路径随之退役删除。
+
+### 说明
+
+- 导出交付物**完全不变**：存 HTML / 导出 PDF / 存原始数据、现场检测四件套、
+  盯障三件套的渲染器与落盘一字未动（golden 逐字节锁 + 盯障落盘契约测试）。
+- 屏幕版遵守既有口径铁律：无根因不写「无故障 / 高置信度」（三态：命中根因 /
+  有未完成模块 / 未匹配到根因）；双口径并排必写「实检 N/M 项 · K 项参与计分」；
+  状态色仍由 `/api/scenarios` 下发（新增 `grade_badges`），JS 不内嵌色表。
+
 ## [1.24.0] - 2026-11-13
 
 ### 新增
