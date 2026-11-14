@@ -20876,11 +20876,27 @@ def _band_counts_band(counts, modules, report):
     return (band_html, exempt_count, total_modules, all_counts,)
 
 
-def _todo_issues_section(modules):
-    """待办问题清单。
+def _todo_issues_data(modules):
+    """待办问题聚合 (纯数据 · v1.25.0)。
+
+    从 _todo_issues_section 抽出的聚合/去重/合并口径, 供两处共用:
+    - 客户报告 HTML (_todo_issues_section)
+    - GUI 报告投影 (_gui_report_view; 屏幕版数字零自算 —— JS 只画不算)
+    改聚合口径两处同步生效, 消费方不得各自再拆一遍。
 
     按 (severity, text) 去重避免多模块重复同一警告, 按模块聚合影响面,
     异常/警告/错误进清单、信息级只做轻量提示。
+
+    返回 {
+      "all_issues":   聚合去重后的全量条目 (含信息级, 已按严重度排序),
+      "need_cnt":     需关注条数 (异常/错误/警告, 去重后),
+      "top_issues":   顶部列表条目 (需关注前 10 条),
+      "merged":       顶部合并卡片 (同来源+同影响+同建议 → 一张卡),
+      "involved_cnt": 波及模块数 (去重),
+      "info_cnt":     信息级条数,
+      "hidden_cnt":   超出顶部 10 条的需关注条数,
+      "critical_cnt": 异常级问题数 (按「条目 × 波及模块」计),
+    }
     """
     todo_issues = []
     seen_keys = {}
@@ -20916,30 +20932,63 @@ def _todo_issues_section(modules):
         for nm in (i.get("_modules") or []):
             if nm and nm not in involved_mods:
                 involved_mods.append(nm)
-    scope_suffix = (f"（涉及 {len(involved_mods)} 个模块）"
-                    if len(involved_mods) > len(need_attention) else "")
 
-    if top_issues:
-        # 合并"同来源 + 同影响 + 同建议"的条目为一张卡 (如 IPv6 的两条异常):
-        # 标题用「；」连接多条问题, 卡片数更少、建议不重复刷屏
-        merged = []
-        merge_index = {}
-        for issue in top_issues:
-            gkey = (issue.get("_module", ""), issue.get("impact", ""),
-                    issue.get("action", ""), issue.get("severity", "信息"))
-            if gkey in merge_index:
-                hit = merged[merge_index[gkey]]
-                hit["_texts"].append(issue.get("text", ""))
-                # 合并卡片时累加波及模块数, 否则"影响 23 个模块"会被算成 1
-                hit["_dup"] = hit.get("_dup", 1) + issue.get("_dup", 1)
-                for nm in issue.get("_modules", []):
-                    if nm not in hit["_modules"]:
-                        hit["_modules"].append(nm)
-            else:
-                merge_index[gkey] = len(merged)
-                merged.append({**issue, "_texts": [issue.get("text", "")]})
+    # 合并"同来源 + 同影响 + 同建议"的条目为一张卡 (如 IPv6 的两条异常):
+    # 标题用「；」连接多条问题, 卡片数更少、建议不重复刷屏
+    merged = []
+    merge_index = {}
+    for issue in top_issues:
+        gkey = (issue.get("_module", ""), issue.get("impact", ""),
+                issue.get("action", ""), issue.get("severity", "信息"))
+        if gkey in merge_index:
+            hit = merged[merge_index[gkey]]
+            hit["_texts"].append(issue.get("text", ""))
+            # 合并卡片时累加波及模块数, 否则"影响 23 个模块"会被算成 1
+            hit["_dup"] = hit.get("_dup", 1) + issue.get("_dup", 1)
+            for nm in issue.get("_modules", []):
+                if nm not in hit["_modules"]:
+                    hit["_modules"].append(nm)
+        else:
+            merge_index[gkey] = len(merged)
+            merged.append({**issue, "_texts": [issue.get("text", "")]})
+
+    # 会诊引导计数: 异常级问题数按「条目 × 波及模块」计: 同一文案在 N 个
+    # 模块出现 = N 个问题。否则 23 个模块全超时会写成「1 项异常级问题」
+    # (v1.15.0 审查 P1-15)。
+    critical_cnt = sum(len(i.get("_modules") or [1]) for i in need_attention
+                       if i.get("severity") in ("异常", "错误"))
+
+    return {
+        "all_issues": todo_issues,
+        "need_cnt": len(need_attention),
+        "top_issues": top_issues,
+        "merged": merged,
+        "involved_cnt": len(involved_mods),
+        "info_cnt": sum(1 for i in todo_issues if i.get("severity", "信息") == "信息"),
+        "hidden_cnt": len(need_attention) - len(top_issues),
+        "critical_cnt": critical_cnt,
+    }
+
+
+def _todo_issues_section(modules):
+    """待办问题清单。
+
+    聚合口径在 _todo_issues_data (v1.25.0 抽出, HTML 与 GUI 投影共用);
+    本函数只把数据拼成 HTML, 文案与结构零变化。
+    """
+    d = _todo_issues_data(modules)
+    todo_issues = d["all_issues"]
+    need_cnt = d["need_cnt"]
+    involved_cnt = d["involved_cnt"]
+    hidden_cnt = d["hidden_cnt"]
+    info_cnt = d["info_cnt"]
+    critical_cnt = d["critical_cnt"]
+    scope_suffix = (f"（涉及 {involved_cnt} 个模块）"
+                    if involved_cnt > need_cnt else "")
+
+    if d["merged"]:
         todo_blocks = []
-        for issue in merged:
+        for issue in d["merged"]:
             sev = issue.get("severity", "信息")
             sev_class = "err" if sev in ("异常", "错误") else "warn"
             impact = issue.get("impact", "")
@@ -20969,10 +21018,7 @@ def _todo_issues_section(modules):
 </div>""")
         extra_bits = []
         # 会诊引导: 存在异常级问题时提示升级路径 (现场解决不了 → 带报告回去)
-        # 异常级问题数按「条目 × 波及模块」计: 同一文案在 N 个模块出现 = N 个
-        # 问题。否则 23 个模块全超时会写成「1 项异常级问题」(v1.15.0 审查 P1-15)。
-        critical_cnt = sum(len(i.get("_modules") or [1]) for i in need_attention
-                           if i.get("severity") in ("异常", "错误"))
+        # (critical_cnt 按「条目 × 波及模块」计, 口径见 _todo_issues_data)
         if critical_cnt:
             todo_blocks.append(f"""
 <div class="issue consult">
@@ -20980,16 +21026,14 @@ def _todo_issues_section(modules):
   <div class="impact">📌 影响: 异常级问题按上述建议现场处理后仍存在的, 多涉及线路质量、运营商侧或设备本身缺陷, 现场手段有限</div>
   <div class="action">💡 建议: 保留本 HTML 报告与同名 <b>.json</b> 文件带回交专家会诊 — .json 内含完整原始测量数据 (逐跳路径、时序曲线、原始统计), 供后台深入分析; 客户处可先留存 HTML 版说明</div>
 </div>""")
-        hidden_cnt = len(need_attention) - len(top_issues)
         if hidden_cnt > 0:
             extra_bits.append(f"顶部仅展示前 10 条, 另有 {hidden_cnt} 条见下方模块详情")
-        info_cnt = sum(1 for i in todo_issues if i.get("severity", "信息") == "信息")
         if info_cnt > 0:
             extra_bits.append(f"另有 {info_cnt} 条信息项可查看下方模块详情")
         info_extra = (f" <span class='extra-count'>({'；'.join(extra_bits)})</span>"
                       if extra_bits else "")
         todo_section = f"""
-<div class="sec" id="todo"><h2><span class="icon">⚠</span>{len(need_attention)} 项需要您关注{scope_suffix}{info_extra}</h2></div>
+<div class="sec" id="todo"><h2><span class="icon">⚠</span>{need_cnt} 项需要您关注{scope_suffix}{info_extra}</h2></div>
 <div class="todo">{"".join(todo_blocks)}</div>"""
     elif todo_issues:
         todo_section = """
