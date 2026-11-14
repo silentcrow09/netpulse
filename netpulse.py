@@ -3719,7 +3719,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.26.0"
+APP_VERSION = "1.26.1"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -27121,6 +27121,10 @@ input,select{ font-family:inherit; }
 .gp-issue.info{ color:#475569; background:#f8fafc; border-color:#e2e8f0; }
 .gp-mods-foot{ padding:10px 16px; background:var(--soft); font-size:12.5px;
                color:var(--dim); text-align:center; }
+/* v1.26.1: 脚注内的「展开全部 ›」按钮 (原 .gp-sec>h3 .lnk 规则不覆盖脚注) */
+.gp-mods-foot .lnk{ margin-left:4px; font-size:12px; font-weight:600; color:var(--navy);
+                    background:none; border:none; padding:0; cursor:pointer; }
+.gp-mods-foot .lnk:hover{ text-decoration:underline; }
 .gp-diag{ margin-top:10px; background:#fff; border:1px solid var(--rule);
           border-radius:12px; padding:14px 16px; }
 .gp-diag .rc{ border-left:4px solid #ea580c; background:#fff7ed; border-radius:0 8px 8px 0;
@@ -28012,9 +28016,6 @@ _GUI_JS = r"""(function () {
     var secM = el("div", "gp-sec");
     var hM = el("h3", null, "模块明细");
     hM.appendChild(el("span", "cnt", d.modules.length + " 项"));
-    var lnk = el("button", "lnk", "展开全部 ›");
-    lnk.type = "button";
-    hM.appendChild(lnk);
     secM.appendChild(hM);
     var wrap = el("div", "gp-mods");
     var bodies = [];
@@ -28077,7 +28078,12 @@ _GUI_JS = r"""(function () {
     var fbN = document.createElement("b");
     fbN.textContent = collapsedOk + " 项正常";
     foot.appendChild(fbN);
-    foot.appendChild(document.createTextNode(" · 点击行展开, 或"));
+    foot.appendChild(document.createTextNode(" · 点击行展开，或 "));
+    // v1.26.1: 「展开全部 ›」挪进脚注 —— 原先挂在区块标题行, 脚注的「或」字
+    // 悬空、整行无点击落点 (Simon 2026-11-14 反馈: 文案不完整、无法点击)。
+    var lnk = el("button", "lnk", "展开全部 ›");
+    lnk.type = "button";
+    foot.appendChild(lnk);
     lnk.addEventListener("click", function () {
       var anyClosed = bodies.some(function (b) {
         return b.body.style.display === "none";
