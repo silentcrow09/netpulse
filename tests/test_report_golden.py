@@ -83,6 +83,12 @@ def _render_all():
     ]
 
 
+def _norm(s):
+    """换行归一: 渲染器恒输出 LF; 基线文件经 git 检出可能变 CRLF。
+    内容不变性归本测试管, 行尾归 git 策略管 —— 归一后比内容。"""
+    return s.replace("\r\n", "\n")
+
+
 class TestReportGolden(unittest.TestCase):
 
     def test_golden_unchanged(self):
@@ -95,7 +101,7 @@ class TestReportGolden(unittest.TestCase):
             with io.open(path, "r", encoding="utf-8", newline="") as f:
                 base = f.read()
             self.assertEqual(
-                html, base,
+                _norm(html), _norm(base),
                 "%s 与基线不一致 —— 导出渲染器被改动。确认为有意变更后运行 "
                 "`python tests/test_report_golden.py --bless` 重新生成基线, "
                 "并逐行审查 diff (AGENTS.md 报告渲染节)" % name)
