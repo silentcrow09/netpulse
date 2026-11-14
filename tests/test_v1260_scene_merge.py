@@ -166,10 +166,11 @@ class TestPageAssets(unittest.TestCase):
         self.assertNotIn("slow:", self.js.split("var CARD_GO_TEXT")[0])
         self.assertIn("M5 16a8 8 0 1 1 14 0", self.js)
 
-    def test_window_size_1180x720(self):
+    def test_window_size_1180x680(self):
         src = open(np.__file__, encoding="utf-8").read()
-        self.assertIn("--window-size=1180,720", src)
+        self.assertIn("--window-size=1180,680", src)
         self.assertNotIn("1280,860", src)
+        self.assertNotIn("1180,720", src)
 
     def test_home_compact_css(self):
         self.assertIn(".g-top{ height:52px;", self.css)

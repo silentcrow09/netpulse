@@ -26843,7 +26843,7 @@ input,select{ font-family:inherit; }
        margin-top:16px; position:relative; overflow:hidden; }
 .pbar i{ position:absolute; top:0; bottom:0; left:0; width:0; background:var(--navy-2);
          border-radius:999px; transition:width .3s; }
-.cfg{ padding:30px 36px 28px; }
+.cfg{ padding:22px 36px 20px; }
 .cfg .fcard{ max-width:780px; margin:0 auto; }
 .cfg-h{ font-size:21px; font-weight:800; letter-spacing:.3px; }
 .cfg-sub{ font-size:13px; color:var(--dim); margin-top:4px; padding-bottom:16px;
@@ -26871,8 +26871,10 @@ input,select{ font-family:inherit; }
 .switch.on{ background:var(--navy-2); }
 .switch.on i{ left:21px; }
 .swstate{ font-size:13px; font-weight:700; color:var(--dim); }
-.mn{ padding:28px 36px 24px; }
-.mn-top{ display:flex; align-items:flex-end; gap:28px; padding-bottom:18px;
+/* v1.26.1: 盯障实时页压进 680 窗口 —— 只收上下留白与间距, 图表 SVG 内部
+   几何不动 (240 高 viewBox 的轴坐标重算风险大, 不值得)。 */
+.mn{ padding:20px 36px 16px; }
+.mn-top{ display:flex; align-items:flex-end; gap:28px; padding-bottom:12px;
          border-bottom:1px solid var(--rule); }
 .mn-num{ font-size:44px; font-weight:800; letter-spacing:-1px; line-height:1; color:var(--navy); }
 .mn-num small{ font-size:17px; font-weight:700; color:var(--mute); letter-spacing:0; margin-left:6px; }
@@ -26890,7 +26892,7 @@ input,select{ font-family:inherit; }
 .badge-run i{ width:8px; height:8px; border-radius:50%; background:#fff;
               animation:mblink 1.6s ease-out infinite; }
 @keyframes mblink{ 0%{ opacity:1; } 50%{ opacity:.35; } 100%{ opacity:1; } }
-.quad{ display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:20px; }
+.quad{ display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:14px; }
 .qcell{ background:var(--soft); border:1px solid var(--rule); border-radius:10px; padding:12px 16px 11px; }
 .q-top{ display:flex; align-items:center; gap:9px; }
 .qdot{ width:10px; height:10px; border-radius:50%; flex:none; background:transparent;
@@ -26899,7 +26901,7 @@ input,select{ font-family:inherit; }
 .qmark{ font-size:13px; font-weight:800; margin-left:2px; }
 .qsub{ font-size:12px; color:var(--dim); margin-top:5px; }
 .qsub b{ font-weight:700; }
-.chart-card{ border:1px solid var(--rule); border-radius:12px; background:#fff; padding:14px 20px 10px;
+.chart-card{ border:1px solid var(--rule); border-radius:12px; background:#fff; padding:12px 20px 8px;
              margin-top:16px; }
 .cap-row{ display:flex; align-items:baseline; }
 .cap-row .lab{ font-size:11px; letter-spacing:2.5px; color:var(--mute); font-weight:700; }
@@ -26933,7 +26935,7 @@ input,select{ font-family:inherit; }
           border-radius:10px; padding:10px 18px; font-size:12.5px; color:var(--dim); }
 .loadbar svg{ width:16px; height:16px; flex:none; color:var(--amber); }
 .loadbar b{ color:var(--text); }
-.mn-foot{ margin-top:20px; padding-top:16px; border-top:1px solid var(--rule); display:flex;
+.mn-foot{ margin-top:14px; padding-top:12px; border-top:1px solid var(--rule); display:flex;
           align-items:center; gap:14px; }
 .mn-back{ margin-left:auto; font-size:12.5px; color:var(--mute); background:none; border:none;
           padding:0; }
@@ -29664,7 +29666,7 @@ def _gui_launch_browser(url):
     if browser:
         try:
             proc = subprocess.Popen([browser, "--app=" + url,
-                                     "--window-size=1180,720"])
+                                     "--window-size=1180,680"])
             _GUI_BROWSER_PROC.append(proc)      # 保留句柄防 GC
             return "app"
         except OSError:
