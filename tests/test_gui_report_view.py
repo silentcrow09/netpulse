@@ -160,5 +160,133 @@ class TestGuiReportView(unittest.TestCase):
         self.assertIn("health", view)
 
 
+# ── 盯障报告投影 (v1.25.0) ──
+
+def _mon_snapshot():
+    """构造与 save_monitor_report 落盘 JSON 同形的 snapshot。"""
+    return {
+        "mode": "monitor",
+        "timestamp": "2026-01-02T03:04:05",
+        "started_at": "2026-01-02 03:04:05",
+        "ended_at": "2026-01-02 05:04:05",
+        "duration_planned_s": 7200, "duration_actual_s": 7200,
+        "early_terminated": False,
+        "targets": {"gateway": "192.168.1.1", "external": "223.5.5.5"},
+        "samples": {
+            "gw_rtt": [[i * 10.0, 2.0 + (i % 3)] for i in range(500)],
+            "gw_loss": [120.0, 121.5, 400.0],
+            "ext_rtt": [[i * 10.0, 20.0 + (i % 7)] for i in range(500)],
+            "ext_loss": [610.0],
+        },
+        "stats": {"gw": {"ok": 497, "loss": 3, "loss_pct": 0.6,
+                         "avg_ms": 2.5, "p50_ms": 2.0, "p95_ms": 4.0,
+                         "max_ms": 4.9},
+                  "ext": {"ok": 499, "loss": 1, "loss_pct": 0.2,
+                          "avg_ms": 21.0, "p50_ms": 20.0, "p95_ms": 26.0,
+                          "max_ms": 27.1},
+                  "tcp": {"ok": 240, "fail": 0, "ok_pct": 100.0,
+                          "avg_ms": 21.5},
+                  "dns": {"ok": 239, "fail": 1, "ok_pct": 99.6,
+                          "avg_ms": 30.2}},
+        "mtu": {"probe_status": "skipped"},
+        "tcp_quality": {"retrans_rate_pct": 0.42},
+        "nic_quality": {"err_delta": 0},
+        "events": [
+            {"type": "jitter_burst", "stream": "ext", "cls": "carrier",
+             "start_ts": 1796000000, "end_ts": 1796000037,
+             "duration_s": 37.0, "open_at_end": False,
+             "detail": "37s 内丢包 4 次", "root_cause": "运营商/上联侧抖动"},
+            {"type": "dns_fail", "stream": "dns", "cls": "dns",
+             "start_ts": 1796001123, "end_ts": 1796001125,
+             "duration_s": 1.8, "open_at_end": False, "detail": "解析超时 1 次"},
+        ],
+        "verdict": "degraded",
+        "conclusion_text": "外网侧存在短暂抖动",
+        "advice": "对照事件时间与用户操作时间",
+        "summary": "盯障 7200s: 网关丢包 0.6%, 外网丢包 0.2%, 无中断, "
+                   "抖动集中 1 段",
+        "report_html": "D:/x/reports/2026-01-02/monitor_20260102_050405.html",
+        "report_csv": "D:/x/reports/2026-01-02/monitor_20260102_050405.csv",
+        "report_json": "D:/x/reports/2026-01-02/monitor_20260102_050405.json",
+    }
+
+
+class TestMonitorReportView(unittest.TestCase):
+
+    def test_none_safe(self):
+        self.assertIsNone(np._gui_monitor_report_view(None))
+        self.assertIsNone(np._gui_monitor_report_view({}))
+        self.assertIsNone(np._gui_monitor_report_view({"mode": "monitor"}))
+
+    def test_projection_keys_and_shapes(self):
+        view = np._gui_monitor_report_view(_mon_snapshot())
+        for k in ("verdict", "conclusion", "advice", "summary", "started_at",
+                  "duration", "targets", "stats", "events", "series",
+                  "bands", "tcp_quality", "files"):
+            self.assertIn(k, view, "盯障投影缺键: %s" % k)
+        # 曲线降采样 ≤240 点/流, 丢包点保留为 None (均值会抹平丢包信号)
+        for name in ("gw", "ext"):
+            pts = view["series"][name]
+            self.assertLessEqual(len(pts), 240)
+        self.assertTrue(any(p[1] is None for p in view["series"]["gw"]),
+                        "丢包点必须以 ms=None 保留")
+        self.assertFalse(any(p[1] is None for p in view["bands"]["gw"]))
+        # 色带合并口径: 120.0 与 121.5 (间隔 ≤2.5s) 合并, 400.0 独立
+        self.assertEqual(view["bands"]["gw"], [[120.0, 121.5], [400.0, 400.0]])
+        self.assertEqual(view["bands"]["ext"], [[610.0, 610.0]])
+        # 统计直传 (屏幕版零自算)
+        self.assertEqual(view["stats"]["gw"]["loss_pct"], 0.6)
+        self.assertEqual(view["tcp_quality"]["retrans_rate_pct"], 0.42)
+
+    def test_events_labels_and_times(self):
+        view = np._gui_monitor_report_view(_mon_snapshot())
+        ev1, ev2 = view["events"]
+        self.assertEqual(ev1["label"], "抖动集中")
+        self.assertEqual(ev1["sev"], "warn")
+        self.assertEqual(ev1["stream"], "外网")
+        self.assertRegex(ev1["start"], r"^\d{2}:\d{2}:\d{2}$")
+        self.assertEqual(ev2["label"], "DNS 解析失败")
+        self.assertEqual(ev2["sev"], "info")
+        # 未知类型回退: 标签用原 type、档位 neutral
+        snap = _mon_snapshot()
+        snap["events"] = [{"type": "future_type", "stream": "zz",
+                           "start_ts": 1796000000, "end_ts": 1796000001,
+                           "duration_s": 1.0, "detail": ""}]
+        ev = np._gui_monitor_report_view(snap)["events"][0]
+        self.assertEqual(ev["label"], "future_type")
+        self.assertEqual(ev["sev"], "neutral")
+
+    def test_files_are_basenames(self):
+        view = np._gui_monitor_report_view(_mon_snapshot())
+        self.assertEqual(view["files"], [
+            "monitor_20260102_050405.html",
+            "monitor_20260102_050405.csv",
+            "monitor_20260102_050405.json"])
+
+    def test_session_report_view_reads_saved_json(self):
+        import json as _json
+        import tempfile
+        m = np._GuiMonitor()
+        self.assertIsNone(m.report_view())          # 无 paths
+        snap = _mon_snapshot()
+        fd, path = tempfile.mkstemp(suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                _json.dump(snap, f)
+            m._paths = {"html": path, "json": path}
+            view = m.report_view()
+            self.assertIsNotNone(view)
+            self.assertEqual(view["verdict"], "degraded")
+            # 落盘文件损坏 → None (路由 404), 不抛异常
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{broken")
+            self.assertIsNone(m.report_view())
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 if __name__ == "__main__":
     unittest.main()

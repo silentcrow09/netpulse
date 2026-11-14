@@ -26026,6 +26026,154 @@ def _gui_net_busy():
     return False
 
 
+# ── 盯障报告投影 (v1.25.0): 屏幕版盯障报告的数据层 ──
+# 事件类型 → (中文标签, 徽章档位)。档位只分 err/warn/info/neutral 四档,
+# 颜色由页面经 /api/scenarios 下发的语义色渲染, 这里不携带色值。
+_MON_EVENT_LABELS = {
+    "outage": ("中断", "err"),
+    "jitter_burst": ("抖动集中", "warn"),
+    "latency_spike": ("延迟突增", "warn"),
+    "mtu_mismatch": ("路径 MTU 受限", "warn"),
+    "tcp_retrans_burst": ("TCP 重传集中", "warn"),
+    "nic_error_burst": ("网卡错误暴增", "err"),
+    "dns_fail": ("DNS 解析失败", "info"),
+    "tcp_fail": ("TCP 连接失败", "info"),
+    "monitor_gap": ("采集间隙", "neutral"),
+}
+_MON_STREAM_LABELS = {
+    "gw": "网关", "ext": "外网", "dns": "DNS", "tcp": "TCP",
+    "tcpq": "TCP 重传", "nic": "网卡", "mtu": "MTU", "": "系统",
+}
+
+
+def _monitor_loss_bands(loss_offsets, merge_s=1.0):
+    """把丢包时刻 (相对起点秒) 合并成色带 [(start, end)...]。
+
+    与 _render_monitor_html 内联 _bands 同口径 —— 导出报告与屏幕投影各自
+    调一份, 不互相引用 (改口径须两边同步, 有注释互相指路)。
+    """
+    if not loss_offsets:
+        return []
+    bands = []
+    s = p = loss_offsets[0]
+    for t in loss_offsets[1:]:
+        if t - p <= merge_s + 1.5:
+            p = t
+        else:
+            bands.append([round(s, 1), round(p, 1)])
+            s = p = t
+    bands.append([round(s, 1), round(p, 1)])
+    return bands
+
+
+def _monitor_series_downsample(pts, cap=240):
+    """延迟序列桶降采样 ≤cap 点 (屏幕版曲线用)。
+
+    含丢包 (ms=None) 的桶保留丢包点 (均值会抹平丢包信号), 纯 ok 桶取 ms
+    均值 —— 与 _GuiMonitor._downsample 同口径; 那一个吃会话内实时流, 这一个
+    吃落盘回放, 不互相调用。
+    """
+    n = len(pts)
+    if n <= cap:
+        return [[round(t, 1), (round(v, 1) if isinstance(v, (int, float))
+                               else None)] for t, v in pts]
+    bucket = -(-n // cap)
+    out = []
+    for i in range(0, n, bucket):
+        chunk = pts[i:i + bucket]
+        loss = next((p for p in chunk if p[1] is None), None)
+        if loss is not None:
+            out.append([round(loss[0], 1), None])
+        else:
+            avg = sum(v for _, v in chunk) / len(chunk)
+            out.append([round(chunk[0][0], 1), round(avg, 1)])
+    return out
+
+
+def _gui_monitor_report_view(snap):
+    """盯障落盘 JSON → 屏幕版盯障报告投影 (v1.25.0)。
+
+    输入是 save_monitor_report 写下的 snapshot (stats/events/samples/
+    verdict/...); 只挑屏幕视图需要的要素, 曲线服务端降采样 (≤240 点/流,
+    丢包点 ms=null)。数字零自算口径同 _gui_report_view。
+    snap 为空/无 stats → None (路由 404)。
+    """
+    if not isinstance(snap, dict) or not snap.get("stats"):
+        return None
+
+    def _series(stream):
+        rtt = ((snap.get("samples") or {}).get("%s_rtt" % stream) or [])
+        loss = ((snap.get("samples") or {}).get("%s_loss" % stream) or [])
+        pts = sorted([[p[0], p[1]] for p in rtt if isinstance(p, list)
+                      and len(p) == 2]
+                     + [[t, None] for t in loss],
+                     key=lambda p: p[0])
+        return _monitor_series_downsample(pts)
+
+    def _hms(ev, key):
+        v = ev.get(key)
+        if not isinstance(v, (int, float)) or not v:
+            return ""
+        try:
+            return datetime.fromtimestamp(v).strftime("%H:%M:%S")
+        except (ValueError, TypeError, OverflowError, OSError):
+            return ""
+
+    events = []
+    for ev in (snap.get("events") or []):
+        label, sev = _MON_EVENT_LABELS.get(
+            ev.get("type", ""), (ev.get("type", "事件"), "neutral"))
+        events.append({
+            "type": ev.get("type", ""),
+            "label": label,
+            "sev": sev,
+            "stream": _MON_STREAM_LABELS.get(ev.get("stream", ""),
+                                             ev.get("stream", "")),
+            "start": _hms(ev, "start_ts"),
+            "end": _hms(ev, "end_ts"),
+            "duration_s": ev.get("duration_s", 0),
+            "detail": ev.get("detail", ""),
+            "root_cause": ev.get("root_cause", ""),
+        })
+
+    stats = snap.get("stats") or {}
+    return {
+        "verdict": snap.get("verdict", ""),
+        "conclusion": snap.get("conclusion_text", ""),
+        "advice": snap.get("advice", ""),
+        "summary": snap.get("summary", ""),
+        "started_at": snap.get("started_at", ""),
+        "ended_at": snap.get("ended_at", ""),
+        "duration": {
+            "actual_s": snap.get("duration_actual_s", 0),
+            "planned_s": snap.get("duration_planned_s", 0),
+            "early": bool(snap.get("early_terminated")),
+        },
+        "targets": snap.get("targets") or {},
+        "stats": stats,
+        "events": events,
+        "series": {"gw": _series("gw"), "ext": _series("ext")},
+        "bands": {
+            "gw": _monitor_loss_bands(
+                (snap.get("samples") or {}).get("gw_loss") or []),
+            "ext": _monitor_loss_bands(
+                (snap.get("samples") or {}).get("ext_loss") or []),
+        },
+        "tcp_quality": {
+            "retrans_rate_pct": ((snap.get("tcp_quality") or {})
+                                 .get("retrans_rate_pct")),
+        },
+        "nic_quality": {
+            "err_delta": ((snap.get("nic_quality") or {}).get("err_delta")),
+        },
+        "mtu": {"probe_status": ((snap.get("mtu") or {})
+                                 .get("probe_status", "skipped"))},
+        "files": [os.path.basename(str(snap.get(k) or ""))
+                  for k in ("report_html", "report_csv", "report_json")
+                  if snap.get(k)],
+    }
+
+
 class _GuiMonitor:
     """盯障 GUI 会话: MonitorSession 只读复用 + 节流快照 + 编排线程。
 
@@ -26415,6 +26563,22 @@ class _GuiMonitor:
                 return f.read()
         except OSError:
             return None
+
+    def report_view(self):
+        """屏幕版盯障报告投影 (v1.25.0): 读落盘 JSON 投影; 无报告 None。
+
+        与 report_html 同一数据源生命周期 (编排线程落盘成功后才有 paths)。
+        """
+        with self._lock:
+            paths = self._paths
+        if not paths or not paths.get("json"):
+            return None
+        try:
+            with open(paths["json"], "rb") as f:
+                snap = json.load(f)
+        except (OSError, ValueError):
+            return None
+        return _gui_monitor_report_view(snap)
 
 
 # ────────────────────────────────────────────────────────────────────────────
