@@ -29761,10 +29761,12 @@ def main():
     parser.add_argument("--diagnose", metavar="PROFILE",
                         choices=sorted(list(DIAGNOSE_PROFILES.keys())),
                         help="按场景 Profile 诊断 (阶段 C · v1.3.0 引入). "
-                             "可选: slow / disconnect / web / gaming / wifi. "
-                             "诊断完成后输出根因分析 (置信度 + 建议). "
+                             "可选: " + " / ".join(
+                                 f"{p}({SCENE_LABELS[p]})"
+                                 for p in SCENE_MENU_KEYS.values())
+                             + ". 诊断完成后输出根因分析 (置信度 + 建议). "
                              "也支持子命令形式: netpulse diagnose <profile>. "
-                             "例: netpulse.py --diagnose slow")
+                             "例: netpulse.py --diagnose web")
     parser.add_argument("--json-schema", action="store_true",
                         help="输出当前 JSON Schema 版本号与结构路径 (阶段 D · v1.4.0 引入). "
                              "供 AI Agent / RMM / 飞书 bot introspect 用, "
