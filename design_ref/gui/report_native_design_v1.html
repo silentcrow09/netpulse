@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetPulse 报告页原生重构 · 设计稿 v1（选型稿）</title>
+<style>
+/* ── 画布（选型稿容器，非产品 UI）── */
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#e8ebf0;color:#1a2230;font:14px/1.65 "Inter","Microsoft YaHei","PingFang SC",sans-serif;
+     padding:34px 30px 60px;-webkit-font-smoothing:antialiased}
+.doc{max-width:1240px;margin:0 auto}
+.doc-h1{font-size:24px;font-weight:800;letter-spacing:.3px}
+.doc-sub{font-size:13px;color:#5b6472;margin-top:6px}
+.doc-note{margin-top:14px;background:#fff;border:1px solid #d8dde5;border-radius:12px;padding:14px 18px;
+          font-size:13px;color:#1a2230;line-height:1.8}
+.doc-note b{color:#0a3b6e}
+h2.doc-sec{font-size:17px;font-weight:800;color:#0a3b6e;margin:34px 0 12px;letter-spacing:.3px}
+
+/* ── 变动与新增清单 ── */
+table.changes{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d8dde5;border-radius:12px;
+              overflow:hidden;font-size:13px}
+table.changes th{background:#f6f7f9;color:#5b6472;font-weight:700;text-align:left;
+                 padding:9px 14px;border-bottom:1px solid #d8dde5;font-size:12.5px}
+table.changes td{padding:9px 14px;border-bottom:1px solid #eef1f5;vertical-align:top}
+table.changes tr:last-child td{border-bottom:none}
+.tag-new,.tag-redo,.tag-keep{display:inline-block;font-size:11px;font-weight:700;border-radius:999px;
+     padding:1.5px 10px;letter-spacing:.4px;white-space:nowrap}
+.tag-new{background:#fef3c7;color:#92400e;border:1px solid #fcd34d}
+.tag-redo{background:#dbeafe;color:#1d4ed8;border:1px solid #bfdbfe}
+.tag-keep{background:#f1f5f9;color:#64748b;border:1px solid #e2e8f0}
+
+/* ── 浏览器框（方案容器）── */
+.frame{background:#f8fafc;border:1px solid #cfd6df;border-radius:14px;overflow:hidden;
+       box-shadow:0 14px 40px -22px rgba(15,23,42,.35);margin-top:14px}
+.frame-bar{height:34px;background:#eef1f5;border-bottom:1px solid #d8dde5;display:flex;
+           align-items:center;gap:7px;padding:0 14px}
+.frame-bar i{width:10px;height:10px;border-radius:50%;background:#cbd5e1;display:block}
+.frame-bar span{margin-left:8px;font-size:11.5px;color:#98a2ad;font-weight:600;letter-spacing:.3px}
+.frame-name{display:flex;align-items:baseline;gap:12px;margin-top:30px}
+.frame-name b{font-size:16.5px;font-weight:800;color:#1a2230}
+.frame-name span{font-size:12.5px;color:#5b6472}
+
+/* ══ 以下为产品 UI 1:1 复刻（与 _GUI_CSS 同源变量）══ */
+.app{background:#fff;font-size:14px;color:#1a2230}
+.g-top{height:58px;display:flex;align-items:center;gap:12px;padding:0 24px;border-bottom:1px solid #d8dde5}
+.g-mark{width:34px;height:34px;border-radius:9px;background:#0a3b6e;color:#fff;font-size:14px;font-weight:800;
+        display:flex;align-items:center;justify-content:center;letter-spacing:.5px}
+.g-brand{font-size:17px;font-weight:800;color:#0a3b6e;letter-spacing:.3px}
+.g-ver{font-size:11px;font-weight:600;letter-spacing:.5px;color:#98a2ad;border:1px solid #d8dde5;
+       border-radius:999px;padding:2px 11px}
+.g-spring{margin-left:auto}
+.g-host{display:flex;align-items:center;gap:8px;background:#f6f7f9;border:1px solid #d8dde5;
+        border-radius:999px;padding:5px 15px;font-size:12.5px;font-weight:600;color:#5b6472}
+.g-dot{width:11px;height:11px;border-radius:50%;background:#16a34a}
+
+/* 方案 A · 报告视图 */
+.rp{padding:24px 32px 34px}
+.rp-head{display:flex;align-items:center;gap:14px}
+.rp-head h1{font-size:22px;font-weight:800;letter-spacing:.3px}
+.rp-head .sub{font-size:12.5px;color:#5b6472}
+.rp-actions{margin-left:auto;display:flex;gap:10px}
+.btn{font:inherit;font-size:12.5px;font-weight:700;border-radius:9px;padding:7px 16px;cursor:pointer;
+     border:1px solid #d8dde5;background:#fff;color:#1a2230}
+.btn.primary{background:#0a3b6e;border-color:#0a3b6e;color:#fff}
+.btn.primary:hover{background:#2a5485}
+.btn:hover{border-color:#2a5485}
+
+.hero{margin-top:18px;background:#fff;border:1px solid #d8dde5;border-radius:14px;padding:22px 26px;
+      display:flex;gap:26px;align-items:center;box-shadow:0 6px 22px -14px rgba(15,23,42,.14)}
+.ring{position:relative;width:118px;height:118px;flex:none}
+.ring .in{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px}
+.ring .num{font-size:34px;font-weight:900;font-variant-numeric:tabular-nums;line-height:1;color:#1a2230}
+.ring .grade{font-size:11.5px;font-weight:700;color:#15803d;background:#dcfce7;border-radius:999px;padding:1px 10px}
+.hero-main{min-width:0}
+.hero-main .t{font-size:19px;font-weight:800}
+.hero-main .formula{font-size:12.5px;color:#475569;margin-top:6px;font-family:Cascadia Mono,Consolas,monospace}
+.hero-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+.hero-chips span{font-size:12px;color:#5b6472;background:#f6f7f9;border:1px solid #d8dde5;
+                 border-radius:999px;padding:2.5px 11px;font-family:Cascadia Mono,Consolas,monospace}
+.hero-chips span b{color:#1a2230;font-weight:600}
+.scope{margin-top:12px;display:flex;align-items:center;gap:8px;background:#f6f7f9;border:1px solid #d8dde5;
+       border-radius:10px;padding:8px 14px;font-size:12.5px;color:#5b6472}
+.scope b{color:#1a2230;font-weight:700}
+
+.sec{margin-top:26px}
+.sec>h3{font-size:15.5px;font-weight:800;letter-spacing:.2px;display:flex;align-items:center;gap:8px}
+.sec>h3 .cnt{font-size:11.5px;font-weight:700;color:#92400e;background:#fef3c7;border-radius:999px;padding:1px 10px}
+.sec>h3 .lnk{margin-left:auto;font-size:12px;font-weight:600;color:#0a3b6e;cursor:pointer}
+
+.todo-card{margin-top:10px;background:#fff;border:1px solid #d8dde5;border-left:4px solid #d97706;
+           border-radius:0 10px 10px 0;padding:12px 16px}
+.todo-card .t{font-size:13.5px;font-weight:700;display:flex;align-items:center;gap:8px}
+.todo-card .t .dot{width:8px;height:8px;border-radius:50%;background:#d97706;flex:none}
+.todo-card .d{font-size:12.5px;color:#5b6472;margin-top:4px}
+.todo-card .fix{font-size:12.5px;color:#1a2230;margin-top:6px;background:#f6f7f9;border-radius:8px;padding:6px 12px}
+.todo-card .fix b{color:#0a3b6e;font-weight:700}
+.todo-card .src{margin-top:8px;display:flex;gap:6px;align-items:center}
+.chip{font-size:11px;font-weight:600;color:#5b6472;background:#f6f7f9;border:1px solid #d8dde5;
+      border-radius:999px;padding:1.5px 10px}
+.chip.exempt{color:#64748b;background:#f1f5f9;border-color:#e2e8f0}
+
+.charts{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-top:10px}
+.chart{background:#fff;border:1px solid #d8dde5;border-radius:12px;padding:14px 16px;min-width:0}
+.chart h4{font-size:13px;font-weight:700;display:flex;align-items:center;gap:8px}
+.chart h4 .tg{font-size:10.5px;font-weight:600;color:#5b6472;background:#f6f7f9;border-radius:999px;padding:1px 9px}
+.chart .cap{font-size:11.5px;color:#98a2ad;margin-top:6px}
+.chart svg{margin-top:8px;display:block;max-width:100%}
+.sbar{display:flex;height:18px;border-radius:6px;overflow:hidden;margin-top:10px}
+.sbar i{display:block;height:100%}
+.sleg{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px;font-size:11.5px;color:#5b6472}
+.sleg i{width:9px;height:9px;border-radius:3px;display:inline-block;margin-right:5px;vertical-align:-1px}
+.hbar{margin-top:10px}
+.hbar .row{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.hbar .lab{width:34px;font-size:12px;color:#5b6472;flex:none}
+.hbar .track{flex:1;height:16px;background:#f1f5f9;border-radius:5px;overflow:hidden}
+.hbar .fill{height:100%;border-radius:5px}
+.hbar .val{width:86px;font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;text-align:right;flex:none}
+
+.mods{margin-top:10px;border:1px solid #d8dde5;border-radius:12px;overflow:hidden;background:#fff}
+.mod{border-bottom:1px solid #eef1f5}
+.mod:last-child{border-bottom:none}
+.mod-head{display:flex;align-items:center;gap:10px;padding:11px 16px;cursor:pointer}
+.mod-head:hover{background:#f8fafc}
+.mod-head .dot{width:9px;height:9px;border-radius:50%;flex:none}
+.mod-head .nm{font-size:13.5px;font-weight:700}
+.mod-head .cat{font-size:11px;color:#98a2ad}
+.mod-head .pv{margin-left:auto;font-size:12px;color:#5b6472;font-family:Cascadia Mono,Consolas,monospace;
+              white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mod-head .cv{font-size:11px;color:#98a2ad;flex:none;transform:rotate(0)}
+.mod-body{padding:2px 16px 14px;border-top:1px dashed #eef1f5}
+.kv{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px}
+.kv .cell{background:#f8fafc;border:1px solid #eef1f5;border-radius:8px;padding:7px 12px}
+.kv .k{font-size:11px;color:#98a2ad}
+.kv .v{font-size:13px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:1px}
+.mod-issue{margin-top:8px;font-size:12.5px;color:#92400e;background:#fffbeb;border:1px solid #fde68a;
+           border-radius:8px;padding:6px 12px}
+.mod-issue.info{color:#475569;background:#f8fafc;border-color:#e2e8f0}
+.mods-foot{padding:10px 16px;background:#f8fafc;font-size:12.5px;color:#5b6472;text-align:center}
+.mods-foot b{color:#0a3b6e;font-weight:700;cursor:pointer}
+
+.diag{margin-top:10px;background:#fff;border:1px solid #d8dde5;border-radius:12px;padding:14px 16px}
+.diag .rc{border-left:4px solid #ea580c;background:#fff7ed;border-radius:0 8px 8px 0;padding:10px 14px}
+.diag .rc .t{font-size:13.5px;font-weight:700;display:flex;gap:8px;align-items:center}
+.diag .rc .t .bd{font-size:11px;font-weight:700;color:#fff;background:#ea580c;border-radius:5px;padding:1px 9px}
+.diag .rc .d{font-size:12.5px;color:#5b6472;margin-top:5px;line-height:1.7}
+.diag .conf{margin-top:8px;font-size:12px;color:#5b6472}
+
+.host{margin-top:10px;background:#fff;border:1px solid #d8dde5;border-radius:12px;padding:14px 16px}
+.host .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px 20px;margin-top:8px}
+.host .kv2{display:flex;gap:8px;font-size:12.5px;padding:3px 0}
+.host .kv2 .k{color:#98a2ad;flex:none;width:72px}
+.host .kv2 .v{color:#1a2230;font-weight:600}
+
+.appendix{margin-top:10px;background:#fff;border:1px solid #d8dde5;border-radius:12px;padding:12px 16px;
+          display:flex;align-items:center;gap:10px;font-size:13px;font-weight:700;color:#5b6472}
+.appendix .chev{margin-left:auto;color:#98a2ad;font-size:11px}
+
+/* 盯障报告视图 */
+.mon-banner{margin-top:18px;border-radius:12px;padding:13px 18px;font-size:13.5px;font-weight:600;
+            background:#fffbeb;border:1px solid #fde68a;color:#92400e;display:flex;gap:10px;align-items:flex-start}
+.mon-banner.ok{background:#f0fdf4;border-color:#bbf7d0;color:#166534}
+.mon-banner .ic{flex:none;font-size:15px;line-height:1.5}
+.mcards{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-top:14px}
+.mcard{background:#fff;border:1px solid #d8dde5;border-radius:12px;padding:12px 16px}
+.mcard .k{font-size:11.5px;color:#98a2ad;font-weight:600}
+.mcard .v{font-size:21px;font-weight:800;font-variant-numeric:tabular-nums;margin-top:3px}
+.mcard .v small{font-size:12px;font-weight:600;color:#98a2ad}
+.mcard.warn .v{color:#b45309}
+.mchart{margin-top:14px;background:#fff;border:1px solid #d8dde5;border-radius:12px;padding:14px 16px}
+.mchart h4{font-size:13px;font-weight:700}
+.mleg{display:flex;gap:16px;margin-top:6px;font-size:11.5px;color:#5b6472}
+.mleg i{width:14px;height:3px;border-radius:2px;display:inline-block;margin-right:6px;vertical-align:3px}
+.mleg .pt{width:8px;height:8px;border-radius:50%}
+.mleg .band{width:14px;height:10px;border-radius:3px}
+.etable{margin-top:14px;background:#fff;border:1px solid #d8dde5;border-radius:12px;overflow:hidden}
+.etable table{width:100%;border-collapse:collapse;font-size:12.5px}
+.etable th{background:#f6f7f9;color:#5b6472;font-weight:700;text-align:left;padding:8px 14px;font-size:12px;
+           border-bottom:1px solid #d8dde5}
+.etable td{padding:8px 14px;border-bottom:1px solid #eef1f5}
+.etable tr:last-child td{border-bottom:none}
+.ebadge{display:inline-block;font-size:11px;font-weight:700;border-radius:5px;padding:1px 9px}
+.ebadge.jitter{background:#fef3c7;color:#92400e}
+.ebadge.dns{background:#e0f2fe;color:#075985}
+.ebadge.nic{background:#fee2e2;color:#991b1b}
+
+/* 方案 B · 双栏 */
+.rpB{display:flex;gap:0;padding:0}
+.rail{width:250px;flex:none;background:#f8fafc;border-right:1px solid #d8dde5;padding:20px 18px 24px}
+.rail .ring{width:92px;height:92px;margin:0 auto}
+.rail .ring .num{font-size:26px}
+.rail .grade-c{text-align:center;font-size:12.5px;font-weight:800;color:#15803d;margin-top:6px}
+.rail .sbar{margin-top:14px}
+.rail .todo-mini{margin-top:14px;background:#fff;border:1px solid #d8dde5;border-radius:10px;padding:10px 12px;
+                 font-size:12.5px;display:flex;justify-content:space-between;align-items:center}
+.rail .todo-mini b{color:#92400e}
+.rail nav{margin-top:14px;border-top:1px solid #e2e8f0;padding-top:10px}
+.rail nav a{display:block;font-size:12.5px;color:#5b6472;text-decoration:none;padding:5px 10px;border-radius:8px}
+.rail nav a.on{background:#dbeafe;color:#1d4ed8;font-weight:700}
+.rail .btn{display:block;width:100%;text-align:center;margin-top:10px}
+.railB{flex:1;min-width:0;padding:22px 28px 34px}
+.rpB .rp-head{padding:0 0 0 0}
+
+/* 标注（新增/重做标记） */
+.anno{position:relative;outline:2px dashed #eab308;outline-offset:4px;border-radius:4px}
+.anno-tag{position:absolute;top:-11px;right:8px;z-index:5;font-size:10.5px;font-weight:800;letter-spacing:.5px;
+          background:#fde047;color:#713f12;border-radius:999px;padding:1px 10px;box-shadow:0 1px 4px rgba(0,0,0,.15)}
+.anno-tag.blue{background:#bfdbfe;color:#1e3a8a}
+
+/* 选型对比 */
+table.vs{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d8dde5;border-radius:12px;
+         overflow:hidden;font-size:13px;margin-top:14px}
+table.vs th{background:#f6f7f9;color:#5b6472;font-weight:700;text-align:left;padding:9px 14px;
+            border-bottom:1px solid #d8dde5;font-size:12.5px}
+table.vs td{padding:9px 14px;border-bottom:1px solid #eef1f5;vertical-align:top}
+table.vs tr:last-child td{border-bottom:none}
+</style>
+</head>
+<body>
+<div class="doc">
+
+<div class="doc-h1">报告页原生重构 · 设计稿 v1（选型稿）</div>
+<div class="doc-sub">2026-11-13 · NetPulse GUI v1.25.0 · 覆盖「诊断报告视图」与「盯障报告视图」两处重做 · 所有尺寸字号 1:1（正文 14px）· 导出 HTML/PDF 报告不在本稿范围、保持现状</div>
+
+<div class="doc-note">
+<b>读稿说明</b>：本稿是静态选型稿，含两套报告视图方案（方案 A 单列流 / 方案 B 双栏总览）。
+<b>淡黄虚线框 + 黄色角标 = 重做区</b>，<b>蓝色角标 = 新增</b>；无标注的顶栏等部件为现状不动。
+方案 A 内一并画出盯障报告视图（与诊断视图同一套视觉语言）；方案 B 与 A 共用组件、只改布局骨架，
+盯障视图不重复画。两方案中报告内容组件完全一致（Hero / 双口径条 / 待办 / 指标图 / 模块明细 /
+诊断结论 / 本机信息 / 技术附录折叠），示例数据为虚构但口径自洽（96 = 100 − 警告 2×2，
+代理为豁免模块，其警告进待办但不计扣分）。
+</div>
+
+<h2 class="doc-sec">变动与新增清单</h2>
+<table class="changes">
+<tr><th>类型</th><th>位置</th><th>内容</th><th>说明</th></tr>
+<tr><td><span class="tag-redo">重做</span></td><td>报告视图（诊断完成 / 查看报告 / 部分报告 / 现场检测）</td><td>iframe 嵌套 → 页面内原生渲染</td><td>删除 #g-frame；报告成为与主页同页面的原生视图，共享顶栏</td></tr>
+<tr><td><span class="tag-redo">重做</span></td><td>盯障报告视图</td><td>iframe 嵌套 → 页面内原生渲染</td><td>删除 #mon-frame；内容结构按盯障自身要素组织</td></tr>
+<tr><td><span class="tag-new">新增</span></td><td>报告数据通道</td><td>/api/report 与盯障报告改为下发 JSON</td><td>服务端投影，含屏幕渲染全部要素；不含 tech.raw 等大对象</td></tr>
+<tr><td><span class="tag-new">新增</span></td><td>报告视图头部工具条</td><td>标题行 + 导出按钮组（HTML/PDF/JSON）+ 打开文件夹</td><td>导出能力沿用现有 doExport，位置移入报告视图头部</td></tr>
+<tr><td><span class="tag-new">新增</span></td><td>双口径说明条</td><td>「实检 N/M 项 · K 项参与计分 · 豁免 5 项」</td><td>沿用 AGENTS.md 诊断汇总口径，Hero 下方常驻</td></tr>
+<tr><td><span class="tag-keep">不变</span></td><td>GUI 顶栏 / 主页 / 进度页 / 现场检测表单 / 模块勾选面板 / 盯障配置与实时视图</td><td>现状保留</td><td>本次只动报告展示层，入口与流程不变</td></tr>
+<tr><td><span class="tag-keep">不变</span></td><td>导出 HTML / PDF / JSON / 盯障三件套</td><td>渲染器与落盘全部现状</td><td>golden 逐字节回归锁</td></tr>
+</table>
+
+<!-- ══════════════════ 方案 A ══════════════════ -->
+<h2 class="doc-sec">方案 A · 结论前置 · 单列流（推荐）</h2>
+<div class="frame-name"><b>诊断报告视图</b><span>自上而下：标题工具条 → Hero+口径条 → 待办 → 指标图 → 模块明细 → 诊断结论 → 本机信息 → 附录折叠；与现有进度页同一阅读节奏</span></div>
+<div class="frame">
+  <div class="frame-bar"><i></i><i></i><i></i><span>NetPulse GUI — 诊断报告</span></div>
+  <div class="app">
+    <div class="g-top">
+      <div class="g-mark">NP</div><div class="g-brand">NetPulse</div><div class="g-ver">v1.25.0</div>
+      <div class="g-spring"></div>
+      <div class="g-host"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 22v-4h6v4"/></svg>DESKTOP-8F3KQ2 · 192.168.1.23<div class="g-dot"></div>在线</div>
+    </div>
+
+    <div class="rp">
+      <!-- 标题工具条（新增） -->
+      <div class="anno" style="position:relative;outline:2px dashed #eab308;outline-offset:6px;border-radius:6px">
+        <span class="anno-tag blue">新增</span>
+        <div class="rp-head" style="padding-top:4px">
+          <h1>诊断报告</h1>
+          <div class="sub">2026-11-13 22:41 · 全量检测 · 耗时 4 分 12 秒</div>
+          <div class="rp-actions">
+            <button class="btn primary">导出报告 ▾</button>
+            <button class="btn">打开文件夹</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Hero + 双口径条（重做） -->
+      <div class="anno" style="position:relative;outline:2px dashed #eab308;outline-offset:6px;border-radius:6px;margin-top:14px">
+        <span class="anno-tag">重做</span>
+        <div class="hero" style="margin-top:8px">
+          <div class="ring">
+            <svg width="118" height="118" viewBox="0 0 118 118">
+              <circle cx="59" cy="59" r="50" fill="none" stroke="#eef1f6" stroke-width="11"/>
+              <circle cx="59" cy="59" r="50" fill="none" stroke="#16a34a" stroke-width="11"
+                      stroke-linecap="round" stroke-dasharray="301.6 314.2" transform="rotate(-90 59 59)"/>
+            </svg>
+            <div class="in"><div class="num">96</div><div class="grade">A 级</div></div>
+          </div>
+          <div class="hero-main">
+            <div class="t">网络良好</div>
+            <div class="formula">96 / 100 ＝ 100 − 警告 2×2（豁免模块不计）</div>
+            <div class="hero-chips">
+              <span>检测范围 <b>24 / 24 项</b></span>
+              <span>实检 <b>22</b> 项</span>
+              <span>待办 <b>3</b> 项</span>
+              <span>生成 <b>2026-11-13 22:41</b></span>
+            </div>
+            <div class="scope">计分口径：实检 <b>24/24</b> 项 · <b>19</b> 项参与计分 · 豁免 <b>5</b> 项（iperf3 / IPv6 / 代理 / NAT 类型 / 环回）；状态分布为全口径 24 项</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 待办清单（重做） -->
+      <div class="sec anno" style="position:relative;outline:2px dashed #eab308;outline-offset:6px;border-radius:6px">
+        <span class="anno-tag">重做</span>
+        <h3>需要关注 <span class="cnt">3 项</span></h3>
+        <div class="todo-card">
+          <div class="t"><span class="dot"></span>DNS 解析偏慢，可能拖慢网页与下载的起连</div>
+          <div class="d">当前系统 DNS 平均响应 86ms（样本 20 次），高于本机直连网关的参考水平；解析慢会放大所有「打开首个网页」的体感延迟。</div>
+          <div class="fix"><b>建议</b>：在网卡属性中将 DNS 改为响应更快的公共地址后复测（PowerShell 管理员）：<span style="font-family:Cascadia Mono,Consolas,monospace;font-size:11.5px">netsh interface ip set dns name="以太网" static 223.5.5.5</span></div>
+          <div class="src"><span class="chip">来源 · DNS 解析</span><span class="chip">警告 · 扣 2 分</span></div>
+        </div>
+        <div class="todo-card">
+          <div class="t"><span class="dot"></span>Wi-Fi 信号偏弱，速率与稳定性受影响</div>
+          <div class="d">RSSI −72dBm（2.4GHz），处于弱信号区间；高负载或隔墙场景容易出现卡顿与丢包。</div>
+          <div class="fix"><b>建议</b>：靠近路由器 2–3 米内复测；若为双频路由，切换 5GHz 频段对比。</div>
+          <div class="src"><span class="chip">来源 · Wi-Fi</span><span class="chip">警告 · 扣 2 分</span></div>
+        </div>
+        <div class="todo-card" style="border-left-color:#94a3b8">
+          <div class="t"><span class="dot" style="background:#94a3b8"></span>检测到系统代理已开启</div>
+          <div class="d">代理进程占用 127.0.0.1:7890；经代理的测速反映的是代理链路能力，不代表直连带宽。</div>
+          <div class="fix"><b>建议</b>：需要评估直连带宽时，关闭代理后重新检测。</div>
+          <div class="src"><span class="chip">来源 · 代理检测</span><span class="chip exempt">豁免 · 不计扣分</span></div>
+        </div>
+      </div>
+
+      <!-- 关键指标图（重做） -->
+      <div class="sec anno" style="position:relative;outline:2px dashed #eab308;outline-offset:6px;border-radius:6px">
+        <span class="anno-tag">重做</span>
+        <h3>关键指标</h3>
+        <div class="charts">
+          <div class="chart">
+            <h4>网关延迟 <span class="tg">逐次 Ping</span></h4>
+            <svg width="100%" height="92" viewBox="0 0 300 92" preserveAspectRatio="none">
+              <line x1="0" y1="72" x2="300" y2="72" stroke="#eef1f5" stroke-width="1"/>
+              <line x1="0" y1="40" x2="300" y2="40" stroke="#f6f7f9" stroke-width="1"/>
+              <text x="2" y="70" font-size="8" fill="#98a2ad">0ms</text>
+              <text x="2" y="38" font-size="8" fill="#98a2ad">5ms</text>
+              <polyline fill="none" stroke="#34c759" stroke-width="1.8" stroke-linejoin="round"
+                points="0,66 12,67 24,66 36,68 48,66 60,67 72,66 84,20 96,66 108,67 120,66 132,68 144,66 156,67 168,66 180,52 192,66 204,67 216,66 228,68 240,66 252,67 264,66 276,68 288,66 300,67"/>
+              <circle cx="84" cy="20" r="2.5" fill="#dc2626"/>
+            </svg>
+            <div class="cap">60 样本 · 平均 2.3ms · 峰值 8.1ms · 丢包 0%</div>
+          </div>
+          <div class="chart">
+            <h4>宽带测速 <span class="tg">Ookla</span></h4>
+            <div class="hbar">
+              <div class="row"><span class="lab">下载</span><div class="track"><div class="fill" style="width:92%;background:#0a84ff"></div></div><span class="val">285.4 Mbps</span></div>
+              <div class="row"><span class="lab">上传</span><div class="track"><div class="fill" style="width:31%;background:#ff9500"></div></div><span class="val">31.2 Mbps</span></div>
+            </div>
+            <div class="cap">签约 300M/30M · 下行达标 95% · 仅为客观测速数据，不含达标判定</div>
+          </div>
+          <div class="chart">
+            <h4>状态分布 <span class="tg">24 项</span></h4>
+            <div class="sbar">
+              <i style="width:79.2%;background:#16a34a"></i>
+              <i style="width:12.5%;background:#d97706"></i>
+              <i style="width:8.3%;background:#94a3b8"></i>
+            </div>
+            <div class="sleg">
+              <span><i style="background:#16a34a"></i>正常 19</span>
+              <span><i style="background:#d97706"></i>警告 3</span>
+              <span><i style="background:#94a3b8"></i>未检测 2（含豁免）</span>
+            </div>
+            <div class="cap">全口径 24 项 · 与计分口径差 5 项豁免</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 模块明细（重做） -->
+      <div class="sec anno" style="position:relative;outline:2px dashed #eab308;outline-offset:6px;border-radius:6px">
+        <span class="anno-tag">重做</span>
+        <h3>模块明细 <span class="cnt">4 项已展开</span><span class="lnk">展开全部 24 项 ›</span></h3>
+        <div class="mods">
+          <div class="mod">
+            <div class="mod-head">
+              <span class="dot" style="background:#16a34a"></span><span class="nm">网关连通</span><span class="cat">基础</span>
+              <span class="pv">平均 2.3ms · 丢包 0%</span><span class="cv">›</span>
+            </div>
+          </div>
+          <div class="mod">
+            <div class="mod-head" style="background:#fffdf7">
+              <span class="dot" style="background:#d97706"></span><span class="nm">DNS 解析</span><span class="cat">基础</span>
+              <span class="pv">平均 86ms</span><span class="cv">⌄</span>
+            </div>
+            <div class="mod-body">
+              <div class="kv">
+                <div class="cell"><div class="k">系统 DNS</div><div class="v">2.3ms</div></div>
+                <div class="cell"><div class="k">解析均值</div><div class="v">86ms</div></div>
+                <div class="cell"><div class="k">失败</div><div class="v">0 / 20</div></div>
+                <div class="cell"><div class="k">参考对比</div><div class="v">223.5.5.5 · 31ms</div></div>
+              </div>
+              <div class="mod-issue">系统 DNS 响应显著慢于公共参考（86ms vs 31ms）。</div>
+            </div>
+          </div>
+          <div class="mod">
+            <div class="mod-head" style="background:#fffdf7">
+              <span class="dot" style="background:#d97706"></span><span class="nm">Wi-Fi 信号</span><span class="cat">接入</span>
+              <span class="pv">RSSI −72dBm</span><span class="cv">⌄</span>
+            </div>
+            <div class="mod-body">
+              <div class="kv">
+                <div class="cell"><div class="k">信号强度</div><div class="v">−72dBm</div></div>
+                <div class="cell"><div class="k">频段</div><div class="v">2.4GHz</div></div>
+                <div class="cell"><div class="k">协商速率</div><div class="v">144Mbps</div></div>
+                <div class="cell"><div class="k">信道</div><div class="v">6</div></div>
+              </div>
+              <div class="mod-issue">RSSI 处于弱信号区间（&lt;−70dBm），建议靠近 AP 或切换 5GHz。</div>
+            </div>
+          </div>
+          <div class="mod">
+            <div class="mod-head">
+              <span class="dot" style="background:#16a34a"></span><span class="nm">宽带测速</span><span class="cat">性能</span>
+              <span class="pv">285.4 / 31.2 Mbps</span><span class="cv">›</span>
+            </div>
+          </div>
+          <div class="mod">
+            <div class="mod-head" style="background:#fbfcfd">
+              <span class="dot" style="background:#94a3b8"></span><span class="nm">系统代理</span><span class="cat">环境</span>
+              <span class="pv">127.0.0.1:7890</span><span class="cv">⌄</span>
+            </div>
+            <div class="mod-body">
+              <div class="mod-issue info">代理已开启（127.0.0.1:7890）；本模块为评分豁免项，问题计入待办、不计扣分。</div>
+            </div>
+          </div>
+          <div class="mod">
+            <div class="mod-head">
+              <span class="dot" style="background:#94a3b8"></span><span class="nm">内网吞吐 iperf3</span><span class="cat">性能</span>
+              <span class="pv">未检测 · 无服务器配置</span><span class="cv">›</span>
+            </div>
+          </div>
+          <div class="mods-foot">其余 <b>18 项正常</b> · 点击展开全部</div>
+        </div>
+      </div>
+
+      <!-- 诊断结论（重做） -->
+      <div class="sec anno" style="position:relative;outline:2px dashed #eab308;outline-offset:6px;border-radius:6px">
+        <span class="anno-tag">重做</span>
+        <h3>诊断结论</h3>
+        <div class="diag">
+          <div class="rc">
+            <div class="t"><span class="bd">中</span>Wi-Fi 链路质量受限</div>
+            <div class="d">接入侧信号偏弱（−72dBm）与 DNS 解析偏慢共同拉高页面起连时间；出口带宽本身正常（下行达标 95%）。</div>
+          </div>
+          <div class="conf">置信度：中 —— 依据 Wi-Fi RSSI、DNS 响应样本与测速结果交叉判断</div>
+        </div>
+      </div>
+
+      <!-- 本机信息 + 附录（重做） -->
+      <div class="sec anno" style="position:relative;outline:2px dashed #eab308;outline-offset:6px;border-radius:6px">
+        <span class="anno-tag">重做</span>
+        <h3>本机信息</h3>
+        <div class="host">
+          <div class="grid">
+            <div class="kv2"><span class="k">主机名</span><span class="v">DESKTOP-8F3KQ2</span></div>
+            <div class="kv2"><span class="k">系统</span><span class="v">Windows 11 23H2</span></div>
+            <div class="kv2"><span class="k">出口 IP</span><span class="v">203.0.113.*（电信）</span></div>
+            <div class="kv2"><span class="k">活动网卡</span><span class="v">Wi-Fi（Intel AX201）</span></div>
+            <div class="kv2"><span class="k">网关</span><span class="v">192.168.1.1</span></div>
+            <div class="kv2"><span class="k">系统 DNS</span><span class="v">221.228.255.1</span></div>
+          </div>
+        </div>
+        <div class="appendix">技术附录 · 阈值 / 判定标准 / 原始结果摘要<span class="chev">点击展开 ⌄</span></div>
+      </div>
+
+      <div style="height:8px"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 方案 A · 盯障报告 -->
+<div class="frame-name"><b>盯障报告视图（方案 A 同一语言）</b><span>结论 banner → 统计卡 → 延迟双线 → 事件表；内容按盯障自身要素组织</span></div>
+<div class="frame">
+  <div class="frame-bar"><i></i><i></i><i></i><span>NetPulse GUI — 盯障报告</span></div>
+  <div class="app">
+    <div class="g-top">
+      <div class="g-mark">NP</div><div class="g-brand">NetPulse</div><div class="g-ver">v1.25.0</div>
+      <div class="g-spring"></div>
+      <div class="g-host">DESKTOP-8F3KQ2 · 192.168.1.23<div class="g-dot"></div>在线</div>
+    </div>
+    <div class="rp">
+      <div class="anno" style="position:relative;outline:2px dashed #eab308;outline-offset:6px;border-radius:6px">
+        <span class="anno-tag blue">新增</span>
+        <div class="rp-head" style="padding-top:4px">
+          <h1>盯障报告</h1>
+          <div class="sub">2026-11-13 20:00 – 22:00 · 实测 2 小时 00 分 / 计划 2 小时</div>
+          <div class="rp-actions">
+            <button class="btn primary">导出报告 ▾</button>
+            <button class="btn">打开文件夹</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="mon-banner"><span class="ic">⚠</span><span>外网侧存在短暂抖动：抖动集中 2 段、外网丢包 0.4%；全程无中断，网关侧稳定（丢包 0.1%）。适合作为「偶发卡顿」类投诉的初步证据，建议结合事件时间与用户操作时间对照。</span></div>
+
+      <div class="mcards">
+        <div class="mcard"><div class="k">网关丢包率</div><div class="v">0.1<small>%</small></div></div>
+        <div class="mcard warn"><div class="k">外网丢包率</div><div class="v">0.4<small>%</small></div></div>
+        <div class="mcard"><div class="k">中断</div><div class="v">0 <small>起</small></div></div>
+        <div class="mcard warn"><div class="k">抖动集中</div><div class="v">2 <small>段</small></div></div>
+        <div class="mcard"><div class="k">DNS 失败</div><div class="v">1 <small>次</small></div></div>
+      </div>
+
+      <div class="mchart">
+        <h4>延迟时序（网关 / 外网双线）</h4>
+        <div class="mleg">
+          <span><i style="background:#0a84ff"></i>网关 192.168.1.1</span>
+          <span><i style="background:#8b5cf6"></i>外网 223.5.5.5</span>
+          <span><i class="pt" style="background:#dc2626"></i>丢包点</span>
+          <span><i class="band" style="background:rgba(217,119,6,.18)"></i>抖动集中段</span>
+        </div>
+        <svg width="100%" height="150" viewBox="0 0 900 150" preserveAspectRatio="none">
+          <rect x="300" y="0" width="70" height="122" fill="rgba(217,119,6,.14)"/>
+          <rect x="620" y="0" width="46" height="122" fill="rgba(217,119,6,.14)"/>
+          <line x1="0" y1="118" x2="900" y2="118" stroke="#eef1f5"/>
+          <line x1="0" y1="80" x2="900" y2="80" stroke="#f6f7f9"/>
+          <line x1="0" y1="42" x2="900" y2="42" stroke="#f6f7f9"/>
+          <text x="4" y="115" font-size="10" fill="#98a2ad">0ms</text>
+          <text x="4" y="77" font-size="10" fill="#98a2ad">20ms</text>
+          <text x="4" y="39" font-size="10" fill="#98a2ad">40ms</text>
+          <polyline fill="none" stroke="#0a84ff" stroke-width="1.6"
+            points="0,112 30,112 60,113 90,112 120,112 150,113 180,112 210,112 240,113 270,112 300,112 330,112 360,112 390,113 420,112 450,112 480,112 510,113 540,112 570,112 600,112 630,112 660,113 690,112 720,112 750,113 780,112 810,112 840,113 870,112 900,112"/>
+          <polyline fill="none" stroke="#8b5cf6" stroke-width="1.6"
+            points="0,86 30,87 60,86 90,88 120,86 150,87 180,86 210,88 240,86 270,30 300,52 330,26 360,55 390,86 420,87 450,86 480,88 510,86 540,87 570,86 600,38 620,44 646,30 666,60 690,87 720,86 750,88 780,86 810,87 840,86 870,88 900,86"/>
+          <circle cx="300" cy="118" r="3" fill="#dc2626"/>
+          <circle cx="646" cy="118" r="3" fill="#dc2626"/>
+          <circle cx="620" cy="118" r="3" fill="#dc2626"/>
+        </svg>
+        <div class="cap">近 2 小时 · 丢包样本以红点标注（ms 缺失）；抖动段按 60s 滑动窗口判定</div>
+      </div>
+
+      <div class="etable">
+        <table>
+          <tr><th>时间</th><th>类型</th><th>流</th><th>详情</th></tr>
+          <tr><td>20:31:07 – 20:31:44</td><td><span class="ebadge jitter">抖动集中</span></td><td>外网 ping</td><td>37s 内丢包 4 次（3.3%），窗口样本 36 个</td></tr>
+          <tr><td>21:47:20 – 21:47:52</td><td><span class="ebadge jitter">抖动集中</span></td><td>外网 ping</td><td>32s 内丢包 3 次（2.5%），网关侧同窗正常 → 外部链路</td></tr>
+          <tr><td>21:12:03</td><td><span class="ebadge dns">DNS 失败</span></td><td>dns</td><td>解析超时 1 次，重试成功（耗时 1.8s）</td></tr>
+        </table>
+      </div>
+      <div style="height:10px"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════ 方案 B ══════════════════ -->
+<h2 class="doc-sec">方案 B · 双栏 · 总览侧栏</h2>
+<div class="frame-name"><b>诊断报告视图（双栏骨架）</b><span>左栏 250px 常驻总览（分数 / 状态 / 待办计数 / 导出 / 锚点导航），右栏内容流与方案 A 相同组件；窗口 &lt;1000px 自动降级为方案 A 单列</span></div>
+<div class="frame">
+  <div class="frame-bar"><i></i><i></i><i></i><span>NetPulse GUI — 诊断报告（双栏）</span></div>
+  <div class="app">
+    <div class="g-top">
+      <div class="g-mark">NP</div><div class="g-brand">NetPulse</div><div class="g-ver">v1.25.0</div>
+      <div class="g-spring"></div>
+      <div class="g-host">DESKTOP-8F3KQ2 · 192.168.1.23<div class="g-dot"></div>在线</div>
+    </div>
+    <div class="rpB">
+      <div class="rail anno" style="position:relative;outline:2px dashed #eab308;outline-offset:5px;border-radius:4px">
+        <span class="anno-tag" style="right:-6px">重做</span>
+        <div style="text-align:center;font-size:12px;font-weight:700;color:#5b6472;letter-spacing:1px;margin-bottom:10px">诊断报告 · 22:41</div>
+        <div class="ring">
+          <svg width="92" height="92" viewBox="0 0 92 92">
+            <circle cx="46" cy="46" r="38" fill="none" stroke="#eef1f6" stroke-width="9"/>
+            <circle cx="46" cy="46" r="38" fill="none" stroke="#16a34a" stroke-width="9"
+                    stroke-linecap="round" stroke-dasharray="230 238.8" transform="rotate(-90 46 46)"/>
+          </svg>
+          <div class="in"><div class="num">96</div></div>
+        </div>
+        <div class="grade-c">A 级 · 网络良好</div>
+        <div class="formula" style="text-align:center;font-size:11px;color:#475569;margin-top:4px;font-family:Cascadia Mono,Consolas,monospace">100 − 警告 2×2</div>
+        <div class="sbar">
+          <i style="width:79.2%;background:#16a34a"></i><i style="width:12.5%;background:#d97706"></i><i style="width:8.3%;background:#94a3b8"></i>
+        </div>
+        <div style="font-size:11px;color:#98a2ad;margin-top:5px;text-align:center">24 项 · 19 项计分 · 豁免 5</div>
+        <div class="todo-mini"><span>需要关注</span><b>3 项</b></div>
+        <nav>
+          <a class="on" href="javascript:void 0">概览</a>
+          <a href="javascript:void 0">需要关注 · 3</a>
+          <a href="javascript:void 0">关键指标</a>
+          <a href="javascript:void 0">模块明细 · 24</a>
+          <a href="javascript:void 0">诊断结论</a>
+          <a href="javascript:void 0">本机信息</a>
+          <a href="javascript:void 0">技术附录</a>
+        </nav>
+        <button class="btn primary">导出 HTML</button>
+        <button class="btn">导出 PDF</button>
+        <button class="btn">导出 JSON</button>
+        <button class="btn">打开文件夹</button>
+      </div>
+      <div class="railB">
+        <div class="rp-head">
+          <h1 style="font-size:20px">诊断报告</h1>
+          <div class="sub">全量检测 · 耗时 4 分 12 秒</div>
+        </div>
+        <div class="sec"><h3>需要关注 <span class="cnt">3 项</span></h3>
+          <div class="todo-card">
+            <div class="t"><span class="dot"></span>DNS 解析偏慢，可能拖慢网页与下载的起连</div>
+            <div class="d">当前系统 DNS 平均响应 86ms（样本 20 次），高于网关直连参考水平。</div>
+            <div class="src"><span class="chip">来源 · DNS 解析</span><span class="chip">警告 · 扣 2 分</span></div>
+          </div>
+          <div class="todo-card">
+            <div class="t"><span class="dot"></span>Wi-Fi 信号偏弱，速率与稳定性受影响</div>
+            <div class="d">RSSI −72dBm（2.4GHz），弱信号区间。</div>
+            <div class="src"><span class="chip">来源 · Wi-Fi</span><span class="chip">警告 · 扣 2 分</span></div>
+          </div>
+          <div class="todo-card" style="border-left-color:#94a3b8">
+            <div class="t"><span class="dot" style="background:#94a3b8"></span>检测到系统代理已开启</div>
+            <div class="d">经代理的测速反映代理链路能力，不代表直连带宽。</div>
+            <div class="src"><span class="chip">来源 · 代理检测</span><span class="chip exempt">豁免 · 不计扣分</span></div>
+          </div>
+        </div>
+        <div class="sec"><h3>关键指标</h3>
+          <div class="charts" style="grid-template-columns:1fr 1fr">
+            <div class="chart">
+              <h4>网关延迟 <span class="tg">逐次 Ping</span></h4>
+              <svg width="100%" height="92" viewBox="0 0 300 92" preserveAspectRatio="none">
+                <line x1="0" y1="72" x2="300" y2="72" stroke="#eef1f5"/>
+                <polyline fill="none" stroke="#34c759" stroke-width="1.8"
+                  points="0,66 24,67 48,66 72,68 84,20 96,66 120,67 144,66 168,52 192,66 216,67 240,66 264,68 288,66 300,67"/>
+                <circle cx="84" cy="20" r="2.5" fill="#dc2626"/>
+              </svg>
+              <div class="cap">60 样本 · 平均 2.3ms · 峰值 8.1ms</div>
+            </div>
+            <div class="chart">
+              <h4>宽带测速 <span class="tg">Ookla</span></h4>
+              <div class="hbar">
+                <div class="row"><span class="lab">下载</span><div class="track"><div class="fill" style="width:92%;background:#0a84ff"></div></div><span class="val">285.4 Mbps</span></div>
+                <div class="row"><span class="lab">上传</span><div class="track"><div class="fill" style="width:31%;background:#ff9500"></div></div><span class="val">31.2 Mbps</span></div>
+              </div>
+              <div class="cap">签约 300M/30M · 下行达标 95%</div>
+            </div>
+          </div>
+        </div>
+        <div class="sec"><h3>模块明细 <span class="cnt">4 项已展开</span></h3>
+          <div class="mods">
+            <div class="mod"><div class="mod-head"><span class="dot" style="background:#d97706"></span><span class="nm">DNS 解析</span><span class="cat">基础</span><span class="pv">平均 86ms</span><span class="cv">⌄</span></div>
+              <div class="mod-body"><div class="kv"><div class="cell"><div class="k">解析均值</div><div class="v">86ms</div></div><div class="cell"><div class="k">失败</div><div class="v">0 / 20</div></div><div class="cell"><div class="k">参考对比</div><div class="v">223.5.5.5 · 31ms</div></div><div class="cell"><div class="k">系统 DNS</div><div class="v">221.228.255.1</div></div></div>
+              <div class="mod-issue">系统 DNS 响应显著慢于公共参考（86ms vs 31ms）。</div></div>
+            </div>
+            <div class="mod"><div class="mod-head"><span class="dot" style="background:#d97706"></span><span class="nm">Wi-Fi 信号</span><span class="cat">接入</span><span class="pv">RSSI −72dBm</span><span class="cv">⌄</span></div>
+              <div class="mod-body"><div class="mod-issue">RSSI 处于弱信号区间（&lt;−70dBm），建议靠近 AP 或切换 5GHz。</div></div>
+            </div>
+            <div class="mod"><div class="mod-head"><span class="dot" style="background:#16a34a"></span><span class="nm">网关连通</span><span class="cat">基础</span><span class="pv">平均 2.3ms · 丢包 0%</span><span class="cv">›</span></div></div>
+            <div class="mod"><div class="mod-head"><span class="dot" style="background:#94a3b8"></span><span class="nm">内网吞吐 iperf3</span><span class="cat">性能</span><span class="pv">未检测 · 无服务器配置</span><span class="cv">›</span></div></div>
+            <div class="mods-foot">其余 <b>20 项正常 / 未检测</b> · 点击展开全部</div>
+          </div>
+        </div>
+        <div class="sec"><h3>诊断结论</h3>
+          <div class="diag">
+            <div class="rc"><div class="t"><span class="bd">中</span>Wi-Fi 链路质量受限</div>
+            <div class="d">接入侧信号偏弱与 DNS 解析偏慢共同拉高起连时间；出口带宽正常。</div></div>
+            <div class="conf">置信度：中 —— 依据 RSSI、DNS 样本与测速交叉判断</div>
+          </div>
+        </div>
+        <div class="appendix">技术附录 · 阈值 / 判定标准 / 原始结果摘要<span class="chev">点击展开 ⌄</span></div>
+        <div style="height:6px"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h2 class="doc-sec">两方案对比</h2>
+<table class="vs">
+<tr><th>维度</th><th>方案 A · 单列流（推荐）</th><th>方案 B · 双栏总览</th></tr>
+<tr><td>首屏信息</td><td>Hero+口径条+待办首卡，结论 3 秒可读</td><td>分数/状态/待办计数常驻左栏，滚动中不丢全局</td></tr>
+<tr><td>阅读节奏</td><td>与现有进度页一致，自上而下单列，窄窗口友好</td><td>内容区变窄，模块卡 key_metrics 四列在窄窗口挤压</td></tr>
+<tr><td>窗口适配</td><td>天然自适应（现有 GUI 最小窗口即可用）</td><td>&lt;1000px 需降级回单列（多一套响应式分支）</td></tr>
+<tr><td>实现成本</td><td>一套布局</td><td>双栏布局 + 降级逻辑 + 锚点滚动联动</td></tr>
+<tr><td>与将来客户端</td><td colspan="2">两者数据通道与组件相同，仅布局骨架差异，不影响「JSON + 前端渲染」分层目标</td></tr>
+</table>
+
+<div class="doc-note" style="margin-top:22px">
+<b>定稿后回写</b>：选型结论回写 docs/spec.md「范围 2」；实施按本稿组件口径执行
+（状态色取自 /api/scenarios 下发的 STATUS_COLORS / GRADE_COLORS，本稿 hex 仅示意；
+数字全部来自报告数据通道，前端零自算）。盯障视图导出按钮组为 CSV/JSON/HTML 三件套。
+</div>
+
+</div>
+</body>
+</html>
