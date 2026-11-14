@@ -99,7 +99,7 @@
 | M1 | 全量测试套件 | `for f in tests/test_*.py; do python "$f"; done` | 全绿（Npcap 2 例环境依赖除外） |
 | M2 | 页面资产闸：无 iframe、零外链、P5 渲染闸 | `tests/test_gui_page.py`（更新后） | 全过 |
 | M3 | /api/report 与盯障数据端点契约 | `tests/test_gui_server.py`（更新后） | 全过 |
-| M4 | 导出链 golden 比对（customer/brief/brief_v2） | golden 测试（fixture 渲染 vs 基线文件） | 逐字节一致 |
+| M4 | 导出链 golden 比对（customer/brief/brief_v2/盯障导出 HTML 四份） | golden 测试（fixture 渲染 vs 基线文件） | 逐字节一致 |
 | M5 | 屏幕版↔导出版口径一致性 | 口径一致性测试 | 逐项一致 |
 | M6 | 盯障三件套落盘字节不变 | `save_monitor_report` 输出比对测试 | 逐字节一致 |
 | M7 | 无新增 LAST_RUN 依赖 | `grep -c LAST_RUN netpulse.py` 改前改后计数 | 只减不增 |

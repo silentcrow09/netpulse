@@ -14,7 +14,9 @@ tests/fixtures/golden/ 下基线**逐字节**比对 —— 这是导出链渲染
 import argparse
 import io
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from datetime import datetime
 
@@ -28,9 +30,13 @@ GOLDEN_DIR = os.path.join(ROOT, "tests", "fixtures", "golden")
 RICH_MARKERS = {
     "report_customer.html": (
         "网关延迟时间序列", "宽带测速", "状态分布", "需要您关注",
-        "检测范围", "主机信息", "未检测"),
+        "检测范围", "主机信息", "未检测",
+        # 根因命中分支 (fixture: DNS 失败率 55% 触发 _rule_dns_failure):
+        # rcard/证据链/「已展开首要问题项」是导出报告最复杂的区块, 必须在基线覆盖内
+        "主要问题", "已展开首要问题项"),
     "report_brief.html": ("<html", "NetPulse"),
     "report_brief_v2.html": ("NetPulse",),
+    "monitor_report.html": ("盯障",),
 }
 
 
@@ -43,12 +49,8 @@ def _fixture_run():
                     "ping": {"rtts": rtts, "avg_ms": 2.3, "loss_pct": 0.0,
                              "sent": 20, "recv": 20}},
         "dns": {"system_dns": ["221.228.255.1"], "avg_time_ms": 118,
-                "current_avg_ms": 118, "success_count": 20, "total_count": 20,
-                "current_total_count": 20,
-                "issues": [{"severity": "warning",
-                            "message": "DNS 解析偏慢（平均 118ms）",
-                            "detail": "当前系统 DNS 平均响应 118ms, "
-                                      "高于网关直连参考水平"}]},
+                "current_avg_ms": 118, "success_count": 9, "total_count": 20,
+                "current_total_count": 20},
         "wifi": {"ssid": "Home-2.4G", "rssi": -72, "channel": 6,
                  "issues": [{"severity": "warning",
                              "message": "Wi-Fi 信号偏弱（RSSI -72dBm）",
@@ -76,6 +78,87 @@ def _fixture_run():
     }
 
 
+def _monitor_fixture_res():
+    """盯障导出固定 res: 与 save_monitor_report 消费的字段同形, 全部定值
+    (时间戳/样本/事件均硬编码 —— _render_monitor_html 无 now() 依赖)。"""
+    t0 = 1796000000
+    return {
+        "mode": "monitor",
+        "timestamp": "2026-01-02T03:04:05",
+        "started_at": "2026-01-02 03:04:05",
+        "ended_at": "2026-01-02 03:34:05",
+        "duration_planned_s": 1800,
+        "duration_actual_s": 1800,
+        "early_terminated": False,
+        "targets": {"gateway": "192.168.1.1", "external": "223.5.5.5",
+                    "external_resolved": "223.5.5.5",
+                    "tcp_target": "223.5.5.5:53",
+                    "dns_server": "223.5.5.5",
+                    "dns_domain": "www.baidu.com"},
+        "notes": [{"t": 15, "text": "负载窗结束"}],
+        "samples": {
+            "gw_rtt": [[i * 5.0, 2.0 + (i % 3)] for i in range(300)],
+            "gw_loss": [120.0, 121.5, 400.0],
+            "ext_rtt": [[i * 5.0, 20.0 + (i % 7)] for i in range(300)],
+            "ext_loss": [610.0, 612.0],
+            "tcp": [[i * 30.0, 21.0] for i in range(60)],
+            "dns": [[i * 30.0, 30.0, "ok"] for i in range(60)],
+        },
+        "stats": {"gw": {"ok": 297, "loss": 3, "loss_pct": 1.0,
+                         "avg_ms": 2.5, "p50_ms": 2.0, "p95_ms": 4.0,
+                         "max_ms": 4.9},
+                  "ext": {"ok": 298, "loss": 2, "loss_pct": 0.67,
+                          "avg_ms": 21.0, "p50_ms": 20.0, "p95_ms": 26.0,
+                          "max_ms": 27.1},
+                  "tcp": {"ok": 60, "fail": 0, "ok_pct": 100.0,
+                          "avg_ms": 21.0},
+                  "dns": {"ok": 60, "fail": 0, "ok_pct": 100.0,
+                          "avg_ms": 30.0}},
+        "mtu": {"probe_status": "ok",
+                "path_mtus": [{"target": "223.5.5.5", "path_mtu": 1500,
+                               "probes": 3}],
+                "local_if_mtu": 1500, "local_if_name": "以太网"},
+        "tcp_quality": {"retrans_rate_pct": 0.42, "retrans_delta": 7,
+                        "sent_delta": 1667,
+                        "series": [[0, 100, 0], [30, 120, 1], [60, 140, 1]]},
+        "nic_quality": {"err_delta": 0, "series": []},
+        "events": [
+            {"type": "jitter_burst", "stream": "ext", "cls": "carrier",
+             "start_ts": t0 + 600, "end_ts": t0 + 637,
+             "duration_s": 37.0, "open_at_end": False,
+             "detail": "37s 内丢包 2 次 (0.7%)",
+             "root_cause": "运营商/上联侧抖动",
+             "start_disp": "03:14:05", "end_disp": "03:14:42"},
+        ],
+        "verdict": "degraded",
+        "conclusion_text": "外网侧存在短暂抖动",
+        "advice": "结合事件时间对照用户操作",
+        "summary": "盯障 1800s: 网关丢包 1.0%, 外网丢包 0.67%, 无中断, "
+                   "抖动集中 1 段",
+        "local_ip": "192.168.1.2",
+        "_csv_rows": [["2026-01-02 03:04:05", "gw_ping", 1, 2.0, 1, ""]],
+    }
+
+
+def _render_monitor_golden_html():
+    """盯障导出 HTML (第四份 golden, v1.25.0 独立验证 P1-1): 走真实
+    save_monitor_report 落盘链路后读回。json 快照内含落盘绝对路径 (随
+    tmp 变化), 故只把 HTML 入基线; csv 内容固定 (fixture 定值)。"""
+    res = _monitor_fixture_res()
+    old_dir = np._report_dir
+    tmp = tempfile.mkdtemp(prefix="np_golden_mon_")
+    np._report_dir = lambda: tmp
+    try:
+        pair = np.save_monitor_report(res)
+        if not pair:
+            raise RuntimeError("save_monitor_report(fixture) 返回 None")
+        with io.open(pair[0], "r", encoding="utf-8", newline="") as f:
+            return f.read()
+    finally:
+        np._report_dir = old_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _render_all():
     rep = np.build_report(run=_fixture_run())
     if rep is None:
@@ -84,6 +167,7 @@ def _render_all():
         ("report_customer.html", np.render_report_html_customer(rep)),
         ("report_brief.html", np.render_report_html_brief(rep)),
         ("report_brief_v2.html", np.render_report_html_brief_v2(rep)),
+        ("monitor_report.html", _render_monitor_golden_html()),
     ]
 
 

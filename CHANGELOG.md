@@ -26,8 +26,9 @@
   （`_score_formula` / `_todo_issues_data` / `SCORE_PENALTY`），口径漂移由
   `tests/test_gui_report_view.py` 锁住。
 - **导出链 golden 回归锁**：`tests/test_report_golden.py` 固定 fixture 渲染
-  customer / brief / brief_v2 三份 HTML 与基线**逐字节**比对（AGENTS.md 原
-  「改前改后 Compare-Object」手工流程的自动化）。
+  customer / brief / brief_v2 / **盯障导出 HTML** 四份与基线**逐字节**比对
+  （AGENTS.md 原「改前改后 Compare-Object」手工流程的自动化；fixture 命中
+  DNS 根因规则，导出报告最复杂的根因分支也在锁的覆盖内）。
 
 ### 修复
 

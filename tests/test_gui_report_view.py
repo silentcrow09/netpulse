@@ -49,6 +49,9 @@ class TestGuiReportView(unittest.TestCase):
         total_in_bar = sum(seg["n"] for seg in view["summary_counts"])
         self.assertEqual(total_in_bar, len(rep["modules"]),
                          "状态分布条 (全口径) 必须覆盖全部模块")
+        # 参与计分数 = counts 合计 (服务端下发, JS 不累加)
+        self.assertEqual(view["scored_count"],
+                         sum(int(v) for v in rep["counts"].values()))
 
     def test_projection_excludes_raw_payload(self):
         view = np._gui_report_view(_rep())
@@ -118,14 +121,29 @@ class TestGuiReportView(unittest.TestCase):
                          np._conf_band(0.6))
 
     def test_expand_without_root_cause_uses_problem_statuses(self):
-        rep = _rep()   # fixture 无根因命中 (合成结果不构成规则证据)
+        # fixture 现触发 DNS 根因 (双分支覆盖), 无根因分支用空 diagnosis 显式构造
+        rep = _rep(diagnosis={"root_causes": [], "overall_confidence": 0.0,
+                              "rules_evaluated": 8, "rules_fired": 0})
         view = np._gui_report_view(rep)
-        if view["diagnosis"]["mode"] == "root_causes":
-            self.skipTest("fixture 命中了根因规则, 本用例不适用")
+        self.assertEqual(view["diagnosis"]["mode"], "none")
         mods = {m["key"]: m for m in view["modules"]}
         self.assertTrue(mods["dns"]["expanded"], "警告模块应默认展开")
         self.assertTrue(mods["wifi"]["expanded"], "警告模块应默认展开")
         self.assertFalse(mods["gateway"]["expanded"], "完成模块默认折叠")
+
+    def test_fixture_covers_root_cause_branch(self):
+        # golden fixture 必须触发 DNS 根因 (独立验证 P1-2: 首要根因展开/
+        # rcard 分支必须在导出基线覆盖内) —— 展开集合 = 根因 affected 模块
+        rep = _rep()
+        rc = (rep["diagnosis"] or {}).get("root_causes") or []
+        self.assertTrue(rc, "fixture 必须命中根因规则 (否则 golden 丢分支)")
+        self.assertEqual(rc[0]["id"], "dns_failure")
+        view = np._gui_report_view(rep)
+        mods = {m["key"]: m for m in view["modules"]}
+        self.assertTrue(mods["dns"]["expanded"])
+        self.assertTrue(mods["gateway"]["expanded"],
+                        "首要根因涉及的模块 (含正常态网关) 应展开")
+        self.assertFalse(mods["wifi"]["expanded"])
 
     def test_scope_partial_and_full(self):
         # 全量跑完 → 「N 项全覆盖」
@@ -237,6 +255,9 @@ class TestMonitorReportView(unittest.TestCase):
         # 统计直传 (屏幕版零自算)
         self.assertEqual(view["stats"]["gw"]["loss_pct"], 0.6)
         self.assertEqual(view["tcp_quality"]["retrans_rate_pct"], 0.42)
+        # 中断/抖动段计数由服务端按事件表计好下发 (JS 不再过滤计数)
+        self.assertEqual(view["outage_cnt"], 0)
+        self.assertEqual(view["jitter_cnt"], 1)
 
     def test_events_labels_and_times(self):
         view = np._gui_monitor_report_view(_mon_snapshot())

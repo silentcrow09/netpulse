@@ -24976,6 +24976,9 @@ def _gui_report_view(report):
             "formula": _score_formula(report),
         },
         "counts": counts,
+        # 参与计分项数 (扣分口径合计): 服务端下发, JS 不在前端累加
+        # (独立验证 P2-1: 「数字零自算」覆盖一切派生数字)
+        "scored_count": sum(int(v) for v in counts.values()),
         "summary_counts": summary_counts,
         "exempt_count": report.get("exempt_count", 0),
         "exempt_names": _exempt_names(report),
@@ -26153,6 +26156,12 @@ def _gui_monitor_report_view(snap):
         "targets": snap.get("targets") or {},
         "stats": stats,
         "events": events,
+        # 事件计数 (中断/抖动段): 服务端按事件表计好下发, JS 不再过滤计数
+        # (独立验证 P2-2, 与「数字零自算」同口径)
+        "outage_cnt": sum(1 for e in (snap.get("events") or [])
+                          if e.get("type") == "outage"),
+        "jitter_cnt": sum(1 for e in (snap.get("events") or [])
+                          if e.get("type") == "jitter_burst"),
         "series": {"gw": _series("gw"), "ext": _series("ext")},
         "bands": {
             "gw": _monitor_loss_bands(
@@ -27847,14 +27856,13 @@ _GUI_JS = r"""(function () {
     chips.appendChild(gpChip("待办 " + d.todo.need_cnt + " 项"));
     chips.appendChild(gpChip("生成 " + (d.meta.generated_at || "")));
     hm.appendChild(chips);
-    var scored = 0;
-    Object.keys(d.counts || {}).forEach(function (k) {
-      scored += Number(d.counts[k]) || 0;
-    });
+    // 双口径说明 (AGENTS.md: 并排必须写明差异; 参与计分数为投影下发值)
     var scopeLine = el("div", "gp-scope");
     scopeLine.appendChild(document.createTextNode(
-      "计分口径：实检 " + d.scope.ran + "/" + d.scope.sel + " 项 · "
-      + scored + " 项参与计分 · 豁免 " + d.exempt_count + " 项"
+      "计分口径：实检 " + (Number(d.scope.ran) || 0) + "/"
+      + (Number(d.scope.sel) || 0) + " 项 · "
+      + (Number(d.scored_count) || 0) + " 项参与计分 · 豁免 "
+      + d.exempt_count + " 项"
       + ((d.exempt_names || []).length
         ? "（" + d.exempt_names.join(" / ") + "）" : "")
       + "；状态分布为全口径 " + d.charts.status.total + " 项"));
@@ -28564,8 +28572,7 @@ _GUI_JS = r"""(function () {
 
   // 盯障报告原生渲染 (v1.25.0): 落盘 JSON 回放投影 → 统计卡 + 延迟双线 + 事件表。
   // 结论条 (徽章/结论/建议/提前终止标) 仍由 openMonReport 用快照既有字段填充,
-  // 本函数只画报告本体; 数字零自算 —— 统计直取投影 stats, 中断/抖动段计数来自
-  // 事件表 (数组计数, 非判定)。
+  // 本函数只画报告本体; 数字零自算 —— 统计与中断/抖动段计数均为投影下发值。
   function renderMonReport(d) {
     var box = $("#mon-frame");
     box.textContent = "";
@@ -28591,13 +28598,9 @@ _GUI_JS = r"""(function () {
     if (extL !== null && extL !== undefined) {
       cards.appendChild(mcard("外网丢包率", extL, "%", extL >= 1));
     }
-    var outages = (d.events || []).filter(function (e) {
-      return e.type === "outage";
-    }).length;
+    var outages = Number(d.outage_cnt) || 0;
     cards.appendChild(mcard("中断", outages, " 起", outages > 0));
-    var jitters = (d.events || []).filter(function (e) {
-      return e.type === "jitter_burst";
-    }).length;
+    var jitters = Number(d.jitter_cnt) || 0;
     cards.appendChild(mcard("抖动集中", jitters, " 段", jitters > 0));
     var dnsF = d.stats.dns ? d.stats.dns.fail : null;
     if (dnsF !== null && dnsF !== undefined) {

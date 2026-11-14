@@ -189,11 +189,12 @@
   textContent / createElementNS（P5 闸延续）。判级三态（命中根因 / 有未完成
   模块 / 未匹配到根因）与导出报告同口径，屏幕版不写「无故障 / 高置信度」。
 - **导出链零回归锁**：`tests/test_report_golden.py` 固定 fixture 渲染
-  customer / brief / brief_v2 三份 HTML 与 `tests/fixtures/golden/` 基线逐字节
-  比对（换行归一）——**本文件「报告渲染」节的手工 Compare-Object 流程以此测试
-  自动化**；有意变更导出渲染器时 `python tests/test_report_golden.py --bless`
-  重生成基线并人工审 diff。投影与导出的口径一致性由 `tests/test_gui_report_view.py`
-  锁住。
+  customer / brief / brief_v2 / **盯障导出 HTML** 四份与 `tests/fixtures/golden/`
+  基线逐字节比对（换行归一；fixture 必须命中 DNS 根因规则，保住「首要根因展开」
+  分支的覆盖，`test_fixture_covers_root_cause_branch` 锁住）——**本文件「报告渲染」
+  节的手工 Compare-Object 流程以此测试自动化**；有意变更导出渲染器时
+  `python tests/test_report_golden.py --bless` 重生成基线并人工审 diff。
+  投影与导出的口径一致性由 `tests/test_gui_report_view.py` 锁住。
 
 ## 诊断汇总口径（v1.19.x）
 
@@ -253,8 +254,8 @@
   `_tech_appendix_section`（技术附录）。191 行 CSS 提成模块常量
   `CSS_CUSTOMER_REPORT`（与 `CSS_BRIEF_V2` 同一惯例）。
   **拆分零回归验证方式**（改渲染代码后照做）：`tests/test_report_golden.py`
-  已把本流程自动化 —— 固定 fixture 渲染 customer/brief/brief_v2 三份与
-  `tests/fixtures/golden/` 基线逐字节比对，测试红即渲染器被改动；有意变更时
+  已把本流程自动化 —— 固定 fixture 渲染 customer/brief/brief_v2/盯障导出 HTML
+  四份与 `tests/fixtures/golden/` 基线逐字节比对，测试红即渲染器被改动；有意变更时
   `--bless` 重生成基线并逐行审查 diff（v1.25.0 起）。
 
 ## JSON Schema 必须与导出一致 (v1.14.14)
