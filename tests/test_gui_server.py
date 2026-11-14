@@ -6,7 +6,7 @@
   P1 无 token → 403; 带 token → 200 (页面与 API)
   P2 /api/scenarios 场景集与 DIAGNOSE_PROFILES 一致, status_colors 来自 STATUS_COLORS
   P3 POST /api/run 启动成功; busy 时 409
-  P4 GET /api/report 无报告 404, 有报告返回 HTML
+  P4 GET /api/report 无报告 404, 有报告返回投影 JSON (v1.25.0 原生视图数据通道)
   P5 POST /api/shutdown 触发事件
   P6 GET /api/netstatus → {"ok": ...} (顶栏联网状态数据源, 锁内读 _GUI_NET)
   P7 _gui_conn_check 三态 (通/不通/OSError→False) + _gui_net_watch 单轮写状态
@@ -218,14 +218,36 @@ class TestGuiServer(unittest.TestCase):
             self.assertEqual(json.loads(raw)["phase"], "done")
 
     def test_report_gate(self):
+        # P4 (v1.25.0): 无报告 404; 有报告返回投影 JSON (原生视图数据通道,
+        # iframe 现渲 HTML 已退役)
         st, _ = _req(self.port, "GET", "/api/report?t=" + self.token)
         self.assertEqual(st, 404)
-        with mock.patch.object(np, "render_report_html_customer",
-                               return_value="<html>fake</html>"):
+        with mock.patch.object(np, "_gui_report_view",
+                               return_value={"health": {"score": 96}}):
             self.session._report = {"fake": True}
             st, raw = _req(self.port, "GET", "/api/report?t=" + self.token)
         self.assertEqual(st, 200)
-        self.assertIn(b"fake", raw)
+        self.assertEqual(json.loads(raw)["health"]["score"], 96)
+
+    def test_report_payload_shape(self):
+        # S6: 真实 build_report 产物 → 投影经路由下发, 屏幕渲染要素齐全
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from test_report_golden import _fixture_run
+        self.session._report = np.build_report(run=_fixture_run())
+        st, raw = _req(self.port, "GET", "/api/report?t=" + self.token)
+        self.assertEqual(st, 200)
+        data = json.loads(raw)
+        for k in ("meta", "health", "counts", "summary_counts", "exempt_names",
+                  "penalty", "scope", "todo", "charts", "modules",
+                  "diagnosis", "host", "thresholds"):
+            self.assertIn(k, data, "报告投影缺键: %s" % k)
+        self.assertEqual(data["health"]["score"],
+                         self.session._report["health"]["score"])
+
+    def test_monitor_report_gate(self):
+        # v1.25.0: 盯障报告路由 = 落盘 JSON 回放投影; 无落盘 → 404
+        st, _ = _req(self.port, "GET", "/api/monitor/report?t=" + self.token)
+        self.assertEqual(st, 404)
 
     def test_shutdown_event(self):
         st, raw = _req(self.port, "POST", "/api/shutdown?t=" + self.token,
@@ -290,6 +312,15 @@ class TestGuiServer(unittest.TestCase):
         def _fake_save(res):
             with open(html_path, "wb") as f:
                 f.write("<html><body>盯障报告OK</body></html>".encode("utf-8"))
+            # v1.25.0: /api/monitor/report 读落盘 JSON 回放投影 → 同步写最小快照
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump({"stats": {"gw": {"loss_pct": 0.0, "ok": 100, "loss": 0},
+                                     "ext": {"loss_pct": 0.2, "ok": 99, "loss": 1},
+                                     "dns": {"fail": 0, "ok": 50, "ok_pct": 100.0}},
+                           "events": [], "verdict": "stable",
+                           "conclusion_text": "盯障报告OK", "samples": {},
+                           "duration_actual_s": 600,
+                           "duration_planned_s": 600, "targets": {}}, f)
             return (html_path, json_path)
 
         rec, p_ms, p_save = _patch_monitor_session(fake,

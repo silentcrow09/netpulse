@@ -13,7 +13,8 @@ ping, 不写真实报告目录。
   P5 事件预览: 连续 3 丢包 → outage ≥1; 独立 ≥5s 节流 (progress 重算不带重算)
   P6 互斥: session running → monitor.start 拒; monitor running → session 拒;
      同类 running → 二次 start 拒
-  P7 report_html: 文件存在 → bytes; 文件被删/无报告 → None
+  P7 report_view (v1.25.0): 落盘 JSON → 投影 dict; 文件被删/损坏/无报告 → None
+     (v1.24.x 的 report_html bytes 内嵌路径已随 iframe 退役)
   P8 编排落盘后 progress_payload 带报告页结论块 (verdict/conclusion/advice/
      early/files + targets/error 元信息); running 期不含 verdict
 """
@@ -169,7 +170,7 @@ class TestGuiMonitor(unittest.TestCase):
         self.assertEqual(snap["phase"], "error")
         self.assertTrue(snap["error"])
         self.assertIsNone(snap["report_paths"])
-        self.assertIsNone(m.report_html())         # 无报告 → None
+        self.assertIsNone(m.report_view())         # 无报告 → None
 
     def test_session_start_failure_rollback(self):
         m = np._GuiMonitor()
@@ -346,25 +347,48 @@ class TestGuiMonitor(unittest.TestCase):
         self.assertIn("盯障", err2)
         self.assertIsNone(eff2)
 
-    # -- P7 report_html --
+    # -- P7 report_view (v1.25.0: 落盘 JSON 回放投影) --
 
-    def test_report_html_bytes(self):
+    def test_report_view_from_saved_json(self):
+        import json as _json
         tmp = tempfile.mkdtemp()
         try:
             hp = os.path.join(tmp, "monitor_x.html")
+            jp = os.path.join(tmp, "monitor_x.json")
             with open(hp, "wb") as f:
                 f.write("<html><body>盯障报告</body></html>".encode("utf-8"))
+            with open(jp, "w", encoding="utf-8") as f:
+                _json.dump({"stats": {"gw": {"loss_pct": 0.5, "ok": 100,
+                                             "loss": 1},
+                                      "ext": {"loss_pct": 0.0, "ok": 101,
+                                              "loss": 0},
+                                      "dns": {"fail": 0, "ok": 50}},
+                            "events": [{"type": "outage", "stream": "ext",
+                                        "start_ts": 1000, "end_ts": 1030,
+                                        "duration_s": 30.0, "detail": "d"}],
+                            "verdict": "degraded",
+                            "conclusion_text": "外网中断 30s",
+                            "samples": {"gw_rtt": [[1.0, 2.0], [2.0, 3.0]],
+                                        "gw_loss": [3.0],
+                                        "ext_rtt": [[1.0, 20.0]],
+                                        "ext_loss": []},
+                            "duration_actual_s": 600, "targets": {}}, f)
             m = np._GuiMonitor()
             with m._lock:
-                m._paths = {"html": hp, "json": hp}   # 直填私有态 (落盘路径已在 P2 验证)
-            data = m.report_html()
-            self.assertIsInstance(data, bytes)
-            self.assertIn("盯障报告".encode("utf-8"), data)
-            os.remove(hp)
-            self.assertIsNone(m.report_html())        # 文件被删 → None
+                m._paths = {"html": hp, "json": jp}   # 直填私有态 (落盘已在 P2 验证)
+            view = m.report_view()
+            self.assertEqual(view["verdict"], "degraded")
+            self.assertEqual(view["stats"]["gw"]["loss_pct"], 0.5)
+            self.assertEqual(view["bands"]["gw"], [[3.0, 3.0]])
+            self.assertEqual(view["events"][0]["label"], "中断")
+            os.remove(jp)
+            self.assertIsNone(m.report_view())        # 文件被删 → None
+            with open(jp, "w", encoding="utf-8") as f:
+                f.write("{broken")
+            self.assertIsNone(m.report_view())        # 损坏 → None
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        self.assertIsNone(np._GuiMonitor().report_html())   # 无报告 → None
+        self.assertIsNone(np._GuiMonitor().report_view())   # 无报告 → None
 
     # -- P8 编排落盘后的结论块 (Task 3 报告页数据源) --
 

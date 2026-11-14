@@ -24979,6 +24979,9 @@ def _gui_report_view(report):
         "summary_counts": summary_counts,
         "exempt_count": report.get("exempt_count", 0),
         "exempt_names": _exempt_names(report),
+        # 评分口径 (v1.25.0): 屏幕版附录「扣分规则」行用 —— 服务端下发,
+        # JS 不硬编码扣分数字 (AGENTS.md: 扣分表唯一来源 SCORE_PENALTY)
+        "penalty": {st: abs(v) for st, v in SCORE_PENALTY.items()},
         "scope": scope,
         "todo": {
             "need_cnt": t["need_cnt"],
@@ -25008,7 +25011,12 @@ def _gui_report_view(report):
     }
     site_check = report.get("site_check") or {}
     if site_check or report.get("site_note") or report.get("meta_manual"):
-        view["site"] = {"check": site_check,
+        # 现场检测: 检查项带中文标签下发 (SITE_CHECK_BY_KEY 单一来源),
+        # 清单外 key 按白名单口径显示「未检查」
+        items = [[(SITE_CHECK_BY_KEY.get(k) or {}).get("label", k),
+                  (v if v else "未检查")]
+                 for k, v in site_check.items()]
+        view["site"] = {"items": items,
                         "note": report.get("site_note", ""),
                         "manual": report.get("meta_manual") or {}}
     return view
@@ -25525,19 +25533,12 @@ class _GuiSession:
             # stopping 也算在跑 —— 收尾期间互斥不能放开 (spec F1)
             return self._phase in ("running", "stopping")
 
-    def report_html(self):
-        """内嵌报告页 (客户版) 的完整 HTML; 无报告返回 None。"""
-        with self._lock:
-            if not self._report:
-                return None
-            report = self._report
-        return render_report_html_customer(report)
-
     def report_view(self):
         """屏幕版报告投影 (v1.25.0): /api/report 的 JSON 数据; 无报告 None。
 
         只读投影 (_gui_report_view), 不持锁渲染 —— 渲染是纯函数, 取引用
-        后锁外计算, 不加重快照路径成本。
+        后锁外计算, 不加重快照路径成本。(v1.25.0: report_html 现渲路径
+        已随 iframe 一并退役)
         """
         with self._lock:
             rep = self._report
@@ -26551,23 +26552,11 @@ class _GuiMonitor:
         return out
 
     # -- 报告 --
-    def report_html(self):
-        """内嵌报告页 (/api/monitor/report): 读落盘 HTML 的 bytes;
-        无报告或文件不可读返回 None。"""
-        with self._lock:
-            paths = self._paths
-        if not paths:
-            return None
-        try:
-            with open(paths["html"], "rb") as f:
-                return f.read()
-        except OSError:
-            return None
-
     def report_view(self):
         """屏幕版盯障报告投影 (v1.25.0): 读落盘 JSON 投影; 无报告 None。
 
-        与 report_html 同一数据源生命周期 (编排线程落盘成功后才有 paths)。
+        (v1.25.0: report_html 读落盘 HTML bytes 的内嵌路径已随 iframe
+        一并退役; 盯障导出 HTML 仍由 _render_monitor_html 落盘)
         """
         with self._lock:
             paths = self._paths
@@ -26777,7 +26766,7 @@ input,select{ font-family:inherit; }
 #rep-files li:last-child{ border-bottom:none; }
 #rep-files:empty{ display:none; }
 #exp-msg{ margin-top:8px; }
-iframe#g-frame{ width:100%; height:calc(100vh - 120px); border:0; margin-top:16px; }
+.g-rpt{ margin-top:18px; }
 
 /* ── 现场检测 (设计稿第 5 节) ── */
 .g-steps{ display:flex; align-items:center; margin:2px 0 24px; }
@@ -26949,7 +26938,7 @@ iframe#g-frame{ width:100%; height:calc(100vh - 120px); border:0; margin-top:16p
           letter-spacing:.5px; white-space:nowrap; }
 .mrp-actions{ display:flex; gap:10px; margin-top:18px; }
 .mrp-files{ margin-top:10px; font-size:12px; color:var(--mute); }
-iframe#mon-frame{ width:100%; height:calc(100vh - 300px); border:0; margin-top:16px; }
+/* 盯障报告容器样式并入下方 v1.25.0 报告视图样式族 (.g-rpt/.gp-*) */
 
 /* ── 模块勾选面板 (v1.23.0, design_ref/gui/modules_design_v1.html 第 2/3 节 1:1) ──
    复选框用原生 input.appearance:none 重绘成设计稿 .ck 方块 (选中 navy 底 +
@@ -27021,6 +27010,180 @@ iframe#mon-frame{ width:100%; height:calc(100vh - 300px); border:0; margin-top:1
 .modal-body{ font-size:13.5px; color:var(--text); line-height:1.75; margin-top:14px; }
 .modal-body b{ color:var(--red); }
 .modal-btns{ display:flex; justify-content:flex-end; gap:12px; margin-top:20px; }
+/* ══ 报告视图原生渲染 (v1.25.0, 方案A · design_ref/gui/report_native_design_v1.html)
+   #g-frame / #mon-frame 由 iframe 改为内容 div, 组件样式 gp-* 前缀防冲突。
+   状态色一律由 JS 从 /api/scenarios 下发的 COLORS/GRADES 赋 style, CSS 只管形状。 ══ */
+.gp-hero{ background:#fff; border:1px solid var(--rule); border-radius:14px;
+          padding:20px 26px; display:flex; gap:26px; align-items:center;
+          box-shadow:0 6px 22px -14px rgba(15,23,42,.14); }
+.gp-ring{ position:relative; width:118px; height:118px; flex:none; }
+.gp-ring svg{ transform:rotate(0); }
+.gp-ring .in{ position:absolute; inset:0; display:flex; flex-direction:column;
+              align-items:center; justify-content:center; gap:2px; }
+.gp-ring .num{ font-size:34px; font-weight:900; font-variant-numeric:tabular-nums;
+               line-height:1; color:var(--text); }
+.gp-ring .grade{ font-size:11.5px; font-weight:700; border-radius:999px; padding:1px 10px; }
+.gp-hero-main{ min-width:0; }
+.gp-hero-t{ font-size:19px; font-weight:800; letter-spacing:.3px; }
+.gp-formula{ font-size:12.5px; color:#475569; margin-top:6px;
+             font-family:Cascadia Mono,Consolas,monospace; }
+.gp-chips{ display:flex; flex-wrap:wrap; gap:6px; margin-top:12px; }
+.gp-chips span{ font-size:12px; color:var(--dim); background:var(--soft);
+                border:1px solid var(--rule); border-radius:999px; padding:2.5px 11px;
+                font-family:Cascadia Mono,Consolas,monospace; }
+.gp-chips span b{ color:var(--text); font-weight:600; }
+.gp-scope{ margin-top:12px; background:var(--soft); border:1px solid var(--rule);
+           border-radius:10px; padding:8px 14px; font-size:12.5px; color:var(--dim);
+           line-height:1.7; }
+.gp-scope b{ color:var(--text); font-weight:700; }
+.gp-sec{ margin-top:26px; }
+.gp-sec>h3{ font-size:15.5px; font-weight:800; letter-spacing:.2px;
+            display:flex; align-items:center; gap:8px; }
+.gp-sec>h3 .cnt{ font-size:11.5px; font-weight:700; color:#92400e; background:#fef3c7;
+                 border-radius:999px; padding:1px 10px; }
+.gp-sec>h3 .lnk{ margin-left:auto; font-size:12px; font-weight:600; color:var(--navy);
+                 background:none; border:none; cursor:pointer; padding:0; }
+.gp-sec>h3 .lnk:hover{ text-decoration:underline; }
+.gp-todo{ margin-top:10px; background:#fff; border:1px solid var(--rule);
+          border-left:4px solid var(--amber); border-radius:0 10px 10px 0;
+          padding:12px 16px; }
+.gp-todo.err{ border-left-color:var(--red); }
+.gp-todo.idle{ border-left-color:var(--mute); }
+.gp-todo .t{ font-size:13.5px; font-weight:700; display:flex; align-items:center; gap:8px; }
+.gp-todo .t .dot{ width:8px; height:8px; border-radius:50%; flex:none; background:var(--amber); }
+.gp-todo.err .t .dot{ background:var(--red); }
+.gp-todo.idle .t .dot{ background:var(--mute); }
+.gp-todo .d{ font-size:12.5px; color:var(--dim); margin-top:4px; line-height:1.7; }
+.gp-todo .fix{ font-size:12.5px; color:var(--text); margin-top:6px; background:var(--soft);
+               border-radius:8px; padding:6px 12px; line-height:1.7; }
+.gp-todo .fix b{ color:var(--navy); font-weight:700; }
+.gp-src{ margin-top:8px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+.gp-chip{ font-size:11px; font-weight:600; color:var(--dim); background:var(--soft);
+          border:1px solid var(--rule); border-radius:999px; padding:1.5px 10px; }
+.gp-chip.exempt{ color:#64748b; background:#f1f5f9; border-color:#e2e8f0; }
+.gp-charts{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; margin-top:10px; }
+.gp-chart{ background:#fff; border:1px solid var(--rule); border-radius:12px;
+           padding:14px 16px; min-width:0; }
+.gp-chart h4{ font-size:13px; font-weight:700; display:flex; align-items:center; gap:8px; }
+.gp-chart h4 .tg{ font-size:10.5px; font-weight:600; color:var(--dim);
+                  background:var(--soft); border-radius:999px; padding:1px 9px; }
+.gp-chart .cap{ font-size:11.5px; color:var(--mute); margin-top:6px; line-height:1.6; }
+.gp-chart svg{ margin-top:8px; display:block; width:100%; height:auto; }
+.gp-sbar{ display:flex; height:18px; border-radius:6px; overflow:hidden; margin-top:10px; }
+.gp-sbar i{ display:block; height:100%; }
+.gp-sleg{ display:flex; flex-wrap:wrap; gap:10px; margin-top:8px; font-size:11.5px;
+          color:var(--dim); }
+.gp-sleg i{ width:9px; height:9px; border-radius:3px; display:inline-block;
+            margin-right:5px; vertical-align:-1px; }
+.gp-hbar .row{ display:flex; align-items:center; gap:10px; margin-bottom:8px; margin-top:10px; }
+.gp-hbar .lab{ width:34px; font-size:12px; color:var(--dim); flex:none; }
+.gp-hbar .track{ flex:1; height:16px; background:#f1f5f9; border-radius:5px; overflow:hidden; }
+.gp-hbar .fill{ height:100%; border-radius:5px; }
+.gp-hbar .val{ width:92px; font-size:12px; font-weight:700; font-variant-numeric:tabular-nums;
+               text-align:right; flex:none; }
+.gp-mods{ margin-top:10px; border:1px solid var(--rule); border-radius:12px;
+          overflow:hidden; background:#fff; }
+.gp-mod{ border-bottom:1px solid #eef1f5; }
+.gp-mod:last-child{ border-bottom:none; }
+.gp-mod-head{ display:flex; align-items:center; gap:10px; padding:11px 16px; cursor:pointer;
+              background:none; border:none; width:100%; text-align:left; font-family:inherit; }
+.gp-mod-head:hover{ background:#f8fafc; }
+.gp-mod-head .dot{ width:9px; height:9px; border-radius:50%; flex:none; background:var(--mute); }
+.gp-mod-head .nm{ font-size:13.5px; font-weight:700; color:var(--text); }
+.gp-mod-head .badge{ font-size:11px; color:var(--dim); }
+.gp-mod-head .pv{ margin-left:auto; font-size:12px; color:var(--dim);
+                  font-family:Cascadia Mono,Consolas,monospace; white-space:nowrap;
+                  overflow:hidden; text-overflow:ellipsis; max-width:46%; }
+.gp-mod-head .cv{ font-size:11px; color:var(--mute); flex:none; }
+.gp-mod-body{ padding:2px 16px 14px; border-top:1px dashed #eef1f5; }
+.gp-kv{ display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-top:10px; }
+.gp-kv .cell{ background:#f8fafc; border:1px solid #eef1f5; border-radius:8px;
+              padding:7px 12px; min-width:0; }
+.gp-kv .k{ font-size:11px; color:var(--mute); }
+.gp-kv .v{ font-size:13px; font-weight:700; font-variant-numeric:tabular-nums; margin-top:1px;
+           word-break:break-all; }
+.gp-issue{ margin-top:8px; font-size:12.5px; color:#92400e; background:#fffbeb;
+           border:1px solid #fde68a; border-radius:8px; padding:6px 12px;
+           line-height:1.7; white-space:pre-line; }
+.gp-issue.err{ color:#991b1b; background:#fef2f2; border-color:#fecaca; }
+.gp-issue.info{ color:#475569; background:#f8fafc; border-color:#e2e8f0; }
+.gp-mods-foot{ padding:10px 16px; background:var(--soft); font-size:12.5px;
+               color:var(--dim); text-align:center; }
+.gp-diag{ margin-top:10px; background:#fff; border:1px solid var(--rule);
+          border-radius:12px; padding:14px 16px; }
+.gp-diag .rc{ border-left:4px solid #ea580c; background:#fff7ed; border-radius:0 8px 8px 0;
+              padding:10px 14px; }
+.gp-diag .rc.plain{ border-left-color:#94a3b8; background:#f8fafc; color:var(--dim); }
+.gp-diag .rc .t{ font-size:13.5px; font-weight:700; display:flex; gap:8px; align-items:center; }
+.gp-diag .rc .t .bd{ font-size:11px; font-weight:700; color:#fff; background:#ea580c;
+                     border-radius:5px; padding:1px 9px; flex:none; }
+.gp-diag .rc .d{ font-size:12.5px; color:var(--dim); margin-top:5px; line-height:1.7;
+                 white-space:pre-line; }
+.gp-diag ul{ margin:8px 0 0 18px; font-size:12.5px; color:var(--dim); line-height:1.8; }
+.gp-diag .rev{ margin-top:8px; font-size:12px; color:var(--dim); line-height:1.7;
+               white-space:pre-line; }
+.gp-diag .conf{ margin-top:8px; font-size:12px; color:var(--dim); }
+.gp-host{ margin-top:10px; background:#fff; border:1px solid var(--rule);
+          border-radius:12px; padding:14px 16px; }
+.gp-host .grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px 20px; margin-top:8px; }
+.gp-host .kv2{ display:flex; gap:8px; font-size:12.5px; padding:3px 0; }
+.gp-host .kv2 .k{ color:var(--mute); flex:none; width:72px; }
+.gp-host .kv2 .v{ color:var(--text); font-weight:600; word-break:break-all; }
+.gp-host .note{ margin-top:8px; font-size:11.5px; color:var(--mute); line-height:1.6; }
+.gp-appx{ margin-top:10px; background:#fff; border:1px solid var(--rule);
+          border-radius:12px; padding:12px 16px; }
+.gp-appx summary{ font-size:13px; font-weight:700; color:var(--dim); cursor:pointer; }
+.gp-appx .rule-line{ font-size:12px; color:var(--dim); margin-top:10px; line-height:1.8; }
+.gp-appx table{ width:100%; border-collapse:collapse; font-size:12px; margin-top:10px; }
+.gp-appx th{ background:var(--soft); color:var(--dim); text-align:left; padding:5px 10px;
+             border-bottom:1px solid var(--rule); font-size:11.5px; font-weight:700; }
+.gp-appx td{ padding:5px 10px; border-bottom:1px solid #eef1f5; }
+.gp-empty{ margin-top:24px; text-align:center; color:var(--mute); font-size:13px;
+           padding:30px 0; }
+/* 盯障报告 (v1.25.0 原生渲染) */
+.gp-mbanner{ margin-top:18px; border-radius:12px; padding:13px 18px; font-size:13.5px;
+             font-weight:600; background:#fffbeb; border:1px solid #fde68a; color:#92400e;
+             line-height:1.8; }
+.gp-mbanner.ok{ background:#f0fdf4; border-color:#bbf7d0; color:#166534; }
+.gp-mcards{ display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin-top:14px; }
+.gp-mcard{ background:#fff; border:1px solid var(--rule); border-radius:12px;
+           padding:12px 16px; }
+.gp-mcard .k{ font-size:11.5px; color:var(--mute); font-weight:600; }
+.gp-mcard .v{ font-size:21px; font-weight:800; font-variant-numeric:tabular-nums;
+              margin-top:3px; }
+.gp-mcard.warn .v{ color:#b45309; }
+.gp-mcard .v small{ font-size:12px; font-weight:600; color:var(--mute); }
+.gp-mchart{ margin-top:14px; background:#fff; border:1px solid var(--rule);
+            border-radius:12px; padding:14px 16px; }
+.gp-mchart h4{ font-size:13px; font-weight:700; }
+.gp-mchart .cap{ font-size:11.5px; color:var(--mute); margin-top:6px; }
+.gp-mleg{ display:flex; gap:16px; margin-top:6px; font-size:11.5px; color:var(--dim);
+          flex-wrap:wrap; }
+.gp-mleg i{ width:14px; height:3px; border-radius:2px; display:inline-block;
+            margin-right:6px; vertical-align:3px; }
+.gp-mleg .pt{ width:8px; height:8px; border-radius:50%; }
+.gp-mleg .band{ width:14px; height:10px; border-radius:3px; }
+.gp-etable{ margin-top:14px; background:#fff; border:1px solid var(--rule);
+            border-radius:12px; overflow:hidden; }
+.gp-etable table{ width:100%; border-collapse:collapse; font-size:12.5px; }
+.gp-etable th{ background:var(--soft); color:var(--dim); font-weight:700; text-align:left;
+               padding:8px 14px; font-size:12px; border-bottom:1px solid var(--rule); }
+.gp-etable td{ padding:8px 14px; border-bottom:1px solid #eef1f5; vertical-align:top;
+               line-height:1.7; }
+.gp-etable tr:last-child td{ border-bottom:none; }
+.gp-elabel{ display:inline-block; font-size:11px; font-weight:700; border-radius:5px;
+            padding:1px 9px; }
+.gp-elabel.err{ background:#fee2e2; color:#991b1b; }
+.gp-elabel.warn{ background:#fef3c7; color:#92400e; }
+.gp-elabel.info{ background:#e0f2fe; color:#075985; }
+.gp-elabel.neutral{ background:#f1f5f9; color:#64748b; }
+@media (max-width: 900px){
+  .gp-charts{ grid-template-columns:1fr; }
+  .gp-kv{ grid-template-columns:repeat(2,1fr); }
+  .gp-host .grid{ grid-template-columns:1fr 1fr; }
+  .gp-mcards{ grid-template-columns:repeat(2,1fr); }
+  .gp-hero{ flex-direction:column; align-items:flex-start; }
+}
 """
 
 _GUI_JS = r"""(function () {
@@ -27603,12 +27766,457 @@ _GUI_JS = r"""(function () {
       });
     }
   }
+  // ── 报告原生渲染 (v1.25.0): /api/report 投影 JSON → DOM ──
+  // 纪律: textContent / createElementNS, 零 innerHTML (P5 闸); 数字零自算
+  // —— 分数/计数/待办/展开集合/扣分表全部取自投影, 服务端与导出报告同源口径
+  // (_score_formula / _todo_issues_data / SCORE_PENALTY), JS 只画不算。
+  var GP_SEV_CLASS = { "异常": "err", "错误": "err", "警告": "", "信息": "info" };
+  function gpFail(box, msg) {
+    box.textContent = "";
+    box.appendChild(el("div", "gp-empty", msg || "报告加载失败, 请重试"));
+  }
+  function svgEl(tag, attrs) {
+    var n = document.createElementNS(SVGNS, tag);
+    if (attrs) Object.keys(attrs).forEach(function (k) { n.setAttribute(k, attrs[k]); });
+    return n;
+  }
+  function gpChip(txt) { return el("span", null, txt); }
+  function gpRing(score, gradeKey) {
+    var wrap = el("div", "gp-ring");
+    var C = 2 * Math.PI * 50;
+    var svg = svgEl("svg", { width: 118, height: 118, viewBox: "0 0 118 118" });
+    svg.appendChild(svgEl("circle", { cx: 59, cy: 59, r: 50, fill: "none",
+      stroke: "#eef1f6", "stroke-width": 11 }));
+    var frac = Math.max(0, Math.min(100, Number(score) || 0)) / 100;
+    svg.appendChild(svgEl("circle", { cx: 59, cy: 59, r: 50, fill: "none",
+      stroke: GRADES[gradeKey] || "#d97706", "stroke-width": 11,
+      "stroke-linecap": "round",
+      "stroke-dasharray": (C * frac).toFixed(1) + " " + C.toFixed(1),
+      transform: "rotate(-90 59 59)" }));
+    wrap.appendChild(svg);
+    var inn = el("div", "in");
+    inn.appendChild(el("div", "num", String(score)));
+    var badge = el("span", "grade", (gradeKey || "") + " 级");
+    var gb = (state.meta && state.meta.grade_badges)
+      ? state.meta.grade_badges[gradeKey] : null;
+    if (gb) { badge.style.color = gb[0]; badge.style.background = gb[1]; }
+    inn.appendChild(badge);
+    wrap.appendChild(inn);
+    return wrap;
+  }
+  function gpPingChart(rtts) {
+    var w = 300, h = 92, pad = 6;
+    var mx = Math.max.apply(null, rtts);
+    var mn = Math.min.apply(null, rtts);
+    var span = Math.max(mx - mn, 1);
+    var svg = svgEl("svg", { viewBox: "0 0 " + w + " " + h,
+      preserveAspectRatio: "none" });
+    var pts = [], peak = 0;
+    rtts.forEach(function (v, i) {
+      var x = pad + (w - 2 * pad) * (i / Math.max(rtts.length - 1, 1));
+      var y = h - pad - (h - 2 * pad) * ((v - mn) / span);
+      pts.push([x, y]);
+      if (v > rtts[peak]) peak = i;
+    });
+    svg.appendChild(svgEl("polyline", { fill: "none", stroke: "#34c759",
+      "stroke-width": 1.8, "stroke-linejoin": "round",
+      points: pts.map(function (p) {
+        return p[0].toFixed(1) + "," + p[1].toFixed(1); }).join(" ") }));
+    svg.appendChild(svgEl("circle", { cx: pts[peak][0].toFixed(1),
+      cy: pts[peak][1].toFixed(1), r: 2.6, fill: "#dc2626" }));
+    return svg;
+  }
+  function renderReport(d) {
+    var box = $("#g-frame");
+    box.textContent = "";
+    var gradeKey = String(d.health.grade || "").trim().charAt(0).toUpperCase();
+
+    // ── Hero (分数环 + 算式行 + 元信息 + 双口径说明) ──
+    var hero = el("div", "gp-hero");
+    hero.appendChild(gpRing(d.health.score, gradeKey));
+    var hm = el("div", "gp-hero-main");
+    hm.appendChild(el("div", "gp-hero-t", d.health.label || d.health.verdict || ""));
+    hm.appendChild(el("div", "gp-formula", d.health.formula || ""));
+    var chips = el("div", "gp-chips");
+    if (d.scope && d.scope.text) {
+      var sc = gpChip("检测范围 " + d.scope.text);
+      if (d.scope.note) sc.title = d.scope.note;
+      chips.appendChild(sc);
+    }
+    chips.appendChild(gpChip("实检 " + d.scope.ran + " 项"));
+    chips.appendChild(gpChip("待办 " + d.todo.need_cnt + " 项"));
+    chips.appendChild(gpChip("生成 " + (d.meta.generated_at || "")));
+    hm.appendChild(chips);
+    var scored = 0;
+    Object.keys(d.counts || {}).forEach(function (k) {
+      scored += Number(d.counts[k]) || 0;
+    });
+    var scopeLine = el("div", "gp-scope");
+    scopeLine.appendChild(document.createTextNode(
+      "计分口径：实检 " + d.scope.ran + "/" + d.scope.sel + " 项 · "
+      + scored + " 项参与计分 · 豁免 " + d.exempt_count + " 项"
+      + ((d.exempt_names || []).length
+        ? "（" + d.exempt_names.join(" / ") + "）" : "")
+      + "；状态分布为全口径 " + d.charts.status.total + " 项"));
+    hm.appendChild(scopeLine);
+    hero.appendChild(hm);
+    box.appendChild(hero);
+
+    // ── 待办 (与导出报告同一聚合口径的投影卡) ──
+    var secT = el("div", "gp-sec");
+    var hT = el("h3", null, "需要关注");
+    hT.appendChild(el("span", "cnt", d.todo.need_cnt + " 项"));
+    secT.appendChild(hT);
+    if (!(d.todo.cards || []).length) {
+      var okLine = el("div", "gp-todo idle");
+      okLine.appendChild(el("div", "t", "✓ 网络状态良好"));
+      okLine.appendChild(el("div", "d", "所有核心检测均正常, 详细指标见下方模块明细。"));
+      secT.appendChild(okLine);
+    } else {
+      (d.todo.cards || []).forEach(function (c) {
+        var sevCls = (c.severity === "异常" || c.severity === "错误") ? " err"
+                     : (c.severity === "警告" ? "" : " idle");
+        var card = el("div", "gp-todo" + sevCls);
+        var t = el("div", "t");
+        var dot = el("span", "dot");
+        dot.style.background = COLORS[c.severity] || "";
+        t.appendChild(dot);
+        t.appendChild(document.createTextNode((c.texts || []).join("；")));
+        card.appendChild(t);
+        if (c.impact) card.appendChild(el("div", "d", c.impact));
+        if (c.action) {
+          var fix = el("div", "fix");
+          var fb = document.createElement("b");
+          fb.textContent = "建议：";
+          fix.appendChild(fb);
+          fix.appendChild(document.createTextNode(c.action));
+          card.appendChild(fix);
+        }
+        var src = el("div", "gp-src");
+        src.appendChild(el("span", "gp-chip", "来源 · " + c.module));
+        var exempt = (d.exempt_names || []).indexOf(c.module) >= 0;
+        if (exempt) {
+          src.appendChild(el("span", "gp-chip exempt", "豁免 · 不计扣分"));
+        } else if (d.penalty && d.penalty[c.severity]) {
+          src.appendChild(el("span", "gp-chip",
+            c.severity + " · 扣 " + d.penalty[c.severity] + " 分"));
+        }
+        if (c.dup > 1) {
+          src.appendChild(el("span", "gp-chip", "波及 " + c.dup + " 个模块"));
+        }
+        if (c.raw_summary) src.appendChild(el("span", "gp-chip", c.raw_summary));
+        card.appendChild(src);
+        secT.appendChild(card);
+      });
+      if (d.todo.hidden_cnt > 0) {
+        secT.appendChild(el("div", "gp-src",
+          "另有 " + d.todo.hidden_cnt + " 条需关注项见下方模块明细"));
+      }
+    }
+    box.appendChild(secT);
+
+    // ── 关键指标 (数据不足的图卡自动隐藏, 与导出报告同口径) ──
+    var charts = [];
+    if (d.charts.ping && d.charts.ping.rtts && d.charts.ping.rtts.length) {
+      var c1 = el("div", "gp-chart");
+      var h1 = el("h4", null, "网关延迟 ");
+      h1.appendChild(el("span", "tg", "逐次 Ping"));
+      c1.appendChild(h1);
+      c1.appendChild(gpPingChart(d.charts.ping.rtts));
+      c1.appendChild(el("div", "cap", (d.charts.ping.cap || []).join(" · ")));
+      charts.push(c1);
+    }
+    var spd = d.charts.speed ? d.charts.speed.data : null;
+    if (spd && (Number(spd.download_mbps) > 0 || Number(spd.upload_mbps) > 0)) {
+      var c2 = el("div", "gp-chart");
+      var h2 = el("h4", null, "宽带测速 ");
+      h2.appendChild(el("span", "tg", d.charts.speed.method || ""));
+      c2.appendChild(h2);
+      var dl = Number(spd.download_mbps) || 0, ul = Number(spd.upload_mbps) || 0;
+      var mx = Math.max(dl, ul, 1);
+      var hbAll = el("div", "gp-hbar");
+      [["下载", dl, "#0a84ff"], ["上传", ul, "#ff9500"]].forEach(function (r) {
+        if (r[1] <= 0) return;
+        var row = el("div", "row");
+        row.appendChild(el("span", "lab", r[0]));
+        var track = el("div", "track");
+        var fill = el("div", "fill");
+        fill.style.width = Math.min(r[1] / mx * 100, 100).toFixed(1) + "%";
+        fill.style.background = r[2];
+        track.appendChild(fill);
+        row.appendChild(track);
+        row.appendChild(el("span", "val", r[1].toFixed(1) + " Mbps"));
+        hbAll.appendChild(row);
+      });
+      c2.appendChild(hbAll);
+      c2.appendChild(el("div", "cap", "仅为客观测速数据, 不包含达标判定"));
+      charts.push(c2);
+    }
+    if (d.charts.status && (d.charts.status.counts || []).length) {
+      var c3 = el("div", "gp-chart");
+      var h3 = el("h4", null, "状态分布 ");
+      h3.appendChild(el("span", "tg", d.charts.status.total + " 项"));
+      c3.appendChild(h3);
+      var bar = el("div", "gp-sbar");
+      (d.charts.status.counts || []).forEach(function (seg) {
+        var segEl = el("i");
+        segEl.style.width = (seg.n / d.charts.status.total * 100).toFixed(2) + "%";
+        segEl.style.background = COLORS[seg.status] || "#94a3b8";
+        bar.appendChild(segEl);
+      });
+      c3.appendChild(bar);
+      var sleg = el("div", "gp-sleg");
+      (d.charts.status.counts || []).forEach(function (seg) {
+        var item = el("span");
+        var legDot = el("i");
+        legDot.style.background = COLORS[seg.status] || "#94a3b8";
+        item.appendChild(legDot);
+        item.appendChild(document.createTextNode(seg.status + " " + seg.n));
+        sleg.appendChild(item);
+      });
+      c3.appendChild(sleg);
+      c3.appendChild(el("div", "cap", "全口径（含评分豁免模块）"));
+      charts.push(c3);
+    }
+    if (charts.length) {
+      var secC = el("div", "gp-sec");
+      secC.appendChild(el("h3", null, "关键指标"));
+      var grid = el("div", "gp-charts");
+      charts.forEach(function (c) { grid.appendChild(c); });
+      secC.appendChild(grid);
+      box.appendChild(secC);
+    }
+
+    // ── 模块明细 (折叠口径由服务端投影给出: 首要根因 / PROBLEM_STATUSES) ──
+    var secM = el("div", "gp-sec");
+    var hM = el("h3", null, "模块明细");
+    hM.appendChild(el("span", "cnt", d.modules.length + " 项"));
+    var lnk = el("button", "lnk", "展开全部 ›");
+    lnk.type = "button";
+    hM.appendChild(lnk);
+    secM.appendChild(hM);
+    var wrap = el("div", "gp-mods");
+    var bodies = [];
+    d.modules.forEach(function (m) {
+      var row = el("div", "gp-mod");
+      var head = el("button", "gp-mod-head");
+      head.type = "button";
+      var dot = el("span", "dot");
+      dot.style.background = COLORS[m.status] || COLORS["未检测"] || "#94a3b8";
+      head.appendChild(dot);
+      head.appendChild(el("span", "nm", m.name));
+      if (m.badge_text && m.badge_text !== m.status) {
+        head.appendChild(el("span", "badge", m.badge_text));
+      }
+      var pvTxt = m.verdict || "";
+      if (pvTxt.length > 60) { pvTxt = pvTxt.slice(0, 60) + "…"; head.title = m.verdict; }
+      head.appendChild(el("span", "pv", pvTxt));
+      var cv = el("span", "cv", m.expanded ? "⌄" : "›");
+      head.appendChild(cv);
+      var body = el("div", "gp-mod-body");
+      if (!m.expanded) body.style.display = "none";
+      if ((m.key_metrics || []).length) {
+        var kv = el("div", "gp-kv");
+        m.key_metrics.forEach(function (me) {
+          var cell = el("div", "cell");
+          cell.appendChild(el("div", "k", me.label));
+          var vv = el("div", "v", String(me.value));
+          if (me.level && me.level !== "ok") {
+            vv.style.color = COLORS[me.level === "err" ? "异常" : "警告"] || "";
+          }
+          if (me.hint) cell.title = me.label + ": " + me.value + "\n💡 " + me.hint;
+          kv.appendChild(cell);
+        });
+        body.appendChild(kv);
+      }
+      (m.issues || []).forEach(function (iss) {
+        var cls = GP_SEV_CLASS[iss.severity] === "err" ? " err"
+                : (GP_SEV_CLASS[iss.severity] === "info" ? " info" : "");
+        var di = el("div", "gp-issue" + cls);
+        di.textContent = "[" + iss.severity + "] " + iss.text
+          + (iss.action ? "\n💡 " + iss.action : "");
+        body.appendChild(di);
+      });
+      head.addEventListener("click", function () {
+        var opening = body.style.display === "none";
+        body.style.display = opening ? "" : "none";
+        cv.textContent = opening ? "⌄" : "›";
+      });
+      row.appendChild(head);
+      row.appendChild(body);
+      wrap.appendChild(row);
+      bodies.push({ body: body, cv: cv });
+    });
+    secM.appendChild(wrap);
+    var collapsedOk = d.modules.filter(function (m) {
+      return m.status === "完成" && !m.expanded;
+    }).length;
+    var foot = el("div", "gp-mods-foot");
+    foot.appendChild(document.createTextNode("其余 "));
+    var fbN = document.createElement("b");
+    fbN.textContent = collapsedOk + " 项正常";
+    foot.appendChild(fbN);
+    foot.appendChild(document.createTextNode(" · 点击行展开, 或"));
+    lnk.addEventListener("click", function () {
+      var anyClosed = bodies.some(function (b) {
+        return b.body.style.display === "none";
+      });
+      bodies.forEach(function (b) {
+        b.body.style.display = anyClosed ? "" : "none";
+        b.cv.textContent = anyClosed ? "⌄" : "›";
+      });
+      lnk.textContent = anyClosed ? "收起全部 ‹" : "展开全部 ›";
+    });
+    secM.appendChild(foot);
+    box.appendChild(secM);
+
+    // ── 诊断结论 (三态口径与导出报告一致: 不写无依据的话) ──
+    var secD = el("div", "gp-sec");
+    secD.appendChild(el("h3", null, "诊断结论"));
+    var dg = el("div", "gp-diag");
+    var dgMode = d.diagnosis ? d.diagnosis.mode : "none";
+    if (dgMode === "root_causes") {
+      (d.diagnosis.root_causes || []).forEach(function (rc) {
+        var card = el("div", "rc");
+        var t = el("div", "t");
+        t.appendChild(el("span", "bd", rc.sev_label || rc.severity || ""));
+        t.appendChild(document.createTextNode(rc.title || ""));
+        card.appendChild(t);
+        if (rc.description) card.appendChild(el("div", "d", rc.description));
+        if ((rc.recommendations || []).length) {
+          var ul = el("ul");
+          rc.recommendations.forEach(function (r) {
+            ul.appendChild(el("li", null, r));
+          });
+          card.appendChild(ul);
+        }
+        var revBits = [];
+        if ((rc.supports || []).length) {
+          revBits.push("为什么这样判断：\n" + rc.supports.map(function (s) {
+            return (s.ok ? "✓ " : "✕ ") + s.text;
+          }).join("\n"));
+        }
+        if ((rc.excludes || []).length) {
+          revBits.push("已基本排除：\n" + rc.excludes.map(function (s) {
+            return "✓ " + s.text;
+          }).join("\n"));
+        }
+        if (revBits.length) card.appendChild(el("div", "rev", revBits.join("\n")));
+        card.appendChild(el("div", "conf",
+          rc.conf_band + " —— 依据跨模块证据交叉判断"));
+        dg.appendChild(card);
+      });
+    } else if (dgMode === "unfinished") {
+      var card2 = el("div", "rc plain");
+      card2.appendChild(el("div", "d", "⚠ 未定位到根因 · "
+        + d.diagnosis.unfinished_cnt + " 个模块未完成检测, 现有结论仅供参考; "
+        + "请先让未完成模块跑完再判断"));
+      dg.appendChild(card2);
+    } else {
+      var card3 = el("div", "rc plain");
+      var suffix = d.diagnosis && d.diagnosis.need_cnt > 0
+        ? d.diagnosis.need_cnt + " 项问题已列在上方待办"
+        : "本次未发现已知根因模式";
+      card3.appendChild(el("div", "d", "未匹配到根因 · " + suffix));
+      dg.appendChild(card3);
+    }
+    secD.appendChild(dg);
+    box.appendChild(secD);
+
+    // ── 本机信息 (+ 现场检测核对项) ──
+    var secH = el("div", "gp-sec");
+    secH.appendChild(el("h3", null, "本机信息"));
+    var host = el("div", "gp-host");
+    var hgrid = el("div", "grid");
+    (d.host.pairs || []).forEach(function (p) {
+      var row = el("div", "kv2");
+      row.appendChild(el("span", "k", p[0]));
+      row.appendChild(el("span", "v", p[1] || "—"));
+      hgrid.appendChild(row);
+    });
+    host.appendChild(hgrid);
+    if (d.host.disclosure) host.appendChild(el("div", "note", d.host.disclosure));
+    if (d.site) {
+      if ((d.site.items || []).length) {
+        host.appendChild(el("div", "note", "现场核对："));
+        var sgrid = el("div", "grid");
+        (d.site.items || []).forEach(function (p) {
+          var row = el("div", "kv2");
+          row.appendChild(el("span", "k", p[0]));
+          row.appendChild(el("span", "v", p[1] || "未检查"));
+          sgrid.appendChild(row);
+        });
+        host.appendChild(sgrid);
+      }
+      if (d.site.note) host.appendChild(el("div", "note", "备注：" + d.site.note));
+      var manKeys = Object.keys(d.site.manual || {});
+      if (manKeys.length) {
+        host.appendChild(el("div", "note", "手输信息："
+          + manKeys.map(function (k) {
+              return k + " " + d.site.manual[k];
+            }).join(" · ")));
+      }
+    }
+    secH.appendChild(host);
+    box.appendChild(secH);
+
+    // ── 技术附录 (弱化: details 默认折叠) ──
+    var secA = el("div", "gp-sec");
+    var appx = el("details", "gp-appx");
+    appx.appendChild(el("summary", null, "技术附录 · 扣分规则与判定阈值"));
+    var ruleLine = el("div", "rule-line");
+    var penBits = [];
+    ["错误", "异常", "超时", "警告"].forEach(function (st) {
+      if (d.penalty && d.penalty[st]) penBits.push(st + " −" + d.penalty[st] + " 分");
+    });
+    penBits.push("未检测 0 分");
+    ruleLine.textContent = "扣分口径：" + penBits.join(" · ")
+      + "；豁免模块不计分（" + (d.exempt_names || []).join(" / ") + "）";
+    appx.appendChild(ruleLine);
+    var th = d.thresholds || {};
+    var modKeys = Object.keys(th).filter(function (k) {
+      return th[k] && Object.keys(th[k]).length;
+    });
+    if (modKeys.length) {
+      var tab = el("table");
+      var thead = el("thead");
+      var hr = el("tr");
+      ["模块", "指标", "警告阈值", "异常阈值"].forEach(function (h) {
+        hr.appendChild(el("th", null, h));
+      });
+      thead.appendChild(hr);
+      tab.appendChild(thead);
+      var tb = el("tbody");
+      modKeys.forEach(function (mk) {
+        Object.keys(th[mk]).forEach(function (metric) {
+          var cfg = th[mk][metric];
+          var tr = el("tr");
+          tr.appendChild(el("td", null, mk));
+          tr.appendChild(el("td", null, cfg.label || metric));
+          tr.appendChild(el("td", null,
+            (cfg.warn !== undefined && cfg.warn !== null)
+              ? cfg.warn + (cfg.unit || "") : "—"));
+          tr.appendChild(el("td", null,
+            (cfg.err !== undefined && cfg.err !== null)
+              ? cfg.err + (cfg.unit || "") : "—"));
+          tb.appendChild(tr);
+        });
+      });
+      tab.appendChild(tb);
+      appx.appendChild(tab);
+    }
+    secA.appendChild(appx);
+    box.appendChild(secA);
+  }
   function openReport() {
-    $("#g-frame").src = API.report;
+    get(API.report).then(function (d) {
+      if (d && d.health && d.modules) renderReport(d);
+      else gpFail($("#g-frame"), "尚无报告");
+    }).catch(function () { gpFail($("#g-frame"), "报告加载失败, 请重试"); });
     get(API.progress).then(function (d) {
       $("#rep-files").textContent = "";
       (d.files || []).forEach(function (f) { $("#rep-files").appendChild(el("li", null, f)); });
-      // 结论条只用快照既有字段; 分数/等级留在内嵌报告里, GUI 不自算 (口径统一)
+      // 结论条只用快照既有字段; 分数/等级留在报告视图里, GUI 不自算 (口径统一)
       $("#ver-line").textContent = "诊断完成" + (d.label ? " · " + d.label : "");
       var sub = "实检 " + d.done + "/" + d.total + " 项 · 用时 " + fmtMs(d.elapsed_ms);
       // v1.24.0: 续跑轮次把「哪些数据来自上一次」写在副行 (复用不隐瞒)
@@ -27954,8 +28562,159 @@ _GUI_JS = r"""(function () {
     g.appendChild(pl);
   }
 
-  // 结束报告页: 结论条 (verdict 徽章 + 结论/建议 + 提前终止标) + 内嵌
-  // 整页报告 + 三件套文件行。数据取最近一次 progress 载荷的 done 态结论块。
+  // 盯障报告原生渲染 (v1.25.0): 落盘 JSON 回放投影 → 统计卡 + 延迟双线 + 事件表。
+  // 结论条 (徽章/结论/建议/提前终止标) 仍由 openMonReport 用快照既有字段填充,
+  // 本函数只画报告本体; 数字零自算 —— 统计直取投影 stats, 中断/抖动段计数来自
+  // 事件表 (数组计数, 非判定)。
+  function renderMonReport(d) {
+    var box = $("#mon-frame");
+    box.textContent = "";
+    var vInfo = VERDICTS[d.verdict] || [d.verdict || "", "warn"];
+    var banner = el("div", "gp-mbanner" + (vInfo[1] === "" ? " ok" : ""));
+    banner.textContent = d.summary || d.conclusion || "盯障报告已生成";
+    box.appendChild(banner);
+    var cards = el("div", "gp-mcards");
+    function mcard(lab, val, unit, warn) {
+      var c = el("div", "gp-mcard" + (warn ? " warn" : ""));
+      c.appendChild(el("div", "k", lab));
+      var v = el("div", "v");
+      v.appendChild(document.createTextNode(String(val)));
+      if (unit) v.appendChild(el("small", null, unit));
+      c.appendChild(v);
+      return c;
+    }
+    var gwL = d.stats.gw ? d.stats.gw.loss_pct : null;
+    if (gwL !== null && gwL !== undefined) {
+      cards.appendChild(mcard("网关丢包率", gwL, "%", gwL >= 1));
+    }
+    var extL = d.stats.ext ? d.stats.ext.loss_pct : null;
+    if (extL !== null && extL !== undefined) {
+      cards.appendChild(mcard("外网丢包率", extL, "%", extL >= 1));
+    }
+    var outages = (d.events || []).filter(function (e) {
+      return e.type === "outage";
+    }).length;
+    cards.appendChild(mcard("中断", outages, " 起", outages > 0));
+    var jitters = (d.events || []).filter(function (e) {
+      return e.type === "jitter_burst";
+    }).length;
+    cards.appendChild(mcard("抖动集中", jitters, " 段", jitters > 0));
+    var dnsF = d.stats.dns ? d.stats.dns.fail : null;
+    if (dnsF !== null && dnsF !== undefined) {
+      cards.appendChild(mcard("DNS 失败", dnsF, " 次", dnsF > 0));
+    }
+    var rr = d.tcp_quality ? d.tcp_quality.retrans_rate_pct : null;
+    if (rr !== null && rr !== undefined) {
+      cards.appendChild(mcard("TCP 重传率", rr, "%", rr >= 1));
+    }
+    box.appendChild(cards);
+
+    // 延迟双线 (网关蓝 #0a84ff / 外网紫 #8b5cf6 —— 数据轴身份色, 非状态色)
+    var win = Number(d.duration && d.duration.actual_s) || 1;
+    var allVals = [];
+    (d.series.gw || []).concat(d.series.ext || []).forEach(function (p) {
+      if (p[1] !== null && p[1] !== undefined) allVals.push(p[1]);
+    });
+    var yMax = Math.max.apply(null, allVals.concat([1]));
+    var mc = el("div", "gp-mchart");
+    mc.appendChild(el("h4", null, "延迟时序（网关 / 外网双线）"));
+    var leg = el("div", "gp-mleg");
+    var lg1 = el("span"), li1 = el("i");
+    li1.style.background = "#0a84ff";
+    lg1.appendChild(li1);
+    lg1.appendChild(document.createTextNode(
+      "网关 " + ((d.targets || {}).gateway || "")));
+    var lg2 = el("span"), li2 = el("i");
+    li2.style.background = "#8b5cf6";
+    lg2.appendChild(li2);
+    lg2.appendChild(document.createTextNode(
+      "外网 " + ((d.targets || {}).external || "")));
+    var lg3 = el("span"), li3 = el("i", "pt");
+    li3.style.background = "#dc2626";
+    lg3.appendChild(li3);
+    lg3.appendChild(document.createTextNode("丢包点"));
+    var lg4 = el("span"), li4 = el("i", "band");
+    li4.style.background = "rgba(217,119,6,.18)";
+    lg4.appendChild(li4);
+    lg4.appendChild(document.createTextNode("丢包集中段"));
+    [lg1, lg2, lg3, lg4].forEach(function (n) { leg.appendChild(n); });
+    mc.appendChild(leg);
+    var svg = svgEl("svg", { viewBox: "0 0 900 132", preserveAspectRatio: "none" });
+    [118, 79, 40].forEach(function (y) {
+      svg.appendChild(svgEl("line", { x1: 40, y1: y, x2: 890, y2: y,
+        stroke: "#eef1f5", "stroke-width": 1 }));
+    });
+    [["gw", d.bands ? d.bands.gw : null],
+     ["ext", d.bands ? d.bands.ext : null]].forEach(function (pair) {
+      (pair[1] || []).forEach(function (b) {
+        var x1 = 40 + (b[0] / win) * 850;
+        var x2 = 40 + (b[1] / win) * 850;
+        svg.appendChild(svgEl("rect", { x: x1.toFixed(1), y: 0,
+          width: Math.max(x2 - x1, 2).toFixed(1), height: 118,
+          fill: "rgba(217,119,6,.14)" }));
+      });
+    });
+    function yOf(v) { return 118 - (v / yMax) * 100; }
+    function plotLine(pts, color) {
+      var run = [];
+      (pts || []).forEach(function (p) {
+        var x = 40 + (p[0] / win) * 850;
+        if (x > 890) x = 890;
+        if (p[1] === null || p[1] === undefined) {
+          if (run.length > 1) {
+            svg.appendChild(svgEl("polyline", { fill: "none", stroke: color,
+              "stroke-width": 1.6, points: run.join(" ") }));
+          }
+          run = [];
+          svg.appendChild(svgEl("circle", { cx: x.toFixed(1), cy: 108, r: 3,
+            fill: "#dc2626" }));
+        } else {
+          run.push(x.toFixed(1) + "," + yOf(p[1]).toFixed(1));
+        }
+      });
+      if (run.length > 1) {
+        svg.appendChild(svgEl("polyline", { fill: "none", stroke: color,
+          "stroke-width": 1.6, points: run.join(" ") }));
+      }
+    }
+    plotLine(d.series.gw, "#0a84ff");
+    plotLine(d.series.ext, "#8b5cf6");
+    mc.appendChild(svg);
+    mc.appendChild(el("div", "cap",
+      "全程 " + mmss(win) + " · 丢包样本以红点标注 (该时刻延迟缺失), 色带为丢包集中段"));
+    box.appendChild(mc);
+    if ((d.events || []).length) {
+      var et = el("div", "gp-etable");
+      var tab = el("table");
+      var thead = el("thead");
+      var hr = el("tr");
+      ["时间", "类型", "流", "详情"].forEach(function (h) {
+        hr.appendChild(el("th", null, h));
+      });
+      thead.appendChild(hr);
+      tab.appendChild(thead);
+      var tb = el("tbody");
+      (d.events || []).forEach(function (e) {
+        var tr = el("tr");
+        tr.appendChild(el("td", null,
+          e.start + (e.end && e.end !== e.start ? " – " + e.end : "")));
+        var tdType = el("td");
+        tdType.appendChild(el("span", "gp-elabel " + (e.sev || "neutral"),
+          e.label));
+        tr.appendChild(tdType);
+        tr.appendChild(el("td", null, e.stream || "—"));
+        tr.appendChild(el("td", null, (e.detail || "")
+          + (e.root_cause ? "（" + e.root_cause + "）" : "")));
+        tb.appendChild(tr);
+      });
+      tab.appendChild(tb);
+      et.appendChild(tab);
+      box.appendChild(et);
+    }
+  }
+
+  // 结束报告页: 结论条 (verdict 徽章 + 结论/建议 + 提前终止标) + 原生渲染的
+  // 盯障报告本体 + 三件套文件行。数据取最近一次 progress 载荷的 done 态结论块。
   function openMonReport() {
     stopMonPoll();
     var d = state.monLast || {};
@@ -27984,7 +28743,11 @@ _GUI_JS = r"""(function () {
         files.appendChild(document.createTextNode(f));
       });
     }
-    $("#mon-frame").src = API.monReport;   // 每次进入强制重载
+    // v1.25.0: 原生渲染 (原 iframe 强制重载退役) — 落盘 JSON 回放投影
+    get(API.monReport).then(function (d) {
+      if (d && d.stats) renderMonReport(d);
+      else gpFail($("#mon-frame"), "盯障报告尚未生成");
+    }).catch(function () { gpFail($("#mon-frame"), "盯障报告加载失败"); });
     show("mon-report");
   }
 
@@ -28296,7 +29059,9 @@ def _gui_page():
             '打开报告文件夹</button>'
             '<button id="btn-home2" class="g-link" type="button">返回主页</button></div>'
             '<ul id="rep-files"></ul><div id="exp-msg" class="g-dim"></div>'
-            '<iframe id="g-frame" title="报告"></iframe></main>\n'
+            # v1.25.0: 原生报告容器 (原 iframe #g-frame 现渲退役)。
+            # 内容由 JS 从 /api/report 投影渲染, textContent 规则同全页。
+            '<div id="g-frame" class="g-rpt" aria-live="polite"></div></main>\n'
             # ── 现场检测 (设计稿第 5 节, 对应终端菜单 [6]) ──
             '<main id="view-site" class="g-view-site" style="display:none">'
             '<div id="site-wizard" class="g-form">'
@@ -28428,7 +29193,8 @@ def _gui_page():
             '<div id="mon-advice" class="mrp-sug"></div></span>'
             '<span id="mon-early-tag" class="mrp-tag num" style="display:none">'
             '</span></div>'
-            '<iframe id="mon-frame" title="盯障报告" src=""></iframe>'
+            # v1.25.0: 原生盯障报告容器 (原 iframe #mon-frame 退役)
+            '<div id="mon-frame" class="g-rpt" aria-live="polite"></div>'
             '<div class="mrp-actions">'
             '<button id="btn-mon-folder" class="btn btn-primary" type="button">'
             '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
@@ -28538,6 +29304,9 @@ def _gui_meta():
                           for st, sk in STATUS_KEY.items()},
         # 终审 F4: 报告页结论条等级徽章色, 同一载荷下发 (页面 JS 不内嵌色表)
         "grade_colors": dict(GRADE_COLORS),
+        # v1.25.0: 报告原生视图等级徽章 (前景, 底色) 二元组 —— 环形分数下方
+        # 「A 级」徽章用; 与 GRADE_BADGE 同源, 页面不内嵌色表
+        "grade_badges": {g: list(c) for g, c in GRADE_BADGE.items()},
         # v1.24.0: 主页续跑横幅数据 —— 有没有「上次没跑完」的轮次。
         # 点开页面读一次续跑点; 文件不存在/损坏都当没有 (不报错、不打断主页)。
         "resume": _gui_resume_summary(_gui_resume_load()[0]),
@@ -28634,11 +29403,11 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
                     ok = _GUI_NET["ok"]
                 return self._send(200, {"ok": ok})
             if p == "/api/report":
-                html = self.session.report_html()
-                if not html:
+                # v1.25.0: 报告原生视图的数据通道 (投影 JSON), iframe 现渲退役
+                view = self.session.report_view()
+                if not view:
                     return self._send(404, {"error": "尚无报告"})
-                return self._send(200, html.encode("utf-8"),
-                                  "text/html; charset=utf-8")
+                return self._send(200, view)
             if p == "/api/monitor/progress":
                 # v1.22.0: 盯障实时页轮询通道 (服务端 ≥2s 节流, 载荷含 counters)
                 return self._send(200, self.monitor.progress_payload())
@@ -28646,11 +29415,11 @@ class _GuiHandler(http.server.BaseHTTPRequestHandler):
                 # 延迟双曲线 (服务端 ≥5s 节流, 窗口 600s, 丢包点 ms=None)
                 return self._send(200, self.monitor.curve_payload())
             if p == "/api/monitor/report":
-                # 盯障报告内嵌 (编排落盘后可读); report_html 已返回 bytes
-                html = self.monitor.report_html()
-                if not html:
+                # v1.25.0: 盯障原生视图的数据通道 (落盘 JSON 回放投影)
+                view = self.monitor.report_view()
+                if not view:
                     return self._send(404, {"error": "尚无报告"})
-                return self._send(200, html, "text/html; charset=utf-8")
+                return self._send(200, view)
             return self._send(404, {"error": "not found"})
         except Exception as e:
             try:

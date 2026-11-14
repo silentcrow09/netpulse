@@ -97,6 +97,20 @@ class TestGuiPage(unittest.TestCase):
                       "曲线 SVG 必须用 createElementNS 逐点绘制")
         self.assertIn("confirm(", p, "停止盯障必须先 confirm")
 
+    def test_no_iframe_native_report(self):
+        # v1.25.0: iframe 嵌套退役 —— 报告与盯障报告都是页面内原生渲染容器
+        # (div#g-frame / div#mon-frame), 由 JS 从投影 JSON 渲染
+        p = self.page
+        self.assertNotIn("<iframe", p, "页面不得再有 iframe (web 嵌套 web 已废除)")
+        self.assertIn('id="g-frame" class="g-rpt"', p, "原生报告容器缺失")
+        self.assertIn('id="mon-frame" class="g-rpt"', p, "原生盯障报告容器缺失")
+        # 渲染器入口锚点: fetch 投影 → renderReport / renderMonReport
+        self.assertIn("function renderReport(", p)
+        self.assertIn("function renderMonReport(", p)
+        self.assertIn("get(API.report)", p)
+        self.assertIn("get(API.monReport)", p)
+        self.assertNotIn('API.report;', p, "不得再用 iframe.src 加载 /api/report")
+
     def test_monitor_view_anchors(self):
         # P6: 三视图锚点 + 第 7 卡链路 (图标常量 / data-p 机制 / 元数据通道)
         p = self.page
