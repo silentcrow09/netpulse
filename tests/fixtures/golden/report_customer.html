@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0a1628">
+<title>NetPulse 诊断报告</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+.skip-link{position:absolute;left:-9999px;top:0;z-index:9999;background:#0a1628;color:#fff;padding:8px 16px;text-decoration:none;border-radius:0 0 8px 0}
+.skip-link:focus{left:0}
+@media (prefers-reduced-motion: reduce){
+*{animation:none!important;transition:none!important}
+}
+/* 报告需可离线打开: 全部使用系统字体, 不引入任何在线资源 */
+body{background:#eef1f6;color:#1e293b;font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding-bottom:60px}
+/* ── 左侧浮动导航 ── */
+.nav{position:fixed;left:18px;top:18px;bottom:18px;width:236px;background:#fff;border:1px solid #e6e9f0;border-radius:18px;padding:18px 14px;overflow-y:auto;z-index:50;box-shadow:0 8px 28px -14px rgba(15,23,42,.16)}
+.nav::-webkit-scrollbar{width:4px}.nav::-webkit-scrollbar-thumb{background:#d7dce6;border-radius:2px}
+.nav .logo{display:flex;align-items:center;gap:9px;padding:2px 6px 16px;border-bottom:1px solid #eef1f5;margin-bottom:12px}
+.nav .logo .mark{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,#7ab3f5,#2563eb);position:relative;flex:none}
+.nav .logo .mark::after{content:'';position:absolute;inset:7px;border:2px solid rgba(255,255,255,.9);border-radius:4px}
+.nav .logo b{font-size:15px;letter-spacing:.3px;display:block}
+.nav .logo span{font-size:10.5px;color:#94a3b8;display:block;font-weight:500}
+.nav .g{font-size:10.5px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;padding:10px 8px 5px}
+.nav a{display:flex;align-items:center;gap:9px;padding:6.5px 10px;border-radius:9px;color:#1e293b;text-decoration:none;font-size:12.8px;line-height:1.3}
+.nav a .st{width:7px;height:7px;border-radius:50%;flex:none}
+.nav a:hover{background:#f4f6fa}
+.nav a.on{background:#dbeafe;color:#1d4ed8;font-weight:600}
+.nav .grp{margin:8px 0 2px;font-size:11px;color:#94a3b8;padding:4px 10px 2px;display:flex;align-items:center;gap:6px}
+.nav .grp::after{content:'';flex:1;height:1px;background:#eef1f5}
+.nav .mods a{padding:5px 10px 5px 26px;font-size:12.3px}
+.nav .foot{margin-top:14px;padding:10px 8px 2px;border-top:1px solid #eef1f5;font-size:10.5px;color:#94a3b8;line-height:1.7}
+/* ── 主区 ── */
+.main{margin-left:282px;margin-right:24px;max-width:1060px}
+/* ── 头部 hero ── */
+.hero{background:#fff;border:1px solid #e6e9f0;border-radius:22px;padding:30px 36px;margin-top:18px;display:flex;gap:36px;align-items:center;box-shadow:0 10px 34px -18px rgba(15,23,42,.2)}
+.hero h1{font-size:26px;font-weight:800;letter-spacing:.3px}
+.hero .app{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.hero .app .mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,#7ab3f5,#2563eb);position:relative}
+.hero .app .mark::after{content:'';position:absolute;inset:8px;border:2px solid #fff;border-radius:4px}
+.hero .app b{font-size:16px}
+.hero .ver{font-size:11px;color:#3b82f6;background:#dbeafe;padding:1px 9px;border-radius:999px;font-weight:600}
+.hero .sub{font-size:12.5px;color:#64748b;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+/* v1.9.4: 健康分数描述(verdict) + 生成时间一行过长会在 hero 卡片右侧
+   强制换行成两行(被 gauge 132px+gap 36px 挤到宽度 < 文字), 与健康卡
+   "两行观感"同类 — 用 nowrap + ellipsis 截断次要时间戳, 保留 verdict */
+.hero .meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
+/* v1.20.0 健康分算式行: 「92 / 100 ＝ 100 − 警告 4×2」——
+   让总分怎么来的直接可见, 不用自己拿模块状态去反推。 */
+.hero .formula{font-size:12.5px;color:#475569;margin-top:5px;font-family:Cascadia Mono,Consolas,monospace}
+.hero .meta span{font-size:12px;color:#64748b;background:#f4f6fa;border:1px solid #e6e9f0;border-radius:999px;padding:2.5px 11px;font-family:Cascadia Mono,Consolas,monospace}
+.hero .meta span b{color:#1e293b;font-weight:600}
+/* 分数环形 */
+.gauge{position:relative;width:132px;height:132px;flex:none;margin-left:auto}
+.gauge svg{transform:rotate(-90deg)}
+.gauge .track{fill:none;stroke:#eef1f6;stroke-width:11}
+.gauge .bar{fill:none;stroke-width:11;stroke-linecap:round}
+.gauge .in{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px}
+.gauge .num{font-size:38px;font-weight:900;color:#1e293b;font-variant-numeric:tabular-nums;line-height:1}
+.gauge .lbl{font-size:12px;font-weight:700;color:#b45309;background:#fef3c7;padding:1px 10px;border-radius:999px}
+/* 信息条 */
+/* gap 作用于 .sep 两侧: 10px+1px+10px≈21px 视觉间距; 生成时间与 hero/页脚重复, 不再在此显示 */
+.band{background:linear-gradient(90deg,#0f2a52,#1d4ed8);color:#e2ebfb;border-radius:16px;padding:14px 24px;margin:12px 0 22px;display:flex;gap:6px 10px;flex-wrap:wrap;align-items:center;font-size:12.5px}
+.band b{color:#fff}
+.band .sep{width:1px;height:14px;background:rgba(255,255,255,.25)}
+/* 分区标题 */
+.sec{margin:34px 0 12px}
+.sec h2{font-size:17px;font-weight:800;display:flex;align-items:center;gap:10px;color:#111827}
+.sec h2 .icon{width:26px;height:26px;border-radius:8px;background:#e0e7ff;color:#4338ca;display:inline-flex;align-items:center;justify-content:center;font-size:13px}
+.sec h2 .extra-count{font-size:12px;font-weight:400;color:#64748b;margin-left:6px}
+.sec h2 .cnt{font-size:11.5px;color:#94a3b8;font-weight:500;margin-left:auto}
+/* 待办问题 */
+.todo{background:#fff;border:1px solid #e6e9f0;border-radius:16px;padding:6px 22px 14px}
+.todo.ok{background:linear-gradient(180deg,#f0fdf4,#f7fee7);border-color:#bbf7d0}
+.todo-head{font-size:15px;font-weight:700;color:#991b1b;margin-bottom:12px}
+.todo.ok .todo-head{color:#166534}
+/* v1.9.4: "所有核心检测通过" 分支的 .impact 在 .todo 内(非 .issue 内), 旧
+   .issue .impact 规则匹配不到, 文字无绿底样式显得"第二行无样式像空白" */
+.todo.ok .impact{color:#166534;background:#f0fdf4;padding:8px 12px;border-radius:6px;font-size:12.5px;line-height:1.7;margin-top:4px}
+.issue{padding:13px 0;border-top:1px dashed #fecaca}
+.issue:first-of-type{border-top:none;padding-top:14px}
+.issue.ok{border-top-color:#bbf7d0}
+.issue h3{font-size:14px;font-weight:700;color:#7f1d1d;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-bottom:2px}
+.issue.ok h3{color:#166534}
+.issue .sev{display:inline-block;padding:2px 10px;border-radius:999px;font-size:10.5px;font-weight:700;background:#dc2626;color:#fff;flex:none}
+.issue.warn .sev{background:#ea580c}
+.issue.info .sev{background:#64748b}
+.issue .meta{font-size:11.5px;color:#94a3b8;margin:2px 0 4px}
+.issue .impact{font-size:12.5px;color:#991b1b;margin:4px 0 6px;padding:6px 10px;background:#fef2f2;border-radius:6px;line-height:1.7}
+.issue.ok .impact{color:#166534;background:#f0fdf4}
+.issue .action{font-size:12.5px;color:#0c4a6e;padding:7px 12px;background:#f0f9ff;border-left:3px solid #0284c7;border-radius:0 8px 8px 0;line-height:1.7}
+.issue.consult{border-top:1px dashed #fecaca}
+/* 统计卡 */
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:12px;margin-bottom:8px}
+.stats-caption{text-align:center;font-size:11.5px;color:#94a3b8;margin-bottom:24px}
+.stat-card{background:#fff;border:1px solid #e6e9f0;border-radius:14px;padding:14px 8px;text-align:center}
+.stat-card .count{font-size:30px;font-weight:800;font-variant-numeric:tabular-nums}
+.stat-card.ok .count{color:#16a34a}.stat-card.warn .count{color:#d97706}.stat-card.err .count,.stat-card.danger .count{color:#dc2626}.stat-card.timeout .count{color:#334155}.stat-card.info .count{color:#6b7280}
+.stat-card .label{font-size:11.5px;color:#94a3b8;margin-top:2px}
+/* 图表区 */
+.charts{display:grid;grid-template-columns:1.1fr .9fr;gap:14px}
+.chart{background:#fff;border:1px solid #e6e9f0;border-radius:16px;padding:18px 20px}
+.chart h4{font-size:13px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px;color:#1e293b}
+.chart h4 .tag{font-size:10px;background:#eef2ff;color:#4338ca;border-radius:6px;padding:1px 8px;font-weight:600;margin-left:auto}
+.chart .cap{font-size:11px;color:#94a3b8;margin-top:8px}
+.chart.wide{grid-column:1/-1}
+/* 检测结果一览 */
+.overview{background:#fff;border:1px solid #e6e9f0;border-radius:16px;overflow:hidden}
+.overview ul{list-style:none}
+.overview li{border-bottom:1px solid #f1f5f9;font-size:13.5px}
+.overview li:last-child{border-bottom:none}
+.overview li a{padding:9px 20px;display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none;line-height:1.4}
+.overview li a:hover{background:#f8fafc}
+.overview li a:hover .name{color:#2563eb}
+.overview .name{font-weight:600;min-width:110px;color:#0f172a;line-height:1.4}
+.overview .verdict{color:#475569;flex:1;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.4}
+.overview .badge{padding:2px 11px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.5px;flex:none;line-height:1.4}
+.badge.ok,.b.ok{background:#dcfce7;color:#15803d}
+.badge.warn,.b.warn{background:#fef3c7;color:#9a3412}
+.badge.err,.b.err{background:#fee2e2;color:#991b1b}
+.badge.fatal,.b.fatal{background:#fecaca;color:#7f1d1d}
+.badge.idle,.b.idle{background:#e2e8f0;color:#475569}
+.badge.timeout,.b.timeout{background:#cbd5e1;color:#1e293b}
+/* v1.20.0 「提示」徽章: 检测完成但有件小事要说 (不是故障, 不扣分)。
+   用中性蓝, 区别于绿色"完成"(会被读成一切正常)与橙色"警告"(会被读成问题)。 */
+.badge.hint,.b.hint{background:#e0f2fe;color:#075985}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
+.dot.ok{background:#16a34a}.dot.warn{background:#d97706}.dot.err{background:#dc2626}.dot.fatal{background:#7f1d1d}.dot.timeout{background:#334155}.dot.idle{background:#94a3b8}
+/* 模块卡 (details 折叠, 问题模块自动展开) */
+details.mod{background:#fff;border:1px solid #e6e9f0;border-radius:16px;margin-bottom:12px;overflow:hidden;box-shadow:0 1px 2px rgba(15,23,42,.04);scroll-margin-top:16px}
+details.mod[open]{border-color:#c7cbd8}
+details.mod>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:12px;padding:14px 20px;user-select:none}
+details.mod>summary::-webkit-details-marker{display:none}
+details.mod>summary .ic{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:16px;flex:none}
+details.mod.ok>summary .ic{background:#dcfce7;color:#15803d}
+details.mod.warn>summary .ic{background:#fef3c7;color:#b45309}
+details.mod.err>summary .ic{background:#fee2e2;color:#b91c1c}
+details.mod.fatal>summary .ic{background:#7f1d1d;color:#fff}
+details.mod.timeout>summary .ic{background:#334155;color:#fff}
+details.mod.idle>summary .ic{background:#f1f5f9;color:#64748b}
+details.mod>summary .nm{font-size:14.5px;font-weight:700;flex:none}
+details.mod>summary .vd{font-size:12px;color:#64748b;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+details.mod>summary .b{font-size:11px;font-weight:700;padding:2px 11px;border-radius:999px;flex:none}
+/* v1.20.0 扣分标记 (标题栏右侧): 「−N 分」= 该模块从健康分里扣了几分;
+   「豁免」= 评分豁免模块, 它的问题不计入总分。 */
+details.mod>summary .dt{font-size:11px;font-weight:700;padding:2px 9px;border-radius:999px;flex:none;line-height:1.4}
+details.mod>summary .dt.deduct{background:#fee2e2;color:#991b1b}
+details.mod>summary .dt.deduct.warn{background:#fef3c7;color:#9a3412}
+details.mod>summary .dt.deduct.timeout{background:#e2e8f0;color:#334155}
+details.mod>summary .dt.exempt{background:#f1f5f9;color:#64748b}
+details.mod>summary .arr{color:#94a3b8;font-size:11px;transition:transform .15s}
+details.mod[open]>summary .arr{transform:rotate(90deg)}
+/* 🔗 复制模块链接按钮 */
+details.mod>summary .anchor{flex:none;font-size:11px;text-decoration:none;color:#94a3b8;padding:2px 7px;border-radius:999px;opacity:.35;transition:opacity .12s;line-height:1.4;cursor:pointer}
+details.mod:hover>summary .anchor,details.mod>summary .anchor:focus-visible,details.mod>summary .anchor.copied{opacity:1}
+details.mod>summary .anchor:hover{color:#2563eb;background:#eef2ff}
+details.mod>summary .anchor.copied{color:#15803d;background:#dcfce7}
+details.mod>.bd{padding:4px 22px 20px;border-top:1px dashed #e6e9f0}
+details.mod .verdict{font-size:13.5px;color:#1e293b;padding:12px 0 4px;line-height:1.7}
+details.mod .verdict .tag{display:inline-block;font-size:10.5px;font-weight:700;background:#eef2ff;color:#4338ca;border-radius:5px;padding:1px 8px;margin-right:8px}
+.explain{font-size:12px;line-height:1.7;color:#64748b;background:#f8fafc;border-left:3px solid #cbd5e1;padding:7px 12px;border-radius:0 6px 6px 0;margin:4px 0 12px}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:10px 0 8px}
+.metric{background:#f8fafc;border:1px solid #e6e9f0;border-radius:9px;padding:9px 13px;display:flex;flex-direction:column;align-items:flex-start;gap:3px;min-width:0}
+.metric .v{font-size:15px;font-weight:700;font-family:Cascadia Mono,Consolas,monospace;text-align:left;max-width:100%;overflow-wrap:break-word}
+.metric .lab{font-size:11.5px;color:#64748b;overflow-wrap:break-word;white-space:normal;line-height:1.45;max-width:100%}
+.metric .v.ok{color:#15803d}.metric .v.warn{color:#c2410c}.metric .v.err{color:#b91c1c}.metric .v.info{color:#64748b}.metric .v.idle{color:#94a3b8}
+.metric[data-hint]{cursor:pointer}
+.metric.show-hint::after{content:attr(data-hint);display:block;font-size:11px;color:#475569;background:#eef2ff;border-radius:4px;padding:4px 8px;margin-top:4px;line-height:1.5}
+.metric .hint{font-size:11px;color:#b45309;font-weight:400;display:block;margin-top:2px;line-height:1.45}
+.impact-line{background:#fef2f2;border-left:3px solid #dc2626;padding:6px 12px;border-radius:0 6px 6px 0;font-size:12.5px;color:#7f1d1d;margin:8px 0}
+.impact-line.warn{background:#fffbeb;border-left-color:#d97706;color:#78350f}.impact-line.info{background:#f1f5f9;border-left-color:#94a3b8;color:#475569;font-size:12px}
+.action-line{background:#f0f9ff;border-left:3px solid #0284c7;padding:6px 12px;border-radius:0 6px 6px 0;font-size:12.5px;color:#0c4a6e;margin:4px 0 8px;line-height:1.6}
+details.collapse{margin-top:10px;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:10px}details.collapse[data-auto-open="1"]{border-style:solid;border-color:#cbd5e1}
+details.collapse summary{padding:9px 14px;font-size:12px;color:#64748b;cursor:pointer;font-weight:600;user-select:none;list-style:none;display:flex;align-items:center;gap:6px}
+details.collapse summary::-webkit-details-marker{display:none}
+details.collapse summary::before{content:"▸";color:#94a3b8;transition:transform .15s;display:inline-block}
+details.collapse[open] summary::before{transform:rotate(90deg)}
+details.collapse .cnt{background:#e2e8f0;color:#475569;border-radius:999px;font-size:10.5px;padding:1px 8px;margin-left:6px;font-weight:600}
+details.collapse .body{padding:4px 14px 12px;font-size:12px;color:#475569;line-height:1.7}
+details.collapse .subcap{font-size:12px;font-weight:700;color:#475569;margin:10px 0 4px}
+.tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin-top:4px;border-radius:4px}
+.tbl-wrap::-webkit-scrollbar{height:6px}
+.tbl-wrap::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
+details.collapse table{width:100%;border-collapse:collapse}
+details.collapse table.tbl{min-width:520px}
+details.collapse table.tbl.kv{min-width:0}
+details.collapse th{background:#e2e8f0;color:#334155;text-align:left;padding:5px 10px;font-weight:600;font-size:11.5px;white-space:nowrap}
+details.collapse td{padding:4px 10px;border-top:1px solid #e2e8f0;font-family:Cascadia Mono,Consolas,monospace;font-size:11.5px;white-space:normal;word-break:break-word;vertical-align:top}
+details.collapse td.k{width:35%;color:#64748b;background:#f8fafc;white-space:normal}
+details.collapse p.mono{font-family:Cascadia Mono,Consolas,monospace;background:#f1f5f9;padding:6px 10px;border-radius:4px;word-break:break-all}
+details.collapse p.muted{color:#94a3b8;font-size:11.5px;margin-top:6px}
+/* 主机信息 */
+.host-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+.host-card{background:#fff;border:1px solid #e6e9f0;border-radius:12px;padding:12px 16px}
+.host-card .lab{font-size:11px;color:#94a3b8;margin-bottom:3px;font-weight:500}
+.host-card .val{font-size:13px;font-weight:600;font-family:Cascadia Mono,Consolas,monospace;color:#0f172a;cursor:pointer;word-break:break-all}.host-card .val:hover{color:#2563eb;background:#f1f5f9}.host-card .val.copied{color:#16a34a !important}
+/* v1.15.2 (审查 P2): 公网 IP / 出口位置的第三方查询披露 */
+.host-note{font-size:11px;color:#94a3b8;margin-top:8px;line-height:1.5}
+/* v1.18.3: 网口对照表 (端口定位) —— 角色徽章走角色语义轴 (蓝/紫/灰),
+   速率档位色走 STATUS_COLORS (状态语义轴), 两轴不混用 */
+.portmap{background:#fff;border:1px solid #e6e9f0;border-radius:16px;padding:6px 22px 14px}
+/* 章节副标题 (默认网关 + 出口口判定口径) —— 与折叠区里的 .subcap 同一套样式 */
+.portmap .subcap{font-size:12px;font-weight:700;color:#475569;margin:8px 0 4px}
+.portmap .tbl{font-size:12.5px;width:100%;border-collapse:collapse}
+.portmap .tbl th{background:#1e293b;color:#f1f5f9;font-weight:600;padding:7px 10px;text-align:left;white-space:nowrap}
+.portmap .tbl td{padding:6px 10px;border-top:1px solid #e2e8f0;vertical-align:middle}
+.portmap .tbl td.st{white-space:nowrap}
+.portmap .tbl td.num{font-family:Cascadia Mono,Consolas,monospace;text-align:right;white-space:nowrap}
+.portmap .tbl td.desc{color:#64748b;font-size:11.5px}
+.portmap .tbl tbody tr:nth-child(odd){background:#f8fafc}
+.portmap .role{display:inline-block;padding:0 7px;border-radius:4px;font-weight:600;font-size:11.5px;white-space:nowrap}
+.portmap .role.egress{background:#dbeafe;color:#1d4ed8}
+.portmap .role.inner{background:#e2e8f0;color:#475569}
+.portmap .role.wireless{background:#ede9fe;color:#6d28d9}
+.portmap .role.virtual{background:#f1f5f9;color:#94a3b8}
+.portmap .role.down{background:#f1f5f9;color:#94a3b8}
+.portmap .role.unknown{background:#f1f5f9;color:#94a3b8}
+.portmap .hint{color:#64748b;font-size:11.5px}
+/* v1.19.0: 环回测速 —— 接入侧 (终端→网关) 与使用侧 (走公网) 并排对照。
+   速率走数据轴配色 (下行蓝 / 上行橙), 不进状态语义轴 —— 这两个数字都不是
+   「好/坏」判定, 只是两组客观速率 (AGENTS.md 状态与配色节) */
+.lb-compare{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
+.lb-col{background:#fff;border:1px solid #e6e9f0;border-radius:12px;padding:14px 16px}
+.lb-col .lab{font-size:11px;color:#94a3b8;font-weight:600}
+.lb-col .val{font-size:26px;font-weight:700;font-family:Cascadia Mono,Consolas,monospace;color:#0f172a;margin:4px 0 3px}
+.lb-col .note{font-size:11.5px;color:#64748b;line-height:1.55}
+.lb-col.access .val{color:#0a84ff}
+.lb-col.usage .val{color:#ff9500}
+.lb-verdict{margin-top:12px;padding:10px 14px;border-radius:10px;background:#f1f5f9;border:1px solid #e2e8f0;font-size:12.5px;line-height:1.6;color:#334155}
+.lb-verdict b{color:#0f172a}
+/* 诊断标准表 */
+.tbl.std{font-size:12px}
+.tbl.std th{background:#1e293b;color:#f1f5f9;font-weight:600;padding:7px 10px}
+.tbl.std td{padding:6px 10px;border-top:1px solid #e2e8f0;vertical-align:top}
+.tbl.std td.num{font-family:Cascadia Mono,Consolas,monospace;text-align:center;font-weight:600;color:#1e293b}
+.tbl.std tbody tr:nth-child(odd){background:#f8fafc}
+.kw{display:inline-block;padding:0 6px;border-radius:4px;font-weight:600;font-size:11.5px}
+.kw.warn{background:#fed7aa;color:#9a3412}
+.kw.err{background:#fecaca;color:#991b1b}
+details.collapse .subcap code{background:#fff;padding:1px 6px;border-radius:3px;border:1px solid #cbd5e1;font-size:11.5px;color:#475569}
+@media(max-width:960px){.nav{display:none}.main{margin:0 14px}.hero{flex-wrap:wrap}.gauge{margin:0}.charts{grid-template-columns:1fr}}
+@media print{body{background:#fff;padding:0;font-size:12px}.nav,.sec .cnt,.chart .tag{display:none}.main{margin:0}.hero,.stat-card,.chart,.mod,.todo,.overview,.host-card{box-shadow:none}.hero{background:#f8fafc !important;border:1px solid #ddd !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.mod,.host-card,.todo{break-inside:avoid}details.mod>summary .arr,details.collapse>summary::before{display:none}details.mod>summary{cursor:default}details.mod,details.collapse{border-style:solid}}
+footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-top:20px;border-top:1px solid #e6e9f0}
+
+.diagnosis { padding: 16px 20px; margin: 16px 0; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+.diagnosis h2 { margin: 0 0 12px; font-size: 18px; color: #1e293b; }
+.diagnosis .dhead { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+/* v1.9.5: 无故障卡片左对齐单行 — 整句水平居中不符合阅读习惯(中文用户习惯
+   结论靠左一眼扫过), 恢复 flex-start 左对齐; 保留 v1.9.4 紧凑高度
+   (padding 9px / row-gap 4px / line-height 1.4) 消除"第二行空白"观感 */
+.diagnosis.healthy { padding: 9px 20px; }
+.diagnosis.healthy .dhead { margin-bottom: 0; flex-wrap: wrap; row-gap: 4px; line-height: 1.4; }
+.diagnosis.healthy .dbadge.ok { font-size: 14px; padding: 5px 14px; }
+.diagnosis .dbadge { padding: 4px 10px; border-radius: 4px; font-weight: 600; font-size: 13px; }
+.diagnosis .dbadge.ok { background: #dcfce7; color: #166534; }
+/* v1.15.2 (审查 P2 · 两种警告色): 旧版 .dbadge.warn 用的是红底红字
+   (#fee2e2/#991b1b) —— 与客户版 .badge.err 逐字节相同, 同一份报告里
+   「警告」和「错误」渲染出来一模一样。现与客户版 .badge.warn 同口径
+   (橙底棕字), 警告/错误一眼可分。 */
+.diagnosis .dbadge.warn { background: #fef3c7; color: #9a3412; }
+/* v1.20.0 「未匹配到根因」徽章: 中性灰蓝, 不再冒充绿色 ✓ 无故障 ——
+   8 条根因规则没命中 ≠ 网络没故障 (同一份报告里常还有 4 条警告)。 */
+.diagnosis .dbadge.neutral { background: #e0f2fe; color: #075985; }
+.diagnosis .dconf { color: #64748b; font-size: 13px; }
+.diagnosis .rcard { padding: 12px 16px; border-left: 4px solid #94a3b8; margin-bottom: 12px; background: #f8fafc; border-radius: 0 6px 6px 0; }
+.diagnosis .rcard.severity-critical { border-color: #dc2626; background: #fef2f2; }
+.diagnosis .rcard.severity-high { border-color: #ea580c; background: #fff7ed; }
+.diagnosis .rcard.severity-medium { border-color: #d97706; background: #fffbeb; }
+.diagnosis .rcard.severity-low { border-color: #65a30d; }
+.diagnosis .rhead { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+.diagnosis .rbadge { padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; background: #e2e8f0; color: #334155; }
+.diagnosis .rcard.severity-critical .rbadge { background: #dc2626; color: #fff; }
+.diagnosis .rcard.severity-high .rbadge { background: #ea580c; color: #fff; }
+.diagnosis .rcard.severity-medium .rbadge { background: #d97706; color: #fff; }
+.diagnosis .rhead strong { flex: 1; font-size: 15px; color: #1e293b; }
+.diagnosis .rconf { font-size: 13px; color: #475569; font-weight: 600; }
+.diagnosis .rdesc { margin: 6px 0; color: #334155; font-size: 13px; line-height: 1.5; }
+.diagnosis .rmods { margin: 4px 0; color: #64748b; font-size: 12px; }
+.diagnosis details { margin-top: 8px; }
+.diagnosis details summary { cursor: pointer; color: #0891b2; font-size: 13px; padding: 4px 0; }
+.diagnosis details ul { margin: 6px 0 0 0; padding-left: 20px; }
+.diagnosis details li { margin: 4px 0; color: #334155; font-size: 13px; line-height: 1.5; }
+/* v1.5.0 证据链: 事实(支持项) / 排除项 分离展示 */
+.diagnosis .rev { margin: 10px 0; padding: 10px 14px; background: #fff; border: 1px solid #e6e9f0; border-radius: 8px; }
+.diagnosis .rev-t { font-size: 12px; font-weight: 600; color: #475569; margin: 6px 0 4px; letter-spacing: .3px; }
+.diagnosis .rev-t:first-child { margin-top: 0; }
+.diagnosis .rev-list { list-style: none; margin: 0; padding: 0; }
+.diagnosis .rev-list li { font-size: 12.5px; line-height: 1.75; color: #334155; }
+.diagnosis .rev-list li.yes { color: #166534; }
+.diagnosis .rev-list li.no { color: #991b1b; font-weight: 600; }
+/* v1.5.0 复测命令卡 */
+.diagnosis .cmd-card { display: flex; align-items: center; gap: 8px; margin-top: 10px; padding: 7px 10px; background: #0f172a; border-radius: 8px; }
+.diagnosis .cmd-card .cmd-lab { font-size: 11px; color: #94a3b8; flex: none; }
+.diagnosis .cmd-card code { font-family: Cascadia Mono,Consolas,monospace; font-size: 12.5px; color: #e2e8f0; flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; }
+.diagnosis .cmd-card .copy-btn { font: inherit; font-size: 11.5px; padding: 3px 10px; border: 1px solid rgba(255,255,255,.25); background: rgba(255,255,255,.08); color: #e2e8f0; border-radius: 6px; cursor: pointer; flex: none; }
+.diagnosis .cmd-card .copy-btn:hover { background: rgba(255,255,255,.18); }
+/* v1.5.0 一句话报障 */
+.ticket { margin-top: 14px; padding: 12px 16px; background: #f8fafc; border: 1px dashed #94a3b8; border-radius: 8px; }
+.ticket .ticket-head { display: flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 600; color: #1e293b; margin-bottom: 8px; }
+.ticket .ticket-head .copy-btn { margin-left: auto; font: inherit; font-size: 11.5px; padding: 3px 10px; border: 1px solid #cbd5e1; background: #fff; color: #1e293b; border-radius: 6px; cursor: pointer; flex: none; }
+.ticket .ticket-head .copy-btn:hover { background: #eef2f7; }
+.ticket .ticket-body { margin: 0; font: 12px/1.75 Cascadia Mono,Consolas,monospace; color: #334155; white-space: pre-wrap; word-break: break-word; }
+.copy-btn.done { background: #16a34a !important; border-color: #16a34a !important; color: #fff !important; }
+@media print {
+  .diagnosis details { open: true; }
+  .diagnosis details ul { display: block !important; }
+  .copy-btn { display: none; }
+}
+</style>
+</head>
+<body>
+<a href="#main-content" class="skip-link">跳到主要内容</a>
+<nav class="nav" aria-label="报告导航">
+  <div class="logo"><div class="mark"></div>
+    <div><b>NetPulse</b><span>网络诊断报告</span></div></div>
+  <div class="g">导航</div><a href="#overview"><span class="st" style="background:#2563eb"></span>报告概览</a><a href="#todo"><span class="st" style="background:#dc2626"></span>待办问题</a><a href="#stats"><span class="st" style="background:#f59e0b"></span>状态统计</a><a href="#charts"><span class="st" style="background:#0284c7"></span>关键指标图</a><a href="#list"><span class="st" style="background:#64748b"></span>检测结果一览</a><div class="grp">基础信息</div><div class="mods"><a href="#mod-wifi"><span class="st" style="background:#d97706"></span>WiFi 分析</a><a href="#mod-ipv6"><span class="st" style="background:#94a3b8"></span>IPv6 检测</a></div><div class="grp">宽带测速</div><div class="mods"><a href="#mod-speedtest"><span class="st" style="background:#16a34a"></span>测速</a><a href="#mod-iperf3"><span class="st" style="background:#94a3b8"></span>iperf3 吞吐</a></div><div class="grp">故障诊断</div><div class="mods"><a href="#mod-gateway"><span class="st" style="background:#16a34a"></span>网关检测</a><a href="#mod-dns"><span class="st" style="background:#d97706"></span>DNS 诊断</a><a href="#mod-tcpstats"><span class="st" style="background:#16a34a"></span>TCP 传输质量</a><a href="#mod-mtu"><span class="st" style="background:#16a34a"></span>MTU 检测</a></div>
+  <div class="foot">v1.25.0 · 生成于 2026-01-02 03:04:05<br>点条目跳转到对应模块</div>
+</nav>
+<div class="main">
+<main id="main-content">
+
+<header class="hero" id="overview">
+  <div style="flex:1;min-width:0">
+    <div class="app"><div class="mark"></div>
+      <b>NetPulse</b><span class="ver">v1.25.0</span></div>
+    <h1>网络诊断报告</h1>
+    <div class="sub">优秀 · 2 个模块提示警告 · 生成于 2026-01-02 03:04:05</div>
+    <div class="formula">96 / 100 ＝ 100 − 警告 2×2</div>
+    <div class="meta"><span>本机 <b>192.168.1.2</b></span><span>网关 <b>192.168.1.1</b></span><span>公网 <b>203.0.113.7</b></span><span>DNS <b>221.228.255.1</b></span><span>耗时 <b>4 分 12 秒</b></span><span title='本轮提前结束, 请求的 8 项里有 2 项没测'>检测范围 <b>6/8</b> 项</span></div>
+  </div>
+  <div class="gauge">
+    <svg width="132" height="132" viewBox="0 0 132 132"><circle class="track" cx="66" cy="66" r="54"/><circle class="bar" cx="66" cy="66" r="54" stroke="#16a34a" stroke-dasharray="339.29" stroke-dashoffset="13.57"/></svg>
+    <div class="in"><div class="num">96</div><div class="lbl" style="color:#15803d;background:#dcfce7">优秀</div></div>
+  </div>
+</header>
+<section class="diagnosis" id="diagnosis"><h2>主要问题</h2><div class="dhead"><span class="dbadge warn">🔴 1 个主要问题</span><span class="dconf">整体中置信度, 触发 1/8 条规则</span></div><div class="rcard severity-high"><div class="rhead"><span class="rbadge">高</span><strong>DNS 解析异常 (失败率 100%)</strong><span class="rconf">中置信度</span></div><p class="rdesc">公网域名解析失败, 网页/应用可能无法访问; 网关和外网均可达, 故障点在 DNS.</p><div class="rev"><div class="rev-t">已基本排除</div><ul class="rev-list"><li class="yes">✓ 网关可达，丢包 0%，平均 2.3ms</li><li class="yes">✓ 本机到网关这一段正常，问题不在网线 / 路由器内网侧</li></ul></div><p class="rmods">影响模块: dns, gateway</p><details><summary>建议 (4 条)</summary><ul><li>1. 换 DNS 服务器 (推荐 223.5.5.5 / 119.29.29.29 / 114.114.114.114)</li><li>2. 检查路由器 DNS 转发配置</li><li>3. 排除安全软件 / 代理的 DNS 劫持</li><li>4. 若仅系统 DNS 异常, 系统设置里手动指定公共 DNS</li></ul></details><div class="cmd-card"><span class="cmd-lab">建议复测</span><code>netpulse dns gateway</code><button type="button" class="copy-btn" data-copy="netpulse dns gateway">复制命令</button></div></div><div class="ticket"><div class="ticket-head">📋 可直接提交给运营商 / 技术支持<button type="button" class="copy-btn" data-copy-from="np-ticket">复制报障描述</button></div><pre class="ticket-body" id="np-ticket">2026-01-02 03:04 · NetPulse v1.25.0
+健康度 96/100（优秀），检测到 1 个主要问题：
+1. DNS 解析异常 (失败率 100%)（中置信度）
+   现象：公网域名解析失败, 网页/应用可能无法访问; 网关和外网均可达, 故障点在 DNS.
+   建议：1. 换 DNS 服务器 (推荐 223.5.5.5 / 119.29.29.29 / 114.114.114.114)</pre></div></section>
+<div class="band">共 <b>8</b> 个模块<span class="sep"></span>扣分项 <b>2</b> 警告级</div>
+
+<div class="sec" id="todo"><h2><span class="icon">⚠</span>1 项需要您关注</h2></div>
+<div class="todo">
+<div class="issue warn">
+  <h3><span class="sev">警告</span>Wi-Fi 信号偏弱（RSSI -72dBm）</h3>
+  <div class="meta">📍 来源: WiFi 分析</div>
+  <div class='impact'>📌 影响: 弱信号区间, 速率与稳定性受影响</div>
+  
+</div></div>
+
+<div class="sec" id="stats"><h2><span class="icon">📊</span>状态统计</h2></div>
+<div class="stats-grid"><div class='stat-card ok'><div class='count'>4</div><div class='label'>完成</div></div><div class='stat-card warn'><div class='count'>2</div><div class='label'>警告</div></div><div class='stat-card err'><div class='count'>0</div><div class='label'>异常</div></div><div class='stat-card err'><div class='count'>0</div><div class='label'>错误</div></div><div class='stat-card timeout'><div class='count'>0</div><div class='label'>超时</div></div><div class='stat-card idle'><div class='count'>0</div><div class='label'>未检测</div></div></div><div class='stats-caption'>共 8 个模块</div>
+<div class="sec" id="charts"><h2><span class="icon">📈</span>关键指标图</h2></div><div class="charts"><div class='chart'><h4>网关延迟时间序列 <span class='tag'>逐次 Ping</span></h4><svg width="100%" height="120" viewBox="0 0 420 120" preserveAspectRatio="none"><defs><linearGradient id="np-grad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2563eb" stop-opacity=".25"/><stop offset="1" stop-color="#2563eb" stop-opacity="0"/></linearGradient></defs><line x1="0" y1="12.0" x2="420" y2="12.0" stroke="#e6e9f0" stroke-width="1"/><line x1="0" y1="104.0" x2="420" y2="104.0" stroke="#e6e9f0" stroke-width="1"/><polygon points="0.0,100.1 22.1,99.6 44.2,100.0 66.3,99.4 88.4,89.1 110.5,99.8 132.6,100.0 154.7,99.6 176.8,99.2 198.9,100.0 221.1,99.8 243.2,99.4 265.3,99.6 287.4,100.0 309.5,99.8 331.6,99.2 353.7,99.6 375.8,100.0 397.9,99.4 420.0,99.8 420,120.0 0,120.0" fill="url(#np-grad)"/><polyline points="0.0,100.1 22.1,99.6 44.2,100.0 66.3,99.4 88.4,89.1 110.5,99.8 132.6,100.0 154.7,99.6 176.8,99.2 198.9,100.0 221.1,99.8 243.2,99.4 265.3,99.6 287.4,100.0 309.5,99.8 331.6,99.2 353.7,99.6 375.8,100.0 397.9,99.4 420.0,99.8" fill="none" stroke="#2563eb" stroke-width="2"/><text x="4" y="8.0" font-size="10" fill="#94a3b8">50ms</text><text x="4" y="117.0" font-size="10" fill="#94a3b8">0ms</text></svg><div class='cap'>共 20 次成功样本 · 平均 2.3ms · 峰值 8.1ms。</div></div><div class='chart'><h4>宽带测速 <span class='tag'>国内节点</span></h4><svg width="100%" height="120" viewBox="0 0 300 120" preserveAspectRatio="none"><text x="0" y="14" font-size="10" fill="#94a3b8">下载 285.4 Mbps</text><rect x="0" y="20" width="258.0" height="22" rx="6" fill="#dbeafe"/><rect x="0" y="20" width="224.3" height="22" rx="6" fill="#2563eb"/><text x="0" y="64" font-size="10" fill="#94a3b8">上传 31.2 Mbps</text><rect x="0" y="70" width="258.0" height="22" rx="6" fill="#fef3c7"/><rect x="0" y="70" width="24.5" height="22" rx="6" fill="#d97706"/><text x="0" y="112" font-size="10" fill="#94a3b8">延迟 — · 抖动 — · 丢包 —</text></svg><div class='cap'>下载 285.4 Mbps · 上传 31.2 Mbps。</div></div><div class='chart wide'><h4>状态分布 <span class='tag'>8 模块</span></h4><svg width="100%" height="46" viewBox="0 0 1000 46" preserveAspectRatio="none"><defs><clipPath id="np-bar-clip"><rect x="0" y="0" width="1000" height="34" rx="7"/></clipPath></defs><g clip-path="url(#np-bar-clip)"><rect x="0.0" y="0" width="500.0" height="34" fill="#16a34a"/><rect x="500.0" y="0" width="250.0" height="34" fill="#d97706"/><rect x="750.0" y="0" width="250.0" height="34" fill="#94a3b8"/></g></svg><div class='cap'>完成 4 · 警告 2 · 未检测 2</div></div></div>
+
+<div class="sec" id="list"><h2><span class="icon">📋</span>检测结果一览</h2></div>
+<div class="overview"><ul><li><a href='#mod-gateway' title='跳转到 网关检测 详细结果'><span class='dot ok'></span><span class='name'>网关检测</span><span class='verdict'>网关 192.168.1.1: 平均 2.3ms, 丢包 0.0%, 抖动 ?ms</span><span class='badge ok'>完成</span></a></li><li><a href='#mod-dns' title='跳转到 DNS 诊断 详细结果'><span class='dot warn'></span><span class='name'>DNS 诊断</span><span class='verdict'>当前 DNS (2, 2, 1, ., 2, 2, 8, ., 2, 5, 5, ., 1) 平均 0ms · 对比测试…</span><span class='badge warn'>警告</span></a></li><li><a href='#mod-wifi' title='跳转到 WiFi 分析 详细结果'><span class='dot warn'></span><span class='name'>WiFi 分析</span><span class='verdict'>发现 0 个 WiFi 网络, 干扰等级: 正常</span><span class='badge warn'>警告</span></a></li><li><a href='#mod-speedtest' title='跳转到 测速 详细结果'><span class='dot ok'></span><span class='name'>测速</span><span class='verdict'>测速 (未启用 Ookla 官方测速, 加 --speedtest-net 可对照参考)</span><span class='badge ok'>完成</span></a></li><li><a href='#mod-mtu' title='跳转到 MTU 检测 详细结果'><span class='dot ok'></span><span class='name'>MTU 检测</span><span class='verdict'>MTU 路径正常</span><span class='badge ok'>完成</span></a></li><li><a href='#mod-tcpstats' title='跳转到 TCP 传输质量 详细结果'><span class='dot ok'></span><span class='name'>TCP 传输质量</span><span class='verdict'>TCP 传输质量</span><span class='badge ok'>完成</span></a></li><li><a href='#mod-ipv6' title='跳转到 IPv6 检测 详细结果'><span class='dot idle'></span><span class='name'>IPv6 检测</span><span class='verdict'>未检测</span><span class='badge idle'>未检测</span></a></li><li><a href='#mod-iperf3' title='跳转到 iperf3 吞吐 详细结果'><span class='dot idle'></span><span class='name'>iperf3 吞吐</span><span class='verdict'>未检测</span><span class='badge idle'>未检测</span></a></li></ul></div>
+
+<div class="sec" id="modules"><h2><span class="icon">🔍</span>详细结果
+<span class="cnt">共 2 个问题模块 · 已展开首要问题项, 其余点击展开</span></h2></div>
+
+<details class="mod ok" id="mod-gateway" open>
+  <summary>
+    <span class="ic ok">✓</span>
+    <span class="nm">网关检测</span>
+    <span class="vd">网关 192.168.1.1: 平均 2.3ms, 丢包 0.0%, 抖动 ?ms</span>
+    <span class="b ok">完成</span>
+    
+    <a class="anchor" href="#mod-gateway" data-mod="mod-gateway"
+       title="复制本模块链接">🔗</a>
+    <span class="arr">▸</span>
+  </summary>
+  <div class="bd">
+    <div class="verdict"><span class="tag">结论</span><span>网关 192.168.1.1: 平均 2.3ms, 丢包 0.0%, 抖动 ?ms</span></div>
+    <div class='explain'>📖 Ping 网关 (光猫/路由器), 反映『本机 ↔ 网关』这一段的质量。这里丢包/高延迟说明问题在内网 (网线/WiFi/路由器), 无需找运营商。</div>
+    <div class='metrics'><div class='metric' title='平均延迟: 2.3 ms
+💡 本机到网关的往返时间, 反映内网段质量' data-hint='本机到网关的往返时间, 反映内网段质量'><span class='v ok'>2.3 ms</span><span class='lab'>平均延迟</span></div><div class='metric' title='丢包率: 0.0%
+💡 内网丢包, 超过 1% 就会影响游戏/通话' data-hint='内网丢包, 超过 1% 就会影响游戏/通话'><span class='v ok'>0.0%</span><span class='lab'>丢包率</span></div><div class='metric' title='抖动: ? ms
+💡 延迟的波动幅度, 越大越卡' data-hint='延迟的波动幅度, 越大越卡'><span class='v ok'>? ms</span><span class='lab'>抖动</span></div><div class='metric' title='最大延迟: ? ms'><span class='v ok'>? ms</span><span class='lab'>最大延迟</span></div></div>
+    
+    
+    <details class='collapse' data-auto-open="1" open><summary>技术细节 <span class='cnt'>1 项</span></summary><div class='body'><div class='subcap'>ping</div><div class='tbl-wrap'><table class='tbl kv'><thead><tr><th>指标</th><th>值</th></tr></thead><tbody><tr><td class='k'>rtts</td><td class='v'>2.1, 2.4, 2.2, 2.5, 8.1, 2.3, 2.2, 2.4, 2.6, 2.2, 2.3, 2.5, 2.4, 2.2, 2.3, 2.6, 2.4, 2.2, 2.5, 2.3</td></tr><tr><td class='k'>平均(ms)</td><td class='v'>2.3</td></tr><tr><td class='k'>丢包(%)</td><td class='v'>0.0</td></tr><tr><td class='k'>sent</td><td class='v'>20</td></tr><tr><td class='k'>recv</td><td class='v'>20</td></tr></tbody></table></div></div></details>
+  </div>
+</details>
+<details class="mod warn" id="mod-dns" open>
+  <summary>
+    <span class="ic warn">⚠</span>
+    <span class="nm">DNS 诊断</span>
+    <span class="vd" title="当前 DNS (2, 2, 1, ., 2, 2, 8, ., 2, 5, 5, ., 1) 平均 0ms · 对比测试 0/0 成功">当前 DNS (2, 2, 1, ., 2, 2, 8, ., 2, 5, 5, ., 1) 平均 0ms · 对比测试…</span>
+    <span class="b warn">警告</span>
+    <span class='dt deduct warn' title='该模块的状态「警告」从健康分里扣 2 分'>−2 分</span>
+    <a class="anchor" href="#mod-dns" data-mod="mod-dns"
+       title="复制本模块链接">🔗</a>
+    <span class="arr">▸</span>
+  </summary>
+  <div class="bd">
+    <div class="verdict"><span class="tag">结论</span><span>当前 DNS (2, 2, 1, ., 2, 2, 8, ., 2, 5, 5, ., 1) 平均 0ms · 对比测试 0/0 成功</span></div>
+    <div class='explain'>📖 检查域名解析 (DNS) 的速度与结果正确性, 并识别 DNS 劫持。典型症状: 网页打不开但 QQ/微信正常。</div>
+    <div class='metrics'><div class='metric' title='当前 DNS 平均: 0 ms
+💡 本机配置的 DNS: 2, 2, 1, ., 2, 2, 8, ., 2, 5, 5, ., 1' data-hint='本机配置的 DNS: 2, 2, 1, ., 2, 2, 8, ., 2, 5, 5, ., 1'><span class='v ok'>0 ms</span><span class='lab'>当前 DNS 平均</span></div><div class='metric' title='当前 DNS 成功率: 0/0
+💡 只统计本机在用的 DNS 服务器' data-hint='只统计本机在用的 DNS 服务器'><span class='v ok'>0/0</span><span class='lab'>当前 DNS 成功率</span></div></div>
+    
+    
+    <details class='collapse' data-auto-open="1" open><summary>技术细节 <span class='cnt'>2 项</span></summary><div class='body'><div class='subcap'>系统 DNS</div><p class='mono'>221.228.255.1</p></div></details>
+  </div>
+</details>
+<details class="mod warn" id="mod-wifi">
+  <summary>
+    <span class="ic warn">⚠</span>
+    <span class="nm">WiFi 分析</span>
+    <span class="vd">发现 0 个 WiFi 网络, 干扰等级: 正常</span>
+    <span class="b warn">警告</span>
+    <span class='dt deduct warn' title='该模块的状态「警告」从健康分里扣 2 分'>−2 分</span>
+    <a class="anchor" href="#mod-wifi" data-mod="mod-wifi"
+       title="复制本模块链接">🔗</a>
+    <span class="arr">▸</span>
+  </summary>
+  <div class="bd">
+    <div class="verdict"><span class="tag">结论</span><span>发现 0 个 WiFi 网络, 干扰等级: 正常</span></div>
+    <div class='explain'>📖 扫描周边 WiFi 的信道占用并推荐最空闲信道。信道拥挤 = WiFi 慢但宽带本身正常, 换信道即可改善。</div>
+    
+    <div class='impact-line warn'><b>[警告]</b> Wi-Fi 信号偏弱（RSSI -72dBm）</div>
+    <div class='impact-line warn'><b>[提示]</b> 当前未连接 Wi-Fi, 因此未扫描周边网络与信道占用 (这是正常现象, 而非故障)。</div>
+    
+  </div>
+</details>
+<details class="mod ok" id="mod-speedtest">
+  <summary>
+    <span class="ic ok">✓</span>
+    <span class="nm">测速</span>
+    <span class="vd">测速 (未启用 Ookla 官方测速, 加 --speedtest-net 可对照参考)</span>
+    <span class="b ok">完成</span>
+    
+    <a class="anchor" href="#mod-speedtest" data-mod="mod-speedtest"
+       title="复制本模块链接">🔗</a>
+    <span class="arr">▸</span>
+  </summary>
+  <div class="bd">
+    <div class="verdict"><span class="tag">结论</span><span>测速 (未启用 Ookla 官方测速, 加 --speedtest-net 可对照参考)</span></div>
+    <div class='explain'>📖 实测下载/上传速率并推算宽带档位。实测明显低于办理档位 = 线路或设备有问题, 是装维核心验收项。</div>
+    <div class='metrics'><div class='metric' title='下载: 285.4 Mbps
+💡 实测下载速率; &lt; 10 Mbps 警告, &lt; 1 Mbps 异常 (千兆期望下应达 800+ Mbps, 百兆期望下应达 80+ Mbps)' data-hint='实测下载速率; &lt; 10 Mbps 警告, &lt; 1 Mbps 异常 (千兆期望下应达 800+ Mbps, 百兆期望下应达 80+ Mbps)'><span class='v ok'>285.4 Mbps</span><span class='lab'>下载</span></div><div class='metric' title='上传: 31.2 Mbps
+💡 实测上传速率; &lt; 5 Mbps 警告, &lt; 1 Mbps 异常' data-hint='实测上传速率; &lt; 5 Mbps 警告, &lt; 1 Mbps 异常'><span class='v ok'>31.2 Mbps</span><span class='lab'>上传</span></div><div class='metric' title='测速方式: 国内HTTP+上行'><span class='v ok'>国内HTTP+上行</span><span class='lab'>测速方式</span></div></div>
+    
+    
+    
+  </div>
+</details>
+<details class="mod ok" id="mod-mtu">
+  <summary>
+    <span class="ic ok">✓</span>
+    <span class="nm">MTU 检测</span>
+    <span class="vd">MTU 路径正常</span>
+    <span class="b ok">完成</span>
+    
+    <a class="anchor" href="#mod-mtu" data-mod="mod-mtu"
+       title="复制本模块链接">🔗</a>
+    <span class="arr">▸</span>
+  </summary>
+  <div class="bd">
+    <div class="verdict"><span class="tag">结论</span><span>MTU 路径正常</span></div>
+    <div class='explain'>📖 探测链路允许的最大包尺寸。不匹配的典型症状: 网页打得开但图片/验证码加载不出、VPN 连得上但传不了数据。</div>
+    
+    
+    
+    
+  </div>
+</details>
+<details class="mod ok" id="mod-tcpstats">
+  <summary>
+    <span class="ic ok">✓</span>
+    <span class="nm">TCP 传输质量</span>
+    <span class="vd">TCP 传输质量</span>
+    <span class="b ok">完成</span>
+    
+    <a class="anchor" href="#mod-tcpstats" data-mod="mod-tcpstats"
+       title="复制本模块链接">🔗</a>
+    <span class="arr">▸</span>
+  </summary>
+  <div class="bd">
+    <div class="verdict"><span class="tag">结论</span><span>TCP 传输质量</span></div>
+    <div class='explain'>📖 看系统 TCP 层的累计质量统计: 重传率高 = 链路实际在丢包 (干扰/劣化), 即使 ping 看不出来。</div>
+    <div class='metrics'><div class='metric' title='重传率: 0%
+💡 丢包后重发的比例; 大于 1% 链路质量偏差, 大于 5% 明显影响网速' data-hint='丢包后重发的比例; 大于 1% 链路质量偏差, 大于 5% 明显影响网速'><span class='v ok'>0%</span><span class='lab'>重传率</span></div></div>
+    
+    
+    
+  </div>
+</details>
+<details class="mod idle" id="mod-ipv6">
+  <summary>
+    <span class="ic idle">○</span>
+    <span class="nm">IPv6 检测</span>
+    <span class="vd">未检测</span>
+    <span class="b idle">未检测</span>
+    <span class='dt exempt' title='评分豁免模块: 该模块的问题不计入健康分'>豁免</span>
+    <a class="anchor" href="#mod-ipv6" data-mod="mod-ipv6"
+       title="复制本模块链接">🔗</a>
+    <span class="arr">▸</span>
+  </summary>
+  <div class="bd">
+    <div class="verdict"><span class="tag">结论</span><span>未检测</span></div>
+    <div class='explain'>📖 检查新一代网络地址 (IPv6) 是否开通可用。部分运营商业务与测评依赖它, 缺失属资源配置问题非故障。</div>
+    
+    
+    
+    
+  </div>
+</details>
+<details class="mod idle" id="mod-iperf3">
+  <summary>
+    <span class="ic idle">○</span>
+    <span class="nm">iperf3 吞吐</span>
+    <span class="vd">未检测</span>
+    <span class="b idle">未检测</span>
+    <span class='dt exempt' title='评分豁免模块: 该模块的问题不计入健康分'>豁免</span>
+    <a class="anchor" href="#mod-iperf3" data-mod="mod-iperf3"
+       title="复制本模块链接">🔗</a>
+    <span class="arr">▸</span>
+  </summary>
+  <div class="bd">
+    <div class="verdict"><span class="tag">结论</span><span>未检测</span></div>
+    <div class='explain'>📖 到指定服务器点对点测吞吐 (内网/专线验收用), 测的是链路吞吐, 与互联网宽带测速是两回事。UDP 模式 (--iperf3-udp) 改测抖动/丢包 — 语音/游戏质量的关键指标。</div>
+    
+    
+    
+    
+  </div>
+</details>
+
+<div class="sec" id="host"><h2><span class="icon">🖥</span>主机信息</h2></div>
+<div class="host-grid"><div class='host-card'><div class='lab'>本机 IP</div><div class='val'>192.168.1.2</div></div><div class='host-card'><div class='lab'>默认网关</div><div class='val'>192.168.1.1</div></div><div class='host-card'><div class='lab'>DNS</div><div class='val'>221.228.255.1</div></div><div class='host-card'><div class='lab'>公网 IP</div><div class='val'>203.0.113.7</div></div></div><div class='host-note'>公网 IP、出口位置与运营商由第三方服务查询 (域名: qifu-api.baidubce.com、myip.ipip.net、ddns.oray.com、api.ipify.org、ifconfig.me、ip.sb、api64.ipify.org、ipv6.icanhazip.com、v6.ident.me、www.cip.cc、ipwho.is); 这些服务会看到你的公网 IP。设 NP_OFFLINE=1 可完全关闭这类查询。</div>
+
+
+
+<div class="sec" id="appendix"><h2><span class="icon">🔧</span>技术附录
+<span class="cnt">默认折叠 · 供装维与技术人员查阅</span></h2></div>
+<details class="collapse" data-auto-open="0"><summary>查看本次诊断的判定标准与评分口径 <span class='cnt'>16 项指标</span></summary>
+<div class="body">
+  <div class='subcap'>本节是工具内部的判定口径，<b>不影响</b>上方已列出的实测数据与结论。阈值只决定状态标签（正常 / 警告 / 异常），所有原始测量值仍完整保留在各模块的「技术细节」中。</div>
+  <div class='subcap' style='margin-top:10px'>判定规则: "越低越差"的指标 (延迟/丢包/重传/抖动), 超过<span class='kw warn'>警告阈值</span>标 ⚠️ 警告, 超过<span class='kw err'>异常阈值</span>标 ❌ 异常; "越高越好"的指标 (速率/TCP 可达数), 低于警告阈值标警告, 低于异常阈值标异常。所有阈值集中维护在 <code>THRESHOLDS</code>, 链路速率在 <code>LINKSPEED_*</code> 常量维护。</div>
+  <table class='tbl std'>
+    <thead><tr><th>模块</th><th>指标</th><th>警告阈值</th><th>异常阈值</th><th>单位</th><th>判定方向</th></tr></thead>
+    <tbody><tr><td>网关检测</td><td>平均延迟</td><td class='num'>10</td><td class='num'>30</td><td>ms</td><td>越低越差 (≥ 触发)</td></tr><tr><td>网关检测</td><td>丢包率</td><td class='num'>1</td><td class='num'>5</td><td>%</td><td>越低越差 (≥ 触发)</td></tr><tr><td>网关检测</td><td>抖动</td><td class='num'>5</td><td class='num'>20</td><td>ms</td><td>越低越差 (≥ 触发)</td></tr><tr><td>网关检测</td><td>最大延迟</td><td class='num'>100</td><td class='num'>300</td><td>ms</td><td>越低越差 (≥ 触发)</td></tr><tr><td>外网检测</td><td>平均延迟</td><td class='num'>50</td><td class='num'>150</td><td>ms</td><td>越低越差 (≥ 触发)</td></tr><tr><td>外网检测</td><td>平均丢包</td><td class='num'>1</td><td class='num'>5</td><td>%</td><td>越低越差 (≥ 触发)</td></tr><tr><td>外网检测</td><td>TCP 可达数</td><td class='num'>—</td><td class='num'>—</td><td></td><td>越低越好 (≤ 触发)</td></tr><tr><td>DNS 诊断</td><td>平均响应</td><td class='num'>50</td><td class='num'>200</td><td>ms</td><td>越低越差 (≥ 触发)</td></tr><tr><td>WiFi 分析</td><td>WiFi 邻居数</td><td class='num'>8</td><td class='num'>15</td><td></td><td>越低越差 (≥ 触发)</td></tr><tr><td>测速</td><td>下载速率</td><td class='num'>10</td><td class='num'>1</td><td>Mbps</td><td>越低越好 (≤ 触发)</td></tr><tr><td>Bufferbloat</td><td>延迟增加</td><td class='num'>30</td><td class='num'>100</td><td>ms</td><td>越低越差 (≥ 触发)</td></tr><tr><td>TCP 传输质量</td><td>重传率</td><td class='num'>1</td><td class='num'>5</td><td>%</td><td>越低越差 (≥ 触发)</td></tr><tr><td>网页体检</td><td>平均首字节</td><td class='num'>500</td><td class='num'>2000</td><td>ms</td><td>越低越差 (≥ 触发)</td></tr><tr><td>TCP 并发</td><td>最大可持续并发</td><td class='num'>1024</td><td class='num'>512</td><td></td><td>越低越好 (≤ 触发)</td></tr><tr><td>链路速率</td><td>有线协商速率</td><td class='num'>100</td><td class='num'>1000</td><td>Mbps</td><td>越低越差 (≥ 触发)</td></tr><tr><td>链路速率</td><td>WiFi 协商速率</td><td class='num'>54</td><td class='num'>150</td><td>Mbps</td><td>越低越差 (≥ 触发)</td></tr></tbody>
+  </table>
+  <div class='subcap' style='margin-top:12px'>评分规则 (健康分是用于快速排序问题优先级的规则分, 不是统计意义上的网络质量评分): 起始 100 分, 异常 -20/项, 错误 -30/项, 超时 -10/项 (检测未跑完, 不是合格), 警告 -2/项, 未检测不扣分。<br>豁免模块 (不参与扣分): IPv6 检测、iperf3 吞吐。等级: A≥90 优秀, B≥75 良好, C≥60 一般, D≥40 欠佳, F&lt;40 严重。</div>
+</div>
+</details>
+</main>
+<footer>由 NetPulse v1.25.0 自动生成 · 2026-01-02 03:04:05</footer>
+</div>
+<script>
+// 左侧导航滚动高亮
+(function(){
+  var links = document.querySelectorAll('.nav a[href^="#"]');
+  var map = {};
+  // 只收集导航目标 id (mod-* 与固定分区), 避免 SVG 渐变 id 等混入;
+  // offsetTop 不是数字的直接跳过 (SVG 内部元素没有 offsetTop)
+  var NAV_IDS = ['overview', 'todo', 'stats', 'charts', 'list'];
+  document.querySelectorAll('[id]').forEach(function(el){
+    if (!el.id || typeof el.offsetTop !== 'number') return;
+    if (el.id.indexOf('mod-') !== 0 && NAV_IDS.indexOf(el.id) < 0) return;
+    map[el.id] = el;
+  });
+  window.addEventListener('scroll', function(){
+    // 阈值须小于折叠模块行的间距 (约 76px), 否则密集列表会提前高亮到下一行
+    var y = window.scrollY + 40, cur = null;
+    Object.keys(map).forEach(function(id){
+      if (map[id].offsetTop <= y) cur = id;
+    });
+    links.forEach(function(a){
+      a.classList.toggle('on', a.getAttribute('href') === '#' + cur);
+    });
+  }, {passive:true});
+})();
+// 指标卡点击展开说明 (触摸设备无 hover; 桌面点击也可用)
+(function(){
+  document.querySelectorAll('.metric[data-hint]').forEach(function(el){
+    el.addEventListener('click', function(){
+      el.classList.toggle('show-hint');
+    });
+  });
+})();
+// 复制工具 (全局): clipboard API 优先, 失败回退 execCommand; done 为成功回调
+function fallbackCopy(txt, done){
+  var ta = document.createElement('textarea');
+  ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } catch(e) {}
+  document.body.removeChild(ta);
+  if (done) done();
+}
+function copyText(txt, done){
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(done).catch(function(){ fallbackCopy(txt, done); });
+  } else {
+    fallbackCopy(txt, done);
+  }
+}
+// IP/MAC 值点击复制
+(function(){
+  document.querySelectorAll('.host-card .val').forEach(function(el){
+    el.addEventListener('click', function(){
+      var txt = el.textContent.trim();
+      if (!txt || txt === '—') return;
+      copyText(txt, function(){
+        var orig = el.textContent;
+        el.textContent = '✓ 已复制';
+        el.classList.add('copied');
+        setTimeout(function(){ el.textContent = orig; el.classList.remove('copied'); }, 1200);
+      });
+    });
+    el.title = '点击复制: ' + el.textContent.trim();
+  });
+})();
+// v1.5.0 通用复制按钮: data-copy 直接取短文本, data-copy-from 从目标元素读长文本
+(function(){
+  document.querySelectorAll('.copy-btn[data-copy], .copy-btn[data-copy-from]').forEach(function(btn){
+    btn.addEventListener('click', function(e){
+      e.preventDefault();
+      var txt = btn.getAttribute('data-copy') || '';
+      if (!txt) {
+        var src = document.getElementById(btn.getAttribute('data-copy-from') || '');
+        txt = src ? src.textContent : '';
+      }
+      if (!txt) return;
+      copyText(txt, function(){
+        var orig = btn.getAttribute('data-orig-text') || btn.textContent;
+        btn.setAttribute('data-orig-text', orig);
+        btn.textContent = '✓ 已复制';
+        btn.classList.add('done');
+        setTimeout(function(){
+          btn.textContent = orig;
+          btn.classList.remove('done');
+        }, 1200);
+      });
+    });
+  });
+})();
+// 模块卡 🔗 按钮: 复制带锚点的报告链接; preventDefault 避免 <summary> 折叠与页面跳转
+(function(){
+  document.querySelectorAll('.mod > summary a.anchor').forEach(function(a){
+    a.addEventListener('click', function(e){
+      e.preventDefault();
+      var id = a.getAttribute('href').slice(1);
+      copyText(location.href.split('#')[0] + '#' + id, function(){
+        a.classList.add('copied');
+        setTimeout(function(){ a.classList.remove('copied'); }, 1200);
+      });
+      location.hash = id;   // 触发下方 hashchange: 展开卡片并定位
+    });
+  });
+})();
+// 锚点跳转: 浏览器只负责滚动到折叠卡, 内容需先展开才能看到
+(function(){
+  function openByHash(){
+    var h = decodeURIComponent((location.hash || '').slice(1));
+    if (!h) return;
+    var t = document.getElementById(h);
+    if (t && t.tagName === 'DETAILS' && !t.open) t.open = true;
+  }
+  window.addEventListener('hashchange', openByHash);
+  window.addEventListener('DOMContentLoaded', openByHash);
+})();
+// 打印/另存 PDF: 闭合的 <details> 无法靠 CSS 强制展开 (需 [open] 属性或 JS),
+// 打印前全部展开、打印后恢复原状 — 保证纸质留档包含技术细节全文
+(function(){
+  var touched = [];
+  window.addEventListener('beforeprint', function(){
+    touched = [];
+    document.querySelectorAll('details').forEach(function(d){
+      if (!d.open){ d.open = true; touched.push(d); }
+    });
+  });
+  window.addEventListener('afterprint', function(){
+    touched.forEach(function(d){ d.open = false; });
+    touched = [];
+  });
+})();
+</script>
+</body>
+</html>
