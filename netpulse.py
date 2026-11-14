@@ -24793,6 +24793,227 @@ def _gui_verdict(report):
             "label": health.get("label"), "summary": counts}
 
 
+def _gui_report_view(report):
+    """GUI 屏幕版报告投影 (v1.25.0): report dict → 页面渲染所需 JSON。
+
+    数据流: session._report (build_report 产物) → 本函数 → /api/report → 页面。
+    只投影屏幕视图需要的要素, **不含** tech.raw_results / 模块 raw 大对象
+    (屏幕视图不需要原始载荷); 页面对投影只做渲染 (textContent), 数字零自算
+    —— 分数/算式/待办/展开集合/置信度分档全部取自 report dict 与共享口径
+    函数 (_score_formula / _todo_issues_data / _conf_band), 与导出 HTML
+    报告同源 (口径一致性由 tests/test_gui_report_view.py 锁住)。
+    report 为空 → None (路由 404)。
+    """
+    if not report:
+        return None
+    health = report.get("health") or {}
+    sys_i = report.get("system") or {}
+    modules = report.get("modules") or []
+    counts = report.get("counts") or {}
+    summary = report.get("summary") or {}
+
+    # ── Hero 检测范围 chip (与 render_report_html_customer 同口径) ──
+    sel = report.get("selected_modules")
+    tot = report.get("total_modules")
+    ran = len(((report.get("tech") or {}).get("raw_results") or {}))
+    scope = {"ran": ran, "sel": sel, "tot": tot, "text": "", "note": ""}
+    if isinstance(sel, int) and isinstance(tot, int) and tot > 0:
+        if ran and ran < sel:
+            scope["text"] = "%d/%d 项" % (ran, sel)
+            note = "本轮提前结束, 请求的 %d 项里有 %d 项没测" % (sel, sel - ran)
+            if sel < tot:
+                note += " (全库共 %d 项)" % tot
+            scope["note"] = note
+        elif sel < tot:
+            scope["text"] = "%d/%d 项" % (sel, tot)
+            scope["note"] = "本次仅运行所选模块, 其余 %d 项未检测" % (tot - sel)
+        else:
+            scope["text"] = "%d 项全覆盖" % tot
+
+    # ── 待办 (与导出报告同一聚合口径, _todo_issues_data 单一来源) ──
+    t = _todo_issues_data(modules)
+    todo_cards = [{
+        "severity": i.get("severity", "信息"),
+        "texts": [x for x in (i.get("_texts") or []) if x],
+        "impact": i.get("impact", ""),
+        "action": i.get("action", ""),
+        "module": i.get("_module", ""),
+        "modules": list(i.get("_modules") or []),
+        "dup": i.get("_dup", 1) or 1,
+        "raw_summary": i.get("raw_summary", ""),
+        "status": i.get("_status", ""),
+    } for i in t["merged"]]
+
+    # ── 模块卡 (指标过滤/问题去重/展开集合与 _module_cards_section 同口径) ──
+    root_causes = (report.get("diagnosis") or {}).get("root_causes") or []
+    primary = set(root_causes[0].get("affected_modules") or []) \
+        if root_causes else set()
+    mod_views = []
+    for m in modules:
+        st = m["status"]
+        metrics = []
+        for me in (m.get("key_metrics") or []):
+            # 空值指标没有信息量, 不占卡片格 (与导出报告同一过滤口径)
+            if str(me.get("value", "")).strip() in ("—", "N/A", "无", ""):
+                continue
+            metrics.append({"label": me.get("label", ""),
+                            "value": me.get("value", ""),
+                            "level": me.get("level", "ok"),
+                            "hint": me.get("hint", "")})
+        seen = set()
+        issues = []
+        for issue in (m.get("issues") or []):
+            sev = issue.get("severity", "信息")
+            text = (issue.get("text", "") or "").strip()
+            key = (sev, text)
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            issues.append({"severity": sev, "text": text,
+                           "action": (issue.get("action", "") or "").strip()})
+        mod_views.append({
+            "key": m["key"], "name": m["name"], "status": st,
+            "badge_text": m.get("badge_text") or "",
+            "verdict": m.get("verdict", ""),
+            "key_metrics": metrics,
+            "issues": issues,
+            # 折叠口径: 有根因 → 只展开首要根因涉及模块; 无根因 → 问题模块
+            # 全展开 (PROBLEM_STATUSES), 与导出报告同一规则
+            "expanded": (m["key"] in primary) if primary
+                        else st in PROBLEM_STATUSES,
+        })
+
+    # ── 图表数据 (与 _chart_section 同源字段) ──
+    by_key = {m["key"]: m for m in modules}
+    ping = {}
+    gw_raw = (by_key.get("gateway") or {}).get("raw") or {}
+    ping_info = (gw_raw.get("ping") or {}) if isinstance(gw_raw, dict) else {}
+    rtts = ping_info.get("rtts") or []
+    if rtts:
+        caps = ["共 %d 次成功样本" % len(rtts)]
+        avg = ping_info.get("avg_ms")
+        if isinstance(avg, (int, float)):
+            # Windows ping 对局域网 (<1ms) 输出整数粒度 0, 直写"平均 0ms"
+            # 会被误读成"数据有问题" — 有样本时按 <1ms 表达 (v1.9.3 同口径)
+            caps.append("平均 <1ms" if (avg < 1 and rtts)
+                        else "平均 %gms" % avg)
+        peak = max(rtts) if rtts else 0
+        if isinstance(peak, (int, float)) and peak > 0:
+            caps.append("峰值 %gms" % peak)
+        loss = ping_info.get("loss_pct")
+        if isinstance(loss, (int, float)) and loss > 0:
+            caps.append("丢包 %s%%" % loss)
+        ping = {"rtts": [r for r in rtts if isinstance(r, (int, float))],
+                "cap": caps}
+    sp_raw = (by_key.get("speedtest") or {}).get("raw") or {}
+    speed_data, speed_method = _resolve_speed_chart_src(sp_raw)
+    # 状态分布 (全口径, 从 summary 派生 — 与 _band_counts_band 同源)
+    summary_counts = []
+    for st in STATUS_BAR_ORDER:
+        n = sum(1 for v in summary.values() if v == st)
+        if n:
+            summary_counts.append({"status": st, "n": n})
+
+    # ── 诊断结论 (三态: 命中根因 / 有未完成模块 / 未匹配到根因,
+    #     与 _render_diagnosis_section_html 同一口径, 不写无依据的话) ──
+    diag = report.get("diagnosis") or {}
+    unfinished = sum(1 for st in summary.values() if st in ("超时", "错误"))
+    if root_causes:
+        diag_mode = "root_causes"
+    elif unfinished:
+        diag_mode = "unfinished"
+    else:
+        diag_mode = "none"
+    rc_views = [{
+        "severity": rc.get("severity", ""),
+        "sev_label": {"critical": "严重", "high": "高",
+                      "medium": "中", "low": "低"}.get(rc.get("severity", ""),
+                                                       rc.get("severity", "")),
+        "title": rc.get("title", ""),
+        "description": rc.get("description", ""),
+        "recommendations": list(rc.get("recommendations") or []),
+        "affected_modules": list(rc.get("affected_modules") or []),
+        "conf_band": _conf_band(rc.get("confidence", 0)),
+        "supports": [{"text": (s.get("text") or "").strip(),
+                      "ok": bool(s.get("ok"))}
+                     for s in (rc.get("supports") or [])
+                     if (s.get("text") or "").strip()],
+        "excludes": [{"text": (s.get("text") or "").strip()}
+                     for s in (rc.get("excludes") or [])
+                     if (s.get("text") or "").strip()],
+    } for rc in root_causes]
+
+    # ── 本机信息 (与 _host_info_section 同口径) ──
+    host_pairs = [["本机 IP", sys_i.get("local_ip") or ""],
+                  ["默认网关", sys_i.get("gateway") or ""],
+                  ["DNS", sys_i.get("dns") or ""],
+                  ["公网 IP", sys_i.get("public_ip") or ""]]
+    if sys_i.get("asn") or sys_i.get("geo"):
+        host_pairs.append(["出口位置", " / ".join(
+            x for x in (sys_i.get("geo"), sys_i.get("asn")) if x)])
+    if sys_i.get("ipv6_public_ip"):
+        if sys_i.get("ipv6_native") is False:
+            host_pairs.append(["IPv6 出口（非本机原生）",
+                               sys_i.get("ipv6_public_ip") or ""])
+        else:
+            host_pairs.append(["IPv6 公网", sys_i.get("ipv6_public_ip") or ""])
+
+    g = report["generated_at"]
+    view = {
+        "meta": {
+            "app": report.get("app", ""),
+            "version": report.get("version", ""),
+            "generated_at": g.strftime("%Y-%m-%d %H:%M:%S")
+                            if hasattr(g, "strftime") else str(g or ""),
+            "duration_ms": int(report.get("duration_ms") or 0),
+            "note": report.get("note", ""),
+        },
+        "health": {
+            "score": health.get("score", 0),
+            "grade": health.get("grade", ""),
+            "label": health.get("label", ""),
+            "verdict": health.get("verdict", ""),
+            "formula": _score_formula(report),
+        },
+        "counts": counts,
+        "summary_counts": summary_counts,
+        "exempt_count": report.get("exempt_count", 0),
+        "exempt_names": _exempt_names(report),
+        "scope": scope,
+        "todo": {
+            "need_cnt": t["need_cnt"],
+            "involved_cnt": t["involved_cnt"],
+            "info_cnt": t["info_cnt"],
+            "hidden_cnt": t["hidden_cnt"],
+            "critical_cnt": t["critical_cnt"],
+            "cards": todo_cards,
+        },
+        "charts": {
+            "ping": ping,
+            "speed": {"data": speed_data, "method": speed_method},
+            "status": {"counts": summary_counts,
+                       "total": len(modules)},
+        },
+        "modules": mod_views,
+        "diagnosis": {
+            "mode": diag_mode,
+            "unfinished_cnt": unfinished,
+            "need_cnt": _need_attention_count(report),
+            "root_causes": rc_views,
+            "conf_band": _conf_band(diag.get("overall_confidence")),
+        },
+        "host": {"pairs": host_pairs,
+                 "disclosure": _public_ip_disclosure()},
+        "thresholds": ((report.get("tech") or {}).get("thresholds") or {}),
+    }
+    site_check = report.get("site_check") or {}
+    if site_check or report.get("site_note") or report.get("meta_manual"):
+        view["site"] = {"check": site_check,
+                        "note": report.get("site_note", ""),
+                        "manual": report.get("meta_manual") or {}}
+    return view
+
+
 def _GUI_LABELS(profile, keys=None):
     """场景/全量诊断的中文标题 (主页卡与导出文件名共用)。
 
@@ -25311,6 +25532,16 @@ class _GuiSession:
                 return None
             report = self._report
         return render_report_html_customer(report)
+
+    def report_view(self):
+        """屏幕版报告投影 (v1.25.0): /api/report 的 JSON 数据; 无报告 None。
+
+        只读投影 (_gui_report_view), 不持锁渲染 —— 渲染是纯函数, 取引用
+        后锁外计算, 不加重快照路径成本。
+        """
+        with self._lock:
+            rep = self._report
+        return _gui_report_view(rep)
 
     # -- 诊断编排 (与终端 _run_scene 同一管线) --
     def _begin(self, profile, keys, resume_ctx=None):

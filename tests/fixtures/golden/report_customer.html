@@ -314,7 +314,7 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 <nav class="nav" aria-label="报告导航">
   <div class="logo"><div class="mark"></div>
     <div><b>NetPulse</b><span>网络诊断报告</span></div></div>
-  <div class="g">导航</div><a href="#overview"><span class="st" style="background:#2563eb"></span>报告概览</a><a href="#todo"><span class="st" style="background:#dc2626"></span>待办问题</a><a href="#stats"><span class="st" style="background:#f59e0b"></span>状态统计</a><a href="#charts"><span class="st" style="background:#0284c7"></span>关键指标图</a><a href="#list"><span class="st" style="background:#64748b"></span>检测结果一览</a><div class="grp">基础信息</div><div class="mods"><a href="#mod-wifi"><span class="st" style="background:#d97706"></span>WiFi 分析</a><a href="#mod-ipv6"><span class="st" style="background:#94a3b8"></span>IPv6 检测</a></div><div class="grp">宽带测速</div><div class="mods"><a href="#mod-speedtest"><span class="st" style="background:#16a34a"></span>测速</a><a href="#mod-iperf3"><span class="st" style="background:#94a3b8"></span>iperf3 吞吐</a></div><div class="grp">故障诊断</div><div class="mods"><a href="#mod-gateway"><span class="st" style="background:#16a34a"></span>网关检测</a><a href="#mod-dns"><span class="st" style="background:#d97706"></span>DNS 诊断</a><a href="#mod-tcpstats"><span class="st" style="background:#16a34a"></span>TCP 传输质量</a><a href="#mod-mtu"><span class="st" style="background:#16a34a"></span>MTU 检测</a></div>
+  <div class="g">导航</div><a href="#overview"><span class="st" style="background:#2563eb"></span>报告概览</a><a href="#todo"><span class="st" style="background:#dc2626"></span>待办问题</a><a href="#stats"><span class="st" style="background:#f59e0b"></span>状态统计</a><a href="#charts"><span class="st" style="background:#0284c7"></span>关键指标图</a><a href="#list"><span class="st" style="background:#64748b"></span>检测结果一览</a><div class="grp">基础信息</div><div class="mods"><a href="#mod-wifi"><span class="st" style="background:#d97706"></span>WiFi 分析</a><a href="#mod-ipv6"><span class="st" style="background:#16a34a"></span>IPv6 检测</a></div><div class="grp">宽带测速</div><div class="mods"><a href="#mod-speedtest"><span class="st" style="background:#16a34a"></span>测速</a><a href="#mod-iperf3"><span class="st" style="background:#94a3b8"></span>iperf3 吞吐</a></div><div class="grp">故障诊断</div><div class="mods"><a href="#mod-gateway"><span class="st" style="background:#16a34a"></span>网关检测</a><a href="#mod-dns"><span class="st" style="background:#d97706"></span>DNS 诊断</a><a href="#mod-tcpstats"><span class="st" style="background:#16a34a"></span>TCP 传输质量</a><a href="#mod-mtu"><span class="st" style="background:#16a34a"></span>MTU 检测</a></div>
   <div class="foot">v1.25.0 · 生成于 2026-01-02 03:04:05<br>点条目跳转到对应模块</div>
 </nav>
 <div class="main">
@@ -327,22 +327,24 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
     <h1>网络诊断报告</h1>
     <div class="sub">优秀 · 2 个模块提示警告 · 生成于 2026-01-02 03:04:05</div>
     <div class="formula">96 / 100 ＝ 100 − 警告 2×2</div>
-    <div class="meta"><span>本机 <b>192.168.1.2</b></span><span>网关 <b>192.168.1.1</b></span><span>公网 <b>203.0.113.7</b></span><span>DNS <b>221.228.255.1</b></span><span>耗时 <b>4 分 12 秒</b></span><span title='本轮提前结束, 请求的 8 项里有 2 项没测'>检测范围 <b>6/8</b> 项</span></div>
+    <div class="meta"><span>本机 <b>192.168.1.2</b></span><span>网关 <b>192.168.1.1</b></span><span>公网 <b>203.0.113.7</b></span><span>DNS <b>221.228.255.1</b></span><span>耗时 <b>4 分 12 秒</b></span><span>检测范围 <b>8 项全覆盖</b></span></div>
   </div>
   <div class="gauge">
     <svg width="132" height="132" viewBox="0 0 132 132"><circle class="track" cx="66" cy="66" r="54"/><circle class="bar" cx="66" cy="66" r="54" stroke="#16a34a" stroke-dasharray="339.29" stroke-dashoffset="13.57"/></svg>
     <div class="in"><div class="num">96</div><div class="lbl" style="color:#15803d;background:#dcfce7">优秀</div></div>
   </div>
 </header>
-<section class="diagnosis" id="diagnosis"><h2>主要问题</h2><div class="dhead"><span class="dbadge warn">🔴 1 个主要问题</span><span class="dconf">整体中置信度, 触发 1/8 条规则</span></div><div class="rcard severity-high"><div class="rhead"><span class="rbadge">高</span><strong>DNS 解析异常 (失败率 100%)</strong><span class="rconf">中置信度</span></div><p class="rdesc">公网域名解析失败, 网页/应用可能无法访问; 网关和外网均可达, 故障点在 DNS.</p><div class="rev"><div class="rev-t">已基本排除</div><ul class="rev-list"><li class="yes">✓ 网关可达，丢包 0%，平均 2.3ms</li><li class="yes">✓ 本机到网关这一段正常，问题不在网线 / 路由器内网侧</li></ul></div><p class="rmods">影响模块: dns, gateway</p><details><summary>建议 (4 条)</summary><ul><li>1. 换 DNS 服务器 (推荐 223.5.5.5 / 119.29.29.29 / 114.114.114.114)</li><li>2. 检查路由器 DNS 转发配置</li><li>3. 排除安全软件 / 代理的 DNS 劫持</li><li>4. 若仅系统 DNS 异常, 系统设置里手动指定公共 DNS</li></ul></details><div class="cmd-card"><span class="cmd-lab">建议复测</span><code>netpulse dns gateway</code><button type="button" class="copy-btn" data-copy="netpulse dns gateway">复制命令</button></div></div><div class="ticket"><div class="ticket-head">📋 可直接提交给运营商 / 技术支持<button type="button" class="copy-btn" data-copy-from="np-ticket">复制报障描述</button></div><pre class="ticket-body" id="np-ticket">2026-01-02 03:04 · NetPulse v1.25.0
-健康度 96/100（优秀），检测到 1 个主要问题：
-1. DNS 解析异常 (失败率 100%)（中置信度）
-   现象：公网域名解析失败, 网页/应用可能无法访问; 网关和外网均可达, 故障点在 DNS.
-   建议：1. 换 DNS 服务器 (推荐 223.5.5.5 / 119.29.29.29 / 114.114.114.114)</pre></div></section>
-<div class="band">共 <b>8</b> 个模块<span class="sep"></span>扣分项 <b>2</b> 警告级</div>
+<section class="diagnosis healthy" id="diagnosis"><div class="dhead"><span class="dbadge neutral">未匹配到根因</span><span class="dconf">2 项问题已列在下方</span></div></div></section>
+<div class="band">共 <b>8</b> 个模块<span class="sep"></span>评分豁免 <b>2</b>（IPv6 检测、iperf3 吞吐）<span class="sep"></span>扣分项 <b>2</b> 警告级</div>
 
-<div class="sec" id="todo"><h2><span class="icon">⚠</span>1 项需要您关注</h2></div>
+<div class="sec" id="todo"><h2><span class="icon">⚠</span>2 项需要您关注</h2></div>
 <div class="todo">
+<div class="issue warn">
+  <h3><span class="sev">警告</span>当前 DNS (221.228.255.1) 平均响应 118ms 较慢</h3>
+  <div class="meta">📍 来源: DNS 诊断</div>
+  <div class='impact'>📌 影响: 网页/APP 首次加载可能偏慢</div>
+  <div class='action'>💡 建议: 当前 DNS 实测 118ms, 本次对比最快是  (, 0ms); 如需切换 (管理员): netsh interface ipv4 set dnsservers "&lt;接口名&gt;" static &lt;DNS服务器地址&gt; primary</div>
+</div>
 <div class="issue warn">
   <h3><span class="sev">警告</span>Wi-Fi 信号偏弱（RSSI -72dBm）</h3>
   <div class="meta">📍 来源: WiFi 分析</div>
@@ -351,16 +353,16 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 </div></div>
 
 <div class="sec" id="stats"><h2><span class="icon">📊</span>状态统计</h2></div>
-<div class="stats-grid"><div class='stat-card ok'><div class='count'>4</div><div class='label'>完成</div></div><div class='stat-card warn'><div class='count'>2</div><div class='label'>警告</div></div><div class='stat-card err'><div class='count'>0</div><div class='label'>异常</div></div><div class='stat-card err'><div class='count'>0</div><div class='label'>错误</div></div><div class='stat-card timeout'><div class='count'>0</div><div class='label'>超时</div></div><div class='stat-card idle'><div class='count'>0</div><div class='label'>未检测</div></div></div><div class='stats-caption'>共 8 个模块</div>
-<div class="sec" id="charts"><h2><span class="icon">📈</span>关键指标图</h2></div><div class="charts"><div class='chart'><h4>网关延迟时间序列 <span class='tag'>逐次 Ping</span></h4><svg width="100%" height="120" viewBox="0 0 420 120" preserveAspectRatio="none"><defs><linearGradient id="np-grad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2563eb" stop-opacity=".25"/><stop offset="1" stop-color="#2563eb" stop-opacity="0"/></linearGradient></defs><line x1="0" y1="12.0" x2="420" y2="12.0" stroke="#e6e9f0" stroke-width="1"/><line x1="0" y1="104.0" x2="420" y2="104.0" stroke="#e6e9f0" stroke-width="1"/><polygon points="0.0,100.1 22.1,99.6 44.2,100.0 66.3,99.4 88.4,89.1 110.5,99.8 132.6,100.0 154.7,99.6 176.8,99.2 198.9,100.0 221.1,99.8 243.2,99.4 265.3,99.6 287.4,100.0 309.5,99.8 331.6,99.2 353.7,99.6 375.8,100.0 397.9,99.4 420.0,99.8 420,120.0 0,120.0" fill="url(#np-grad)"/><polyline points="0.0,100.1 22.1,99.6 44.2,100.0 66.3,99.4 88.4,89.1 110.5,99.8 132.6,100.0 154.7,99.6 176.8,99.2 198.9,100.0 221.1,99.8 243.2,99.4 265.3,99.6 287.4,100.0 309.5,99.8 331.6,99.2 353.7,99.6 375.8,100.0 397.9,99.4 420.0,99.8" fill="none" stroke="#2563eb" stroke-width="2"/><text x="4" y="8.0" font-size="10" fill="#94a3b8">50ms</text><text x="4" y="117.0" font-size="10" fill="#94a3b8">0ms</text></svg><div class='cap'>共 20 次成功样本 · 平均 2.3ms · 峰值 8.1ms。</div></div><div class='chart'><h4>宽带测速 <span class='tag'>国内节点</span></h4><svg width="100%" height="120" viewBox="0 0 300 120" preserveAspectRatio="none"><text x="0" y="14" font-size="10" fill="#94a3b8">下载 285.4 Mbps</text><rect x="0" y="20" width="258.0" height="22" rx="6" fill="#dbeafe"/><rect x="0" y="20" width="224.3" height="22" rx="6" fill="#2563eb"/><text x="0" y="64" font-size="10" fill="#94a3b8">上传 31.2 Mbps</text><rect x="0" y="70" width="258.0" height="22" rx="6" fill="#fef3c7"/><rect x="0" y="70" width="24.5" height="22" rx="6" fill="#d97706"/><text x="0" y="112" font-size="10" fill="#94a3b8">延迟 — · 抖动 — · 丢包 —</text></svg><div class='cap'>下载 285.4 Mbps · 上传 31.2 Mbps。</div></div><div class='chart wide'><h4>状态分布 <span class='tag'>8 模块</span></h4><svg width="100%" height="46" viewBox="0 0 1000 46" preserveAspectRatio="none"><defs><clipPath id="np-bar-clip"><rect x="0" y="0" width="1000" height="34" rx="7"/></clipPath></defs><g clip-path="url(#np-bar-clip)"><rect x="0.0" y="0" width="500.0" height="34" fill="#16a34a"/><rect x="500.0" y="0" width="250.0" height="34" fill="#d97706"/><rect x="750.0" y="0" width="250.0" height="34" fill="#94a3b8"/></g></svg><div class='cap'>完成 4 · 警告 2 · 未检测 2</div></div></div>
+<div class="stats-grid"><div class='stat-card ok'><div class='count'>4</div><div class='label'>完成</div></div><div class='stat-card warn'><div class='count'>2</div><div class='label'>警告</div></div><div class='stat-card err'><div class='count'>0</div><div class='label'>异常</div></div><div class='stat-card err'><div class='count'>0</div><div class='label'>错误</div></div><div class='stat-card timeout'><div class='count'>0</div><div class='label'>超时</div></div><div class='stat-card idle'><div class='count'>0</div><div class='label'>未检测</div></div></div><div class='stats-caption'>上方为<b>扣分口径</b> 6 个模块（全量 8 个, 其中 2 个评分豁免不计入: IPv6 检测、iperf3 吞吐）；下方状态分布条为<b>全口径</b> 8 个模块</div>
+<div class="sec" id="charts"><h2><span class="icon">📈</span>关键指标图</h2></div><div class="charts"><div class='chart'><h4>网关延迟时间序列 <span class='tag'>逐次 Ping</span></h4><svg width="100%" height="120" viewBox="0 0 420 120" preserveAspectRatio="none"><defs><linearGradient id="np-grad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2563eb" stop-opacity=".25"/><stop offset="1" stop-color="#2563eb" stop-opacity="0"/></linearGradient></defs><line x1="0" y1="12.0" x2="420" y2="12.0" stroke="#e6e9f0" stroke-width="1"/><line x1="0" y1="104.0" x2="420" y2="104.0" stroke="#e6e9f0" stroke-width="1"/><polygon points="0.0,100.1 22.1,99.6 44.2,100.0 66.3,99.4 88.4,89.1 110.5,99.8 132.6,100.0 154.7,99.6 176.8,99.2 198.9,100.0 221.1,99.8 243.2,99.4 265.3,99.6 287.4,100.0 309.5,99.8 331.6,99.2 353.7,99.6 375.8,100.0 397.9,99.4 420.0,99.8 420,120.0 0,120.0" fill="url(#np-grad)"/><polyline points="0.0,100.1 22.1,99.6 44.2,100.0 66.3,99.4 88.4,89.1 110.5,99.8 132.6,100.0 154.7,99.6 176.8,99.2 198.9,100.0 221.1,99.8 243.2,99.4 265.3,99.6 287.4,100.0 309.5,99.8 331.6,99.2 353.7,99.6 375.8,100.0 397.9,99.4 420.0,99.8" fill="none" stroke="#2563eb" stroke-width="2"/><text x="4" y="8.0" font-size="10" fill="#94a3b8">50ms</text><text x="4" y="117.0" font-size="10" fill="#94a3b8">0ms</text></svg><div class='cap'>共 20 次成功样本 · 平均 2.3ms · 峰值 8.1ms。</div></div><div class='chart'><h4>宽带测速 <span class='tag'>国内节点</span></h4><svg width="100%" height="120" viewBox="0 0 300 120" preserveAspectRatio="none"><text x="0" y="14" font-size="10" fill="#94a3b8">下载 285.4 Mbps</text><rect x="0" y="20" width="258.0" height="22" rx="6" fill="#dbeafe"/><rect x="0" y="20" width="224.3" height="22" rx="6" fill="#2563eb"/><text x="0" y="64" font-size="10" fill="#94a3b8">上传 31.2 Mbps</text><rect x="0" y="70" width="258.0" height="22" rx="6" fill="#fef3c7"/><rect x="0" y="70" width="24.5" height="22" rx="6" fill="#d97706"/><text x="0" y="112" font-size="10" fill="#94a3b8">延迟 — · 抖动 — · 丢包 —</text></svg><div class='cap'>下载 285.4 Mbps · 上传 31.2 Mbps。</div></div><div class='chart wide'><h4>状态分布 <span class='tag'>8 模块</span></h4><svg width="100%" height="46" viewBox="0 0 1000 46" preserveAspectRatio="none"><defs><clipPath id="np-bar-clip"><rect x="0" y="0" width="1000" height="34" rx="7"/></clipPath></defs><g clip-path="url(#np-bar-clip)"><rect x="0.0" y="0" width="625.0" height="34" fill="#16a34a"/><rect x="625.0" y="0" width="250.0" height="34" fill="#d97706"/><rect x="875.0" y="0" width="125.0" height="34" fill="#94a3b8"/></g></svg><div class='cap'>完成 5 · 警告 2 · 未检测 1（含评分豁免模块）</div></div></div>
 
 <div class="sec" id="list"><h2><span class="icon">📋</span>检测结果一览</h2></div>
-<div class="overview"><ul><li><a href='#mod-gateway' title='跳转到 网关检测 详细结果'><span class='dot ok'></span><span class='name'>网关检测</span><span class='verdict'>网关 192.168.1.1: 平均 2.3ms, 丢包 0.0%, 抖动 ?ms</span><span class='badge ok'>完成</span></a></li><li><a href='#mod-dns' title='跳转到 DNS 诊断 详细结果'><span class='dot warn'></span><span class='name'>DNS 诊断</span><span class='verdict'>当前 DNS (2, 2, 1, ., 2, 2, 8, ., 2, 5, 5, ., 1) 平均 0ms · 对比测试…</span><span class='badge warn'>警告</span></a></li><li><a href='#mod-wifi' title='跳转到 WiFi 分析 详细结果'><span class='dot warn'></span><span class='name'>WiFi 分析</span><span class='verdict'>发现 0 个 WiFi 网络, 干扰等级: 正常</span><span class='badge warn'>警告</span></a></li><li><a href='#mod-speedtest' title='跳转到 测速 详细结果'><span class='dot ok'></span><span class='name'>测速</span><span class='verdict'>测速 (未启用 Ookla 官方测速, 加 --speedtest-net 可对照参考)</span><span class='badge ok'>完成</span></a></li><li><a href='#mod-mtu' title='跳转到 MTU 检测 详细结果'><span class='dot ok'></span><span class='name'>MTU 检测</span><span class='verdict'>MTU 路径正常</span><span class='badge ok'>完成</span></a></li><li><a href='#mod-tcpstats' title='跳转到 TCP 传输质量 详细结果'><span class='dot ok'></span><span class='name'>TCP 传输质量</span><span class='verdict'>TCP 传输质量</span><span class='badge ok'>完成</span></a></li><li><a href='#mod-ipv6' title='跳转到 IPv6 检测 详细结果'><span class='dot idle'></span><span class='name'>IPv6 检测</span><span class='verdict'>未检测</span><span class='badge idle'>未检测</span></a></li><li><a href='#mod-iperf3' title='跳转到 iperf3 吞吐 详细结果'><span class='dot idle'></span><span class='name'>iperf3 吞吐</span><span class='verdict'>未检测</span><span class='badge idle'>未检测</span></a></li></ul></div>
+<div class="overview"><ul><li><a href='#mod-gateway' title='跳转到 网关检测 详细结果'><span class='dot ok'></span><span class='name'>网关检测</span><span class='verdict'>网关 192.168.1.1: 平均 2.3ms, 丢包 0.0%, 抖动 ?ms</span><span class='badge ok'>完成</span></a></li><li><a href='#mod-dns' title='跳转到 DNS 诊断 详细结果'><span class='dot warn'></span><span class='name'>DNS 诊断</span><span class='verdict'>当前 DNS (221.228.255.1) 平均 118ms · 对比测试 20/20 成功</span><span class='badge warn'>警告</span></a></li><li><a href='#mod-wifi' title='跳转到 WiFi 分析 详细结果'><span class='dot warn'></span><span class='name'>WiFi 分析</span><span class='verdict'>发现 0 个 WiFi 网络, 干扰等级: 正常</span><span class='badge warn'>警告</span></a></li><li><a href='#mod-speedtest' title='跳转到 测速 详细结果'><span class='dot ok'></span><span class='name'>测速</span><span class='verdict'>测速 (未启用 Ookla 官方测速, 加 --speedtest-net 可对照参考)</span><span class='badge ok'>完成</span></a></li><li><a href='#mod-mtu' title='跳转到 MTU 检测 详细结果'><span class='dot ok'></span><span class='name'>MTU 检测</span><span class='verdict'>MTU 路径正常</span><span class='badge ok'>完成</span></a></li><li><a href='#mod-tcpstats' title='跳转到 TCP 传输质量 详细结果'><span class='dot ok'></span><span class='name'>TCP 传输质量</span><span class='verdict'>TCP 传输质量</span><span class='badge ok'>完成</span></a></li><li><a href='#mod-ipv6' title='跳转到 IPv6 检测 详细结果'><span class='dot ok'></span><span class='name'>IPv6 检测</span><span class='verdict'>检测结果未知</span><span class='badge ok'>完成</span></a></li><li><a href='#mod-iperf3' title='跳转到 iperf3 吞吐 详细结果'><span class='dot idle'></span><span class='name'>iperf3 吞吐</span><span class='verdict'>未配置 iperf3 服务器</span><span class='badge idle'>未检测</span></a></li></ul></div>
 
 <div class="sec" id="modules"><h2><span class="icon">🔍</span>详细结果
-<span class="cnt">共 2 个问题模块 · 已展开首要问题项, 其余点击展开</span></h2></div>
+<span class="cnt">2 个问题模块已展开 · 正常模块点击展开</span></h2></div>
 
-<details class="mod ok" id="mod-gateway" open>
+<details class="mod ok" id="mod-gateway">
   <summary>
     <span class="ic ok">✓</span>
     <span class="nm">网关检测</span>
@@ -380,14 +382,14 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
 💡 延迟的波动幅度, 越大越卡' data-hint='延迟的波动幅度, 越大越卡'><span class='v ok'>? ms</span><span class='lab'>抖动</span></div><div class='metric' title='最大延迟: ? ms'><span class='v ok'>? ms</span><span class='lab'>最大延迟</span></div></div>
     
     
-    <details class='collapse' data-auto-open="1" open><summary>技术细节 <span class='cnt'>1 项</span></summary><div class='body'><div class='subcap'>ping</div><div class='tbl-wrap'><table class='tbl kv'><thead><tr><th>指标</th><th>值</th></tr></thead><tbody><tr><td class='k'>rtts</td><td class='v'>2.1, 2.4, 2.2, 2.5, 8.1, 2.3, 2.2, 2.4, 2.6, 2.2, 2.3, 2.5, 2.4, 2.2, 2.3, 2.6, 2.4, 2.2, 2.5, 2.3</td></tr><tr><td class='k'>平均(ms)</td><td class='v'>2.3</td></tr><tr><td class='k'>丢包(%)</td><td class='v'>0.0</td></tr><tr><td class='k'>sent</td><td class='v'>20</td></tr><tr><td class='k'>recv</td><td class='v'>20</td></tr></tbody></table></div></div></details>
+    <details class='collapse'><summary>技术细节 <span class='cnt'>1 项</span></summary><div class='body'><div class='subcap'>ping</div><div class='tbl-wrap'><table class='tbl kv'><thead><tr><th>指标</th><th>值</th></tr></thead><tbody><tr><td class='k'>rtts</td><td class='v'>2.1, 2.4, 2.2, 2.5, 8.1, 2.3, 2.2, 2.4, 2.6, 2.2, 2.3, 2.5, 2.4, 2.2, 2.3, 2.6, 2.4, 2.2, 2.5, 2.3</td></tr><tr><td class='k'>平均(ms)</td><td class='v'>2.3</td></tr><tr><td class='k'>丢包(%)</td><td class='v'>0.0</td></tr><tr><td class='k'>sent</td><td class='v'>20</td></tr><tr><td class='k'>recv</td><td class='v'>20</td></tr></tbody></table></div></div></details>
   </div>
 </details>
 <details class="mod warn" id="mod-dns" open>
   <summary>
     <span class="ic warn">⚠</span>
     <span class="nm">DNS 诊断</span>
-    <span class="vd" title="当前 DNS (2, 2, 1, ., 2, 2, 8, ., 2, 5, 5, ., 1) 平均 0ms · 对比测试 0/0 成功">当前 DNS (2, 2, 1, ., 2, 2, 8, ., 2, 5, 5, ., 1) 平均 0ms · 对比测试…</span>
+    <span class="vd">当前 DNS (221.228.255.1) 平均 118ms · 对比测试 20/20 成功</span>
     <span class="b warn">警告</span>
     <span class='dt deduct warn' title='该模块的状态「警告」从健康分里扣 2 分'>−2 分</span>
     <a class="anchor" href="#mod-dns" data-mod="mod-dns"
@@ -395,17 +397,17 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
     <span class="arr">▸</span>
   </summary>
   <div class="bd">
-    <div class="verdict"><span class="tag">结论</span><span>当前 DNS (2, 2, 1, ., 2, 2, 8, ., 2, 5, 5, ., 1) 平均 0ms · 对比测试 0/0 成功</span></div>
+    <div class="verdict"><span class="tag">结论</span><span>当前 DNS (221.228.255.1) 平均 118ms · 对比测试 20/20 成功</span></div>
     <div class='explain'>📖 检查域名解析 (DNS) 的速度与结果正确性, 并识别 DNS 劫持。典型症状: 网页打不开但 QQ/微信正常。</div>
-    <div class='metrics'><div class='metric' title='当前 DNS 平均: 0 ms
-💡 本机配置的 DNS: 2, 2, 1, ., 2, 2, 8, ., 2, 5, 5, ., 1' data-hint='本机配置的 DNS: 2, 2, 1, ., 2, 2, 8, ., 2, 5, 5, ., 1'><span class='v ok'>0 ms</span><span class='lab'>当前 DNS 平均</span></div><div class='metric' title='当前 DNS 成功率: 0/0
-💡 只统计本机在用的 DNS 服务器' data-hint='只统计本机在用的 DNS 服务器'><span class='v ok'>0/0</span><span class='lab'>当前 DNS 成功率</span></div></div>
+    <div class='metrics'><div class='metric' title='当前 DNS 平均: 118 ms
+💡 本机配置的 DNS: 221.228.255.1· 实测 20/20 成功' data-hint='本机配置的 DNS: 221.228.255.1· 实测 20/20 成功'><span class='v warn'>118 ms</span><span class='lab'>当前 DNS 平均</span></div><div class='metric' title='当前 DNS 成功率: 20/20
+💡 只统计本机在用的 DNS 服务器' data-hint='只统计本机在用的 DNS 服务器'><span class='v ok'>20/20</span><span class='lab'>当前 DNS 成功率</span></div></div>
+    <div class='impact-line warn'><b>[警告]</b> 当前 DNS (221.228.255.1) 平均响应 118ms 较慢</div><div class='action-line'>💡 当前 DNS 实测 118ms, 本次对比最快是  (, 0ms); 如需切换 (管理员): netsh interface ipv4 set dnsservers "&lt;接口名&gt;" static &lt;DNS服务器地址&gt; primary</div>
     
-    
-    <details class='collapse' data-auto-open="1" open><summary>技术细节 <span class='cnt'>2 项</span></summary><div class='body'><div class='subcap'>系统 DNS</div><p class='mono'>221.228.255.1</p></div></details>
+    <details class='collapse' data-auto-open="1" open><summary>技术细节 <span class='cnt'>2 项</span></summary><div class='body'><div class='subcap'>系统 DNS</div><p class='mono'>['221.228.255.1']</p></div></details>
   </div>
 </details>
-<details class="mod warn" id="mod-wifi">
+<details class="mod warn" id="mod-wifi" open>
   <summary>
     <span class="ic warn">⚠</span>
     <span class="nm">WiFi 分析</span>
@@ -488,21 +490,23 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
     
   </div>
 </details>
-<details class="mod idle" id="mod-ipv6">
+<details class="mod ok" id="mod-ipv6">
   <summary>
-    <span class="ic idle">○</span>
+    <span class="ic ok">✓</span>
     <span class="nm">IPv6 检测</span>
-    <span class="vd">未检测</span>
-    <span class="b idle">未检测</span>
+    <span class="vd">检测结果未知</span>
+    <span class="b ok">完成</span>
     <span class='dt exempt' title='评分豁免模块: 该模块的问题不计入健康分'>豁免</span>
     <a class="anchor" href="#mod-ipv6" data-mod="mod-ipv6"
        title="复制本模块链接">🔗</a>
     <span class="arr">▸</span>
   </summary>
   <div class="bd">
-    <div class="verdict"><span class="tag">结论</span><span>未检测</span></div>
+    <div class="verdict"><span class="tag">结论</span><span>检测结果未知</span></div>
     <div class='explain'>📖 检查新一代网络地址 (IPv6) 是否开通可用。部分运营商业务与测评依赖它, 缺失属资源配置问题非故障。</div>
-    
+    <div class='metrics'><div class='metric' title='连通性: 不可达
+💡 未达到正常标准' data-hint='未达到正常标准'><span class='v err'>不可达</span><span class='lab'>连通性</span></div><div class='metric' title='IPv6 DNS: 失败
+💡 轻微超出正常范围' data-hint='轻微超出正常范围'><span class='v warn'>失败</span><span class='lab'>IPv6 DNS</span></div></div>
     
     
     
@@ -512,7 +516,7 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
   <summary>
     <span class="ic idle">○</span>
     <span class="nm">iperf3 吞吐</span>
-    <span class="vd">未检测</span>
+    <span class="vd">未配置 iperf3 服务器</span>
     <span class="b idle">未检测</span>
     <span class='dt exempt' title='评分豁免模块: 该模块的问题不计入健康分'>豁免</span>
     <a class="anchor" href="#mod-iperf3" data-mod="mod-iperf3"
@@ -520,7 +524,7 @@ footer{text-align:center;color:#94a3b8;font-size:12px;margin-top:36px;padding-to
     <span class="arr">▸</span>
   </summary>
   <div class="bd">
-    <div class="verdict"><span class="tag">结论</span><span>未检测</span></div>
+    <div class="verdict"><span class="tag">结论</span><span>未配置 iperf3 服务器</span></div>
     <div class='explain'>📖 到指定服务器点对点测吞吐 (内网/专线验收用), 测的是链路吞吐, 与互联网宽带测速是两回事。UDP 模式 (--iperf3-udp) 改测抖动/丢包 — 语音/游戏质量的关键指标。</div>
     
     

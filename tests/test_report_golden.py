@@ -42,11 +42,12 @@ def _fixture_run():
         "gateway": {"gateway": "192.168.1.1", "issues": [],
                     "ping": {"rtts": rtts, "avg_ms": 2.3, "loss_pct": 0.0,
                              "sent": 20, "recv": 20}},
-        "dns": {"system_dns": "221.228.255.1", "avg_ms": 86.0, "fail": 0,
-                "total": 20,
+        "dns": {"system_dns": ["221.228.255.1"], "avg_time_ms": 118,
+                "current_avg_ms": 118, "success_count": 20, "total_count": 20,
+                "current_total_count": 20,
                 "issues": [{"severity": "warning",
-                            "message": "DNS 解析偏慢（平均 86ms）",
-                            "detail": "当前系统 DNS 平均响应 86ms, "
+                            "message": "DNS 解析偏慢（平均 118ms）",
+                            "detail": "当前系统 DNS 平均响应 118ms, "
                                       "高于网关直连参考水平"}]},
         "wifi": {"ssid": "Home-2.4G", "rssi": -72, "channel": 6,
                  "issues": [{"severity": "warning",
@@ -56,9 +57,12 @@ def _fixture_run():
                       "issues": []},
         "mtu": {"path_mtu": 1500, "issues": []},
         "tcpstats": {"established": 42, "issues": []},
+        "ipv6": {"ipv6_native": False, "issues": []},
+        "iperf3": {"error": "未配置 iperf3 服务器", "issues": []},
     }
     statuses = {"gateway": "完成", "dns": "警告", "wifi": "警告",
-                "speedtest": "完成", "mtu": "完成", "tcpstats": "完成"}
+                "speedtest": "完成", "mtu": "完成", "tcpstats": "完成",
+                "ipv6": "完成", "iperf3": "未检测"}
     keys = ["gateway", "dns", "wifi", "speedtest", "mtu", "tcpstats",
             "ipv6", "iperf3"]
     return {
