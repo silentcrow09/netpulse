@@ -2840,12 +2840,17 @@ def _render_diagnosis_section_html(diagnosis_dict, report=None):
             unfinished = sum(1 for st in (report.get("summary") or {}).values()
                              if st in ("超时", "错误"))
         if unfinished:
+            # v1.26.3: 这里原来多了一个 </div> —— <div class="dhead"> 只开了一个,
+            # 多出的 </div> 在 HTML 解析时会一路弹栈, 把 <main> 与外层
+            # <div class="main"> 一起关掉 → 之后的 band/todo/各分区变成 body
+            # 的直接子节点 (从 x=282 回到 x=0, 通栏), 左侧固定导航正好压在上面
+            # (排版乱)。标签必须配平: dhead 开一个关一个。
             return ('<section class="diagnosis healthy" id="diagnosis">'
                     '<div class="dhead">'
                     '<span class="dbadge warn">⚠ 未定位到根因</span>'
                     f'<span class="dconf">{unfinished} 个模块未完成检测, '
                     '现有结论仅供参考; 请先让未完成模块跑完再判断</span>'
-                    '</div></div>'
+                    '</div>'
                     '</section>')
         # 健康时显示一行轻提示
         # v1.20.0: 不再断言「无故障 / 整体高置信度 / 评估 N 条规则」。
@@ -2862,7 +2867,7 @@ def _render_diagnosis_section_html(diagnosis_dict, report=None):
                 '<div class="dhead">'
                 '<span class="dbadge neutral">未匹配到根因</span>'
                 f'<span class="dconf">{_html_esc(suffix)}</span>'
-                '</div></div>'
+                '</div>'
                 '</section>')
     cards = []
     for i, rc in enumerate(root_causes, 1):
@@ -3719,7 +3724,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.26.2"
+APP_VERSION = "1.26.3"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -28050,6 +28055,9 @@ _GUI_JS = r"""(function () {
           var cell = el("div", "cell");
           cell.appendChild(el("div", "k", me.label));
           var vv = el("div", "v", String(me.value));
+          // v1.26.3: 这行以前漏了 —— vv 造出来、上了色, 却没 append 进 cell,
+          // 于是「模块明细」里每格只剩标签(重传率), 数值不显示。
+          cell.appendChild(vv);
           if (me.level && me.level !== "ok") {
             vv.style.color = COLORS[me.level === "err" ? "异常" : "警告"] || "";
           }

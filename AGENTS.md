@@ -285,6 +285,15 @@
   已把本流程自动化 —— 固定 fixture 渲染 customer/brief/brief_v2/盯障导出 HTML
   四份与 `tests/fixtures/golden/` 基线逐字节比对，测试红即渲染器被改动；有意变更时
   `--bless` 重生成基线并逐行审查 diff（v1.25.0 起）。
+- **HTML 片段必须标签配平（v1.26.3 教训）**：多一个 `</div>` 不是「多一个标签」
+  那么无害 —— HTML 解析器遇到落单的结束标签会一路弹栈，把 `<main>` 和外层
+  `<div class="main">` 一起提前关掉，后续分区（band / todo / 各 sec）变成 body
+  的直接子节点、从 x=282 退回 x=0 通栏，左侧 `position:fixed` 导航正好压在
+  内容上（用户实测「排版很乱」；宽窗口 >960px 显示导航时才暴露）。客户版
+  「未匹配到根因 / 未定位到根因」两个分支曾各多一个 `</div>`（dhead 只开一个）。
+  改任何报告 HTML 片段后，除了 golden 逐字节比对，还要验**嵌套**：
+  `tests/test_v1263_report_layout.py` 用 HTMLParser 断言 band/todo 在
+  `<main>` 之内。
 
 ## JSON Schema 必须与导出一致 (v1.14.14)
 
