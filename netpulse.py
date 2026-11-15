@@ -3719,7 +3719,7 @@ def ensure_scapy(auto_yes=False, mirror=None):
 # ============================================================
 
 APP_NAME = "NetPulse"
-APP_VERSION = "1.26.1"
+APP_VERSION = "1.26.2"
 # JSON 结果 Schema 版本 (对应 schema/netpulse-result-v{主.次}.json 文件)。
 # 唯一来源 — build_report / --json-schema / debug-bundle 三处统一消费。
 SCHEMA_VERSION = "1.2.0"
@@ -26625,7 +26625,12 @@ input,select{ font-family:inherit; }
 .g-netword{ font-size:10px; color:var(--dim); }
 
 /* ── 各视图容器 padding (v1.26.0: 主页收紧 32/36/30→22/32/20, 其余不动) ── */
-.g-view-home{ padding:22px 32px 20px; }
+/* v1.26.2 主页撑满一屏: 主页内容原本是恒定的 485px (与窗口宽高无关),
+   窗口一高底下就空一大段 (实测用户窗口 945x1012 → 空 421px)。改法:
+   主页本身是纵向 flex, min-height 扣掉 52px 顶栏占满一屏, 场景卡所在
+   的网格吃掉剩余高度 (两行等分), 底行贴底 —— 窗口多高都不留底白。 */
+.g-view-home{ padding:22px 32px 16px; min-height:calc(100vh - 52px);
+               display:flex; flex-direction:column; }
 .g-view-prog{ padding:30px 36px 26px; }
 .g-rep{ padding:26px 32px 30px; }
 .g-view-site{ padding:26px 36px 30px; }
@@ -26633,10 +26638,12 @@ input,select{ font-family:inherit; }
 /* ── 主页 (v1.26.0 方案A紧凑化: 设计稿 02 节数值 1:1) ── */
 .g-h1{ font-size:22px; font-weight:800; letter-spacing:.3px; }
 .g-sub{ font-size:12.5px; color:var(--dim); margin-top:3px; }
-.g-cards{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:14px; }
+.g-cards{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:14px;
+          flex:1; }   /* v1.26.2: 吃掉主页剩余高度, 两行等分撑满一屏 */
 .g-card{ background:var(--soft); border:1px solid var(--rule); border-radius:12px;
-         padding:13px 16px 12px; min-height:140px; display:flex; flex-direction:column;
-         text-align:left; color:var(--text); }
+         padding:13px 16px 12px; min-height:130px; display:flex; flex-direction:column;
+         text-align:left; color:var(--text);
+         max-height:215px; }  /* v1.26.2: 窗口被拉很高时卡片不再无限长高 */
 .g-card:hover{ border-color:var(--navy-2); }
 .g-card-ic{ width:32px; height:32px; border-radius:9px; background:#fff;
             border:1px solid var(--rule); display:flex; align-items:center;
@@ -29662,8 +29669,40 @@ def _console_hide():
         pass
 
 
+def _gui_app_profile_dir():
+    """GUI app 窗口专用 Chromium profile 目录 (v1.26.2 新增)。
+
+    为什么必须有独立 profile: Chromium 只在「自己不是已在运行的实例」时
+    才应用 `--window-size`; 用户自己的 Chrome 开着时, 新开的 app 窗口会
+    落回浏览器的默认尺寸 (实测 945x1012, 而主页内容恒为 485px → 底下
+    空四百多像素)。独立 profile 让 app 窗口走独立进程, 尺寸参数才真的
+    生效 (实测独立 profile 下连开两次都是 1180x680)。
+
+    目录位置: %LOCALAPPDATA%\\NetPulse\\gui-chrome-profile (持久化 →
+    二次启动不必重建 profile); 不可写时退化到临时目录。
+    """
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    d = os.path.join(base, "NetPulse", "gui-chrome-profile")
+    try:
+        os.makedirs(d, exist_ok=True)
+        if os.access(d, os.W_OK):
+            return d
+    except OSError:
+        pass
+    try:
+        return tempfile.mkdtemp(prefix="np_gui_profile_")
+    except Exception:
+        return None
+
+
 def _gui_launch_browser(url):
-    """三级降级拉起界面: Chromium --app → 默认浏览器 → "none" (终端打印 URL)。"""
+    """三级降级拉起界面: Chromium --app → 默认浏览器 → "none" (终端打印 URL)。
+
+    v1.26.2: app 窗口走**独立 profile** (`_gui_app_profile_dir`) —— 用户
+    自己的 Chromium 已在运行时 `--window-size` 会被忽略, 窗口尺寸形同虚设
+    (实测落成 945x1012, 主页底下空四百多像素)。独立 profile 是让
+    `--window-size=1180,680` 真正生效的唯一可靠办法。
+    """
     browser = None
     try:
         browser = _find_pdf_browser()
@@ -29671,8 +29710,13 @@ def _gui_launch_browser(url):
         browser = None
     if browser:
         try:
-            proc = subprocess.Popen([browser, "--app=" + url,
-                                     "--window-size=1180,680"])
+            args = [browser, "--app=" + url, "--window-size=1180,680"]
+            prof = _gui_app_profile_dir()
+            if prof:
+                # 独立 profile 的首次运行会弹欢迎页 → 一并关掉
+                args += ["--user-data-dir=" + prof,
+                         "--no-first-run", "--no-default-browser-check"]
+            proc = subprocess.Popen(args)
             _GUI_BROWSER_PROC.append(proc)      # 保留句柄防 GC
             return "app"
         except OSError:

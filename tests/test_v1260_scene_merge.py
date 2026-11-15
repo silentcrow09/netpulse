@@ -175,8 +175,9 @@ class TestPageAssets(unittest.TestCase):
     def test_home_compact_css(self):
         self.assertIn(".g-top{ height:52px;", self.css)
         self.assertIn(".g-h1{ font-size:22px;", self.css)
-        self.assertIn("padding:22px 32px 20px", self.css)
-        self.assertIn("min-height:140px", self.css)
+        # v1.26.2: 主页撑满一屏 (底 padding 20→16, 卡片 min-height 140→130)
+        self.assertIn("padding:22px 32px 16px", self.css)
+        self.assertIn("min-height:130px", self.css)
         self.assertIn(".g-card-ic{ width:32px;", self.css)
 
     def test_site_page_centered_760(self):
