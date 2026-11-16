@@ -7,6 +7,28 @@
 
 ## [Unreleased]
 
+## [1.26.4] - 2026-11-16
+
+### 修复
+
+- **GUI 窗口任务栏图标是系统默认图标**：GUI 窗口是 Chromium `--app` 模式,
+  这类窗口的任务栏/标题栏图标取自页面 icon —— 页面此前没有 favicon,
+  任务栏落成默认文档图标。修法: 新增品牌 favicon (navy 圆角方块 + 白色
+  脉搏波形, 与顶栏 `.g-mark` 同款视觉), 7 尺寸 (16~256) PNG-in-ICO 以
+  base64 内嵌进页面 `<head>` (data URI, 零网络请求, 守住零外链契约)。
+  实测探针读回窗口 HICON: 32×32、navy 主体 66%、白色线 143 像素、
+  四角透明圆角 4/4 (`tests/_gui_icon_probe.py`)。
+
+### 变更
+
+- 版本三处同步 1.26.4; golden 基线 `monitor_report.html` 页脚版本号随版本
+  提升 (`--bless` 重生成, 人工审 diff 仅 1 行版本号)。
+- 新增 `tests/_make_favicon.py` (图标生成器: `--embed` 直接刷新源文件常量,
+  `--out` 出 .ico, 带帧完整性自校验); 新增 `tests/test_v1264_favicon.py`
+  (4 用例: link 形态 / 与 `_FAVICON_B64` 单一来源 / ICO 结构与关键帧 /
+  体积上限); `test_gui_page.py` 零外链闸放宽为「无外链 `<link`」——
+  允许恰好一条 data URI favicon, 外链样式表等仍禁。
+
 ## [1.26.3] - 2026-11-15
 
 ### 修复

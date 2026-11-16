@@ -25,6 +25,7 @@
      Ookla 真布尔直发 + 每组全选/清空 (spec F2) + 旧错清理/请求体锚点
 """
 import os
+import re
 import sys
 import unittest
 
@@ -66,12 +67,22 @@ class TestGuiPage(unittest.TestCase):
 
     def test_no_external_resources(self):
         p = self.page
-        self.assertNotIn('<link', p)
+        # v1.26.4: 允许唯一一条 favicon link, 且 href 必须是 data: URI
+        # (内嵌零请求, 与下方 SVG 命名空间白名单同一逻辑); 其余 <link
+        # (外链样式表/预连接等) 仍一律禁止。
+        links = re.findall(r'<link\b[^>]*>', p)
+        favicons = [t for t in links if 'rel="icon"' in t]
+        self.assertEqual(len(favicons), 1,
+                         "favicon link 必须恰好一条: %s" % links)
+        self.assertIn('href="data:image/x-icon;base64,', favicons[0],
+                      "favicon 必须内嵌 data URI, 不许外链")
         self.assertNotIn('<script src', p)
         self.assertNotIn('<img', p)
         # SVG 命名空间是 URI 标识符而非外链资源 (浏览器从不 dereference),
         # createElementNS 必需; 白名单这一处, 其余 http(s):// 一律禁止。
         p = p.replace('"http://www.w3.org/2000/svg"', "")
+        # data URI 的 base64 载荷可能撞巧含 "http://" 字样, 剥掉再查外链
+        p = re.sub(r'href="data:[^"]*"', "", p)
         for bad in ('http://', 'https://'):
             self.assertNotIn(bad, p, "外链资源: %s" % bad)
         self.assertIn('"http://www.w3.org/2000/svg"', self.page,

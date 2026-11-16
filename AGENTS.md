@@ -117,6 +117,12 @@
 - 状态色唯一来源 `STATUS_COLORS`，经 `/api/scenarios` 下发，页面 JS 不内嵌色表；
 - 页面动态数据一律 `textContent`，禁止 innerHTML 插值；
 - `--cli`/`--json`/非 TTY 契约永不进 GUI。
+- **任务栏图标（v1.26.4）**：Chromium `--app` 窗口的任务栏/标题栏图标取自
+  页面 favicon —— `_gui_page()` head 里那条 data URI favicon
+  （`_FAVICON_B64`）是唯一图标来源，**别改回外链**（零外链闸
+  `test_gui_page.py` 只放行 data URI favicon）。改图标走
+  `py tests/_make_favicon.py --embed`（生成器自动刷新常量并自校验帧完整），
+  实机验证用 `py tests/_gui_icon_probe.py`（读窗口 HICON 像素判品牌特征）。
 
 ### 场景合并与主页紧凑化（v1.26.0 增补）
 
