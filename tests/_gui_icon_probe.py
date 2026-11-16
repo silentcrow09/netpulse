@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
-"""实测 Chromium --app 窗口的任务栏图标是否为 NetPulse favicon (v1.26.4)。
+"""实测 Chromium --app 窗口的任务栏图标是否为 NetPulse favicon (C 方案)。
 
 开发期工具: 起真 GUI 服务 → --app 拉真窗口 (独立临时 profile) →
 EnumWindows 找 "NetPulse 网络诊断" → WM_GETICON / GetClassLongPtr 取 HICON →
 GetIconInfo + GetDIBits 读像素 → 判定是否为品牌图标
-(深蓝 #0a3b6e 圆角方块 + 白色脉搏线; 反之默认文档图标为灰白方角)。
+(墨蓝 #0b2545 圆角方块 + 达标绿弧 + 白色对勾; 反之默认文档图标为灰白方角)。
 
 判定标准 (PIXELS 段输出):
-  - 四角 alpha=0 (圆角), 主体 navy 占比 > 40%, 白色亮像素 > 0  → ICON-OK
+  - 四角 alpha=0 (圆角), 墨蓝主体占比 > 40%, 绿弧像素 > 0, 白勾像素 > 0
+    → ICON-OK
   - 读不到彩色位图 / 不满足上述 → ICON-FAIL (附实测数值)
 
 用法: py tests/_gui_icon_probe.py
@@ -27,7 +28,7 @@ CHROME = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 WM_GETICON = 0x7F
 ICON_SMALL, ICON_BIG, ICON_SMALL2 = 0, 1, 2
 GCLP_HICON, GCLP_HICONSM = 14, 34
-NAVY = (10, 59, 110)          # --navy #0a3b6e
+INK = (11, 37, 69)            # C 方案底 #0b2545
 TOL = 24
 
 
@@ -93,6 +94,26 @@ def find_app_window(timeout=30):
 def icon_pixels(hwnd):
     """从窗口取 HICON (WM_GETICON 优先, 类图标兜底), 返回 (w, h, pixels BGRA)。"""
     u32, g32 = ctypes.windll.user32, ctypes.windll.gdi32
+    # 64 位下 HWND/HICON/HBITMAP 都是指针宽度。ctypes 未声明 argtypes 时
+    # 默认按 c_int (32 位) 传参, 句柄值 > 2^31-1 就 OverflowError —— 这是
+    # 探针自身的老问题 (与图标内容无关), 高句柄机器上必崩。逐个声明原型。
+    u32.SendMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+    u32.SendMessageW.restype = wt.LPARAM
+    u32.GetClassLongPtrW.argtypes = [wt.HWND, ctypes.c_int]
+    u32.GetClassLongPtrW.restype = ctypes.c_void_p
+    u32.GetIconInfo.argtypes = [wt.HICON, ctypes.c_void_p]
+    u32.GetIconInfo.restype = wt.BOOL
+    u32.GetDC.argtypes = [wt.HWND]
+    u32.GetDC.restype = wt.HDC
+    u32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+    u32.ReleaseDC.restype = ctypes.c_int
+    g32.GetObjectW.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p]
+    g32.GetObjectW.restype = ctypes.c_int
+    g32.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, wt.UINT, wt.UINT,
+                              ctypes.c_void_p, ctypes.c_void_p, wt.UINT]
+    g32.GetDIBits.restype = ctypes.c_int
+    g32.DeleteObject.argtypes = [wt.HANDLE]
+    g32.DeleteObject.restype = wt.BOOL
     hicon = u32.SendMessageW(hwnd, WM_GETICON, ICON_BIG, 0)
     src = "WM_GETICON BIG"
     if not hicon:
@@ -139,8 +160,8 @@ def icon_pixels(hwnd):
 
 
 def judge(w, h, px):
-    """判定像素是否为品牌图标: navy 主体 + 白色线 + 透明圆角。"""
-    navy = white = opaque = 0
+    """判定像素是否为 C 方案图标: 墨蓝主体 + 达标绿弧 + 白对勾 + 透明圆角。"""
+    ink = green = white = opaque = 0
     total = w * h
     corners_clear = 0
     pts = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
@@ -149,20 +170,23 @@ def judge(w, h, px):
         if a < 40:
             continue
         opaque += 1
-        if abs(r - NAVY[0]) <= TOL and abs(g - NAVY[1]) <= TOL \
-                and abs(b - NAVY[2]) <= TOL:
-            navy += 1
-        elif min(r, g, b) >= 200:
+        if abs(r - INK[0]) <= TOL and abs(g - INK[1]) <= TOL \
+                and abs(b - INK[2]) <= TOL:
+            ink += 1
+        elif g > 140 and r < 100 and b < 150:      # 达标绿 #22c55e
+            green += 1
+        elif min(r, g, b) >= 200:                  # 白色对勾 / 末端点
             white += 1
     for x, y in pts:
         i = (y * w + x) * 4
         if px[i + 3] < 40:
             corners_clear += 1
-    navy_ratio = navy / max(1, opaque)
-    ok = (navy_ratio > 0.4 and white > 0 and corners_clear >= 2
-          and opaque > total * 0.5)
-    return ok, "navy=%.2f white=%d corners=%d/4 opaque=%.2f size=%dx%d" % (
-        navy_ratio, white, corners_clear, opaque / total, w, h)
+    ink_ratio = ink / max(1, opaque)
+    ok = (ink_ratio > 0.4 and green > 0 and white > 0
+          and corners_clear >= 2 and opaque > total * 0.5)
+    return ok, ("ink=%.2f green=%d white=%d corners=%d/4 opaque=%.2f "
+                "size=%dx%d") % (ink_ratio, green, white, corners_clear,
+                                 opaque / total, w, h)
 
 
 def main():

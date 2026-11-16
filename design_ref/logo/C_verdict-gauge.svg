@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+  <title id="title">NetPulse 方案 C · 结论仪表</title>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#0B2545"/>
+  <path d="M74.3 181.7A76 76 0 1 1 181.7 181.7" fill="none" stroke="#FFFFFF" stroke-opacity=".18" stroke-width="16" stroke-linecap="round"/>
+  <path d="M74.3 181.7A76 76 0 1 1 181.7 181.7" fill="none" stroke="#22C55E" stroke-width="16" stroke-linecap="round" stroke-dasharray="268 358"/>
+  <circle cx="198" cy="99" r="11" fill="#FFFFFF"/>
+  <path d="M100 130l20 20 38-44" fill="none" stroke="#FFFFFF" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

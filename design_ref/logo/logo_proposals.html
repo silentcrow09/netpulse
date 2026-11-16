@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetPulse 图标 / Logo 方案对比</title>
+<style>
+:root{--navy:#0A3B6E;--blue:#1668C9;--ink:#152238;--muted:#5C6B80;--line:#DCE5F0;--bg:#F4F7FB;--soft:#EEF3F9}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.65 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+header{background:var(--navy);color:#fff;padding:26px 40px 22px}
+header h1{margin:0;font-size:23px;letter-spacing:.4px;font-weight:600}
+header p{margin:6px 0 0;color:#C9DBEF;font-size:13px}
+header .meta{float:right;color:#9FC0E2;font-size:12px;letter-spacing:.5px;padding-top:6px}
+.wrap{max-width:1160px;margin:0 auto;padding:24px 30px 64px}
+.brief{background:#fff;border:1px solid var(--line);border-left:4px solid var(--blue);border-radius:10px;padding:14px 20px;margin-bottom:22px;font-size:13px}
+.brief b{color:var(--navy)}
+.brief .kv{display:flex;gap:26px;flex-wrap:wrap;margin-top:8px;color:var(--muted)}
+.brief .kv span b{color:var(--ink)}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+.card{background:#fff;border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.top{display:flex;align-items:center;gap:10px;padding:16px 20px 0}
+.letter{width:26px;height:26px;border-radius:7px;background:var(--navy);color:#fff;display:inline-flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex:0 0 26px}
+.card h2{margin:0;font-size:17px;font-weight:600}
+.en{color:var(--muted);font-size:12px;letter-spacing:.6px;margin-left:auto}
+.stage{display:flex;align-items:center;gap:20px;padding:16px 20px 14px}
+.big{width:128px;height:128px;flex:0 0 128px;background:var(--soft);border-radius:14px;display:flex;align-items:center;justify-content:center}
+.pitch{font-size:13px;color:var(--muted)}
+.pitch b{display:block;color:var(--ink);font-size:14px;margin-bottom:4px;font-weight:600}
+dl{margin:0 20px 16px;display:grid;grid-template-columns:72px 1fr;gap:5px 12px;font-size:12.5px}
+dt{color:var(--muted)}dd{margin:0}
+.strip{border-top:1px solid var(--line);padding:12px 20px 14px}
+.strip .lbl{font-size:11px;color:var(--muted);letter-spacing:1.2px;display:block;margin-bottom:10px}
+.sizes{display:flex;align-items:flex-end;gap:16px}
+.sizes i{display:flex;flex-direction:column;align-items:center;gap:5px;font-style:normal;font-size:11px;color:var(--muted)}
+.scenes{display:flex;gap:12px;margin-top:14px;flex-wrap:wrap}
+.scene{width:62px;height:62px;border-radius:10px;display:flex;align-items:center;justify-content:center;border:1px solid var(--line)}
+.scene.light{background:#E9EDF2}
+.scene.dark{background:var(--navy)}
+.scene.mono{background:#fff}
+.lockup{display:flex;align-items:center;gap:10px;margin-top:14px;padding:8px 12px;background:var(--soft);border-radius:9px;width:max-content}
+.lockup .nm{font-size:16px;font-weight:700;color:var(--navy);letter-spacing:.2px;line-height:1.1}
+.lockup .sub{font-size:10px;color:var(--muted);letter-spacing:1px}
+h3.sec{font-size:15px;font-weight:600;color:var(--navy);margin:34px 0 12px;padding-bottom:8px;border-bottom:2px solid var(--navy)}
+table{border-collapse:collapse;width:100%;background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden;font-size:12.5px}
+th,td{padding:9px 11px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{background:var(--soft);color:var(--navy);font-weight:600;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+td:first-child{color:var(--muted);white-space:nowrap}
+.pick{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:12px}
+.pick div{background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 15px;font-size:13px}
+.pick b{color:var(--navy)}
+.steps{background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 20px;font-size:13px}
+.steps ol{margin:6px 0 0;padding-left:20px}
+.steps code{background:var(--soft);padding:1px 5px;border-radius:4px;font-family:Consolas,monospace;font-size:12px;color:var(--navy)}
+.note{color:var(--muted);font-size:12px;margin-top:18px;line-height:1.7}
+.i{display:block}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="icoA" viewBox="0 0 256 256">
+    <rect x="8" y="8" width="240" height="240" rx="56" fill="#0A3B6E"/>
+    <path d="M44 128H88l20-52 26 104 20-68 14 16h44" fill="none" stroke="#FFFFFF" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="icoB" viewBox="0 0 256 256">
+    <rect x="8" y="8" width="240" height="240" rx="56" fill="#1668C9"/>
+    <g fill="none" stroke="#FFFFFF" stroke-width="13" stroke-linecap="round">
+      <path d="M121.7 97.4A40 40 0 0 1 121.7 158.6" opacity=".95"/>
+      <path d="M142.3 72.8A72 72 0 0 1 142.3 183.2" opacity=".62"/>
+      <path d="M162.9 48.3A104 104 0 0 1 162.9 207.7" opacity=".34"/>
+    </g>
+    <circle cx="96" cy="128" r="15" fill="#FFFFFF"/>
+    <circle cx="96" cy="128" r="6" fill="#7DD3FC"/>
+  </symbol>
+  <symbol id="icoC" viewBox="0 0 256 256">
+    <rect x="8" y="8" width="240" height="240" rx="56" fill="#0B2545"/>
+    <path d="M74.3 181.7A76 76 0 1 1 181.7 181.7" fill="none" stroke="#FFFFFF" stroke-opacity=".18" stroke-width="16" stroke-linecap="round"/>
+    <path d="M74.3 181.7A76 76 0 1 1 181.7 181.7" fill="none" stroke="#22C55E" stroke-width="16" stroke-linecap="round" stroke-dasharray="268 358"/>
+    <circle cx="198" cy="99" r="11" fill="#FFFFFF"/>
+    <path d="M100 130l20 20 38-44" fill="none" stroke="#FFFFFF" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="icoD" viewBox="0 0 256 256">
+    <g fill="#0A3B6E">
+      <rect x="52" y="44" width="22" height="152" rx="11"/>
+      <rect x="182" y="44" width="22" height="152" rx="11"/>
+    </g>
+    <path d="M74 44L182 196" fill="none" stroke="#0A3B6E" stroke-width="22" stroke-linecap="round"/>
+    <path d="M28 218H92l16-18 20 36 18-26 14 8h68" fill="none" stroke="#1668C9" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+</svg>
+
+<header>
+  <span class="meta">v1.26.x 品牌资产 · 2026-11 · 选型稿（未改动运行时代码）</span>
+  <h1>NetPulse · 图标 / Logo 方案对比</h1>
+  <p>四套互不相同的图形语言：线性极简 / 几何信号 / 工程仪表 / 品牌字标</p>
+</header>
+
+<div class="wrap">
+  <div class="brief">
+    <b>定位约束</b>：单文件 Windows 网络体检工具，主要使用者是一线装维工程师（客户现场、笔记本、报告交客户），其次是普通用户自助排障。产品灵魂是「结论先行」，不是堆指标。
+    <div class="kv">
+      <span>品牌色 <b>#0A3B6E</b>（与 GUI / PDF 报告同源）</span>
+      <span>硬约束 <b>16px 任务栏可辨</b></span>
+      <span>硬约束 <b>单色可印 / 报告蓝头可反白</b></span>
+      <span>硬约束 <b>零外链、data URI &lt; 48KB</b></span>
+    </div>
+  </div>
+
+  <div class="grid">
+
+    <article class="card">
+      <div class="top"><span class="letter">A</span><h2>脉搏基线</h2><span class="en">PULSE BASELINE</span></div>
+      <div class="stage">
+        <div class="big"><svg class="i" style="width:112px;height:112px" viewBox="0 0 256 256"><use href="#icoA"/></svg></div>
+        <div class="pitch"><b>一根线讲完「网络脉搏」</b>现有 v1.26.4 图标的精修版：折点 7→6、峰谷对称、端点圆头、按尺寸钳底线宽。改动最小，与 CLI / HTML 报告完全一套色。</div>
+      </div>
+      <dl>
+        <dt>设计语言</dt><dd>极简线性 · 单一线宽 · 零装饰</dd>
+        <dt>语言参考</dt><dd>Windows 11 系统图标、Linear、Vercel 的单色几何符号</dd>
+        <dt>语义</dt><dd>网络脉搏；用户零学习成本（现状延续）</dd>
+        <dt>16px</dt><dd>优 —— 线宽钳底 2px，去掉一个折点</dd>
+        <dt>单色印刷</dt><dd>优 —— 反相即白底深线</dd>
+        <dt>落地改动</dt><dd>最小，只改 <code>_make_favicon.py</code> 的 PULSE 点列</dd>
+        <dt>最适场景</dt><dd>任务栏 / EXE / 报告页眉 / 全场景兜底</dd>
+      </dl>
+      <div class="strip">
+        <span class="lbl">尺寸对照 · 项目要求 16/24/32/48/64/128/256 每帧独立重绘</span>
+        <div class="sizes">
+          <i><svg class="i" style="width:96px;height:96px" viewBox="0 0 256 256"><use href="#icoA"/></svg>96</i>
+          <i><svg class="i" style="width:64px;height:64px" viewBox="0 0 256 256"><use href="#icoA"/></svg>64</i>
+          <i><svg class="i" style="width:32px;height:32px" viewBox="0 0 256 256"><use href="#icoA"/></svg>32</i>
+          <i><svg class="i" style="width:24px;height:24px" viewBox="0 0 256 256"><use href="#icoA"/></svg>24</i>
+          <i><svg class="i" style="width:16px;height:16px" viewBox="0 0 256 256"><use href="#icoA"/></svg>16</i>
+        </div>
+        <div class="scenes">
+          <div class="scene light"><svg class="i" style="width:44px;height:44px" viewBox="0 0 256 256"><use href="#icoA"/></svg></div>
+          <div class="scene mono"><svg class="i" style="width:44px;height:44px;filter:grayscale(1) invert(1) contrast(1.2)" viewBox="0 0 256 256"><use href="#icoA"/></svg></div>
+        </div>
+        <div class="lockup"><svg class="i" style="width:34px;height:34px" viewBox="0 0 256 256"><use href="#icoA"/></svg><div><div class="nm">NetPulse</div><div class="sub">网络体检 · 结论先行</div></div></div>
+      </div>
+    </article>
+
+    <article class="card">
+      <div class="top"><span class="letter">B</span><h2>回波雷达</h2><span class="en">ECHO RADAR</span></div>
+      <div class="stage">
+        <div class="big"><svg class="i" style="width:112px;height:112px" viewBox="0 0 256 256"><use href="#icoB"/></svg></div>
+        <div class="pitch"><b>发出探测，收回回波</b>三条同心弧从探针向外扩散，一眼看出是「网络工具」而非医疗心电。亮蓝比 navy 更跳，适合下载页、官网、未来移动端。</div>
+      </div>
+      <dl>
+        <dt>设计语言</dt><dd>几何波纹 · 方向性弧 · 亮蓝纯色</dd>
+        <dt>语言参考</dt><dd>Fing 雷达波纹、Speedtest 圆环、Wi-Fi 信号弧</dd>
+        <dt>语义</dt><dd>探测 → 回波 → 定位（24 个模块在做的事）</dd>
+        <dt>16px</dt><dd>良 —— 保留中心点 + 2 条弧，去最外弧与青点</dd>
+        <dt>单色印刷</dt><dd>良 —— 弧靠透明度分层，单色下需改线宽分层</dd>
+        <dt>落地改动</dt><dd>中，<code>render(size)</code> 改弧线绘制并分档简化</dd>
+        <dt>最适场景</dt><dd>官网 / 下载页 / 宣传物料 / NetPulse Mobile</dd>
+      </dl>
+      <div class="strip">
+        <span class="lbl">尺寸对照 · 小尺寸必须做减法，不能等比缩放</span>
+        <div class="sizes">
+          <i><svg class="i" style="width:96px;height:96px" viewBox="0 0 256 256"><use href="#icoB"/></svg>96</i>
+          <i><svg class="i" style="width:64px;height:64px" viewBox="0 0 256 256"><use href="#icoB"/></svg>64</i>
+          <i><svg class="i" style="width:32px;height:32px" viewBox="0 0 256 256"><use href="#icoB"/></svg>32</i>
+          <i><svg class="i" style="width:24px;height:24px" viewBox="0 0 256 256"><use href="#icoB"/></svg>24</i>
+          <i><svg class="i" style="width:16px;height:16px" viewBox="0 0 256 256"><use href="#icoB"/></svg>16</i>
+        </div>
+        <div class="scenes">
+          <div class="scene light"><svg class="i" style="width:44px;height:44px" viewBox="0 0 256 256"><use href="#icoB"/></svg></div>
+          <div class="scene mono"><svg class="i" style="width:44px;height:44px;filter:grayscale(1) invert(1) contrast(1.2)" viewBox="0 0 256 256"><use href="#icoB"/></svg></div>
+        </div>
+        <div class="lockup"><svg class="i" style="width:34px;height:34px" viewBox="0 0 256 256"><use href="#icoB"/></svg><div><div class="nm">NetPulse</div><div class="sub">网络体检 · 结论先行</div></div></div>
+      </div>
+    </article>
+
+    <article class="card">
+      <div class="top"><span class="letter">C</span><h2>结论仪表</h2><span class="en">VERDICT GAUGE</span></div>
+      <div class="stage">
+        <div class="big"><svg class="i" style="width:112px;height:112px" viewBox="0 0 256 256"><use href="#icoC"/></svg></div>
+        <div class="pitch"><b>测完就给结论</b>270° 仪表环 + 达标绿弧 + 中心对勾，把「结论先行 / 签约带宽达标判定」直接画进图标。最贴装维现场，代价是小尺寸要专门简化。</div>
+      </div>
+      <dl>
+        <dt>设计语言</dt><dd>工程仪表 · 状态色 · 高信息密度</dd>
+        <dt>语言参考</dt><dd>Speedtest 圆环仪表、Windows 性能环、装维验收单</dd>
+        <dt>语义</dt><dd>测完即判达标，而不是丢一堆数字给用户</dd>
+        <dt>16px</dt><dd>中 —— 环简化为一段绿弧 + 白对勾</dd>
+        <dt>单色印刷</dt><dd>中 —— 绿弧会丢，须靠对勾与环缺口区分</dd>
+        <dt>落地改动</dt><dd>中，弧 + dasharray + 对勾，三档尺寸分别重绘</dd>
+        <dt>最适场景</dt><dd>装维现场 / 客户报告 / 场景化诊断入口</dd>
+      </dl>
+      <div class="strip">
+        <span class="lbl">尺寸对照 · 这套最需要「小尺寸专用版」</span>
+        <div class="sizes">
+          <i><svg class="i" style="width:96px;height:96px" viewBox="0 0 256 256"><use href="#icoC"/></svg>96</i>
+          <i><svg class="i" style="width:64px;height:64px" viewBox="0 0 256 256"><use href="#icoC"/></svg>64</i>
+          <i><svg class="i" style="width:32px;height:32px" viewBox="0 0 256 256"><use href="#icoC"/></svg>32</i>
+          <i><svg class="i" style="width:24px;height:24px" viewBox="0 0 256 256"><use href="#icoC"/></svg>24</i>
+          <i><svg class="i" style="width:16px;height:16px" viewBox="0 0 256 256"><use href="#icoC"/></svg>16</i>
+        </div>
+        <div class="scenes">
+          <div class="scene light"><svg class="i" style="width:44px;height:44px" viewBox="0 0 256 256"><use href="#icoC"/></svg></div>
+          <div class="scene mono"><svg class="i" style="width:44px;height:44px;filter:grayscale(1) invert(1) contrast(1.2)" viewBox="0 0 256 256"><use href="#icoC"/></svg></div>
+        </div>
+        <div class="lockup"><svg class="i" style="width:34px;height:34px" viewBox="0 0 256 256"><use href="#icoC"/></svg><div><div class="nm">NetPulse</div><div class="sub">网络体检 · 结论先行</div></div></div>
+      </div>
+    </article>
+
+    <article class="card">
+      <div class="top"><span class="letter">D</span><h2>N 字标</h2><span class="en">LETTERMARK</span></div>
+      <div class="stage">
+        <div class="big"><svg class="i" style="width:112px;height:112px" viewBox="0 0 256 256"><use href="#icoD"/></svg></div>
+        <div class="pitch"><b>品牌字标，给对外物料用</b>透明底 N 字 + 脉搏下划线，不套方块底板。适合 README、GitHub、客户报告蓝头（反白）、宣传片片头；任务栏另配图形标。</div>
+      </div>
+      <dl>
+        <dt>设计语言</dt><dd>纯字标 · 几何笔画 · 图形下划线</dd>
+        <dt>语言参考</dt><dd>Notion / Netflix N / 运营商企业字标</dd>
+        <dt>语义</dt><dd>Net + Pulse 双关，品牌名直接可读</dd>
+        <dt>16px</dt><dd>弱 —— 不建议用作任务栏图标</dd>
+        <dt>单色印刷</dt><dd>优 —— 单色描边，白底深字直接印</dd>
+        <dt>落地改动</dt><dd>需另配 favicon；字标本身 SVG 可直接用</dd>
+        <dt>最适场景</dt><dd>README / 报告页眉 / 宣传片 / 工单名片</dd>
+      </dl>
+      <div class="strip">
+        <span class="lbl">尺寸对照 · 字标低于 32px 就不再清晰</span>
+        <div class="sizes">
+          <i><svg class="i" style="width:96px;height:96px" viewBox="0 0 256 256"><use href="#icoD"/></svg>96</i>
+          <i><svg class="i" style="width:64px;height:64px" viewBox="0 0 256 256"><use href="#icoD"/></svg>64</i>
+          <i><svg class="i" style="width:32px;height:32px" viewBox="0 0 256 256"><use href="#icoD"/></svg>32</i>
+          <i><svg class="i" style="width:24px;height:24px" viewBox="0 0 256 256"><use href="#icoD"/></svg>24</i>
+          <i><svg class="i" style="width:16px;height:16px" viewBox="0 0 256 256"><use href="#icoD"/></svg>16</i>
+        </div>
+        <div class="scenes">
+          <div class="scene light"><svg class="i" style="width:44px;height:44px" viewBox="0 0 256 256"><use href="#icoD"/></svg></div>
+          <div class="scene dark"><svg class="i" style="width:44px;height:44px;filter:brightness(0) invert(1)" viewBox="0 0 256 256"><use href="#icoD"/></svg></div>
+        </div>
+        <div class="lockup"><svg class="i" style="width:34px;height:34px" viewBox="0 0 256 256"><use href="#icoD"/></svg><div><div class="nm">NetPulse</div><div class="sub">网络体检 · 结论先行</div></div></div>
+      </div>
+    </article>
+
+  </div>
+
+  <h3 class="sec">横向对比</h3>
+  <table>
+    <tr><th>维度</th><th>A 脉搏基线</th><th>B 回波雷达</th><th>C 结论仪表</th><th>D N 字标</th></tr>
+    <tr><td>风格</td><td>极简线性</td><td>几何信号</td><td>工程仪表</td><td>品牌字标</td></tr>
+    <tr><td>底色</td><td>navy 深蓝</td><td>亮蓝</td><td>墨蓝 + 达标绿</td><td>透明 / 反白</td></tr>
+    <tr><td>一眼辨识为</td><td>脉搏 / 监控</td><td>网络 / 信号</td><td>测速 / 达标判定</td><td>品牌名</td></tr>
+    <tr><td>16px 任务栏</td><td>优</td><td>良</td><td>中（需简化版）</td><td>弱（不建议）</td></tr>
+    <tr><td>单色印刷</td><td>优</td><td>良</td><td>中</td><td>优</td></tr>
+    <tr><td>落地改动量</td><td>最小</td><td>中</td><td>中偏大</td><td>需另配图标</td></tr>
+    <tr><td>最适场景</td><td>全场景兜底</td><td>官网 / 移动端</td><td>装维现场 / 客户报告</td><td>对外物料 / 宣传片</td></tr>
+  </table>
+
+  <h3 class="sec">怎么选</h3>
+  <div class="pick">
+    <div><b>要稳、要零风险</b> → 选 A。与 GUI、PDF 报告、CLI 配色同源，只改点列就能上线，验收闸不用动。</div>
+    <div><b>要一眼看出是网络工具、要现代感</b> → 选 B。波形太像医疗，雷达弧才是网络语言；亮蓝在下载页最抓眼。</div>
+    <div><b>要图标直接讲产品灵魂</b> → 选 C。「结论先行 / 达标判定」被画出来了，但 16px 必须单独做简化版。</div>
+    <div><b>要对外品牌物料</b> → D 作字标，图形标仍选 A 或 B 搭配。两者分工，不必四选一。</div>
+  </div>
+
+  <h3 class="sec">选定后的落地路径（当前未改动任何运行时代码）</h3>
+  <div class="steps">
+    <ol>
+      <li>改 <code>tests/_make_favicon.py</code> 的 <code>render(size)</code>：<code>SIZES = [16,24,32,48,64,128,256]</code> 每帧按几何独立重绘，16/24 帧单独简化，不靠位图缩放。</li>
+      <li><code>py tests/_make_favicon.py --embed</code> 刷新 <code>netpulse.py</code> 里的 <code>_FAVICON_B64</code>（页面 data URI 零外链）。</li>
+      <li><code>py -m unittest tests/test_v1264_favicon.py</code> 过 P1–P4：单条 favicon link、载荷同源、含 256/48/32/16 帧、base64 &lt; 64KB。</li>
+      <li><code>py tests/_gui_icon_probe.py</code> 实机读 Chromium --app 窗口 HICON，确认任务栏不是默认文档图标。</li>
+      <li>EXE 图标：<code>NetPulse.spec</code> 的 <code>EXE(...)</code> 目前<strong>没有</strong> <code>icon=</code> 参数，用的是 PyInstaller 默认图标；可一并指向同一份多尺寸 ICO。</li>
+      <li>客户报告页眉 / 宣传片用 D 字标（浅底原色、蓝头反白）；按 <code>design_ref/README.md</code> 的约定，定型后只保留选中的稿。</li>
+    </ol>
+  </div>
+
+  <p class="note">说明：表中「语言参考」指的是成熟产品的<strong>设计语言层面</strong>（圆角方块 + 单色符号、雷达波纹、圆环仪表、纯字标等通用手法），不是对其图标的复刻或逐像素考证；四套图形均为本次原创几何构造。预览页中的 16/24px 是浏览器对矢量的等比缩放示意，正式 ICO 会按项目约定逐帧独立重绘，小尺寸表现只会更好不会更差。竞品名称仅作风格定位参照，不涉及商标使用。</p>
+</div>
+
+</body>
+</html>

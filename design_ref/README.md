@@ -8,10 +8,24 @@
 design_ref/
 ├── README.md              本文件
 ├── gui/gui_design_v1.html      ← GUI 设计稿 (v1.21.0, 方案A 已选型)
+├── logo/                       ← 品牌图标选型稿 (2026-11-16, C 方案已定案)
+│   ├── C_verdict-gauge.svg     ← 选中稿 (运行时几何见 tests/_make_favicon.py)
+│   ├── logo_proposals.html     ← 四套方案对比页 (自包含, 零外链)
+│   ├── preview.png / frames_check.png
+│   ├── _preview_render.py       ← Pillow 重绘工具 (预览图生成)
+│   └── A/B/D_*.svg             ← 未采纳备选, 暂留存档
 └── report_templates/
     ├── 模板D_现代仪表盘风.html    ← 已接入 (v1.14.10): 选项 6 一页客户报告
     └── assets/ct_logo_white.png     ← 同源 logo, 已被 netpulse.py 内嵌
 ```
+
+## logo/ 选型记录
+
+2026-11-16 评估了 4 套图形语言（A 线性脉搏 / B 回波雷达 / C 结论仪表 /
+D N 字标），Simon 定案 **C**。运行时实现不在本目录：`tests/_make_favicon.py`
+是几何唯一来源，`netpulse.py` 的 `_FAVICON_B64` / `_G_MARK_SVG` 与
+`netpulse.ico` 都由它派生。未采纳的稿暂留作备选存档；需要清理时先确认范围，
+别直接删。
 
 ## 模板 D 同步关系
 

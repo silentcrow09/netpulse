@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+  <title id="title">NetPulse 方案 D · N 字标与脉搏下划线</title>
+  <g fill="#0A3B6E">
+    <rect x="52" y="44" width="22" height="152" rx="11"/>
+    <rect x="182" y="44" width="22" height="152" rx="11"/>
+  </g>
+  <path d="M74 44L182 196" fill="none" stroke="#0A3B6E" stroke-width="22" stroke-linecap="round"/>
+  <path d="M28 218H92l16-18 20 36 18-26 14 8h68" fill="none" stroke="#1668C9" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

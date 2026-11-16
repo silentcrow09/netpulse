@@ -1,15 +1,22 @@
 # -*- coding: utf-8 -*-
-"""NetPulse GUI favicon 生成器 (v1.26.4, 开发期工具)。
+"""NetPulse favicon / EXE 图标生成器 (C 方案「结论仪表」, 开发期工具)。
 
-画一枚与页面顶栏 ``.g-mark`` 同品牌的图标: navy (#0a3b6e) 圆角方块 +
-白色脉搏波形 (NetPulse = 网络脉搏, 心电式折线)。输出多尺寸 PNG-in-ICO
-并打印 base64 —— 整体替换 netpulse.py 里的 ``_FAVICON_B64`` 常量
-(单文件零外链约定: 页面用 data URI, 浏览器不发任何网络请求)。
+画一枚「结论仪表」图标: 墨蓝 (#0b2545) 圆角方块 + 270° 仪表环,
+达标段为绿弧 (#22c55e), 环内白色对勾 —— 对应产品灵魂「结论先行」,
+而不是只丢一堆指标。与页面顶栏 .g-mark、EXE 图标同源。
+
+输出: 7 尺寸 PNG-in-ICO (16/24/32/48/64/128/256, 每帧按几何独立重绘),
+--embed 刷新 netpulse.py 的 _FAVICON_B64 (data URI, 零外链),
+--out 另存 .ico 供 PyInstaller 的 EXE(icon=...) 使用。
+
+小尺寸不是等比缩放: 16/24 帧换成放大版几何 (更粗的对勾 + 更外扩的绿弧),
+并去掉会糊成一片的底环和末端白点 —— 这是 C 方案选型时明确记下的代价,
+也是它跟 A/B 方案在落地工作量上的差别。
 
 用法:
-    py tests/_make_favicon.py              # 打印 base64 (Python 字面量, 可直接粘贴)
-    py tests/_make_favicon.py --embed      # 直接刷新 netpulse.py 里的 _FAVICON_B64
-    py tests/_make_favicon.py --out x.ico  # 另存 .ico 文件 (调试用)
+    py tests/_make_favicon.py                    # 打印 base64 (Python 字面量)
+    py tests/_make_favicon.py --embed            # 刷新 netpulse.py 的 _FAVICON_B64
+    py tests/_make_favicon.py --out netpulse.ico # 另存 EXE 图标
 
 自校验: 保存后重新打开 ICO, 断言帧尺寸集合完整, 不达标直接非零退出。
 """
@@ -25,42 +32,79 @@ sys.path.insert(0, ROOT)
 
 from PIL import Image, ImageDraw  # noqa: E402
 
-# 品牌色: 与 _GUI_CSS 的 --navy 严格一致 (改 CSS 时同步改这里并重跑)
-NAVY = (10, 59, 110, 255)        # #0a3b6e
+# 品牌色 (C 方案): 墨蓝底比 GUI 的 --navy #0a3b6e 更深, 让绿弧/白勾更跳;
+# 未达标段用【实色】而不是半透明白 —— PNG-in-ICO 里半透明像素在深浅背景下
+# 表现不一致, 实色等价于「白 18% 混墨蓝」。
+INK = (11, 37, 69, 255)          # #0b2545 圆角方块
+TRACK = (55, 76, 102, 255)       # 仪表环未达标段
+GREEN = (34, 197, 94, 255)       # #22c55e 达标段
 WHITE = (255, 255, 255, 255)
 
 # ICO 帧尺寸链: 16/32 任务栏与标题栏, 24 小任务栏, 48/64 资源管理器,
 # 128/256 Alt-Tab 与高 DPI。每帧按几何独立重绘 (非位图缩放), 小尺寸不糊。
 SIZES = [16, 24, 32, 48, 64, 128, 256]
 
-# 脉搏折线 (24x24 网格): 平线 → 上冲 → 下探 → 回中 → 平线, 心电波形。
-PULSE = [(2.5, 12), (7, 12), (9.2, 6.8), (11.6, 17.2), (13.8, 10.6),
-         (15.2, 12), (21.5, 12)]
-
-# 圆角比例对齐顶栏 .g-mark (radius 8px / 边 30px)
-_CORNER = 8.0 / 30.0
+# 几何基于 256x256 网格, 与 design_ref/logo/C_verdict-gauge.svg 同一套坐标。
+# 圆角 56/256 对齐顶栏 .g-mark 内联 SVG 的圆角。
+_CORNER = 56.0 / 256.0
 # 超采样倍数 (Pillow 无抗锯齿, 4x 画再缩)
 _SS = 4
 
+# 仪表环 (圆心 128,128 / r=76) 与对勾 (256 网格)
+_RING_BOX = (52, 52, 204, 204)
+_CHECK = [(100, 130), (120, 150), (158, 106)]
+# 16/24 帧专用: 放大到接近满画布, 只留绿弧 + 对勾
+_SMALL_RING_BOX = (28, 28, 228, 228)
+_SMALL_CHECK = [(78, 132), (112, 164), (178, 96)]
 
-def _pulse_width(size):
-    """折线宽 (px): 24 网格里 1.8 单位 ≈ 7.5%; 小尺寸钳底 2px 保可辨。"""
-    return max(2, round(size * 1.8 / 24))
+
+def q(v, s):
+    """256 网格坐标 → 当前超采样画布坐标。"""
+    return round(v / 256 * s)
+
+
+def _stroke(d, s, pts, width, color, floor=2):
+    """折线 + 端点/拐点补圆 (round linecap / linejoin 效果)。"""
+    p = [(q(x, s), q(y, s)) for x, y in pts]
+    w = max(floor, q(width, s))
+    d.line(p, fill=color, width=w, joint="curve")
+    r = w / 2.0
+    for x, y in p:
+        d.ellipse([x - r, y - r, x + r, y + r], fill=color)
+
+
+def _dot(d, s, cx, cy, r, color):
+    rr = q(r, s)
+    x, y = q(cx, s), q(cy, s)
+    d.ellipse([x - rr, y - rr, x + rr, y + rr], fill=color)
 
 
 def render(size):
-    """画一帧: navy 圆角方块底 + 白色脉搏折线 (圆端点/圆拐点)。"""
+    """画一帧: 墨蓝圆角方块 + 270° 仪表环 + 达标绿弧 + 白色对勾。
+
+    三档几何 (不是缩放):
+      <=24 : 放大版绿弧 + 放大版对勾, 无底环、无末端点 (16px 仍可辨)
+      32/48: 标准环 + 对勾, 去掉末端白点
+      >=64 : 完整稿, 补绿弧末端白色圆点
+    """
     s = size * _SS
     img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([0, 0, s - 1, s - 1], radius=round(s * _CORNER),
-                        fill=NAVY)
-    w = _pulse_width(size) * _SS
-    pts = [(round(x / 24 * s), round(y / 24 * s)) for x, y in PULSE]
-    d.line(pts, fill=WHITE, width=w, joint="curve")
-    r = w / 2.0
-    for px, py in pts:   # 端点与拐点补圆 → linecap/linejoin round 效果
-        d.ellipse([px - r, py - r, px + r, py + r], fill=WHITE)
+    d.rounded_rectangle([0, 0, s - 1, s - 1],
+                        radius=round(s * _CORNER), fill=INK)
+    if size <= 24:
+        box = [q(v, s) for v in _SMALL_RING_BOX]
+        d.arc(box, start=140, end=330, fill=GREEN,
+              width=max(3, q(30, s)))
+        _stroke(d, s, _SMALL_CHECK, 32, WHITE, floor=3)
+    else:
+        box = [q(v, s) for v in _RING_BOX]
+        w = max(2, q(16, s))
+        d.arc(box, start=135, end=405, fill=TRACK, width=w)
+        d.arc(box, start=135, end=337.5, fill=GREEN, width=w)
+        _stroke(d, s, _CHECK, 16, WHITE, floor=2)
+        if size >= 64:
+            _dot(d, s, 198, 99, 11, WHITE)
     return img.resize((size, size), Image.LANCZOS)
 
 
@@ -101,8 +145,9 @@ def embed(path):
     eol = "\r\n" if "\r\n" in raw else "\n"
     literal = b64_literal(build_ico_bytes()[0]).replace("\n", eol)
     header = eol.join([
-        "# ── favicon (v1.26.4): 顶栏 .g-mark 同品牌图标, 多尺寸 PNG-in-ICO ──",
+        "# ── favicon: C 方案「结论仪表」图标, 7 尺寸 PNG-in-ICO ──",
         "# 生成: py tests/_make_favicon.py --embed (改图标后重跑自动刷新本常量)",
+        "# 同源资产: 顶栏 .g-mark 内联 SVG / EXE 图标 netpulse.ico 均由本生成器几何派生。",
         "# 为什么内嵌 data URI: Chromium --app 窗口任务栏图标取页面 icon,",
         "# 无 icon 落默认文档图标; data URI 零网络请求, 守零外链契约。",
     ]) + eol

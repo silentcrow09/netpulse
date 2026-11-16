@@ -7,6 +7,31 @@
 
 ## [Unreleased]
 
+### 变更
+
+- **品牌图标换成 C 方案「结论仪表」**（Simon 四选一定案）: 墨蓝 `#0b2545`
+  圆角方块 + 270° 仪表环 + 达标绿弧 `#22c55e` + 白色对勾 —— 把「结论先行 /
+  签约带宽达标判定」画进图标, 替代 v1.26.4 的 navy + 白色脉搏波形。
+  三处同源: 顶栏 `.g-mark` 内联 SVG、7 尺寸 PNG-in-ICO 内嵌 favicon、
+  EXE 图标 `netpulse.ico`。
+- **小尺寸分档重绘**: 16/24 帧换成放大版几何 (绿弧 + 对勾, 去掉底环与末端
+  白点), 32/48 去末端点, 64+ 才是完整稿 —— C 方案 16px 会糊是选型时记下的
+  代价, 用逐帧重绘解决, 不做等比缩放。
+- `NetPulse.spec` 的 `EXE(...)` 补 `icon=`: 此前 EXE 用 PyInstaller 默认图标。
+  路径按 `SPECPATH` + cwd 双重兜底 (兼容 `build_exe.ps1 --specpath build`),
+  ICO 缺失时退回默认图标, 不让打包因资产文件失败。
+- `tests/_gui_icon_probe.py`: 判定口径改为墨蓝主体 + 绿弧 + 白勾; 补齐 Win32
+  函数 `argtypes` —— 64 位下句柄 > 2^31-1 时 ctypes 默认按 c_int 传参会
+  OverflowError, 探针此前在高句柄机器上必崩 (与图标内容无关)。
+- 实机复验: `ICON-OK`, 32×32, ink=0.65 / green=112 / white=53 / 圆角 4/4。
+- 修正 README 头部版本号 (v1.26.3 → v1.26.4, 与 `APP_VERSION` 三处同步)。
+
+### 备注
+
+- 本次是品牌资产修订, **未提升 `APP_VERSION`**: 只升 `version.json` 而不发
+  tag 会让回落源领先 Releases, 造成假「有新版本」提示。发版时再统一升版本
+  号并推 tag。
+
 ## [1.26.4] - 2026-11-16
 
 ### 修复

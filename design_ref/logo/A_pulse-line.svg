@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+  <title id="title">NetPulse 方案 A · 脉搏基线</title>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#0A3B6E"/>
+  <path d="M44 128H88l20-52 26 104 20-68 14 16h44" fill="none" stroke="#FFFFFF" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

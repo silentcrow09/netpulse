@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+  <title id="title">NetPulse 方案 B · 回波雷达</title>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#1668C9"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="13" stroke-linecap="round">
+    <path d="M121.7 97.4A40 40 0 0 1 121.7 158.6" opacity=".95"/>
+    <path d="M142.3 72.8A72 72 0 0 1 142.3 183.2" opacity=".62"/>
+    <path d="M162.9 48.3A104 104 0 0 1 162.9 207.7" opacity=".34"/>
+  </g>
+  <circle cx="96" cy="128" r="15" fill="#FFFFFF"/>
+  <circle cx="96" cy="128" r="6" fill="#7DD3FC"/>
+</svg>

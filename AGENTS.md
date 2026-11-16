@@ -117,12 +117,22 @@
 - 状态色唯一来源 `STATUS_COLORS`，经 `/api/scenarios` 下发，页面 JS 不内嵌色表；
 - 页面动态数据一律 `textContent`，禁止 innerHTML 插值；
 - `--cli`/`--json`/非 TTY 契约永不进 GUI。
-- **任务栏图标（v1.26.4）**：Chromium `--app` 窗口的任务栏/标题栏图标取自
-  页面 favicon —— `_gui_page()` head 里那条 data URI favicon
-  （`_FAVICON_B64`）是唯一图标来源，**别改回外链**（零外链闸
-  `test_gui_page.py` 只放行 data URI favicon）。改图标走
-  `py tests/_make_favicon.py --embed`（生成器自动刷新常量并自校验帧完整），
-  实机验证用 `py tests/_gui_icon_probe.py`（读窗口 HICON 像素判品牌特征）。
+- **品牌图标（C 方案「结论仪表」，2026-11-16 定案）**：墨蓝 `#0b2545`
+  圆角方块 + 270° 仪表环 + 达标绿弧 `#22c55e` + 白色对勾。**三处同源**：
+  `_gui_page()` head 的 data URI favicon（`_FAVICON_B64`，Chromium `--app`
+  窗口任务栏/标题栏取它，**别改回外链**，`test_gui_page.py` 零外链闸只放行
+  data URI）、顶栏 `.g-mark` 内联 SVG（`_G_MARK_SVG`，不写 `xmlns`）、
+  EXE 图标 `netpulse.ico`（`NetPulse.spec` 的 `icon=`）。
+  几何唯一来源是 `tests/_make_favicon.py`：改图标走
+  `py tests/_make_favicon.py --embed`（刷新常量 + 帧完整性自校验），
+  `py tests/_make_favicon.py --out netpulse.ico` 同步 EXE 图标，
+  实机验证用 `py tests/_gui_icon_probe.py`（读窗口 HICON 像素判墨蓝/绿弧/白勾）。
+- **小尺寸必须分档重绘，不是等比缩放**：16/24 帧用放大版几何（绿弧 + 对勾，
+  去掉底环与末端白点），32/48 去末端点，64+ 才是完整稿。C 方案信息密度高，
+  等比缩到 16px 会糊成一团 —— 改 `render(size)` 时守住这三档。
+- **探针的 64 位句柄**：`_gui_icon_probe.py` 里所有 Win32 调用都显式声明了
+  `argtypes`；不声明时 ctypes 按 `c_int` 传句柄，> 2^31-1 直接
+  `OverflowError`（曾误判成图标没生效）。新增 Win32 调用时一并补原型。
 
 ### 场景合并与主页紧凑化（v1.26.0 增补）
 
